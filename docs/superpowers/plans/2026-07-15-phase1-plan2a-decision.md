@@ -147,16 +147,21 @@ def get_settings() -> Settings:
 
 - [ ] **Step 5: 生成迁移并验证**
 
+顺序至关重要：必须先把 DB 恢复到 Plan 1 head（`c832da65db01`）再 autogenerate，否则会对空库比对而重建全部 11 张表。且新增的 Settings 校验器会让 alembic CLI 在默认 `change-me` 密钥下报错，需 `TESTING=true`：
+
 ```bash
 docker compose -f deploy/docker-compose.yml exec -T postgres \
   psql -U dev -d social_reply -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
-uv run alembic revision --autogenerate -m "reply_decisions and message index"
-uv run alembic upgrade head
+TESTING=true uv run alembic upgrade head          # 先回到 Plan 1 状态（10 表，无 reply_decisions）
+TESTING=true uv run alembic revision --autogenerate -m "reply_decisions and message index"
+TESTING=true uv run alembic upgrade head          # 再应用本次增量
 docker compose -f deploy/docker-compose.yml exec -T postgres \
   psql -U dev -d social_reply -c "\dt" | grep reply_decisions
 ```
 
-检查生成的 `migrations/versions/*_reply_decisions*.py` 含 `create_table('reply_decisions')` 与 messages 的 `create_index`。若 ruff 对生成文件报错，已有 per-file-ignore 覆盖 `migrations/versions/*`。
+检查生成的 `migrations/versions/*_reply_decisions*.py`：`down_revision='c832da65db01'`，upgrade 只含 `create_table('reply_decisions')` 与 messages 的 `create_index`（**不含**其它 10 表——若包含则 autogenerate 顺序错了，重做）。若 ruff 对生成文件报错，已有 per-file-ignore 覆盖 `migrations/versions/*`。
+
+> **后续任务注意**：Settings 校验器使 `Settings()` 在非测试上下文（如手动跑 alembic/脚本）遇 `change-me` 密钥即报错。手动运行迁移或集成脚本时需 `export TESTING=true` 或提供真实 `CHATWOOT_WEBHOOK_SECRET`；pytest 不受影响（根 conftest 已设 TESTING）。
 
 - [ ] **Step 6: 运行全部门禁**
 
