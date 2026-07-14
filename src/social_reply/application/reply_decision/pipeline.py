@@ -52,6 +52,10 @@ async def run_decision_pipeline(
     # 输出侧闸门
     decision = run_final_guard(decision, snapshot.platform)
 
+    # 安全不变量：本管线只 gate HUMAN_ACTIVE(→IGNORE) 与 BOT_DRAFT_ONLY(→草稿)。
+    # 其余非活跃态（HANDOFF_PENDING/BOT_COOLDOWN/CLOSED）可产出 auto_reply，
+    # 靠 Task 7 persist 的 CAS 白名单 state==BOT_ACTIVE 抑制外发——
+    # 切勿把该 CAS 松成 != HUMAN_ACTIVE，否则这些态会立即开始自动外发。
     # 草稿先行：BOT_DRAFT_ONLY 把 auto_reply 降级为 draft（PLAN.md §十八）
     if snapshot.automation_state == "BOT_DRAFT_ONLY" and decision.action is ReplyAction.AUTO_REPLY:
         decision = replace(decision, action=ReplyAction.DRAFT)
