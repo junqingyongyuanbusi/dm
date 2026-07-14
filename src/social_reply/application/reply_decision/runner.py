@@ -7,6 +7,7 @@ from social_reply.application.reply_decision.pipeline import (
     DecisionSnapshot,
     run_decision_pipeline,
 )
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.llm import StubLLMClient
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.killswitch import KillSwitchChecker
@@ -26,7 +27,15 @@ async def run_and_persist_decision(
     """tx1 提交后调用：跑纯管线（不持事务），再在 tx2 写决策+outbox。
     返回 outbox_id（供 Plan 2b enqueue 投递）。"""
     settings = get_settings()
-    decision = await run_decision_pipeline(snapshot, llm=_llm, killswitch=_make_killswitch())
+    try:
+        killswitch = _make_killswitch()
+    except Exception:
+        # redis_url 配置错误等构造期异常也必须 fail-closed（Task 9 评审 I1）：
+        # 不得逃逸为静默决策丢失；与管线内部急停不可用同路，降级为草稿而非放行外发。
+        decision = ReplyDecision(action=ReplyAction.DRAFT,
+                                 reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule")
+    else:
+        decision = await run_decision_pipeline(snapshot, llm=_llm, killswitch=killswitch)
     async with get_session_factory()() as session:
         outbox_id = await persist_decision(
             session, snapshot, conversation_id, message_id, account_id,

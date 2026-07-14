@@ -1,3 +1,4 @@
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,8 @@ from social_reply.domain.messages.events import build_dm_conversation_key
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,8 +62,9 @@ async def process_raw_event(raw_event_id: str) -> None:
                 outcome.message_id, outcome.account_id,
             )
         except Exception:
-            # Task 7 评审 I2：tx2 失败则决策丢失（已 PROCESSED，重试被去重挡回）；Plan 2b 补扫兜底
-            pass
+            # Task 7 评审 I2：tx2 失败则决策丢失（已 PROCESSED，重试被去重挡回）；Plan 2b 补扫兜底。
+            # 仍吞异常以护住 actor（不 dead-letter/无限重试），但先记录使静默丢失可观测。
+            logger.exception("tx2 decision persist failed, raw_event_id=%s", raw_event_id)
 
 
 async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:
