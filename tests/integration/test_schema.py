@@ -44,3 +44,18 @@ async def test_normalized_events_dedup_constraint(migrated_db, session):
             **{**values, "id": uuid.uuid4()}
         ))
         await session.commit()
+
+
+async def test_metadata_matches_migrations(migrated_db):
+    """漂移护栏：models 改动但忘记生成迁移时在测试期报警"""
+    from alembic.autogenerate import compare_metadata
+    from alembic.migration import MigrationContext
+
+    engine = get_engine()
+    async with engine.connect() as conn:
+        diffs = await conn.run_sync(
+            lambda c: compare_metadata(
+                MigrationContext.configure(c), models.Base.metadata
+            )
+        )
+    assert diffs == []
