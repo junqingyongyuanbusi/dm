@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import func, insert, select
@@ -59,6 +60,7 @@ async def test_inbound_user_message_full_chain(session):
     assert mapping.chatwoot_conversation_id == 77
     msg = (await session.execute(select(models.Message))).scalar_one()
     assert msg.direction == "inbound" and msg.chatwoot_message_id == 55
+    assert msg.occurred_at == datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
     state = (await session.execute(select(models.AutomationState))).scalar_one()
     assert state.state == "BOT_DRAFT_ONLY"  # 账号默认草稿先行
     norm = (await session.execute(select(models.NormalizedEvent))).scalar_one()
@@ -158,3 +160,67 @@ async def test_missing_account_id_marked_parse_failed(session):
     )).scalar_one()
     assert raw.processing_status == "PARSE_FAILED"
     assert await _count(session, models.ConversationMapping) == 0
+
+
+async def test_epoch_int_created_at_processed(session):
+    await _seed_account(session)
+    # Chatwoot push_event_data 形态：created_at 为 epoch 秒整数
+    raw_id = await _seed_raw(session, _payload(created_at=1768384800))
+    await process_raw_event(raw_id)
+    raw = (await session.execute(
+        select(models.RawEvent).where(models.RawEvent.id == uuid.UUID(raw_id))
+    )).scalar_one()
+    assert raw.processing_status == "PROCESSED"
+    msg = (await session.execute(select(models.Message))).scalar_one()
+    assert msg.occurred_at == datetime.fromtimestamp(1768384800, tz=UTC)
+
+
+async def test_orphan_agent_message_skipped(session):
+    await _seed_account(session)
+    # 无先行 inbound（无 ConversationMapping）→ 坐席 outgoing 不得建脏联系人/会话
+    agent_payload = _payload(
+        id=70, message_type="outgoing", sender={"id": 3, "type": "user", "name": "客服A"},
+    )
+    raw_id = await _seed_raw(session, agent_payload)
+    await process_raw_event(raw_id)
+    raw = (await session.execute(
+        select(models.RawEvent).where(models.RawEvent.id == uuid.UUID(raw_id))
+    )).scalar_one()
+    assert raw.processing_status == "SKIPPED_ORPHAN_AGENT_MSG"
+    assert await _count(session, models.Contact) == 0
+    assert await _count(session, models.Conversation) == 0
+    assert await _count(session, models.ConversationMapping) == 0
+
+
+async def test_private_note_skipped_ignored(session):
+    await _seed_account(session)
+    # 私有备注（outgoing + user + private）不触发任何状态变更，也不落库
+    note_payload = _payload(
+        id=71, message_type="outgoing", private=True,
+        sender={"id": 3, "type": "user", "name": "客服A"},
+    )
+    raw_id = await _seed_raw(session, note_payload)
+    await process_raw_event(raw_id)
+    raw = (await session.execute(
+        select(models.RawEvent).where(models.RawEvent.id == uuid.UUID(raw_id))
+    )).scalar_one()
+    assert raw.processing_status == "SKIPPED_IGNORED"
+    assert await _count(session, models.Message) == 0
+
+
+async def test_bot_echo_without_outbox_record_skipped(session):
+    await _seed_account(session)
+    await process_raw_event(await _seed_raw(session, _payload()))  # 先建会话与状态
+    # agent_bot 消息但 Outbox 无对账记录 → 仅对账，不入管线，状态不变
+    echo_payload = _payload(
+        id=72, message_type="outgoing", sender={"id": 2, "type": "agent_bot"},
+    )
+    raw_id = await _seed_raw(session, echo_payload)
+    await process_raw_event(raw_id)
+    raw = (await session.execute(
+        select(models.RawEvent).where(models.RawEvent.id == uuid.UUID(raw_id))
+    )).scalar_one()
+    assert raw.processing_status == "SKIPPED_ECHO"
+    state = (await session.execute(select(models.AutomationState))).scalar_one()
+    assert state.state == "BOT_DRAFT_ONLY"  # 未被误翻转
+    assert await _count(session, models.Message) == 1  # 回声不入消息表

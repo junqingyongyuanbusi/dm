@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -25,7 +25,7 @@ async def process_raw_event(raw_event_id: str) -> None:
         )).scalar_one()
         try:
             status = await _process(session, raw)
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError, AttributeError):
             # 畸形 payload 不得卡死在 PENDING / 打死信（Task 4 评审 I1）
             await session.rollback()
             status = "PARSE_FAILED"
@@ -34,7 +34,7 @@ async def process_raw_event(raw_event_id: str) -> None:
             # 用入参 UUID 而非 raw.id：异常路径 rollback 后 raw 已过期，
             # 访问 raw.id 会触发同步上下文里的异步刷新 → MissingGreenlet
             .where(models.RawEvent.id == uuid.UUID(raw_event_id))
-            .values(processing_status=status, processed_at=datetime.now().astimezone())
+            .values(processing_status=status, processed_at=datetime.now(UTC))
         )
         await session.commit()
 
@@ -63,6 +63,18 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> str:
     if event_class is EventClass.BOT_ECHO:
         # sender=agent_bot 但 Outbox 无记录（如手动经 bot token 发送）：仅对账，不入管线
         return "SKIPPED_ECHO"
+
+    if event_class is EventClass.AGENT_PUBLIC_REPLY:
+        mapping_exists = (await session.execute(
+            select(models.ConversationMapping).where(
+                models.ConversationMapping.chatwoot_account_id == msg.chatwoot_account_id,
+                models.ConversationMapping.chatwoot_conversation_id
+                == msg.chatwoot_conversation_id,
+            )
+        )).scalar_one_or_none()
+        if mapping_exists is None:
+            # 乱序坐席消息：不得用坐席 id 建脏联系人/会话（Task 8 质量评审 I2）
+            return "SKIPPED_ORPHAN_AGENT_MSG"
 
     # PLAN.md §十二 去重：normalized_events 唯一约束，冲突即重复投递
     settings = get_settings()
@@ -120,10 +132,13 @@ def _event_type(event_class: EventClass) -> str:
     }[event_class]
 
 
-def _parse_ts(iso: str | None) -> datetime | None:
-    if not iso:
+def _parse_ts(value: str | int | float | None) -> datetime | None:
+    if value is None or value == "":
         return None
-    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    if isinstance(value, (int, float)):
+        # Chatwoot push_event_data 形态：created_at.to_i（epoch 秒）
+        return datetime.fromtimestamp(value, tz=UTC)
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 async def _ensure_conversation(
