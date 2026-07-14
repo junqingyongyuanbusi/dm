@@ -1,10 +1,13 @@
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.reply_decision.pipeline import DecisionSnapshot
+from social_reply.application.reply_decision.runner import run_and_persist_decision
 from social_reply.connectors.chatwoot.normalizer import (
     ChatwootMessage,
     EventClass,
@@ -18,51 +21,72 @@ from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
 
+@dataclass(frozen=True)
+class _Outcome:
+    """_process 的结果：status 供 tx1 落 raw 状态；snapshot 非空时 tx1 提交后走 tx2 决策。"""
+    status: str
+    snapshot: DecisionSnapshot | None = None
+    conversation_id: uuid.UUID | None = None
+    message_id: uuid.UUID | None = None
+    account_id: uuid.UUID | None = None
+
+
 async def process_raw_event(raw_event_id: str) -> None:
     async with get_session_factory()() as session:
         raw = (await session.execute(
             select(models.RawEvent).where(models.RawEvent.id == uuid.UUID(raw_event_id))
         )).scalar_one()
         try:
-            status = await _process(session, raw)
+            outcome = await _process(session, raw)
         except (KeyError, ValueError, TypeError, AttributeError):
             # 畸形 payload 不得卡死在 PENDING / 打死信（Task 4 评审 I1）
             await session.rollback()
-            status = "PARSE_FAILED"
+            outcome = _Outcome("PARSE_FAILED")
         await session.execute(
             update(models.RawEvent)
             # 用入参 UUID 而非 raw.id：异常路径 rollback 后 raw 已过期，
             # 访问 raw.id 会触发同步上下文里的异步刷新 → MissingGreenlet
             .where(models.RawEvent.id == uuid.UUID(raw_event_id))
-            .values(processing_status=status, processed_at=datetime.now(UTC))
+            .values(processing_status=outcome.status, processed_at=datetime.now(UTC))
         )
         await session.commit()
 
+    # tx1 已提交。仅 INBOUND_USER 有快照 → tx2 决策与 outbox（PLAN.md §十一 分事务）
+    if outcome.snapshot is not None:
+        try:
+            await run_and_persist_decision(
+                outcome.snapshot, outcome.conversation_id,
+                outcome.message_id, outcome.account_id,
+            )
+        except Exception:
+            # Task 7 评审 I2：tx2 失败则决策丢失（已 PROCESSED，重试被去重挡回）；Plan 2b 补扫兜底
+            pass
 
-async def _process(session: AsyncSession, raw: models.RawEvent) -> str:
+
+async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:
     msg = parse_message_created(raw.payload)
 
     if msg.chatwoot_account_id == 0:
         # normalizer 对缺失 account.id 容错为 0——不得用哨兵值建映射（Task 4 评审 M1）
-        return "PARSE_FAILED"
+        return _Outcome("PARSE_FAILED")
 
     account = (await session.execute(
         select(models.PlatformAccount)
         .where(models.PlatformAccount.chatwoot_inbox_id == msg.chatwoot_inbox_id)
     )).scalar_one_or_none()
     if account is None:
-        return "SKIPPED_UNKNOWN_INBOX"
+        return _Outcome("SKIPPED_UNKNOWN_INBOX")
 
     # PLAN.md §四 回声断路器规则 1：与 Outbox 已记录的 chatwoot_message_id 比对
     if await _is_self_echo(session, msg):
-        return "SKIPPED_ECHO"
+        return _Outcome("SKIPPED_ECHO")
 
     event_class = classify(msg)
     if event_class is EventClass.IGNORE:
-        return "SKIPPED_IGNORED"
+        return _Outcome("SKIPPED_IGNORED")
     if event_class is EventClass.BOT_ECHO:
         # sender=agent_bot 但 Outbox 无记录（如手动经 bot token 发送）：仅对账，不入管线
-        return "SKIPPED_ECHO"
+        return _Outcome("SKIPPED_ECHO")
 
     if event_class is EventClass.AGENT_PUBLIC_REPLY:
         mapping_exists = (await session.execute(
@@ -74,7 +98,7 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> str:
         )).scalar_one_or_none()
         if mapping_exists is None:
             # 乱序坐席消息：不得用坐席 id 建脏联系人/会话（Task 8 质量评审 I2）
-            return "SKIPPED_ORPHAN_AGENT_MSG"
+            return _Outcome("SKIPPED_ORPHAN_AGENT_MSG")
 
     # PLAN.md §十二 去重：normalized_events 唯一约束，冲突即重复投递
     settings = get_settings()
@@ -96,7 +120,7 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> str:
     )
     normalized_id = dedup.scalar_one_or_none()
     if normalized_id is None:
-        return "SKIPPED_DUPLICATE"
+        return _Outcome("SKIPPED_DUPLICATE")
 
     conversation = await _ensure_conversation(session, account, msg)
     await ensure_state(session, conversation.id, account.automation_default)
@@ -113,7 +137,19 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> str:
         await flip_to_human_active(
             session, conversation.id, msg.sender_id, "agent_public_reply"
         )
-    return "PROCESSED"
+        return _Outcome("PROCESSED")
+
+    # 仅 INBOUND_USER 走决策管线：读当前状态快照供 tx2 CAS
+    state_row = (await session.execute(
+        select(models.AutomationState.state, models.AutomationState.state_version)
+        .where(models.AutomationState.conversation_id == conversation.id)
+    )).one()
+    snapshot = DecisionSnapshot(
+        text=msg.content, platform=account.platform, brand_id=account.brand_id,
+        account_id=str(account.id), conversation_key=conversation.conversation_key,
+        automation_state=state_row.state, state_version=state_row.state_version,
+    )
+    return _Outcome("PROCESSED", snapshot, conversation.id, message_id, account.id)
 
 
 async def _is_self_echo(session: AsyncSession, msg: ChatwootMessage) -> bool:
