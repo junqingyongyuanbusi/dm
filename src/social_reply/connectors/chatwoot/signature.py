@@ -17,4 +17,4 @@ def verify_signature(
     expected = hmac.new(
         secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(signature.removeprefix("sha256="), expected)
+    return hmac.compare_digest(signature.removeprefix("sha256=").encode(), expected.encode())
