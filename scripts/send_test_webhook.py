@@ -8,7 +8,7 @@ import time
 
 import httpx
 
-SECRET = sys.argv[1] if len(sys.argv) > 1 else "change-me"
+SECRET = sys.argv[1] if len(sys.argv) > 1 else "dev-local-secret"
 payload = {
     "event": "message_created", "id": int(time.time()), "content": "冒烟测试：可以提现吗？",
     "message_type": "incoming", "private": False,

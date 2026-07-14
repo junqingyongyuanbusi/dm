@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     chatwoot_webhook_secret: str = "change-me"
     chatwoot_signature_tolerance_seconds: int = 300
     tenant_id: str = "default"
-    default_automation_state: str = "BOT_DRAFT_ONLY"
     llm_provider: str = "stub"  # stub / anthropic / openai（Plan 2b/后续接真）
     prompt_version: str = "v0-stub"
     testing: bool = False
