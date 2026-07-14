@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("TESTING", "true")
+
 import pytest
 
 from social_reply.infrastructure.database import models
@@ -19,3 +23,14 @@ async def session(migrated_db):
     async with get_session_factory()() as s:
         yield s
         await s.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _flush_stub_broker():
+    import dramatiq
+    from dramatiq.brokers.stub import StubBroker
+
+    broker = dramatiq.get_broker()
+    if isinstance(broker, StubBroker):
+        broker.flush_all()
+    yield
