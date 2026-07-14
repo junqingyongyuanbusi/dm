@@ -78,5 +78,6 @@ async def test_non_message_event_acknowledged_without_enqueue(client, session):
     resp = await client.post("/webhooks/chatwoot", content=body, headers=_signed_headers(body))
     assert resp.status_code == 200
     # conversation_* 事件 Plan 2 处理，这里只存 raw 不入队
-    assert (await session.execute(select(models.RawEvent))).scalar_one() is not None
+    raw = (await session.execute(select(models.RawEvent))).scalar_one()
+    assert raw.processing_status == "IGNORED_AT_INGRESS"
     assert broker.queues["default"].qsize() == 0

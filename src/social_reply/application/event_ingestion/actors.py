@@ -15,4 +15,10 @@ threading.Thread(target=_loop.run_forever, daemon=True, name="actor-loop").start
 def process_chatwoot_event(raw_event_id: str) -> None:
     from social_reply.application.event_ingestion.processor import process_raw_event
 
-    asyncio.run_coroutine_threadsafe(process_raw_event(raw_event_id), _loop).result()
+    future = asyncio.run_coroutine_threadsafe(process_raw_event(raw_event_id), _loop)
+    try:
+        # 无超时的 result() 会阻塞在 C 层锁上，Dramatiq TimeLimit 杀不掉（评审核对源码）
+        future.result(timeout=120)
+    except TimeoutError:
+        future.cancel()
+        raise

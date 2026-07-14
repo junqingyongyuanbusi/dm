@@ -28,17 +28,26 @@ async def chatwoot_webhook(request: Request) -> Response:
         return Response(status_code=401)
 
     payload = await request.json()
+    is_message = payload.get("event") == "message_created"
     async with get_session_factory()() as session:
         result = await session.execute(
             insert(models.RawEvent)
-            .values(source="chatwoot", payload=payload,
-                    headers={"X-Chatwoot-Timestamp": request.headers.get("X-Chatwoot-Timestamp")})
+            .values(
+                source="chatwoot",
+                payload=payload,
+                headers={
+                    "X-Chatwoot-Timestamp": request.headers.get("X-Chatwoot-Timestamp"),
+                    "X-Chatwoot-Delivery": request.headers.get("X-Chatwoot-Delivery"),
+                    "User-Agent": request.headers.get("User-Agent"),
+                },
+                processing_status="PENDING" if is_message else "IGNORED_AT_INGRESS",
+            )
             .returning(models.RawEvent.id)
         )
         raw_event_id = result.scalar_one()
         await session.commit()
 
     # PLAN.md §四：入口只做验签+存 raw+入队，重活交给 worker
-    if payload.get("event") == "message_created":
+    if is_message:
         process_chatwoot_event.send(str(raw_event_id))
     return Response(status_code=200)
