@@ -15,7 +15,7 @@ def test_draft_only_to_human_active_on_agent_reply():
 
 
 def test_closed_is_terminal_except_reopen():
-    assert not can_transition(AutomationStateEnum.CLOSED, AutomationStateEnum.HUMAN_ACTIVE)
+    assert can_transition(AutomationStateEnum.CLOSED, AutomationStateEnum.HUMAN_ACTIVE)
     assert can_transition(AutomationStateEnum.CLOSED, AutomationStateEnum.BOT_ACTIVE)
 
 

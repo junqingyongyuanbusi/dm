@@ -46,6 +46,7 @@ _ALLOWED: dict[AutomationStateEnum, set[AutomationStateEnum]] = {
     },
     AutomationStateEnum.CLOSED: {
         AutomationStateEnum.BOT_ACTIVE,
+        AutomationStateEnum.HUMAN_ACTIVE,
     },
 }
 
@@ -96,5 +97,16 @@ async def flip_to_human_active(
                 subject_id=str(conversation_id),
                 detail={"reason": reason},
             )
+        )
+        # 注：defense 3 与 defense 1（persist CAS）联合仍为尽力而为——
+        # 权威闸门是 defense 2（Plan 2b 发送前复检，见计划文档"防线边界"）。
+        # defense 3：接管即取消该会话所有未发送 outbox（PLAN.md §六 竞态第 3 层）
+        await session.execute(
+            update(models.OutboxMessage)
+            .where(
+                models.OutboxMessage.conversation_id == conversation_id,
+                models.OutboxMessage.status.in_(["PENDING", "RETRY"]),
+            )
+            .values(status="CANCELLED", last_error_code="TAKEOVER")
         )
     return flipped
