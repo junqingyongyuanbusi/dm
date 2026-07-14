@@ -12,7 +12,7 @@ pytestmark = pytest.mark.integration
 EXPECTED_TABLES = {
     "platform_accounts", "contacts", "conversations", "conversation_mappings",
     "messages", "raw_events", "normalized_events", "automation_states",
-    "outbox_messages", "audit_logs",
+    "outbox_messages", "audit_logs", "reply_decisions",
 }
 
 
@@ -24,6 +24,23 @@ async def test_all_core_tables_exist(migrated_db):
         )
         tables = {r[0] for r in rows}
     assert EXPECTED_TABLES <= tables
+
+
+async def test_reply_decisions_columns_and_message_index(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        cols = {r[0] for r in await conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='reply_decisions'"
+        ))}
+        idx = {r[0] for r in await conn.execute(text(
+            "SELECT indexname FROM pg_indexes WHERE tablename='messages'"
+        ))}
+    assert {"id", "conversation_id", "message_id", "action", "risk_level",
+            "confidence", "reply_text", "reply_visibility", "reason_codes",
+            "source", "prompt_version", "state_version_at_decision",
+            "created_at"} <= cols
+    assert any("conversation_id" in name for name in idx)
 
 
 async def test_normalized_events_dedup_constraint(migrated_db, session):

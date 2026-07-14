@@ -5,6 +5,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     Text,
@@ -77,7 +78,9 @@ class ConversationMapping(Base):
 class Message(Base):
     __tablename__ = "messages"
     id: Mapped[uuid.UUID] = _uuid_pk()
-    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id"), index=True
+    )
     direction: Mapped[str] = mapped_column(Text)  # inbound / outbound
     sender_type: Mapped[str] = mapped_column(Text)  # contact / agent / bot
     text: Mapped[str | None] = mapped_column(Text)
@@ -173,3 +176,25 @@ class AuditLog(Base):
     subject_id: Mapped[str] = mapped_column(Text)
     detail: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReplyDecision(Base):
+    __tablename__ = "reply_decisions"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text, default="default")
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
+    message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
+    action: Mapped[str] = mapped_column(Text)  # auto_reply / draft / handoff / ignore
+    intent: Mapped[str | None] = mapped_column(Text)
+    risk_level: Mapped[str] = mapped_column(Text, default="low")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reply_text: Mapped[str | None] = mapped_column(Text)
+    reply_visibility: Mapped[str] = mapped_column(Text, default="public")
+    reason_codes: Mapped[list] = mapped_column(JSONB, default=list)
+    source: Mapped[str] = mapped_column(Text)  # rule / llm / guard
+    prompt_version: Mapped[str | None] = mapped_column(Text)
+    state_version_at_decision: Mapped[int | None] = mapped_column(Integer)
+    outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

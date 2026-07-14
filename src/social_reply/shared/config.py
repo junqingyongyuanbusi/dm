@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,7 +13,18 @@ class Settings(BaseSettings):
     chatwoot_signature_tolerance_seconds: int = 300
     tenant_id: str = "default"
     default_automation_state: str = "BOT_DRAFT_ONLY"
+    llm_provider: str = "stub"  # stub / anthropic / openai（Plan 2b/后续接真）
+    prompt_version: str = "v0-stub"
     testing: bool = False
+
+    @model_validator(mode="after")
+    def _reject_default_secret_in_prod(self) -> "Settings":
+        # 生产环境（非测试）拒绝空/默认 webhook 密钥（Plan 1 安全评审 backlog）
+        if not self.testing and self.chatwoot_webhook_secret in ("", "change-me"):
+            raise ValueError(
+                "CHATWOOT_WEBHOOK_SECRET 未配置（不能为空或 change-me）；测试环境请设 TESTING=true"
+            )
+        return self
 
 
 @lru_cache
