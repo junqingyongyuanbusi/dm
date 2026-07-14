@@ -7,6 +7,9 @@ from sqlalchemy.ext.asyncio import (
 
 from social_reply.shared.config import get_settings
 
+# 进程级单例引擎：连接池绑定首次建连的事件循环，
+# 仅适用于单一常驻循环（Uvicorn / session 级测试循环）。
+# Dramatiq worker 不得每消息 asyncio.run()——需常驻循环或 NullPool（见 Task 7）。
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
