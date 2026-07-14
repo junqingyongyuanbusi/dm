@@ -18,6 +18,8 @@
 
 **Plan 1 backlog 在本计划兑现：** messages.conversation_id 索引（Task 0）、CLOSED→HUMAN_ACTIVE 对账（Task 8）、Settings 拒绝 change-me 密钥（Task 0）。
 
+**接管竞态防线的边界（Task 7 质量评审实证结论，必读）：** defense 1（tx2 决策提交时的 state_version CAS）是 Python 侧读-判-写、非数据库原子 CAS；即便叠加 defense 3（Task 8 flip 取消在途 outbox），因"tx2 基于陈旧读通过 CAS 后写入 outbox、坐席翻转在其提交之前发生"的窗口，联合仍是**尽力而为**而非保证。**权威且必需的最后闸门是 defense 2（Plan 2b：投递 worker 在锁定 outbox 行的同一事务内复检 state==BOT_ACTIVE 且 version 匹配，再调 Chatwoot）。** Plan 2a 阶段无投递 worker，残留 PENDING outbox 无人消费，故此窗口潜伏无害；Plan 2b 上线 worker 前必须落地 defense 2。可选加固：Task 8 给 CAS 的 SELECT 加 `.with_for_update()` 与 flip 在 automation_states 行上互斥，确定性关闭已复现的窗口（但 tx2 提交后才接管的窗口仍需 defense 2 兜底）。
+
 ---
 
 ### Task 0: reply_decisions 迁移、messages 索引与 Settings 加固
