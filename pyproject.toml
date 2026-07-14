@@ -38,7 +38,10 @@ markers = ["integration: 需要 docker compose 中的 PG/Redis"]
 
 [tool.ruff]
 line-length = 100
-src = ["src", "apps", "tests"]
+src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["social_reply", "apps"]
