@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     tenant_id: str = "default"
     llm_provider: str = "stub"  # stub / anthropic / openai（Plan 2b/后续接真）
     prompt_version: str = "v0-stub"
+    chatwoot_base_url: str = "http://localhost:3000"
+    chatwoot_api_token: str = "dev-local-token"
     testing: bool = False
 
     @model_validator(mode="after")
