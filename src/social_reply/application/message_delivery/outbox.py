@@ -1,6 +1,7 @@
 import uuid
 from datetime import UTC, datetime
 
+import httpx
 from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,12 +69,14 @@ async def deliver_outbox(outbox_id: str) -> str:
         payload = dict(row.payload)
         attempt_no = row.attempt_count + 1
 
-        # 2) defense 2：公开回复（text）发送前必须 state==BOT_ACTIVE（PLAN §六 权威闸门）
+        # 2) defense 2：公开回复（非私有备注）发送前必须 state==BOT_ACTIVE（PLAN §六 权威闸门）。
+        # 判据用"是否私有备注"而非 message_type 名——非私有备注均为客户可见，杜绝新增公开类型漏门。
         state = (await session.execute(
             select(models.AutomationState.state)
             .where(models.AutomationState.conversation_id == conversation_id)
         )).scalar_one_or_none()
-        if message_type == "text" and state != "BOT_ACTIVE":
+        is_public = message_type != "private_note"
+        if is_public and state != "BOT_ACTIVE":
             await session.execute(
                 update(models.OutboxMessage).where(models.OutboxMessage.id == oid)
                 .values(status="CANCELLED", last_error_code="TAKEOVER_AT_SEND"))
@@ -101,11 +104,15 @@ async def deliver_outbox(outbox_id: str) -> str:
         chatwoot_message_id = await client.create_message(
             account_id=account_id, conversation_id=chatwoot_conv_id,
             content=payload["text"], private=(message_type == "private_note"))
-    except Exception as e:  # noqa: BLE001 平台错误统一按可重试处理，超阈值转人工
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        # 歧义失败：不确定 Chatwoot 是否已创建消息，无客户端幂等键——不重试，转人工（PLAN §十一）
+        return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
+                               error_code="AMBIGUOUS_SEND", error_message=repr(e))
+    except Exception as e:  # noqa: BLE001 明确失败（如 4xx/5xx HTTPStatusError）：可重试，超阈值转人工
         if attempt_no >= _MAX_ATTEMPTS:
             return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
                                    error_code="SEND_ERROR", error_message=repr(e))
-        # 指数退避（简化：attempt_no 秒；生产可换真正退避）
+        # 指数退避（简化：立即到期；生产可换真正退避）
         next_at = datetime.now(UTC)
         return await _finalize(oid, "FAILED", attempt_no=attempt_no,
                                error_code="SEND_ERROR", error_message=repr(e),

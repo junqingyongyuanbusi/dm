@@ -101,3 +101,38 @@ async def test_no_mapping_marks_needs_review(session):
     ob = (await session.execute(
         select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
     assert ob.status == "NEEDS_REVIEW" and ob.last_error_code == "NO_MAPPING"
+
+
+async def test_ambiguous_timeout_marks_needs_review_no_retry(session, monkeypatch):
+    import httpx
+
+    from social_reply.connectors.chatwoot import client as cw
+    conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+
+    async def _boom(**kwargs):
+        raise httpx.ConnectTimeout("timeout")
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
+
+    result = await deliver_outbox(str(ob_id))
+    assert result == "NEEDS_REVIEW"
+    ob = (await session.execute(
+        select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
+    assert ob.status == "NEEDS_REVIEW" and ob.last_error_code == "AMBIGUOUS_SEND"
+
+
+async def test_5xx_marks_failed_for_retry(session, monkeypatch):
+    import httpx
+
+    from social_reply.connectors.chatwoot import client as cw
+    conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+
+    async def _boom(**kwargs):
+        raise httpx.HTTPStatusError("500", request=httpx.Request("POST", "http://x"),
+                                    response=httpx.Response(500))
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
+
+    result = await deliver_outbox(str(ob_id))
+    assert result == "FAILED"
+    ob = (await session.execute(
+        select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
+    assert ob.status == "FAILED" and ob.last_error_code == "SEND_ERROR"
