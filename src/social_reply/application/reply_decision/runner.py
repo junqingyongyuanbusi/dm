@@ -16,8 +16,19 @@ from social_reply.shared.config import get_settings
 _llm = StubLLMClient()  # 先 Stub 后接真：Plan 2b/后续按 settings.llm_provider 切换
 
 
+_redis = None
+
+
+def _get_redis():
+    # 模块级共享 client（惰性初始化）：避免每次决策 from_url 新建连接池（Plan 2a 评审 M1）
+    global _redis
+    if _redis is None:
+        _redis = aioredis.from_url(get_settings().redis_url)
+    return _redis
+
+
 def _make_killswitch() -> KillSwitchChecker:
-    return KillSwitchChecker(aioredis.from_url(get_settings().redis_url))
+    return KillSwitchChecker(_get_redis())
 
 
 async def run_and_persist_decision(
