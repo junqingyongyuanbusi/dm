@@ -80,12 +80,14 @@ async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[str, ...]:
     if not settings.knowledge_retrieval_enabled:
         return ()
     try:
-        query_embedding = (await _get_embedder().embed([snapshot.text or ""]))[0]
+        embedder = _get_embedder()
+        query_embedding = (await embedder.embed([snapshot.text or ""]))[0]
         # 短事务：检索独立于决策持久化的 tx2，不与慢 LLM 调用同事务
         async with get_session_factory()() as session:
             hits = await retrieve_knowledge(
                 session, query_embedding,
                 brand_id=snapshot.brand_id, platform=snapshot.platform,
+                embedding_version=embedder.version,
                 top_k=settings.knowledge_top_k,
                 min_similarity=settings.knowledge_min_similarity,
             )

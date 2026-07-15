@@ -65,5 +65,5 @@ uv run python -m apps.cli.import_knowledge 模板.csv --brand default
 ```
 
 - 幂等：按内容 sha256（content_hash）去重，重复导入/模板未变的行自动跳过，不重复扣 embedding 费；修改模板文本后重导会追加新记录。
-- `TESTING=true` 或未配置 `OPENAI_API_KEY` 时自动使用确定性伪向量（FakeEmbeddingClient）并打印提示，方便无凭证试导入。
+- 未配置 `OPENAI_API_KEY` 时（非测试环境）导入会直接报错，防止误导入不可用向量；仅试跑请加 `--allow-fake`（伪向量按 version=fake-sha256 与真实向量隔离，正式检索不可用）。
 - Excel 用户：请在 Excel 中「另存为 → CSV UTF-8（逗号分隔）」后再导入。

@@ -30,7 +30,7 @@ async def _seed_chunk(session, content: str, *, brand_id="b1", platform=None,
     embedding = (await _EMBEDDER.embed([content]))[0]
     await session.execute(insert(models.KnowledgeChunk).values(
         document_id=doc_id, content=content, content_hash=uuid.uuid4().hex,
-        embedding_version=embedding_version or get_settings().openai_embedding_model,
+        embedding_version=embedding_version or _EMBEDDER.version,
         embedding=embedding))
     await session.commit()
 
@@ -40,7 +40,8 @@ async def test_同文本查询相似度为一命中(session):
     await _seed_chunk(session, _TPL_EMAIL)
     vec = (await _EMBEDDER.embed([_TPL_HOURS]))[0]
     hits = await retrieve_knowledge(
-        session, vec, brand_id="b1", platform="telegram", top_k=3, min_similarity=0.9)
+        session, vec, brand_id="b1", platform="telegram", embedding_version=_EMBEDDER.version,
+        top_k=3, min_similarity=0.9)
     assert [h.content for h in hits] == [_TPL_HOURS]
     assert hits[0].similarity == pytest.approx(1.0, abs=1e-6)
 
@@ -50,7 +51,8 @@ async def test_不相干文本低于阈值不命中(session):
     await _seed_chunk(session, _TPL_HOURS)
     vec = (await _EMBEDDER.embed(["今天天气怎么样"]))[0]
     hits = await retrieve_knowledge(
-        session, vec, brand_id="b1", platform="telegram", top_k=3, min_similarity=0.9)
+        session, vec, brand_id="b1", platform="telegram", embedding_version=_EMBEDDER.version,
+        top_k=3, min_similarity=0.9)
     assert hits == []
 
 
@@ -61,7 +63,8 @@ async def test_过滤条件_品牌_状态_版本(session):
     for content in (_TPL_HOURS, _TPL_EMAIL, "问：A\n答：B"):
         vec = (await _EMBEDDER.embed([content]))[0]
         hits = await retrieve_knowledge(
-            session, vec, brand_id="b1", platform="telegram", top_k=3, min_similarity=0.9)
+            session, vec, brand_id="b1", platform="telegram", embedding_version=_EMBEDDER.version,
+        top_k=3, min_similarity=0.9)
         assert hits == []
 
 

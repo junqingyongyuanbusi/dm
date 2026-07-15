@@ -10,6 +10,8 @@ _DIMENSIONS = 1536
 
 
 class EmbeddingClient(Protocol):
+    version: str  # 向量版本标识（入库与检索过滤必须一致，防不同来源向量混比）
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """按输入顺序返回每条文本的 embedding 向量"""
         ...
@@ -32,6 +34,7 @@ class OpenAIEmbeddingClient:
         self._model = model
         self._timeout = timeout
         self._transport = transport
+        self.version = model  # 版本即模型名：换模型后旧向量按版本过滤不可比
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         payload = {"model": self._model, "input": texts}
@@ -51,6 +54,8 @@ class OpenAIEmbeddingClient:
 
 class FakeEmbeddingClient:
     """确定性伪向量：sha256 派生 1536 维并归一化，测试/无 key 环境使用"""
+
+    version = "fake-sha256"  # 与真实模型版本隔离：伪向量绝不与 OpenAI 向量混检（2c3 终审 I4）
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(text) for text in texts]

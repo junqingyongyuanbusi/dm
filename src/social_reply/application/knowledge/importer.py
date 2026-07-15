@@ -11,7 +11,6 @@ from sqlalchemy import select
 from social_reply.domain.knowledge.embeddings import EmbeddingClient
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.database.models import KnowledgeChunk, KnowledgeDocument
-from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +75,8 @@ async def import_knowledge_csv(
     """导入回复模板 CSV：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
     path = Path(path)
     rows, blank = _parse_rows(path, brand_id_default)
-    embedding_version = get_settings().openai_embedding_model
+    # 版本以 embedder 自身为准（Fake 记 fake-sha256），保证入库版本与实际向量来源一致
+    embedding_version = embedder.version
 
     async with get_session_factory()() as session:
         # 幂等：已存在的 content_hash 直接 skip，不重复扣 embedding 费

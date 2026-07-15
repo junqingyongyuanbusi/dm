@@ -7,7 +7,6 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.infrastructure.database.models import KnowledgeChunk, KnowledgeDocument
-from social_reply.shared.config import get_settings
 
 
 @dataclass(frozen=True)
@@ -21,7 +20,8 @@ class KnowledgeHit:
 
 async def retrieve_knowledge(
     session: AsyncSession, query_embedding: list[float], *,
-    brand_id: str, platform: str, top_k: int = 3, min_similarity: float = 0.5,
+    brand_id: str, platform: str, embedding_version: str,
+    top_k: int = 3, min_similarity: float = 0.5,
 ) -> list[KnowledgeHit]:
     """按余弦相似度检索已发布模板：过滤品牌、平台（NULL=全平台）、当前 embedding 版本。
 
@@ -44,8 +44,8 @@ async def retrieve_knowledge(
                 KnowledgeDocument.platform.is_(None),
                 KnowledgeDocument.platform == platform,
             ),
-            # 版本过滤：换 embedding 模型后旧向量不可比，绝不混用
-            KnowledgeChunk.embedding_version == get_settings().openai_embedding_model,
+            # 版本过滤：以查询向量的实际来源版本为准（换模型/Fake 的旧向量不可比，绝不混用）
+            KnowledgeChunk.embedding_version == embedding_version,
             distance <= 1.0 - min_similarity,
         )
         .order_by(distance.asc())
