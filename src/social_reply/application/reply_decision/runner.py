@@ -42,5 +42,9 @@ async def run_and_persist_decision(
             decision, settings.prompt_version,
         )
         await session.commit()
-    # Plan 2b：if outbox_id: enqueue deliver_outbox(outbox_id)
+    if outbox_id is not None:
+        # 函数内延迟 import，避免 web 进程 import broker 副作用扩散
+        from social_reply.application.message_delivery.actors import deliver_outbox_message
+
+        deliver_outbox_message.send(str(outbox_id))
     return outbox_id
