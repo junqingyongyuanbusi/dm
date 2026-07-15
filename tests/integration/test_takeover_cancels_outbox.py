@@ -42,6 +42,15 @@ async def test_flip_cancels_pending_outbox(session):
     assert ob.status == "CANCELLED"  # defense 3：接管取消在途发送
 
 
+async def test_flip_cancels_failed_outbox(session):
+    conv_id, ob_id = await _seed_conv_with_outbox(session, "FAILED")
+    await flip_to_human_active(session, conv_id, "3", "agent_public_reply")
+    await session.commit()
+    ob = (await session.execute(
+        select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
+    assert ob.status == "CANCELLED"
+
+
 async def test_flip_does_not_cancel_already_sent(session):
     conv_id, ob_id = await _seed_conv_with_outbox(session, "SENT")
     await flip_to_human_active(session, conv_id, "3", "agent_public_reply")

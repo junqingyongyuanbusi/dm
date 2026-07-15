@@ -13,7 +13,21 @@ EXPECTED_TABLES = {
     "platform_accounts", "contacts", "conversations", "conversation_mappings",
     "messages", "raw_events", "normalized_events", "automation_states",
     "outbox_messages", "audit_logs", "reply_decisions",
+    "delivery_attempts",
 }
+
+
+async def test_delivery_attempts_and_outbox_index(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        cols = {r[0] for r in await conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='delivery_attempts'"))}
+        idx = {r[0] for r in await conn.execute(text(
+            "SELECT indexname FROM pg_indexes WHERE tablename='outbox_messages'"))}
+    assert {"id", "outbox_id", "attempt_no", "outcome",
+            "error_code", "created_at"} <= cols
+    assert any("conversation" in name and "status" in name for name in idx)
 
 
 async def test_all_core_tables_exist(migrated_db):

@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     Text,
     UniqueConstraint,
@@ -142,6 +143,10 @@ class AutomationState(Base):
 
 class OutboxMessage(Base):
     __tablename__ = "outbox_messages"
+    __table_args__ = (
+        # defense 3 取消 + 补扫认领：按会话+状态过滤（FK 无自动索引，Task 8 评审）
+        Index("ix_outbox_conversation_status", "conversation_id", "status"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
@@ -198,3 +203,16 @@ class ReplyDecision(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class DeliveryAttempt(Base):
+    __tablename__ = "delivery_attempts"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    outbox_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("outbox_messages.id"))
+    attempt_no: Mapped[int] = mapped_column(Integer)
+    outcome: Mapped[str] = mapped_column(Text)  # SENT / FAILED / CANCELLED / NEEDS_REVIEW
+    error_code: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now())

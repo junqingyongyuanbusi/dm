@@ -105,7 +105,7 @@ async def flip_to_human_active(
             update(models.OutboxMessage)
             .where(
                 models.OutboxMessage.conversation_id == conversation_id,
-                models.OutboxMessage.status.in_(["PENDING", "RETRY"]),
+                models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
             )
             .values(status="CANCELLED", last_error_code="TAKEOVER")
         )
