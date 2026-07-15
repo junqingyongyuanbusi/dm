@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from social_reply.application.reply_decision import runner
 from social_reply.domain.reply.llm import StubLLMClient
@@ -33,7 +34,9 @@ def test_openai_provider(reset_llm_and_settings):
     assert isinstance(llm, OpenAILLMClient)
 
 
-def test_未知_provider_抛_value_error(reset_llm_and_settings):
+def test_未知_provider_在配置层被拒(reset_llm_and_settings):
+    # llm_provider 已收紧为 Literal["stub","openai"]（2c 终审 I1）：
+    # 配错在 Settings 构造期即报错，而非每条消息 _get_llm 抛错致决策丢失
     reset_llm_and_settings.setenv("LLM_PROVIDER", "anthropic")
-    with pytest.raises(ValueError, match="未知 LLM_PROVIDER"):
-        runner._get_llm()
+    with pytest.raises(ValidationError):
+        get_settings()

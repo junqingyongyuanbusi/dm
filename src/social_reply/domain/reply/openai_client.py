@@ -1,4 +1,3 @@
-import json
 import logging
 
 import httpx
@@ -138,8 +137,9 @@ class OpenAILLMClient:
                         source="llm",
                     )
                 return _handoff("LLM_SCHEMA_FAIL")
-        except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError):
-            # 超时/网络/HTTP 状态错误/响应体结构异常：不重试，降级转人工
+        except Exception:
+            # 超时/网络/HTTP 状态错误/响应体结构异常（含 200+病态结构的 TypeError 等）：
+            # decide 的契约是绝不向上抛——任何未知异常一律降级转人工，防决策丢失
             logger.exception(
                 "LLM 调用失败降级 HANDOFF: conversation=%s", context.conversation_key,
             )

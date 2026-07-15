@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,7 +13,8 @@ class Settings(BaseSettings):
     chatwoot_webhook_secret: str = "change-me"
     chatwoot_signature_tolerance_seconds: int = 300
     tenant_id: str = "default"
-    llm_provider: str = "stub"  # stub / anthropic / openai（Plan 2b/后续接真）
+    # Literal 收紧：配错 provider 在进程启动即报错，而非每条消息决策丢失（2c 终审 I1）
+    llm_provider: Literal["stub", "openai"] = "stub"
     prompt_version: str = "v0-stub"
     chatwoot_base_url: str = "http://localhost:3000"
     chatwoot_api_token: str = "dev-local-token"
