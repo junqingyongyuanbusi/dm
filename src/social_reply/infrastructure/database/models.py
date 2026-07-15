@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -9,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    String,
     Text,
     UniqueConstraint,
     func,
@@ -216,3 +218,41 @@ class DeliveryAttempt(Base):
     chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    brand_id: Mapped[str] = mapped_column(String(64), default="default")
+    platform: Mapped[str | None] = mapped_column(String(32))  # NULL=全平台
+    category: Mapped[str | None] = mapped_column(String(64))
+    question: Mapped[str] = mapped_column(Text)  # 模板触发问题/关键词
+    reply: Mapped[str] = mapped_column(Text)  # 标准回复
+    status: Mapped[str] = mapped_column(String(16), default="published")
+    source_file: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class KnowledgeChunk(Base):
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        # 余弦相似度检索用 HNSW 索引
+        Index(
+            "ix_knowledge_chunks_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True
+    )
+    content: Mapped[str] = mapped_column(Text)  # 参与 embedding 的文本（question+reply 拼接）
+    content_hash: Mapped[str] = mapped_column(String(64), unique=True)  # sha256，导入幂等
+    embedding_version: Mapped[str] = mapped_column(String(32))  # 如 "text-embedding-3-small"
+    embedding: Mapped[list[float]] = mapped_column(Vector(1536))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

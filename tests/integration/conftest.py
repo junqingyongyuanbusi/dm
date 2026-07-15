@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("TESTING", "true")
 
 import pytest
+from sqlalchemy import text
 
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_engine, get_session_factory
@@ -13,6 +14,8 @@ async def migrated_db():
     """每个测试用干净 schema：直接用 metadata 建表（迁移文件另行人工验证）"""
     engine = get_engine()
     async with engine.begin() as conn:
+        # pgvector 扩展（迁移里也有，这里覆盖 metadata 直建路径）
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(models.Base.metadata.drop_all)
         await conn.run_sync(models.Base.metadata.create_all)
     yield
