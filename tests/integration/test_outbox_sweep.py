@@ -69,3 +69,8 @@ async def test_sweep_marks_stale_sending_needs_review(session):
     fresh = (await session.execute(
         select(models.OutboxMessage).where(models.OutboxMessage.id == fresh_id))).scalar_one()
     assert fresh.status == "SENDING"
+    # 转 NEEDS_REVIEW 必须留审计行（与 deliver_outbox 终态一致）
+    att = (await session.execute(
+        select(models.DeliveryAttempt)
+        .where(models.DeliveryAttempt.outbox_id == stale_id))).scalar_one()
+    assert att.outcome == "NEEDS_REVIEW" and att.error_code == "STALE_SENDING"

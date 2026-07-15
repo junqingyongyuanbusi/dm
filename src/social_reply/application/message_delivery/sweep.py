@@ -1,7 +1,7 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import insert, or_, select, update
 
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -15,11 +15,18 @@ async def sweep_outbox() -> list[uuid.UUID]:
     PENDING / 退避到期 FAILED 重新入队。返回本轮入队的 outbox id。"""
     now = datetime.now(UTC)
     async with get_session_factory()() as session:
-        await session.execute(
+        stale_rows = (await session.execute(
             update(models.OutboxMessage)
             .where(models.OutboxMessage.status == "SENDING",
                    models.OutboxMessage.locked_at < now - _STALE_SENDING)
-            .values(status="NEEDS_REVIEW", last_error_code="STALE_SENDING"))
+            .values(status="NEEDS_REVIEW", last_error_code="STALE_SENDING")
+            .returning(models.OutboxMessage.id, models.OutboxMessage.attempt_count))).all()
+        # 与 deliver_outbox 的终态一致：每条转 NEEDS_REVIEW 的行补一条审计
+        for sid, attempt_count in stale_rows:
+            await session.execute(insert(models.DeliveryAttempt).values(
+                outbox_id=sid, attempt_no=attempt_count + 1, outcome="NEEDS_REVIEW",
+                error_code="STALE_SENDING",
+                error_message="stale SENDING swept (worker lost)"))
         rows = (await session.execute(
             select(models.OutboxMessage.id)
             .where(or_(
