@@ -1,5 +1,6 @@
+import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from sqlalchemy import insert, select, update
@@ -8,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+
+logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 5
 
@@ -36,9 +39,17 @@ async def _finalize(
             values["sent_at"] = datetime.now(UTC)
         if next_attempt_at is not None:
             values["next_attempt_at"] = next_attempt_at
-        await session.execute(
+        # SENDING 守卫：行可能已被 sweep 转 NEEDS_REVIEW 等终态，迟到的 finalize 不得覆盖
+        result = await session.execute(
             update(models.OutboxMessage)
-            .where(models.OutboxMessage.id == outbox_id).values(**values))
+            .where(models.OutboxMessage.id == outbox_id,
+                   models.OutboxMessage.status == "SENDING")
+            .values(**values))
+        if result.rowcount == 0:
+            logger.warning(
+                "outbox %s 终态更新被跳过：行已非 SENDING（可能被 sweep 接管），目标状态=%s",
+                outbox_id, status)
+        # DeliveryAttempt 审计行始终写入——记录"本次尝试发生了什么"的事实，与 outbox 状态解耦
         await session.execute(insert(models.DeliveryAttempt).values(
             outbox_id=outbox_id, attempt_no=attempt_no, outcome=status,
             error_code=error_code, error_message=error_message,
@@ -100,23 +111,42 @@ async def deliver_outbox(outbox_id: str) -> str:
 
     # 3) 发送（不持 DB 事务，避免网络 I/O 期间持锁）
     client = get_chatwoot_client()
+
+    async def _fail_retryable(e: Exception) -> str:
+        """明确未送达的失败：FAILED 可重试（指数退避），超阈值转人工。"""
+        if attempt_no >= _MAX_ATTEMPTS:
+            return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
+                                   error_code="SEND_ERROR", error_message=repr(e))
+        # 指数退避：30s * 2^attempt_count，上限 1h
+        next_at = datetime.now(UTC) + timedelta(
+            seconds=min(30 * 2 ** attempt_no, 3600))
+        return await _finalize(oid, "FAILED", attempt_no=attempt_no,
+                               error_code="SEND_ERROR", error_message=repr(e),
+                               next_attempt_at=next_at)
+
     try:
         chatwoot_message_id = await client.create_message(
             account_id=account_id, conversation_id=chatwoot_conv_id,
             content=payload["text"], private=(message_type == "private_note"))
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        # 连接阶段失败（TCP/TLS 未建立或连接超时）：请求必然未发出，Chatwoot 侧不可能已建消息
+        # → 明确未送达，FAILED 可重试。注意 ConnectError 是 TransportError 子类、
+        # ConnectTimeout 是 TimeoutException 子类，本分支必须排在歧义分支之前。
+        return await _fail_retryable(e)
     except (httpx.TimeoutException, httpx.TransportError) as e:
-        # 歧义失败：不确定 Chatwoot 是否已创建消息，无客户端幂等键——不重试，转人工（PLAN §十一）
+        # 其余传输失败（读超时、写中断等）：请求可能已到达服务端，无客户端幂等键
+        # → 歧义失败，不重试，转人工（PLAN §十一）
         return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
                                error_code="AMBIGUOUS_SEND", error_message=repr(e))
-    except Exception as e:  # noqa: BLE001 明确失败（如 4xx/5xx HTTPStatusError）：可重试，超阈值转人工
-        if attempt_no >= _MAX_ATTEMPTS:
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code >= 500:
+            # 5xx：服务端可能已创建消息后才出错 → 同样歧义，转人工，避免盲目重试造成重复发送
             return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
-                                   error_code="SEND_ERROR", error_message=repr(e))
-        # 指数退避（简化：立即到期；生产可换真正退避）
-        next_at = datetime.now(UTC)
-        return await _finalize(oid, "FAILED", attempt_no=attempt_no,
-                               error_code="SEND_ERROR", error_message=repr(e),
-                               next_attempt_at=next_at)
+                                   error_code="AMBIGUOUS_SEND", error_message=repr(e))
+        # 4xx：服务端明确拒绝，未建消息 → 可重试，超阈值转人工
+        return await _fail_retryable(e)
+    except Exception as e:  # noqa: BLE001 其它未知错误：按明确失败处理，可重试
+        return await _fail_retryable(e)
 
     # 4) 成功：SENT + 存 chatwoot_message_id（闭合 Plan 1 回声断路器）
     return await _finalize(oid, "SENT", attempt_no=attempt_no,

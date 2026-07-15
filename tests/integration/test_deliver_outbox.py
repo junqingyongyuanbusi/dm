@@ -110,7 +110,8 @@ async def test_ambiguous_timeout_marks_needs_review_no_retry(session, monkeypatc
     conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
 
     async def _boom(**kwargs):
-        raise httpx.ConnectTimeout("timeout")
+        # 读超时：请求可能已到达服务端 → 歧义
+        raise httpx.ReadTimeout("timeout")
     monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
 
     result = await deliver_outbox(str(ob_id))
@@ -120,7 +121,8 @@ async def test_ambiguous_timeout_marks_needs_review_no_retry(session, monkeypatc
     assert ob.status == "NEEDS_REVIEW" and ob.last_error_code == "AMBIGUOUS_SEND"
 
 
-async def test_5xx_marks_failed_for_retry(session, monkeypatch):
+async def test_5xx_marks_needs_review_ambiguous(session, monkeypatch):
+    # 新语义：5xx 时服务端可能已创建消息 → 歧义，不盲目重试
     import httpx
 
     from social_reply.connectors.chatwoot import client as cw
@@ -132,7 +134,76 @@ async def test_5xx_marks_failed_for_retry(session, monkeypatch):
     monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
 
     result = await deliver_outbox(str(ob_id))
+    assert result == "NEEDS_REVIEW"
+    ob = (await session.execute(
+        select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
+    assert ob.status == "NEEDS_REVIEW" and ob.last_error_code == "AMBIGUOUS_SEND"
+
+
+async def test_4xx_marks_failed_for_retry(session, monkeypatch):
+    import httpx
+
+    from social_reply.connectors.chatwoot import client as cw
+    conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+
+    async def _boom(**kwargs):
+        raise httpx.HTTPStatusError("422", request=httpx.Request("POST", "http://x"),
+                                    response=httpx.Response(422))
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
+
+    result = await deliver_outbox(str(ob_id))
     assert result == "FAILED"
     ob = (await session.execute(
         select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
     assert ob.status == "FAILED" and ob.last_error_code == "SEND_ERROR"
+
+
+async def test_connect_error_marks_failed_with_backoff(session, monkeypatch):
+    # 连接未建立 → 请求必然未发出 → 明确失败可重试，且退避到未来
+    from datetime import UTC, datetime
+
+    import httpx
+
+    from social_reply.connectors.chatwoot import client as cw
+    conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+
+    async def _boom(**kwargs):
+        raise httpx.ConnectError("refused")
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
+
+    now = datetime.now(UTC)
+    result = await deliver_outbox(str(ob_id))
+    assert result == "FAILED"
+    ob = (await session.execute(
+        select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
+    assert ob.status == "FAILED" and ob.last_error_code == "SEND_ERROR"
+    next_at = ob.next_attempt_at
+    if next_at.tzinfo is None:
+        next_at = next_at.replace(tzinfo=UTC)
+    assert next_at > now  # 指数退避：下次尝试在未来
+
+
+async def test_finalize_does_not_overwrite_non_sending_row(session, monkeypatch, caplog):
+    # 迟到 finalize 场景：行已被 sweep 转 NEEDS_REVIEW，终态 UPDATE 不应覆盖
+    from sqlalchemy import update as sa_update
+
+    from social_reply.application.message_delivery.outbox import _finalize
+    conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text",
+                                 status="NEEDS_REVIEW")
+    await session.execute(sa_update(models.OutboxMessage)
+                          .where(models.OutboxMessage.id == ob_id)
+                          .values(last_error_code="SWEPT"))
+    await session.commit()
+
+    result = await _finalize(ob_id, "SENT", attempt_no=1, chatwoot_message_id=999)
+    assert result == "SENT"
+    session.expire_all()
+    ob = (await session.execute(
+        select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))).scalar_one()
+    # outbox 状态未被覆盖
+    assert ob.status == "NEEDS_REVIEW" and ob.last_error_code == "SWEPT"
+    assert ob.chatwoot_message_id is None
+    # 审计行仍写入（记录本次尝试事实）
+    att = (await session.execute(
+        select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == ob_id))).scalar_one()  # noqa: E501
+    assert att.outcome == "SENT" and att.chatwoot_message_id == 999
