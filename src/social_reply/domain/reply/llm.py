@@ -13,6 +13,8 @@ from social_reply.domain.reply.decision import (
 class LLMContext:
     text: str
     conversation_key: str
+    # 检索命中的官方回复模板文本（默认空，向后兼容）
+    knowledge: tuple[str, ...] = ()
 
 
 class LLMClient(Protocol):

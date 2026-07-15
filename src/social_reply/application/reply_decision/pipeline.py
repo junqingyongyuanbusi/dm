@@ -20,7 +20,8 @@ class DecisionSnapshot:
 
 
 async def run_decision_pipeline(
-    snapshot: DecisionSnapshot, *, llm: LLMClient, killswitch
+    snapshot: DecisionSnapshot, *, llm: LLMClient, killswitch,
+    knowledge: tuple[str, ...] = (), require_knowledge: bool = False,
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 规则 → LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。"""
@@ -44,10 +45,19 @@ async def run_decision_pipeline(
     ruled = apply_rules(snapshot.text)
     if ruled is not None:
         decision = ruled
+    elif require_knowledge and not knowledge:
+        # 无知识降级：要求知识兜底时检索无命中，直接转人工，不调 LLM（省 token）
+        decision = ReplyDecision(action=ReplyAction.HANDOFF,
+                                 reason_codes=("INSUFFICIENT_KNOWLEDGE",), source="rule")
     else:
         decision = await llm.decide(
-            LLMContext(text=snapshot.text or "", conversation_key=snapshot.conversation_key)
+            LLMContext(text=snapshot.text or "",
+                       conversation_key=snapshot.conversation_key, knowledge=knowledge)
         )
+        if knowledge:
+            # 命中审计（最简）：reason_codes 记 KNOWLEDGE_HIT，完整 chunk 审计列已记债
+            decision = replace(decision,
+                               reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
 
     # 输出侧闸门
     decision = run_final_guard(decision, snapshot.platform)

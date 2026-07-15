@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_timeout_seconds: float = 30.0
+    # 知识检索（Plan 3）：默认全关，不影响现有决策行为
+    knowledge_retrieval_enabled: bool = False
+    knowledge_min_similarity: float = 0.5
+    knowledge_top_k: int = 3
+    # true 时检索无命中直接 HANDOFF/INSUFFICIENT_KNOWLEDGE，不调 LLM（省 token，§十三）
+    require_knowledge: bool = False
     testing: bool = False
 
     @model_validator(mode="after")
