@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     prompt_version: str = "v0-stub"
     chatwoot_base_url: str = "http://localhost:3000"
     chatwoot_api_token: str = "dev-local-token"
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
+    openai_timeout_seconds: float = 30.0
     testing: bool = False
 
     @model_validator(mode="after")
@@ -24,6 +28,16 @@ class Settings(BaseSettings):
         if not self.testing and self.chatwoot_webhook_secret in ("", "change-me"):
             raise ValueError(
                 "CHATWOOT_WEBHOOK_SECRET 未配置（不能为空或 change-me）；测试环境请设 TESTING=true"
+            )
+        # 生产环境拒绝空/默认 Chatwoot API token（Plan 2c：真实投递前置）
+        if not self.testing and self.chatwoot_api_token in ("", "dev-local-token"):
+            raise ValueError(
+                "CHATWOOT_API_TOKEN 未配置（不能为空或 dev-local-token）；测试环境请设 TESTING=true"
+            )
+        # 生产环境启用 openai provider 时必须提供 API key
+        if not self.testing and self.llm_provider == "openai" and self.openai_api_key == "":
+            raise ValueError(
+                "OPENAI_API_KEY 未配置（LLM_PROVIDER=openai 时不能为空）；测试环境请设 TESTING=true"
             )
         return self
 
