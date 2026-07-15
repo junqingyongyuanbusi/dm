@@ -47,3 +47,23 @@ uv run pytest -m "not integration"   # 纯单元
 docker compose -f deploy/docker-compose.yml up -d
 uv run pytest                        # 全量
 ```
+
+## 回复模板导入（知识库）
+
+CSV 格式（UTF-8，表头必需 `question,reply`，可选 `brand_id,platform,category`）：
+
+| 列 | 必需 | 说明 |
+| --- | --- | --- |
+| question | 是 | 模板触发问题/关键词 |
+| reply | 是 | 标准回复文本 |
+| brand_id | 否 | 品牌，缺省用 `--brand`（默认 default） |
+| platform | 否 | 平台，留空表示全平台 |
+| category | 否 | 分类标签 |
+
+```bash
+uv run python -m apps.cli.import_knowledge 模板.csv --brand default
+```
+
+- 幂等：按内容 sha256（content_hash）去重，重复导入/模板未变的行自动跳过，不重复扣 embedding 费；修改模板文本后重导会追加新记录。
+- `TESTING=true` 或未配置 `OPENAI_API_KEY` 时自动使用确定性伪向量（FakeEmbeddingClient）并打印提示，方便无凭证试导入。
+- Excel 用户：请在 Excel 中「另存为 → CSV UTF-8（逗号分隔）」后再导入。
