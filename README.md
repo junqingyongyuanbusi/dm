@@ -25,6 +25,21 @@ uv run python scripts/send_test_webhook.py
 
 验收：`raw_events.processing_status='PROCESSED'`，`conversations`/`messages`/`automation_states`（BOT_DRAFT_ONLY）各一行。
 
+## Plan 2b：真实 Chatwoot 发送（需自托管 Chatwoot 凭证）
+
+1. 在 Chatwoot 建一个 API/AgentBot inbox，取 `api_access_token` 与 account id。
+2. `.env` 设：`CHATWOOT_BASE_URL` / `CHATWOOT_API_TOKEN` / `TESTING=false` / `CHATWOOT_WEBHOOK_SECRET=<真实密钥>`。
+3. 确保 `platform_accounts.chatwoot_inbox_id` 与 `conversation_mappings` 已建立（首条入站消息会自动建 mapping）。
+4. 起三个常驻进程：
+
+   ```bash
+   uv run uvicorn apps.api.main:app --port 8000   # API（webhook 入口）
+   uv run dramatiq apps.worker.main               # worker（入站处理 + outbox 投递）
+   uv run python -m apps.scheduler.main           # scheduler（outbox 补扫，30s 一轮）
+   ```
+
+5. Chatwoot webhook 指向 `http(s)://<host>:8000/webhooks/chatwoot`。用户发消息 → 决策 → BOT_ACTIVE 下自动回复经 Chatwoot Messages API 发出。
+
 ## 测试
 
 ```bash
