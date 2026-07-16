@@ -2,12 +2,10 @@ from social_reply.domain.reply.decision import ReplyAction, RiskLevel
 from social_reply.domain.reply.rules import apply_rules
 
 
-def test_greeting_returns_template_auto_reply():
-    d = apply_rules("你好")
-    assert d is not None
-    assert d.action is ReplyAction.AUTO_REPLY
-    assert d.source == "rule"
-    assert "GREETING_TEMPLATE" in d.reason_codes
+def test_greeting_falls_through_to_knowledge():
+    # 问候语不再内置拦截（用户 CSV 模板优先）：交给知识库/LLM 处理
+    assert apply_rules("你好") is None
+    assert apply_rules("hello") is None
 
 
 def test_risk_word_forces_handoff():

@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     knowledge_retrieval_enabled: bool = False
     knowledge_min_similarity: float = 0.5
     knowledge_top_k: int = 3
+    # true 时命中模板原文直出（不经 LLM 改写/翻译）；false 则模板作参考交 LLM 生成
+    knowledge_verbatim_reply: bool = False
     # true 时检索无命中直接 HANDOFF/INSUFFICIENT_KNOWLEDGE，不调 LLM（省 token，§十三）
     require_knowledge: bool = False
     testing: bool = False

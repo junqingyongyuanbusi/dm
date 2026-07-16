@@ -3,7 +3,7 @@ import uuid
 
 import redis.asyncio as aioredis
 
-from social_reply.application.knowledge.retrieval import retrieve_knowledge
+from social_reply.application.knowledge.retrieval import KnowledgeHit, retrieve_knowledge
 from social_reply.application.reply_decision.persist import persist_decision
 from social_reply.application.reply_decision.pipeline import (
     DecisionSnapshot,
@@ -74,8 +74,8 @@ def _get_embedder() -> EmbeddingClient:
     return _embedder
 
 
-async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[str, ...]:
-    """检索开关开启时 embed 用户消息并取 top-k 模板文本；任何失败按无知识继续不阻断决策"""
+async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[KnowledgeHit, ...]:
+    """检索开关开启时 embed 用户消息并取 top-k 模板命中；任何失败按无知识继续不阻断决策"""
     settings = get_settings()
     if not settings.knowledge_retrieval_enabled:
         return ()
@@ -103,7 +103,7 @@ async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[str, ...]:
             len(hits), snapshot.conversation_key,
             [(str(h.chunk_id), h.content_hash[:12], round(h.similarity, 3)) for h in hits],
         )
-    return tuple(hit.content for hit in hits)
+    return tuple(hits)
 
 
 async def run_and_persist_decision(
@@ -121,12 +121,20 @@ async def run_and_persist_decision(
         decision = ReplyDecision(action=ReplyAction.DRAFT,
                                  reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule")
     else:
-        knowledge = await _fetch_knowledge(snapshot)
+        hits = await _fetch_knowledge(snapshot)
+        # 模板直答：命中且开启 verbatim 时取相似度最高一条的原文回复（hits 已按距离升序）
+        verbatim = (
+            hits[0].reply
+            if hits and settings.knowledge_verbatim_reply
+            else None
+        )
         decision = await run_decision_pipeline(
-            snapshot, llm=_get_llm(), killswitch=killswitch, knowledge=knowledge,
+            snapshot, llm=_get_llm(), killswitch=killswitch,
+            knowledge=tuple(h.content for h in hits),
             # require_knowledge 仅在检索开启时生效，否则会把所有消息误降级为转人工
             require_knowledge=settings.knowledge_retrieval_enabled
             and settings.require_knowledge,
+            verbatim_reply=verbatim,
         )
     async with get_session_factory()() as session:
         outbox_id = await persist_decision(

@@ -65,3 +65,29 @@ async def test_killswitch_error_fails_closed_to_draft():
     d = await run_decision_pipeline(_snap(), llm=StubLLMClient(), killswitch=_BrokenSwitch())
     assert d.action is ReplyAction.DRAFT
     assert "KILLSWITCH_UNAVAILABLE" in d.reason_codes
+
+
+async def test_verbatim_reply_returns_template_text_without_llm():
+    class _MustNotCall:
+        async def decide(self, context):
+            raise AssertionError("verbatim 模式不得调用 LLM")
+
+    d = await run_decision_pipeline(
+        _snap(text="hello"), llm=_MustNotCall(), killswitch=_OpenSwitch(),
+        knowledge=("问：Hello\n答：Hello! Welcome to our trading community.",),
+        verbatim_reply="Hello! Welcome to our trading community. How can we help you today?",
+    )
+    assert d.action is ReplyAction.AUTO_REPLY
+    assert d.reply_text == "Hello! Welcome to our trading community. How can we help you today?"
+    assert d.source == "knowledge"
+    assert "KNOWLEDGE_VERBATIM" in d.reason_codes
+
+
+async def test_risk_word_beats_verbatim_template():
+    # 安全规则优先：风险词即使命中模板也必须转人工
+    d = await run_decision_pipeline(
+        _snap(text="你们是不是诈骗"), llm=StubLLMClient(), killswitch=_OpenSwitch(),
+        knowledge=("问：Scam?\n答：check regulators",), verbatim_reply="check regulators",
+    )
+    assert d.action is ReplyAction.HANDOFF
+    assert "RISK_WORD" in d.reason_codes

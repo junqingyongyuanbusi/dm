@@ -22,9 +22,11 @@ class DecisionSnapshot:
 async def run_decision_pipeline(
     snapshot: DecisionSnapshot, *, llm: LLMClient, killswitch,
     knowledge: tuple[str, ...] = (), require_knowledge: bool = False,
+    verbatim_reply: str | None = None,
 ) -> ReplyDecision:
-    """纯管线：状态门 → kill switch → 规则 → LLM → Final Guard → 草稿降级。
-    不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。"""
+    """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
+    不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
+    verbatim_reply 非空时（知识库命中且开模板直答）原文返回模板回复，不调 LLM。"""
     # 状态门：人工接管中，AI 一律不自动发（PLAN.md §六）
     if snapshot.automation_state == "HUMAN_ACTIVE":
         return ReplyDecision(action=ReplyAction.IGNORE,
@@ -41,10 +43,21 @@ async def run_decision_pipeline(
         return ReplyDecision(action=ReplyAction.DRAFT,
                              reason_codes=("KILLSWITCH",), source="rule")
 
-    # 确定性规则优先于 LLM
+    # 确定性安全规则（空消息/风险词）优先于一切
     ruled = apply_rules(snapshot.text)
     if ruled is not None:
         decision = ruled
+    elif verbatim_reply is not None:
+        # 模板直答：检索命中且开启 KNOWLEDGE_VERBATIM_REPLY——原文返回用户模板，
+        # 不经 LLM 改写/翻译（确定性 100%，也省调用费）
+        decision = ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text=verbatim_reply,
+            intent="knowledge_template",
+            confidence=1.0,
+            reason_codes=("KNOWLEDGE_VERBATIM",),
+            source="knowledge",
+        )
     elif require_knowledge and not knowledge:
         # 无知识降级：要求知识兜底时检索无命中，直接转人工，不调 LLM（省 token）
         decision = ReplyDecision(action=ReplyAction.HANDOFF,
