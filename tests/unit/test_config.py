@@ -7,6 +7,7 @@ from social_reply.shared.config import Settings
 _ENV_KEYS = [
     "CHATWOOT_WEBHOOK_SECRET",
     "CHATWOOT_API_TOKEN",
+    "CONTROL_API_KEY",
     "LLM_PROVIDER",
     "OPENAI_API_KEY",
     "TESTING",
@@ -50,6 +51,7 @@ def test_非测试环境_openai_provider_空_key_拒绝() -> None:
             testing=False,
             chatwoot_webhook_secret="real-secret",
             chatwoot_api_token="real-token",
+            control_api_key="control-token",
             llm_provider="openai",
         )
 
@@ -59,7 +61,17 @@ def test_非测试环境_凭证齐全通过() -> None:
         testing=False,
         chatwoot_webhook_secret="real-secret",
         chatwoot_api_token="real-token",
+        control_api_key="control-token",
         llm_provider="openai",
         openai_api_key="sk-test",
     )
     assert settings.openai_api_key == "sk-test"
+
+
+def test_非测试环境_空_control_api_key_拒绝() -> None:
+    with pytest.raises(ValueError, match="CONTROL_API_KEY"):
+        _make(
+            testing=False,
+            chatwoot_webhook_secret="real-secret",
+            chatwoot_api_token="real-token",
+        )

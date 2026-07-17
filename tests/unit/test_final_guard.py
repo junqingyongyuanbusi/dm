@@ -12,34 +12,43 @@ def test_non_auto_reply_passes_through_untouched():
 
 
 def test_public_reply_with_pii_downgraded_to_handoff():
-    d = ReplyDecision(action=ReplyAction.AUTO_REPLY,
-                      reply_text="您的账户 88123456 已处理",
-                      reply_visibility=Visibility.PUBLIC)
+    d = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="您的账户 88123456 已处理",
+        reply_visibility=Visibility.PUBLIC,
+    )
     out = run_final_guard(d, "telegram")
     assert out.action is ReplyAction.HANDOFF
     assert "GUARD_PII_LEAK" in out.reason_codes
 
 
 def test_email_in_public_reply_blocked():
-    d = ReplyDecision(action=ReplyAction.AUTO_REPLY,
-                      reply_text="请联系 a@b.com", reply_visibility=Visibility.PUBLIC)
+    d = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="请联系 a@b.com",
+        reply_visibility=Visibility.PUBLIC,
+    )
     assert run_final_guard(d, "telegram").action is ReplyAction.HANDOFF
 
 
 def test_pii_with_space_separators_blocked():
     # 分隔符绕过：空格分组手机号在归一化后仍应命中长数字串
-    d = ReplyDecision(action=ReplyAction.AUTO_REPLY,
-                      reply_text="我的手机是 138 0013 8000",
-                      reply_visibility=Visibility.PUBLIC)
+    d = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="我的手机是 138 0013 8000",
+        reply_visibility=Visibility.PUBLIC,
+    )
     out = run_final_guard(d, "telegram")
     assert out.action is ReplyAction.HANDOFF
     assert "GUARD_PII_LEAK" in out.reason_codes
 
 
 def test_pii_with_dash_separators_blocked():
-    d = ReplyDecision(action=ReplyAction.AUTO_REPLY,
-                      reply_text="卡号 8812-3456-7890",
-                      reply_visibility=Visibility.PUBLIC)
+    d = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="卡号 8812-3456-7890",
+        reply_visibility=Visibility.PUBLIC,
+    )
     out = run_final_guard(d, "telegram")
     assert out.action is ReplyAction.HANDOFF
     assert "GUARD_PII_LEAK" in out.reason_codes
@@ -47,9 +56,11 @@ def test_pii_with_dash_separators_blocked():
 
 def test_short_ticket_number_not_false_positive():
     # 5 位工单号不应误伤（阈值为 6 位以上）
-    d = ReplyDecision(action=ReplyAction.AUTO_REPLY,
-                      reply_text="3 天内回复，工单号 12345",
-                      reply_visibility=Visibility.PUBLIC)
+    d = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="3 天内回复，工单号 12345",
+        reply_visibility=Visibility.PUBLIC,
+    )
     assert run_final_guard(d, "telegram").action is ReplyAction.AUTO_REPLY
 
 

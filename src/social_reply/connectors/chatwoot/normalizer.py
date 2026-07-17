@@ -5,10 +5,10 @@ _MESSAGE_TYPE_BY_INT = {0: "incoming", 1: "outgoing", 2: "activity", 3: "templat
 
 
 class EventClass(Enum):
-    INBOUND_USER = auto()       # 进入决策管线
-    AGENT_PUBLIC_REPLY = auto() # 人工坐席公开回复 → HUMAN_ACTIVE
-    BOT_ECHO = auto()           # 机器人自身消息，仅对账
-    IGNORE = auto()             # 私有备注 / activity 等
+    INBOUND_USER = auto()  # 进入决策管线
+    AGENT_PUBLIC_REPLY = auto()  # 人工坐席公开回复 → HUMAN_ACTIVE
+    BOT_ECHO = auto()  # 机器人自身消息，仅对账
+    IGNORE = auto()  # 私有备注 / activity 等
 
 
 @dataclass(frozen=True)

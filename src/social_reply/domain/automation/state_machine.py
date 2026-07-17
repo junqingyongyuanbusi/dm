@@ -17,7 +17,6 @@ class AutomationStateEnum(StrEnum):
     CLOSED = "CLOSED"
 
 
-# PLAN.md §六 状态图的允许转换（Plan 1 只使用其中初始化与 HUMAN_ACTIVE 翻转）
 _ALLOWED: dict[AutomationStateEnum, set[AutomationStateEnum]] = {
     AutomationStateEnum.BOT_ACTIVE: {
         AutomationStateEnum.HANDOFF_PENDING,
@@ -98,9 +97,7 @@ async def flip_to_human_active(
                 detail={"reason": reason},
             )
         )
-        # 注：defense 3 与 defense 1（persist CAS）联合仍为尽力而为——
-        # 权威闸门是 defense 2（Plan 2b 发送前复检，见计划文档"防线边界"）。
-        # defense 3：接管即取消该会话所有未发送 outbox（PLAN.md §六 竞态第 3 层）
+        # This cancellation narrows the takeover race; delivery still rechecks BOT_ACTIVE.
         await session.execute(
             update(models.OutboxMessage)
             .where(

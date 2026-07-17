@@ -5,6 +5,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Computed,
     DateTime,
     Float,
     ForeignKey,
@@ -15,7 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -27,13 +28,46 @@ def _uuid_pk() -> Mapped[uuid.UUID]:
     return mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
 
+class PlatformApp(Base):
+    __tablename__ = "platform_apps"
+    __table_args__ = (
+        UniqueConstraint("platform_family", "public_id"),
+        UniqueConstraint("tenant_id", "platform_family", "external_app_id"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text, default="default")
+    platform_family: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    external_app_id: Mapped[str | None] = mapped_column(Text)
+    public_id: Mapped[str] = mapped_column(Text)
+    # Secret bundle 内联存储：无持久卷/跨容器（api 验签、worker 投递）共享的唯一可靠位置
+    credential_bundle: Mapped[dict] = mapped_column(JSONB, default=dict)
+    config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    config_version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(Text, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class PlatformAccount(Base):
     __tablename__ = "platform_accounts"
+    __table_args__ = (
+        UniqueConstraint("platform", "public_id"),
+        UniqueConstraint("tenant_id", "platform", "external_account_id"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     brand_id: Mapped[str] = mapped_column(Text)
     platform: Mapped[str] = mapped_column(Text)
+    platform_app_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("platform_apps.id"))
     name: Mapped[str] = mapped_column(Text)
+    external_account_id: Mapped[str | None] = mapped_column(Text)
+    public_id: Mapped[str | None] = mapped_column(Text)
+    # Secret bundle 内联存储（同 PlatformApp）：credential=平台凭证，webhook_secret=验签密钥
+    credential_bundle: Mapped[dict] = mapped_column(JSONB, default=dict)
+    webhook_secret_bundle: Mapped[dict | None] = mapped_column(JSONB)
+    config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    capability: Mapped[dict] = mapped_column(JSONB, default=dict)
+    config_version: Mapped[int] = mapped_column(Integer, default=1)
     chatwoot_inbox_id: Mapped[int | None] = mapped_column(Integer, unique=True)
     automation_default: Mapped[str] = mapped_column(Text, default="BOT_DRAFT_ONLY")
     status: Mapped[str] = mapped_column(Text, default="CONNECTED")
@@ -81,14 +115,13 @@ class ConversationMapping(Base):
 class Message(Base):
     __tablename__ = "messages"
     id: Mapped[uuid.UUID] = _uuid_pk()
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("conversations.id"), index=True
-    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"), index=True)
     direction: Mapped[str] = mapped_column(Text)  # inbound / outbound
     sender_type: Mapped[str] = mapped_column(Text)  # contact / agent / bot
     text: Mapped[str | None] = mapped_column(Text)
     chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     platform_message_id: Mapped[str | None] = mapped_column(Text, index=True)
+    reply_target: Mapped[dict] = mapped_column(JSONB, default=dict)
     private: Mapped[bool] = mapped_column(Boolean, default=False)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -110,7 +143,7 @@ class RawEvent(Base):
 class NormalizedEvent(Base):
     __tablename__ = "normalized_events"
     __table_args__ = (
-        # PLAN.md §十二：多租户去重约束
+        # 多租户去重约束
         UniqueConstraint("tenant_id", "platform", "platform_account_id", "external_event_id"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -131,7 +164,7 @@ class AutomationState(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversations.id"), primary_key=True
     )
-    state: Mapped[str] = mapped_column(Text)  # PLAN.md §六 六状态
+    state: Mapped[str] = mapped_column(Text)
     state_version: Mapped[int] = mapped_column(Integer, default=1)
     human_agent_id: Mapped[str | None] = mapped_column(Text)
     last_human_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -146,7 +179,7 @@ class AutomationState(Base):
 class OutboxMessage(Base):
     __tablename__ = "outbox_messages"
     __table_args__ = (
-        # defense 3 取消 + 补扫认领：按会话+状态过滤（FK 无自动索引，Task 8 评审）
+        # Takeover cancellation and recovery sweeps both filter by conversation and status.
         Index("ix_outbox_conversation_status", "conversation_id", "status"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -185,8 +218,61 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ProvisioningJob(Base):
+    __tablename__ = "provisioning_jobs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key"),
+        Index("ix_provisioning_jobs_status_next_attempt", "status", "next_attempt_at"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    brand_id: Mapped[str] = mapped_column(Text)
+    platform: Mapped[str] = mapped_column(Text)
+    operation: Mapped[str] = mapped_column(Text, default="CONNECT_ACCOUNT")
+    actor: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    request: Mapped[dict] = mapped_column(JSONB)
+    # 用户提交的原始 secret，内联暂存；job 完成后置 NULL。绝不可经 _public_result 外泄
+    staging_secret: Mapped[dict | None] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(Text, default="PENDING")
+    current_step: Mapped[str] = mapped_column(Text, default="QUEUED")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_by: Mapped[str | None] = mapped_column(Text)
+    account_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("platform_accounts.id"))
+    platform_app_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("platform_apps.id"))
+    result: Mapped[dict] = mapped_column(JSONB, default=dict)
+    last_error_code: Mapped[str | None] = mapped_column(Text)
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DecisionJob(Base):
+    __tablename__ = "decision_jobs"
+    __table_args__ = (Index("ix_decision_jobs_status_next_attempt", "status", "next_attempt_at"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    raw_event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("raw_events.id"))
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
+    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), unique=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("platform_accounts.id"))
+    snapshot: Mapped[dict] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(Text, default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class ReplyDecision(Base):
     __tablename__ = "reply_decisions"
+    __table_args__ = (UniqueConstraint("message_id"),)
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
@@ -202,9 +288,7 @@ class ReplyDecision(Base):
     prompt_version: Mapped[str | None] = mapped_column(Text)
     state_version_at_decision: Mapped[int | None] = mapped_column(Integer)
     outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class DeliveryAttempt(Base):
@@ -216,18 +300,32 @@ class DeliveryAttempt(Base):
     error_code: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
     chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        # 词法检索（BM25 近似）：question 的 tsvector GIN 索引，用于混合检索的关键词一路，
+        # 补向量对专有名词（pip/broker/品牌名）召回不足的短板。'simple' 分词器不做词干/停用词，
+        # 对多语言与短模板更稳（避免 english 词干把 "pips"→"pip" 误并或丢词）。
+        Index(
+            "ix_knowledge_documents_question_tsv",
+            "question_tsv",
+            postgresql_using="gin",
+        ),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
     brand_id: Mapped[str] = mapped_column(String(64), default="default")
     platform: Mapped[str | None] = mapped_column(String(32))  # NULL=全平台
     category: Mapped[str | None] = mapped_column(String(64))
     question: Mapped[str] = mapped_column(Text)  # 模板触发问题/关键词
     reply: Mapped[str] = mapped_column(Text)  # 标准回复
+    # 生成列：DB 自动维护 question 的 tsvector，导入/更新无需手工计算（DRY）
+    question_tsv: Mapped[str] = mapped_column(
+        TSVECTOR, Computed("to_tsvector('simple', question)", persisted=True)
+    )
     status: Mapped[str] = mapped_column(String(16), default="published")
     source_file: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -251,7 +349,10 @@ class KnowledgeChunk(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True
     )
-    content: Mapped[str] = mapped_column(Text)  # 参与 embedding 的文本（question+reply 拼接）
+    content: Mapped[str] = mapped_column(Text)  # 展示/LLM 上下文用（question+reply 拼接）
+    # 实际参与 embedding 的文本。非对称检索：只 embed question，与用户 query 同语义空间对齐，
+    # 不让 answer 措辞稀释向量（见 importer）。历史行可能为 NULL（旧数据 embed 的是 content）。
+    embed_text: Mapped[str | None] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64), unique=True)  # sha256，导入幂等
     embedding_version: Mapped[str] = mapped_column(String(32))  # 如 "text-embedding-3-small"
     embedding: Mapped[list[float]] = mapped_column(Vector(1536))

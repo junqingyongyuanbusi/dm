@@ -12,7 +12,6 @@ from sqlalchemy import insert, select
 
 import social_reply.infrastructure.queue.broker  # noqa: F401  确保测试用 StubBroker
 from social_reply.application.event_ingestion.processor import process_raw_event
-from social_reply.application.message_delivery.outbox import deliver_outbox
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.infrastructure.database import models
 
@@ -35,9 +34,11 @@ def _signed_headers(body: bytes) -> dict[str, str]:
 async def client(migrated_db, monkeypatch):
     monkeypatch.setenv("TESTING", "true")
     from social_reply.shared.config import get_settings
+
     get_settings.cache_clear()
 
     from apps.api.main import create_app
+
     transport = httpx.ASGITransport(app=create_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -52,8 +53,11 @@ def _flush_fake_sent():
 
 
 PAYLOAD = {
-    "event": "message_created", "id": 55, "content": "请问怎么改邮箱",
-    "message_type": "incoming", "private": False,
+    "event": "message_created",
+    "id": 55,
+    "content": "请问怎么改邮箱",
+    "message_type": "incoming",
+    "private": False,
     "created_at": "2026-07-15T10:00:00Z",
     "sender": {"id": 9, "type": "contact"},
     "conversation": {"id": 77, "inbox_id": 101, "status": "pending"},
@@ -63,9 +67,16 @@ PAYLOAD = {
 
 async def test_full_loop_inbound_to_chatwoot_reply(client, session):
     # 1. seed 平台账号（BOT_ACTIVE：允许自动公开回复）
-    await session.execute(insert(models.PlatformAccount).values(
-        id=uuid.uuid4(), brand_id="b1", platform="telegram", name="a",
-        chatwoot_inbox_id=101, automation_default="BOT_ACTIVE"))
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=uuid.uuid4(),
+            brand_id="b1",
+            platform="telegram",
+            name="a",
+            chatwoot_inbox_id=101,
+            automation_default="BOT_ACTIVE",
+        )
+    )
     await session.commit()
 
     # 2. 签名 webhook 入站 → RawEvent 落库
@@ -74,26 +85,32 @@ async def test_full_loop_inbound_to_chatwoot_reply(client, session):
     assert resp.status_code == 200
     raw = (await session.execute(select(models.RawEvent))).scalar_one()
 
-    # 3. 手动驱动处理（tx1 入站 + tx2 决策 → PENDING outbox）
+    # 3. 驱动处理：决策提交后 Fast Path 立即完成投递
     await process_raw_event(str(raw.id))
     session.expire_all()
     ob = (await session.execute(select(models.OutboxMessage))).scalar_one()
-    assert ob.status == "PENDING"
+    assert ob.status == "SENT"
 
     # 4. Plan 1 入站应已自动建 ConversationMapping（deliver 靠它解析目标）
-    mapping = (await session.execute(select(models.ConversationMapping).where(
-        models.ConversationMapping.chatwoot_account_id == 1,
-        models.ConversationMapping.chatwoot_conversation_id == 77))).scalar_one()
+    mapping = (
+        await session.execute(
+            select(models.ConversationMapping).where(
+                models.ConversationMapping.chatwoot_account_id == 1,
+                models.ConversationMapping.chatwoot_conversation_id == 77,
+            )
+        )
+    ).scalar_one()
     assert mapping.conversation_id == ob.conversation_id
 
-    # 5. 手动驱动投递 → Fake Chatwoot 收到回复
+    # 5. Fake Chatwoot 已在同一低延迟链路收到回复
     ob_id = ob.id
-    result = await deliver_outbox(str(ob_id))
-    assert result == "SENT"
-    # deliver 在自己的 session 更新，这里按列重查（避免刷新已过期的 ORM 实例）
-    status, chatwoot_message_id = (await session.execute(
-        select(models.OutboxMessage.status, models.OutboxMessage.chatwoot_message_id)
-        .where(models.OutboxMessage.id == ob_id))).one()
+    status, chatwoot_message_id = (
+        await session.execute(
+            select(models.OutboxMessage.status, models.OutboxMessage.chatwoot_message_id).where(
+                models.OutboxMessage.id == ob_id
+            )
+        )
+    ).one()
     assert status == "SENT" and chatwoot_message_id is not None
 
     fake = get_chatwoot_client()

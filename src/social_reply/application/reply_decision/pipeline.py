@@ -10,8 +10,10 @@ from social_reply.domain.reply.rules import apply_rules
 class DecisionSnapshot:
     """决策入口读到的会话快照——纯数据，脱离数据库会话。
     state_version 用于 tx2 的 CAS（防接管竞态 defense 1）。"""
+
     text: str | None
     platform: str
+    tenant_id: str
     brand_id: str
     account_id: str
     conversation_key: str
@@ -20,36 +22,42 @@ class DecisionSnapshot:
 
 
 async def run_decision_pipeline(
-    snapshot: DecisionSnapshot, *, llm: LLMClient, killswitch,
-    knowledge: tuple[str, ...] = (), require_knowledge: bool = False,
+    snapshot: DecisionSnapshot,
+    *,
+    llm: LLMClient,
+    killswitch,
+    knowledge: tuple[str, ...] = (),
+    require_knowledge: bool = False,
     verbatim_reply: str | None = None,
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
     verbatim_reply 非空时（知识库命中且开模板直答）原文返回模板回复，不调 LLM。"""
-    # 状态门：人工接管中，AI 一律不自动发（PLAN.md §六）
+    # Human takeover suppresses all automated decisions.
     if snapshot.automation_state == "HUMAN_ACTIVE":
-        return ReplyDecision(action=ReplyAction.IGNORE,
-                             reason_codes=("HUMAN_ACTIVE",), source="rule")
+        return ReplyDecision(
+            action=ReplyAction.IGNORE, reason_codes=("HUMAN_ACTIVE",), source="rule"
+        )
 
     # 全局/品牌/账号急停：降级为草稿（仍生成供人工参考，但不外发）。
-    # kill switch 是安全控制：无法验证急停状态时 fail-closed（Task 5 评审）。
+    # kill switch 是安全控制：无法验证急停状态时 fail-closed。
     try:
-        disabled = await killswitch.is_disabled(snapshot.brand_id, snapshot.account_id)
+        disabled = await killswitch.is_disabled(
+            snapshot.brand_id, snapshot.account_id, snapshot.tenant_id
+        )
     except Exception:
-        return ReplyDecision(action=ReplyAction.DRAFT,
-                             reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule")
+        return ReplyDecision(
+            action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule"
+        )
     if disabled:
-        return ReplyDecision(action=ReplyAction.DRAFT,
-                             reason_codes=("KILLSWITCH",), source="rule")
+        return ReplyDecision(action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH",), source="rule")
 
     # 确定性安全规则（空消息/风险词）优先于一切
     ruled = apply_rules(snapshot.text)
     if ruled is not None:
         decision = ruled
     elif verbatim_reply is not None:
-        # 模板直答：检索命中且开启 KNOWLEDGE_VERBATIM_REPLY——原文返回用户模板，
-        # 不经 LLM 改写/翻译（确定性 100%，也省调用费）
+        # Exact templates bypass the LLM so approved wording is preserved.
         decision = ReplyDecision(
             action=ReplyAction.AUTO_REPLY,
             reply_text=verbatim_reply,
@@ -59,27 +67,27 @@ async def run_decision_pipeline(
             source="knowledge",
         )
     elif require_knowledge and not knowledge:
-        # 无知识降级：要求知识兜底时检索无命中，直接转人工，不调 LLM（省 token）
-        decision = ReplyDecision(action=ReplyAction.HANDOFF,
-                                 reason_codes=("INSUFFICIENT_KNOWLEDGE",), source="rule")
+        # Knowledge-required deployments hand off rather than answer without evidence.
+        decision = ReplyDecision(
+            action=ReplyAction.HANDOFF, reason_codes=("INSUFFICIENT_KNOWLEDGE",), source="rule"
+        )
     else:
         decision = await llm.decide(
-            LLMContext(text=snapshot.text or "",
-                       conversation_key=snapshot.conversation_key, knowledge=knowledge)
+            LLMContext(
+                text=snapshot.text or "",
+                conversation_key=snapshot.conversation_key,
+                knowledge=knowledge,
+            )
         )
         if knowledge:
-            # 命中审计（最简）：reason_codes 记 KNOWLEDGE_HIT，完整 chunk 审计列已记债
-            decision = replace(decision,
-                               reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
+            # Preserve whether retrieved knowledge influenced the model decision.
+            decision = replace(decision, reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
 
     # 输出侧闸门
     decision = run_final_guard(decision, snapshot.platform)
 
-    # 安全不变量：本管线只 gate HUMAN_ACTIVE(→IGNORE) 与 BOT_DRAFT_ONLY(→草稿)。
-    # 其余非活跃态（HANDOFF_PENDING/BOT_COOLDOWN/CLOSED）可产出 auto_reply，
-    # 靠 Task 7 persist 的 CAS 白名单 state==BOT_ACTIVE 抑制外发——
-    # 切勿把该 CAS 松成 != HUMAN_ACTIVE，否则这些态会立即开始自动外发。
-    # 草稿先行：BOT_DRAFT_ONLY 把 auto_reply 降级为 draft（PLAN.md §十八）
+    # Persistence creates a public Outbox only when state and version still match BOT_ACTIVE.
+    # Keep this draft downgrade separate from that send-time race check.
     if snapshot.automation_state == "BOT_DRAFT_ONLY" and decision.action is ReplyAction.AUTO_REPLY:
         decision = replace(decision, action=ReplyAction.DRAFT)
 

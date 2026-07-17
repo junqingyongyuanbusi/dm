@@ -1,0 +1,7 @@
+ACTIVE_ACCOUNT_STATUS = "active"
+DISABLED_ACCOUNT_STATUS = "DISABLED"
+LEGACY_ACTIVE_ACCOUNT_STATUSES = frozenset({ACTIVE_ACCOUNT_STATUS, "CONNECTED"})
+
+
+def is_active_account_status(status: str) -> bool:
+    return status in LEGACY_ACTIVE_ACCOUNT_STATUSES

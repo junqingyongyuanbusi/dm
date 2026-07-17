@@ -3,7 +3,7 @@ from dataclasses import replace
 
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 
-# 账户号/长数字串、邮箱——公开回复禁止回显（PLAN.md §五 Final Guard）
+# 账户号/长数字串、邮箱——公开回复禁止回显
 _LONG_DIGITS = re.compile(r"\d{6,}")
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 # 去分隔符归一化：抹掉空白与常见分组符，防"138 0013 8000 / 8812-3456-7890"式绕过
@@ -13,12 +13,10 @@ _SEPARATORS = re.compile(r"[\s\-–—.·]")
 def _has_pii(text: str) -> bool:
     """原文与归一化文本都跑长数字串；email 只跑原文（归一化会破坏 email 结构）。"""
     normalized = _SEPARATORS.sub("", text)
-    return bool(
-        _LONG_DIGITS.search(text)
-        or _LONG_DIGITS.search(normalized)
-        or _EMAIL.search(text)
-    )
-_MAX_TEXT_LENGTH = {"telegram": 4096, "facebook": 2000, "instagram": 1000}
+    return bool(_LONG_DIGITS.search(text) or _LONG_DIGITS.search(normalized) or _EMAIL.search(text))
+
+
+_MAX_TEXT_LENGTH = {"telegram": 4096, "facebook": 2000, "instagram": 1000, "x": 280}
 _DEFAULT_MAX = 2000
 
 

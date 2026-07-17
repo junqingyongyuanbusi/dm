@@ -1,0 +1,188 @@
+import uuid
+
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from social_reply.application.reply_decision.jobs import snapshot_to_dict
+from social_reply.application.reply_decision.pipeline import DecisionSnapshot
+from social_reply.domain.automation.state_machine import ensure_state
+from social_reply.domain.messages.canonical import CanonicalEvent
+from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.queue.dispatch import dispatch_actor
+
+
+async def ingest_canonical_event(
+    event: CanonicalEvent,
+    *,
+    raw_event_id: uuid.UUID | None = None,
+) -> uuid.UUID | None:
+    """平台直连事件的通用 Inbox：同事务保存消息、状态快照和 DecisionJob。"""
+    account_uuid = uuid.UUID(event.platform_account_key)
+    async with get_session_factory()() as session:
+        account = (
+            await session.execute(
+                select(models.PlatformAccount).where(
+                    models.PlatformAccount.id == account_uuid,
+                    models.PlatformAccount.platform == event.platform,
+                )
+            )
+        ).scalar_one_or_none()
+        if account is None:
+            raise LookupError(f"unknown_{event.platform}_account")
+
+        if raw_event_id is not None:
+            await session.execute(
+                update(models.RawEvent)
+                .where(models.RawEvent.id == raw_event_id)
+                .values(processing_status="PROCESSING")
+            )
+
+        normalized_id = (
+            await session.execute(
+                pg_insert(models.NormalizedEvent)
+                .values(
+                    tenant_id=account.tenant_id,
+                    platform=event.platform,
+                    platform_account_id=account.id,
+                    external_event_id=event.external_event_id,
+                    event_type=f"{event.channel_type}.message.created",
+                    raw_event_id=raw_event_id,
+                    occurred_at=event.occurred_at,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        "tenant_id",
+                        "platform",
+                        "platform_account_id",
+                        "external_event_id",
+                    ]
+                )
+                .returning(models.NormalizedEvent.id)
+            )
+        ).scalar_one_or_none()
+        if normalized_id is None:
+            if raw_event_id is not None:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == raw_event_id)
+                    .values(processing_status="SKIPPED_DUPLICATE")
+                )
+            await session.commit()
+            return None
+
+        contact = (
+            await session.execute(
+                pg_insert(models.Contact)
+                .values(
+                    id=uuid.uuid4(),
+                    tenant_id=account.tenant_id,
+                    platform=event.platform,
+                    platform_account_id=account.id,
+                    external_user_id=event.external_user_id,
+                )
+                .on_conflict_do_nothing(index_elements=["platform_account_id", "external_user_id"])
+                .returning(models.Contact.id)
+            )
+        ).scalar_one_or_none()
+        if contact is None:
+            contact = (
+                await session.execute(
+                    select(models.Contact.id).where(
+                        models.Contact.platform_account_id == account.id,
+                        models.Contact.external_user_id == event.external_user_id,
+                    )
+                )
+            ).scalar_one()
+
+        await session.execute(
+            pg_insert(models.Conversation)
+            .values(
+                id=uuid.uuid4(),
+                tenant_id=account.tenant_id,
+                brand_id=account.brand_id,
+                platform=event.platform,
+                platform_account_id=account.id,
+                contact_id=contact,
+                conversation_key=event.conversation_key,
+                channel_type=event.channel_type,
+            )
+            .on_conflict_do_nothing(index_elements=["tenant_id", "conversation_key"])
+        )
+        conversation = (
+            await session.execute(
+                select(models.Conversation).where(
+                    models.Conversation.tenant_id == account.tenant_id,
+                    models.Conversation.conversation_key == event.conversation_key,
+                )
+            )
+        ).scalar_one()
+        await ensure_state(session, conversation.id, account.automation_default)
+
+        message_id = uuid.uuid4()
+        await session.execute(
+            pg_insert(models.Message).values(
+                id=message_id,
+                conversation_id=conversation.id,
+                direction="inbound",
+                sender_type="contact",
+                text=event.text,
+                platform_message_id=event.external_event_id,
+                reply_target=event.reply_target,
+                occurred_at=event.occurred_at,
+            )
+        )
+        await session.execute(
+            models.NormalizedEvent.__table__.update()
+            .where(models.NormalizedEvent.id == normalized_id)
+            .values(conversation_id=conversation.id, message_id=message_id)
+        )
+        state = (
+            await session.execute(
+                select(models.AutomationState.state, models.AutomationState.state_version).where(
+                    models.AutomationState.conversation_id == conversation.id
+                )
+            )
+        ).one()
+        snapshot = DecisionSnapshot(
+            text=event.text,
+            platform=event.platform,
+            tenant_id=account.tenant_id,
+            brand_id=account.brand_id,
+            account_id=str(account.id),
+            conversation_key=conversation.conversation_key,
+            automation_state=state.state,
+            state_version=state.state_version,
+        )
+        job_id = (
+            await session.execute(
+                pg_insert(models.DecisionJob)
+                .values(
+                    raw_event_id=raw_event_id,
+                    conversation_id=conversation.id,
+                    message_id=message_id,
+                    account_id=account.id,
+                    snapshot=snapshot_to_dict(snapshot),
+                    status="PENDING",
+                )
+                .on_conflict_do_nothing(index_elements=["message_id"])
+                .returning(models.DecisionJob.id)
+            )
+        ).scalar_one_or_none()
+        if job_id is None:
+            job_id = (
+                await session.execute(
+                    select(models.DecisionJob.id).where(models.DecisionJob.message_id == message_id)
+                )
+            ).scalar_one()
+        await session.commit()
+
+    from social_reply.application.reply_decision.actors import process_reply_decision
+    from social_reply.application.reply_decision.jobs import process_decision_job
+
+    await dispatch_actor(
+        process_reply_decision,
+        str(job_id),
+        inline=lambda: process_decision_job(str(job_id)),
+    )
+    return job_id

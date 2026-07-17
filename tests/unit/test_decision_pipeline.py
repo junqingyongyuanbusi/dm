@@ -7,24 +7,30 @@ from social_reply.domain.reply.llm import StubLLMClient
 
 
 class _OpenSwitch:
-    async def is_disabled(self, brand_id, account_id):
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
         return False
 
 
 class _ClosedSwitch:
-    async def is_disabled(self, brand_id, account_id):
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
         return True
 
 
 class _BrokenSwitch:
-    async def is_disabled(self, brand_id, account_id):
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
         raise ConnectionError("redis down")
 
 
 def _snap(state="BOT_ACTIVE", text="请问怎么改邮箱"):
     return DecisionSnapshot(
-        text=text, platform="telegram", brand_id="b1", account_id="acc1",
-        conversation_key="telegram:acc1:9", automation_state=state, state_version=1,
+        text=text,
+        platform="telegram",
+        tenant_id="default",
+        brand_id="b1",
+        account_id="acc1",
+        conversation_key="telegram:acc1:9",
+        automation_state=state,
+        state_version=1,
     )
 
 
@@ -35,15 +41,17 @@ async def test_bot_active_normal_question_auto_replies_via_llm():
 
 
 async def test_human_active_forces_ignore():
-    d = await run_decision_pipeline(_snap(state="HUMAN_ACTIVE"), llm=StubLLMClient(),
-                                    killswitch=_OpenSwitch())
+    d = await run_decision_pipeline(
+        _snap(state="HUMAN_ACTIVE"), llm=StubLLMClient(), killswitch=_OpenSwitch()
+    )
     assert d.action is ReplyAction.IGNORE
     assert "HUMAN_ACTIVE" in d.reason_codes
 
 
 async def test_draft_only_downgrades_auto_reply_to_draft():
-    d = await run_decision_pipeline(_snap(state="BOT_DRAFT_ONLY"), llm=StubLLMClient(),
-                                    killswitch=_OpenSwitch())
+    d = await run_decision_pipeline(
+        _snap(state="BOT_DRAFT_ONLY"), llm=StubLLMClient(), killswitch=_OpenSwitch()
+    )
     assert d.action is ReplyAction.DRAFT
 
 
@@ -54,8 +62,9 @@ async def test_killswitch_forces_draft():
 
 
 async def test_risk_word_handoff_before_llm():
-    d = await run_decision_pipeline(_snap(text="我要起诉你们"), llm=StubLLMClient(),
-                                    killswitch=_OpenSwitch())
+    d = await run_decision_pipeline(
+        _snap(text="我要起诉你们"), llm=StubLLMClient(), killswitch=_OpenSwitch()
+    )
     assert d.action is ReplyAction.HANDOFF
     assert "RISK_WORD" in d.reason_codes
 
@@ -73,7 +82,9 @@ async def test_verbatim_reply_returns_template_text_without_llm():
             raise AssertionError("verbatim 模式不得调用 LLM")
 
     d = await run_decision_pipeline(
-        _snap(text="hello"), llm=_MustNotCall(), killswitch=_OpenSwitch(),
+        _snap(text="hello"),
+        llm=_MustNotCall(),
+        killswitch=_OpenSwitch(),
         knowledge=("问：Hello\n答：Hello! Welcome to our trading community.",),
         verbatim_reply="Hello! Welcome to our trading community. How can we help you today?",
     )
@@ -86,8 +97,11 @@ async def test_verbatim_reply_returns_template_text_without_llm():
 async def test_risk_word_beats_verbatim_template():
     # 安全规则优先：风险词即使命中模板也必须转人工
     d = await run_decision_pipeline(
-        _snap(text="你们是不是诈骗"), llm=StubLLMClient(), killswitch=_OpenSwitch(),
-        knowledge=("问：Scam?\n答：check regulators",), verbatim_reply="check regulators",
+        _snap(text="你们是不是诈骗"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        knowledge=("问：Scam?\n答：check regulators",),
+        verbatim_reply="check regulators",
     )
     assert d.action is ReplyAction.HANDOFF
     assert "RISK_WORD" in d.reason_codes

@@ -25,40 +25,56 @@ class FakeChatwootClient:
         self, *, account_id: int, conversation_id: int, content: str, private: bool
     ) -> int:
         self._next_id += 1
-        self.sent.append({
-            "account_id": account_id, "conversation_id": conversation_id,
-            "content": content, "private": private, "id": self._next_id})
+        self.sent.append(
+            {
+                "account_id": account_id,
+                "conversation_id": conversation_id,
+                "content": content,
+                "private": private,
+                "id": self._next_id,
+            }
+        )
         return self._next_id
 
 
 class HttpxChatwootClient:
-    """生产：POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/messages
-    Header api_access_token；message_type=outgoing，private 决定是否私有备注。"""
+    """生产 Chatwoot Client；复用 AsyncClient 的连接池和 TLS 会话降低发送延迟。"""
 
     def __init__(
-        self, base_url: str, api_token: str,
+        self,
+        base_url: str,
+        api_token: str,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._api_token = api_token
-        self._transport = transport
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers={"api_access_token": api_token},
+            timeout=httpx.Timeout(connect=3.0, read=10.0, write=10.0, pool=2.0),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=60.0,
+            ),
+            transport=transport,
+        )
 
     async def create_message(
         self, *, account_id: int, conversation_id: int, content: str, private: bool
     ) -> int:
-        url = (f"{self._base_url}/api/v1/accounts/{account_id}"
-               f"/conversations/{conversation_id}/messages")
-        async with httpx.AsyncClient(timeout=15.0, transport=self._transport) as client:
-            resp = await client.post(
-                url,
-                headers={"api_access_token": self._api_token},
-                json={"content": content, "message_type": "outgoing", "private": private},
-            )
-            resp.raise_for_status()
-            return int(resp.json()["id"])
+        url = f"/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
+        resp = await self._client.post(
+            url,
+            json={"content": content, "message_type": "outgoing", "private": private},
+        )
+        resp.raise_for_status()
+        return int(resp.json()["id"])
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
 
 _fake: FakeChatwootClient | None = None
+_http: HttpxChatwootClient | None = None
 
 
 def get_chatwoot_client() -> ChatwootClient:
@@ -68,4 +84,7 @@ def get_chatwoot_client() -> ChatwootClient:
         if _fake is None:
             _fake = FakeChatwootClient()
         return _fake
-    return HttpxChatwootClient(settings.chatwoot_base_url, settings.chatwoot_api_token)
+    global _http
+    if _http is None:
+        _http = HttpxChatwootClient(settings.chatwoot_base_url, settings.chatwoot_api_token)
+    return _http

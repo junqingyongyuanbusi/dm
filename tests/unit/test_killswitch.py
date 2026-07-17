@@ -15,17 +15,17 @@ async def test_no_flags_enabled():
 
 
 async def test_global_flag_disables_all():
-    checker = KillSwitchChecker(_FakeRedis({"killswitch:global"}))
+    checker = KillSwitchChecker(_FakeRedis({"killswitch:global:default"}))
     assert await checker.is_disabled("b1", "acc1") is True
 
 
 async def test_brand_flag_disables_brand():
-    checker = KillSwitchChecker(_FakeRedis({"killswitch:brand:b1"}))
+    checker = KillSwitchChecker(_FakeRedis({"killswitch:brand:default:b1"}))
     assert await checker.is_disabled("b1", "acc1") is True
     assert await checker.is_disabled("b2", "acc1") is False
 
 
 async def test_account_flag_disables_account():
-    checker = KillSwitchChecker(_FakeRedis({"killswitch:account:acc1"}))
+    checker = KillSwitchChecker(_FakeRedis({"killswitch:account:default:acc1"}))
     assert await checker.is_disabled("b1", "acc1") is True
     assert await checker.is_disabled("b1", "acc2") is False

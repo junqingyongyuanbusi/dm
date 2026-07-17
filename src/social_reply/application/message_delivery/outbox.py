@@ -7,147 +7,319 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
+from social_reply.connectors.registry import get_platform_sender
+from social_reply.domain.platform_accounts import is_active_account_status
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 5
+_DIRECT_CAPABILITY = {
+    "telegram_dm": "dm",
+    "meta_messenger_dm": "dm",
+    "meta_instagram_dm": "dm",
+    "meta_public_comment": "comments",
+    "meta_private_reply": "comments",
+    "whatsapp_session_message": "session_messages",
+    "x_dm": "dm",
+    "x_post_reply": "mentions",
+}
+
+
+def _safe_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "transport timeout"
+    if isinstance(exc, httpx.TransportError):
+        return "transport error"
+    if isinstance(exc, ValueError):
+        return str(exc)[:500]
+    return exc.__class__.__name__
 
 
 async def _resolve_target(
     session: AsyncSession, conversation_id: uuid.UUID
 ) -> tuple[int, int] | None:
-    row = (await session.execute(
-        select(models.ConversationMapping.chatwoot_account_id,
-               models.ConversationMapping.chatwoot_conversation_id)
-        .where(models.ConversationMapping.conversation_id == conversation_id)
-    )).first()
+    row = (
+        await session.execute(
+            select(
+                models.ConversationMapping.chatwoot_account_id,
+                models.ConversationMapping.chatwoot_conversation_id,
+            ).where(models.ConversationMapping.conversation_id == conversation_id)
+        )
+    ).first()
     return (row.chatwoot_account_id, row.chatwoot_conversation_id) if row else None
 
 
-async def _finalize(
-    outbox_id: uuid.UUID, status: str, *, attempt_no: int,
-    error_code: str | None = None, error_message: str | None = None,
-    chatwoot_message_id: int | None = None, next_attempt_at: datetime | None = None,
+async def _record_outcome(
+    session: AsyncSession,
+    outbox_id: uuid.UUID,
+    status: str,
+    *,
+    attempt_no: int,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    chatwoot_message_id: int | None = None,
+    platform_message_id: str | None = None,
+    next_attempt_at: datetime | None = None,
+    require_sending: bool = True,
 ) -> str:
+    values: dict = {
+        "status": status,
+        "last_error_code": error_code,
+        "last_error_message": error_message,
+        "next_attempt_at": next_attempt_at,
+    }
+    if chatwoot_message_id is not None:
+        values["chatwoot_message_id"] = chatwoot_message_id
+    if platform_message_id is not None:
+        values["platform_message_id"] = platform_message_id
+    if status == "SENT":
+        values["sent_at"] = datetime.now(UTC)
+    statement = update(models.OutboxMessage).where(models.OutboxMessage.id == outbox_id)
+    if require_sending:
+        statement = statement.where(models.OutboxMessage.status == "SENDING")
+    result = await session.execute(statement.values(**values))
+    actual_status = status
+    actual_error_code = error_code
+    actual_error_message = error_message
+    if result.rowcount == 0:
+        current_status = await session.scalar(
+            select(models.OutboxMessage.status).where(models.OutboxMessage.id == outbox_id)
+        )
+        logger.warning(
+            "outbox %s outcome %s skipped because current status is %s",
+            outbox_id,
+            status,
+            current_status,
+        )
+        actual_status = "STALE_FINALIZE"
+        actual_error_code = "STALE_FINALIZE"
+        actual_error_message = f"requested={status}; current={current_status}"
+    await session.execute(
+        insert(models.DeliveryAttempt).values(
+            outbox_id=outbox_id,
+            attempt_no=attempt_no,
+            outcome=actual_status,
+            error_code=actual_error_code,
+            error_message=actual_error_message,
+            chatwoot_message_id=chatwoot_message_id,
+        )
+    )
+    await session.commit()
+    return actual_status
+
+
+async def _finalize(outbox_id: uuid.UUID, status: str, **kwargs) -> str:
     async with get_session_factory()() as session:
-        values: dict = {"status": status, "last_error_code": error_code,
-                        "last_error_message": error_message}
-        if chatwoot_message_id is not None:
-            values["chatwoot_message_id"] = chatwoot_message_id
-            values["sent_at"] = datetime.now(UTC)
-        if next_attempt_at is not None:
-            values["next_attempt_at"] = next_attempt_at
-        # SENDING 守卫：行可能已被 sweep 转 NEEDS_REVIEW 等终态，迟到的 finalize 不得覆盖
-        result = await session.execute(
-            update(models.OutboxMessage)
-            .where(models.OutboxMessage.id == outbox_id,
-                   models.OutboxMessage.status == "SENDING")
-            .values(**values))
-        if result.rowcount == 0:
-            logger.warning(
-                "outbox %s 终态更新被跳过：行已非 SENDING（可能被 sweep 接管），目标状态=%s",
-                outbox_id, status)
-        # DeliveryAttempt 审计行始终写入——记录"本次尝试发生了什么"的事实，与 outbox 状态解耦
-        await session.execute(insert(models.DeliveryAttempt).values(
-            outbox_id=outbox_id, attempt_no=attempt_no, outcome=status,
-            error_code=error_code, error_message=error_message,
-            chatwoot_message_id=chatwoot_message_id))
-        await session.commit()
-    return status
+        return await _record_outcome(session, outbox_id, status, **kwargs)
+
+
+async def _stop_before_send(
+    session: AsyncSession,
+    outbox_id: uuid.UUID,
+    status: str,
+    error_code: str,
+    attempt_no: int,
+) -> str:
+    return await _record_outcome(
+        session,
+        outbox_id,
+        status,
+        attempt_no=attempt_no,
+        error_code=error_code,
+    )
+
+
+async def _validate_direct_send(
+    session: AsyncSession,
+    row: models.OutboxMessage,
+    payload: dict,
+    attempt_no: int,
+) -> tuple[str | None, models.PlatformAccount | None]:
+    account = (
+        await session.execute(
+            select(models.PlatformAccount).where(
+                models.PlatformAccount.id == row.platform_account_id
+            )
+        )
+    ).scalar_one()
+    conversation = (
+        await session.execute(
+            select(models.Conversation).where(models.Conversation.id == row.conversation_id)
+        )
+    ).scalar_one()
+    if (
+        account.tenant_id != row.tenant_id
+        or conversation.tenant_id != row.tenant_id
+        or conversation.platform_account_id != row.platform_account_id
+    ):
+        return await _stop_before_send(
+            session, row.id, "NEEDS_REVIEW", "TENANT_SCOPE_MISMATCH", attempt_no
+        ), None
+    if not is_active_account_status(account.status):
+        return await _stop_before_send(
+            session, row.id, "NEEDS_REVIEW", "ACCOUNT_NOT_ACTIVE", attempt_no
+        ), None
+    capability = dict(account.capability or {})
+    required = _DIRECT_CAPABILITY.get(row.destination_type)
+    if required is None or not capability.get(required, False):
+        return await _stop_before_send(
+            session, row.id, "NEEDS_REVIEW", "CAPABILITY_NOT_ALLOWED", attempt_no
+        ), None
+    if row.valid_until is not None and row.valid_until <= datetime.now(UTC):
+        return await _stop_before_send(
+            session, row.id, "NEEDS_REVIEW", "DELIVERY_WINDOW_EXPIRED", attempt_no
+        ), None
+    if len(str(payload.get("text", ""))) > int(capability.get("max_text_length", 4096)):
+        return await _stop_before_send(
+            session, row.id, "NEEDS_REVIEW", "CAPABILITY_TEXT_TOO_LONG", attempt_no
+        ), None
+    return None, account
 
 
 async def deliver_outbox(outbox_id: str) -> str:
-    """认领 → defense 2 发送前复检 → 发送 → 落库。返回终态字符串。"""
+    """Claim, validate, send without a DB transaction, then durably record the outcome."""
     oid = uuid.UUID(outbox_id)
-
-    # 1) 原子认领：仅 PENDING/FAILED 可认领 → SENDING（防重复认领、跳过已取消/已发送）
     async with get_session_factory()() as session:
-        claimed = (await session.execute(
-            update(models.OutboxMessage)
-            .where(models.OutboxMessage.id == oid,
-                   models.OutboxMessage.status.in_(["PENDING", "FAILED"]))
-            .values(status="SENDING", locked_at=datetime.now(UTC), locked_by="deliver")
-            .returning(models.OutboxMessage.id))).first()
+        claimed = (
+            await session.execute(
+                update(models.OutboxMessage)
+                .where(
+                    models.OutboxMessage.id == oid,
+                    models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
+                )
+                .values(status="SENDING", locked_at=datetime.now(UTC), locked_by="deliver")
+                .returning(models.OutboxMessage.id)
+            )
+        ).first()
         if claimed is None:
             await session.commit()
             return "SKIPPED_NOT_CLAIMABLE"
-        row = (await session.execute(
-            select(models.OutboxMessage).where(models.OutboxMessage.id == oid))).scalar_one()
-        conversation_id = row.conversation_id
-        message_type = row.message_type
+        row = (
+            await session.execute(
+                select(models.OutboxMessage).where(models.OutboxMessage.id == oid)
+            )
+        ).scalar_one()
         payload = dict(row.payload)
         attempt_no = row.attempt_count + 1
+        is_direct = row.destination_type != "chatwoot_conversation"
+        is_public = row.message_type != "private_note"
 
-        # 2) defense 2：公开回复（非私有备注）发送前必须 state==BOT_ACTIVE（PLAN §六 权威闸门）。
-        # 判据用"是否私有备注"而非 message_type 名——非私有备注均为客户可见，杜绝新增公开类型漏门。
-        state = (await session.execute(
-            select(models.AutomationState.state)
-            .where(models.AutomationState.conversation_id == conversation_id)
-        )).scalar_one_or_none()
-        is_public = message_type != "private_note"
-        if is_public and state != "BOT_ACTIVE":
+        if is_direct and not is_public:
+            return await _stop_before_send(
+                session, oid, "CANCELLED", "DIRECT_DRAFT_BLOCKED", attempt_no
+            )
+        state = (
             await session.execute(
-                update(models.OutboxMessage).where(models.OutboxMessage.id == oid)
-                .values(status="CANCELLED", last_error_code="TAKEOVER_AT_SEND"))
-            await session.execute(insert(models.DeliveryAttempt).values(
-                outbox_id=oid, attempt_no=attempt_no, outcome="CANCELLED",
-                error_code="TAKEOVER_AT_SEND"))
-            await session.commit()
-            return "CANCELLED"
-
-        target = await _resolve_target(session, conversation_id)
+                select(models.AutomationState.state).where(
+                    models.AutomationState.conversation_id == row.conversation_id
+                )
+            )
+        ).scalar_one_or_none()
+        if is_public and state != "BOT_ACTIVE":
+            return await _stop_before_send(
+                session, oid, "CANCELLED", "TAKEOVER_AT_SEND", attempt_no
+            )
+        if is_direct:
+            stopped, _account = await _validate_direct_send(session, row, payload, attempt_no)
+            if stopped is not None:
+                return stopped
+        target = None if is_direct else await _resolve_target(session, row.conversation_id)
         await session.execute(
-            update(models.OutboxMessage).where(models.OutboxMessage.id == oid)
-            .values(attempt_count=attempt_no))
+            update(models.OutboxMessage)
+            .where(models.OutboxMessage.id == oid)
+            .values(attempt_count=attempt_no)
+        )
         await session.commit()
 
-    if target is None:
-        return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
-                               error_code="NO_MAPPING", error_message="no chatwoot mapping")
+    if not is_direct and target is None:
+        return await _finalize(
+            oid,
+            "NEEDS_REVIEW",
+            attempt_no=attempt_no,
+            error_code="NO_MAPPING",
+            error_message="no chatwoot mapping",
+        )
 
-    account_id, chatwoot_conv_id = target
-
-    # 3) 发送（不持 DB 事务，避免网络 I/O 期间持锁）
-    client = get_chatwoot_client()
-
-    async def _fail_retryable(e: Exception) -> str:
-        """明确未送达的失败：FAILED 可重试（指数退避），超阈值转人工。"""
+    async def fail_retryable(exc: Exception) -> str:
         if attempt_no >= _MAX_ATTEMPTS:
-            return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
-                                   error_code="SEND_ERROR", error_message=repr(e))
-        # 指数退避：30s * 2^attempt_count，上限 1h
-        next_at = datetime.now(UTC) + timedelta(
-            seconds=min(30 * 2 ** attempt_no, 3600))
-        return await _finalize(oid, "FAILED", attempt_no=attempt_no,
-                               error_code="SEND_ERROR", error_message=repr(e),
-                               next_attempt_at=next_at)
+            return await _finalize(
+                oid,
+                "NEEDS_REVIEW",
+                attempt_no=attempt_no,
+                error_code="SEND_ERROR",
+                error_message=_safe_error(exc),
+            )
+        next_at = datetime.now(UTC) + timedelta(seconds=min(30 * 2**attempt_no, 3600))
+        return await _finalize(
+            oid,
+            "FAILED",
+            attempt_no=attempt_no,
+            error_code="SEND_ERROR",
+            error_message=_safe_error(exc),
+            next_attempt_at=next_at,
+        )
+
+    async def ambiguous(exc: Exception) -> str:
+        return await _finalize(
+            oid,
+            "NEEDS_REVIEW",
+            attempt_no=attempt_no,
+            error_code="AMBIGUOUS_SEND",
+            error_message=_safe_error(exc),
+        )
+
+    direct_target: dict | None = None
+    if is_direct:
+        try:
+            direct_target = dict(payload.get("target") or {})
+            if not direct_target and row.destination_type in {"telegram_chat", "telegram_dm"}:
+                direct_target = {"chat_id": int(row.destination_id.rsplit(":", 1)[-1])}
+            if not direct_target:
+                raise ValueError(f"direct_reply_target_missing:{row.destination_type}")
+        except (TypeError, ValueError) as exc:
+            return await fail_retryable(exc)
+
+    sender = None
+    if is_direct:
+        try:
+            sender = await get_platform_sender(row.platform_account_id)
+        except Exception as exc:  # noqa: BLE001 - sender resolution happens before dispatch
+            return await fail_retryable(exc)
 
     try:
-        chatwoot_message_id = await client.create_message(
-            account_id=account_id, conversation_id=chatwoot_conv_id,
-            content=payload["text"], private=(message_type == "private_note"))
-    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-        # 连接阶段失败（TCP/TLS 未建立或连接超时）：请求必然未发出，Chatwoot 侧不可能已建消息
-        # → 明确未送达，FAILED 可重试。注意 ConnectError 是 TransportError 子类、
-        # ConnectTimeout 是 TimeoutException 子类，本分支必须排在歧义分支之前。
-        return await _fail_retryable(e)
-    except (httpx.TimeoutException, httpx.TransportError) as e:
-        # 其余传输失败（读超时、写中断等）：请求可能已到达服务端，无客户端幂等键
-        # → 歧义失败，不重试，转人工（PLAN §十一）
-        return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
-                               error_code="AMBIGUOUS_SEND", error_message=repr(e))
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code >= 500:
-            # 5xx：服务端可能已创建消息后才出错 → 同样歧义，转人工，避免盲目重试造成重复发送
-            return await _finalize(oid, "NEEDS_REVIEW", attempt_no=attempt_no,
-                                   error_code="AMBIGUOUS_SEND", error_message=repr(e))
-        # 4xx：服务端明确拒绝，未建消息 → 可重试，超阈值转人工
-        return await _fail_retryable(e)
-    except Exception as e:  # noqa: BLE001 其它未知错误：按明确失败处理，可重试
-        return await _fail_retryable(e)
+        if is_direct:
+            assert direct_target is not None and sender is not None
+            platform_message_id = await sender.send_text(target=direct_target, text=payload["text"])
+            chatwoot_message_id = None
+        else:
+            assert target is not None
+            account_id, chatwoot_conv_id = target
+            chatwoot_message_id = await get_chatwoot_client().create_message(
+                account_id=account_id,
+                conversation_id=chatwoot_conv_id,
+                content=payload["text"],
+                private=(row.message_type == "private_note"),
+            )
+            platform_message_id = None
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        return await fail_retryable(exc)
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        return await ambiguous(exc)
+    except httpx.HTTPStatusError as exc:
+        return (
+            await ambiguous(exc) if exc.response.status_code >= 500 else await fail_retryable(exc)
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown post-dispatch failures are ambiguous
+        return await ambiguous(exc)
 
-    # 4) 成功：SENT + 存 chatwoot_message_id（闭合 Plan 1 回声断路器）
-    return await _finalize(oid, "SENT", attempt_no=attempt_no,
-                           chatwoot_message_id=chatwoot_message_id)
+    return await _finalize(
+        oid,
+        "SENT",
+        attempt_no=attempt_no,
+        chatwoot_message_id=chatwoot_message_id,
+        platform_message_id=platform_message_id,
+    )

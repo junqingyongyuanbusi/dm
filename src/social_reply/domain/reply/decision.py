@@ -4,9 +4,9 @@ from enum import StrEnum
 
 class ReplyAction(StrEnum):
     AUTO_REPLY = "auto_reply"
-    DRAFT = "draft"        # 只写 Chatwoot 私有备注，不对外发
-    HANDOFF = "handoff"    # 转人工
-    IGNORE = "ignore"      # 不回复也不接管
+    DRAFT = "draft"  # 只写 Chatwoot 私有备注，不对外发
+    HANDOFF = "handoff"  # 转人工
+    IGNORE = "ignore"  # 不回复也不接管
 
 
 class RiskLevel(StrEnum):

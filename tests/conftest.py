@@ -6,9 +6,17 @@ import os
 # 同时保留 CI/开发者显式 export 覆盖的能力。DATABASE_URL/REDIS_URL 不钉，允许指向本地容器。
 _TEST_DEFAULTS = {
     "TESTING": "true",
+    # 集成测试会 drop/create 全部业务表，必须固定使用独立测试库，禁止读取 .env 开发库。
+    "DATABASE_URL": "postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test",
     "CHATWOOT_WEBHOOK_SECRET": "change-me",
     "CHATWOOT_BASE_URL": "http://localhost:3000",
     "CHATWOOT_API_TOKEN": "dev-local-token",
+    "CONTROL_API_KEY": "test-control-key",
+    "ADMIN_SESSION_SECRET": "test-admin-session-secret-at-least-32-bytes",
+    "ADMIN_USERNAME": "admin",
+    "ADMIN_PASSWORD": "test-admin-password",
+    "PUBLIC_BASE_URL": "https://reply.example.com",
+    "ADMIN_ALLOWED_TENANTS": "default,tenant-a,tenant-b",
     "LLM_PROVIDER": "stub",
     "OPENAI_API_KEY": "",
     "OPENAI_BASE_URL": "https://api.openai.com/v1",

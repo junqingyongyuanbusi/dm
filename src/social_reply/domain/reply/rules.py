@@ -1,6 +1,6 @@
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, RiskLevel
 
-# PLAN.md §五：高风险词默认转人工
+# 高风险词默认转人工
 RISK_WORDS = ("诈骗", "无法出金", "无法提现", "律师", "起诉", "退款", "账户冻结", "冻结")
 
 

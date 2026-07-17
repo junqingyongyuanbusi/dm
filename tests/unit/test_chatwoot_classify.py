@@ -26,10 +26,16 @@ def _payload(**overrides) -> dict:
 def test_parse_extracts_fields():
     msg = parse_message_created(_payload())
     assert msg == ChatwootMessage(
-        chatwoot_message_id=55, content="你好", message_type="incoming",
-        private=False, sender_id="9", sender_type="contact",
-        chatwoot_conversation_id=77, chatwoot_inbox_id=101,
-        chatwoot_account_id=1, occurred_at_iso="2026-07-14T10:00:00Z",
+        chatwoot_message_id=55,
+        content="你好",
+        message_type="incoming",
+        private=False,
+        sender_id="9",
+        sender_type="contact",
+        chatwoot_conversation_id=77,
+        chatwoot_inbox_id=101,
+        chatwoot_account_id=1,
+        occurred_at_iso="2026-07-14T10:00:00Z",
     )
 
 

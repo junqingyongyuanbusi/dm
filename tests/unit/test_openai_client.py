@@ -28,8 +28,10 @@ def _completion_response(content: str, refusal: str | None = None) -> httpx.Resp
 
 def _client(handler) -> OpenAILLMClient:
     return OpenAILLMClient(
-        api_key="sk-test", base_url="https://api.openai.com/v1",
-        model="gpt-4o-mini", timeout=5.0,
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        timeout=5.0,
         transport=httpx.MockTransport(handler),
     )
 

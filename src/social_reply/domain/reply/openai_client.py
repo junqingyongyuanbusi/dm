@@ -36,6 +36,7 @@ def _build_system_prompt(knowledge: tuple[str, ...]) -> str:
     blocks = "\n\n".join(f"【模板 {i}】\n{text}" for i, text in enumerate(knowledge, start=1))
     return f"{_SYSTEM_PROMPT}\n\n{_KNOWLEDGE_HEADER}\n\n{blocks}"
 
+
 # strict 模式要求：所有字段 required、additionalProperties=false
 _RESPONSE_SCHEMA = {
     "type": "json_schema",
@@ -56,8 +57,12 @@ _RESPONSE_SCHEMA = {
                 "reply_visibility": {"type": "string", "enum": ["public", "private"]},
             },
             "required": [
-                "action", "reply_text", "intent",
-                "risk_level", "confidence", "reply_visibility",
+                "action",
+                "reply_text",
+                "intent",
+                "risk_level",
+                "confidence",
+                "reply_visibility",
             ],
             "additionalProperties": False,
         },
@@ -96,14 +101,21 @@ class OpenAILLMClient:
     """
 
     def __init__(
-        self, api_key: str, base_url: str, model: str, timeout: float = 30.0,
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
         self._model = model
-        self._timeout = timeout
-        self._transport = transport
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            transport=transport,
+        )
 
     async def decide(self, context: LLMContext) -> ReplyDecision:
         payload = {
@@ -114,46 +126,46 @@ class OpenAILLMClient:
             ],
             "response_format": _RESPONSE_SCHEMA,
         }
-        url = f"{self._base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout, transport=self._transport,
-            ) as client:
-                # schema 校验失败重试一次（同请求）；其余失败不重试
-                for attempt in (1, 2):
-                    resp = await client.post(url, headers=headers, json=payload)
-                    resp.raise_for_status()
-                    message = resp.json()["choices"][0]["message"]
-                    if message.get("refusal"):
-                        logger.warning(
-                            "LLM refusal 降级 HANDOFF: conversation=%s",
-                            context.conversation_key,
-                        )
-                        return _handoff("LLM_REFUSAL")
-                    try:
-                        output = _LLMOutput.model_validate_json(message["content"])
-                    except ValidationError:
-                        logger.warning(
-                            "LLM 输出 schema 校验失败（第 %d 次）: conversation=%s",
-                            attempt, context.conversation_key,
-                        )
-                        continue
-                    return ReplyDecision(
-                        action=output.action,
-                        reply_text=output.reply_text or None,
-                        intent=output.intent or None,
-                        risk_level=output.risk_level,
-                        confidence=output.confidence,
-                        reply_visibility=output.reply_visibility,
-                        reason_codes=("OPENAI",),
-                        source="llm",
+            # schema 校验失败重试一次（同请求）；其余失败不重试
+            for attempt in (1, 2):
+                resp = await self._client.post("/chat/completions", json=payload)
+                resp.raise_for_status()
+                message = resp.json()["choices"][0]["message"]
+                if message.get("refusal"):
+                    logger.warning(
+                        "LLM refusal 降级 HANDOFF: conversation=%s",
+                        context.conversation_key,
                     )
-                return _handoff("LLM_SCHEMA_FAIL")
+                    return _handoff("LLM_REFUSAL")
+                try:
+                    output = _LLMOutput.model_validate_json(message["content"])
+                except ValidationError:
+                    logger.warning(
+                        "LLM 输出 schema 校验失败（第 %d 次）: conversation=%s",
+                        attempt,
+                        context.conversation_key,
+                    )
+                    continue
+                return ReplyDecision(
+                    action=output.action,
+                    reply_text=output.reply_text or None,
+                    intent=output.intent or None,
+                    risk_level=output.risk_level,
+                    confidence=output.confidence,
+                    reply_visibility=output.reply_visibility,
+                    reason_codes=("OPENAI",),
+                    source="llm",
+                )
+            return _handoff("LLM_SCHEMA_FAIL")
         except Exception:
             # 超时/网络/HTTP 状态错误/响应体结构异常（含 200+病态结构的 TypeError 等）：
             # decide 的契约是绝不向上抛——任何未知异常一律降级转人工，防决策丢失
             logger.exception(
-                "LLM 调用失败降级 HANDOFF: conversation=%s", context.conversation_key,
+                "LLM 调用失败降级 HANDOFF: conversation=%s",
+                context.conversation_key,
             )
             return _handoff("LLM_UNAVAILABLE")
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
