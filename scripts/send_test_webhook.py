@@ -22,7 +22,7 @@ ts = str(int(time.time()))
 digest = hmac.new(SECRET.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
 resp = httpx.post(
     # 用 127.0.0.1 而非 localhost：macOS 双栈下 localhost 可能先解析到 IPv6 ::1，
-    # 而 uvicorn 默认仅绑 IPv4 127.0.0.1，会连接失败（Task 9 端到端冒烟实测）
+    # 而 uvicorn 默认仅绑 IPv4 127.0.0.1，会连接失败
     "http://127.0.0.1:8000/webhooks/chatwoot",
     content=body,
     headers={

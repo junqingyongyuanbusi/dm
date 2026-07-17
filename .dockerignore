@@ -1,0 +1,25 @@
+# 构建上下文瘦身 + 防止本地密钥/环境进镜像（安全关键）
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.run/
+.spec-workflow/
+
+# 绝不打包任何真实凭证与环境文件
+.env
+.env.*
+!.env.example
+.secrets/
+
+# 文档与本地数据，运行期不需要
+docs/
+*.md
+!README.md
+*.csv
+
+# 测试不进运行镜像
+tests/
