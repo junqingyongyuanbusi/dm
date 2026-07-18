@@ -222,9 +222,7 @@ async def conversations_page(request: Request) -> Response:
                 )
                 .join(last_msg, last_msg.c.cid == models.Conversation.id, isouter=True)
                 .where(models.Conversation.tenant_id.in_(tenants))
-                .order_by(
-                    desc(func.coalesce(last_msg.c.last_at, models.Conversation.created_at))
-                )
+                .order_by(desc(func.coalesce(last_msg.c.last_at, models.Conversation.created_at)))
                 .limit(50)
             )
         ).all()
@@ -321,7 +319,11 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         )
         or "<tr><td colspan='5' class='muted'>暂无决策</td></tr>"
     )
-    who = html.escape((contact.display_name if contact else None) or (contact.external_user_id if contact else "") or "匿名用户")
+    who = html.escape(
+        (contact.display_name if contact else None)
+        or (contact.external_user_id if contact else "")
+        or "匿名用户"
+    )
     body = f"""<a class="back" href="/admin/conversations">← 返回对话列表</a>
 <section class="card"><h1 style="font-size:24px">{who}<span style="margin-left:12px">{_pill(cur_state)}</span></h1>
 <p class="hint">{html.escape(conv.platform)} · 会话键 <code>{html.escape(conv.conversation_key)}</code></p>
@@ -417,16 +419,20 @@ async def decisions_page(request: Request, action: str = "") -> Response:
         )
         or "<p class='muted'>没有待审核的草稿。</p>"
     )
-    chips = '<div class="chips">' + "".join(
-        f'<a class="chip{" active" if action == a else ""}" href="/admin/decisions{("?action=" + a) if a else ""}">{label}</a>'
-        for a, label in (
-            ("", "全部"),
-            ("auto_reply", "自动回复"),
-            ("draft", "草稿"),
-            ("handoff", "转人工"),
-            ("ignore", "忽略"),
+    chips = (
+        '<div class="chips">'
+        + "".join(
+            f'<a class="chip{" active" if action == a else ""}" href="/admin/decisions{("?action=" + a) if a else ""}">{label}</a>'
+            for a, label in (
+                ("", "全部"),
+                ("auto_reply", "自动回复"),
+                ("draft", "草稿"),
+                ("handoff", "转人工"),
+                ("ignore", "忽略"),
+            )
         )
-    ) + "</div>"
+        + "</div>"
+    )
     rows = (
         "".join(
             f"<tr><td class='muted'>{_fmt(d.created_at)}</td><td>{_pill(d.action)}</td>"
@@ -463,16 +469,21 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
     async with get_session_factory()() as session:
         decision = await _load_draft(session, decision_id)
         conv = await session.get(models.Conversation, decision.conversation_id)
+        if conv is None or conv.tenant_id != decision.tenant_id:
+            raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
         account = await session.get(models.PlatformAccount, conv.platform_account_id)
+        if account is None or account.tenant_id != decision.tenant_id:
+            raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
         if (account.config or {}).get("delivery_mode") != "direct":
             raise HTTPException(status_code=409, detail="approve_only_supports_direct_platforms")
         reply_target: dict = {}
         occurred_at = None
         if decision.message_id is not None:
             msg = await session.get(models.Message, decision.message_id)
-            if msg is not None:
-                reply_target = dict(msg.reply_target or {})
-                occurred_at = msg.occurred_at
+            if msg is None or msg.conversation_id != decision.conversation_id:
+                raise HTTPException(status_code=409, detail="decision_message_scope_mismatch")
+            reply_target = dict(msg.reply_target or {})
+            occurred_at = msg.occurred_at
         kind = reply_target.get("kind", "dm")
         visibility = decision.reply_visibility or "public"
         # 目的地映射与 persist_decision 保持一致（DRY 的最小可行复制，含会话时限）
@@ -518,6 +529,8 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
                         "text": decision.reply_text or "",
                         "visibility": visibility,
                         "target": reply_target,
+                        "approval": "admin",
+                        "approved_by": _current_actor(request),
                     },
                     idempotency_key=_idempotency_key(
                         account.id, conv.id, decision.message_id or conv.id, "draft_approved"
@@ -534,6 +547,17 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
                 update(models.ReplyDecision)
                 .where(models.ReplyDecision.id == decision_id)
                 .values(outbox_id=outbox_id)
+            )
+            await session.execute(
+                models.AuditLog.__table__.insert().values(
+                    tenant_id=account.tenant_id,
+                    category="admin_action",
+                    actor=_current_actor(request) or "admin",
+                    action="APPROVE_DRAFT",
+                    subject_type="reply_decision",
+                    subject_id=str(decision_id),
+                    detail={"outbox_id": str(outbox_id)},
+                )
             )
         await session.commit()
     if outbox_id is not None:
@@ -605,7 +629,7 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
             f"<td class='muted'>{html.escape((d.reply or '')[:48])}</td>"
             f"<td class='muted'>{html.escape(d.category or '—')}</td>"
             f"<td>{_pill(d.status)}</td>"
-            f"""<td><form class="inline" method="post" action="/admin/knowledge/{d.id}/status"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">{'下架' if d.status == 'published' else '上架'}</button></form>
+            f"""<td><form class="inline" method="post" action="/admin/knowledge/{d.id}/status"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">{"下架" if d.status == "published" else "上架"}</button></form>
 <form class="inline" method="post" action="/admin/knowledge/{d.id}/delete"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-danger" onclick="return confirm('确认删除该知识条目？此操作不可恢复。')">删除</button></form></td></tr>"""
             for d in docs
         )
@@ -613,7 +637,7 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
     )
     add_form = f"""<details class="collapse"><summary>新增知识条目</summary><div class="inner">
 <form method="post" action="/admin/knowledge/add"><input type="hidden" name="csrf_token" value="{csrf}">
-{_input("question", "触发问题（用户会怎么问）")}
+{_input("tenant_id", "Tenant")}{_input("question", "触发问题（用户会怎么问）")}
 <label for="f-kb-reply">标准回复（命中后原文发送）</label><textarea id="f-kb-reply" name="reply" required></textarea>
 {_input("category", "分类（可选）", required=False)}{_input("brand_id", "Brand（默认 default）", required=False)}
 <button class="btn-block">添加并向量化</button></form></div></details>"""
@@ -630,6 +654,9 @@ async def knowledge_add(request: Request) -> Response:
         return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
     form = await _form(request)
     _require_csrf(request, form)
+    tenant_id = (form.get("tenant_id") or "").strip()
+    if tenant_id not in _tenants():
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
     question = (form.get("question") or "").strip()
     reply = (form.get("reply") or "").strip()
     if not question or not reply:
@@ -648,8 +675,14 @@ async def knowledge_add(request: Request) -> Response:
     async with get_session_factory()() as session:
         exists = (
             await session.execute(
-                select(models.KnowledgeChunk.id).where(
-                    models.KnowledgeChunk.content_hash == content_hash
+                select(models.KnowledgeChunk.id)
+                .join(
+                    models.KnowledgeDocument,
+                    models.KnowledgeChunk.document_id == models.KnowledgeDocument.id,
+                )
+                .where(
+                    models.KnowledgeDocument.tenant_id == tenant_id,
+                    models.KnowledgeChunk.content_hash == content_hash,
                 )
             )
         ).first()
@@ -658,7 +691,7 @@ async def knowledge_add(request: Request) -> Response:
                 "/admin/knowledge?notice=duplicate", status_code=status.HTTP_303_SEE_OTHER
             )
         doc = models.KnowledgeDocument(
-            tenant_id=get_settings().tenant_id,
+            tenant_id=tenant_id,
             brand_id=(form.get("brand_id") or "").strip() or "default",
             category=(form.get("category") or "").strip() or None,
             question=question,
@@ -669,6 +702,7 @@ async def knowledge_add(request: Request) -> Response:
         await session.flush()
         session.add(
             models.KnowledgeChunk(
+                tenant_id=tenant_id,
                 document_id=doc.id,
                 content=content,
                 embed_text=question,
@@ -742,10 +776,17 @@ async def delivery_page(request: Request) -> Response:
             await session.execute(
                 select(
                     models.RawEvent.source,
-                    func.count(),
+                    func.count(func.distinct(models.RawEvent.id)),
                     func.max(models.RawEvent.received_at),
                 )
-                .where(models.RawEvent.received_at >= day_ago)
+                .join(
+                    models.NormalizedEvent,
+                    models.NormalizedEvent.raw_event_id == models.RawEvent.id,
+                )
+                .where(
+                    models.RawEvent.received_at >= day_ago,
+                    models.NormalizedEvent.tenant_id.in_(tenants),
+                )
                 .group_by(models.RawEvent.source)
             )
         ).all()
@@ -758,7 +799,7 @@ async def delivery_page(request: Request) -> Response:
             f"<td class='muted'>{html.escape(o.last_error_code or '—')}</td>"
             + (
                 f"""<td><form class="inline" method="post" action="/admin/delivery/{o.id}/retry"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">重试</button></form></td>"""
-                if o.status in {"FAILED", "NEEDS_REVIEW"}
+                if o.status == "FAILED"
                 else "<td></td>"
             )
             + "</tr>"
@@ -791,12 +832,23 @@ async def delivery_retry(request: Request, outbox_id: uuid.UUID) -> Response:
         row = await session.get(models.OutboxMessage, outbox_id)
         if row is None or row.tenant_id not in _tenants():
             raise HTTPException(status_code=404, detail="outbox_not_found")
-        if row.status not in {"FAILED", "NEEDS_REVIEW"}:
+        if row.status != "FAILED":
             raise HTTPException(status_code=409, detail="outbox_not_retryable")
         await session.execute(
             update(models.OutboxMessage)
             .where(models.OutboxMessage.id == outbox_id)
             .values(status="PENDING", next_attempt_at=None, locked_at=None, locked_by=None)
+        )
+        await session.execute(
+            models.AuditLog.__table__.insert().values(
+                tenant_id=row.tenant_id,
+                category="admin_action",
+                actor=_current_actor(request) or "admin",
+                action="RETRY_CONFIRMED_FAILURE",
+                subject_type="outbox",
+                subject_id=str(outbox_id),
+                detail={"previous_error_code": row.last_error_code},
+            )
         )
         await session.commit()
     return RedirectResponse("/admin/delivery", status_code=status.HTTP_303_SEE_OTHER)
@@ -842,29 +894,34 @@ async def accounts_page(request: Request) -> Response:
             .scalars()
             .all()
         )
-    tenant = settings.tenant_id
     redis = aioredis.from_url(settings.redis_url)
     try:
-        flags = await redis.mget(_kill_keys(tenant, [str(a.id) for a in accounts]))
+        account_keys = [f"killswitch:account:{a.tenant_id}:{a.id}" for a in accounts]
+        account_flags = await redis.mget(account_keys) if account_keys else []
+        global_flags = await redis.mget([f"killswitch:global:{tenant}" for tenant in tenants])
     finally:
         await redis.aclose()
-    global_stopped = flags[0] is not None
-    account_stopped = {str(a.id): flags[i + 1] is not None for i, a in enumerate(accounts)}
-
-    global_pill = (
-        '<span class="pill err">已急停</span>' if global_stopped else '<span class="pill ok">运行中</span>'
+    account_stopped = {
+        str(account.id): account_flags[index] is not None for index, account in enumerate(accounts)
+    }
+    global_rows = "".join(
+        f"<form class='inline' method='post' action='/admin/killswitch/toggle'>"
+        f"<input type='hidden' name='csrf_token' value='{csrf}'>"
+        f"<input type='hidden' name='scope' value='global'>"
+        f"<input type='hidden' name='tenant_id' value='{html.escape(tenant)}'>"
+        f"<button class='btn-sm {'btn-ghost' if global_flags[index] else 'btn-danger'}'>"
+        f"{html.escape(tenant)}：{'解除急停' if global_flags[index] else '全局急停'}</button></form>"
+        for index, tenant in enumerate(tenants)
     )
-    global_btn_label = "解除全局急停" if global_stopped else "全局急停"
-    global_btn_cls = "btn-ghost" if global_stopped else "btn-danger"
     killswitch_card = f"""<section class="card"><h2>自动回复总开关</h2>
-<p class="hint">急停后所有自动回复降级为草稿（三级开关的全局层，秒级生效）。当前状态：{global_pill}</p>
-<form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="global">
-<button class="btn-sm {global_btn_cls}"{' onclick="return confirm(\'确认触发全局急停？所有账号将停止自动外发。\')"' if not global_stopped else ""}>{global_btn_label}</button></form></section>"""
+<p class="hint">急停按租户隔离，启用后该租户自动回复降级为草稿。</p>{global_rows}</section>"""
 
     account_rows = ""
     for a in accounts:
         stopped = account_stopped.get(str(a.id), False)
-        ks_pill = '<span class="pill err">急停</span>' if stopped else '<span class="pill ok">正常</span>'
+        ks_pill = (
+            '<span class="pill err">急停</span>' if stopped else '<span class="pill ok">正常</span>'
+        )
         ks_btn = "解除" if stopped else "急停"
         ks_cls = "btn-ghost" if stopped else "btn-danger"
         auto_target = "BOT_DRAFT_ONLY" if a.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
@@ -873,7 +930,7 @@ async def accounts_page(request: Request) -> Response:
             f"<tr><td>{html.escape(a.platform)}</td><td>{html.escape(a.name)}</td>"
             f"<td>{_pill(a.status)}</td><td>{_pill(a.automation_default)}</td><td>{ks_pill}</td>"
             f"""<td><form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>
-<form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="account"><input type="hidden" name="account_id" value="{a.id}"><button class="btn-sm {ks_cls}">{ks_btn}</button></form></td></tr>"""
+<form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="account"><input type="hidden" name="account_id" value="{a.id}"><input type="hidden" name="tenant_id" value="{html.escape(a.tenant_id)}"><button class="btn-sm {ks_cls}">{ks_btn}</button></form></td></tr>"""
         )
     account_rows = account_rows or "<tr><td colspan='6' class='muted'>尚未连接账号</td></tr>"
 
@@ -935,16 +992,23 @@ async def killswitch_toggle(request: Request) -> Response:
     form = await _form(request)
     _require_csrf(request, form)
     settings = get_settings()
+    tenant_id = form.get("tenant_id", "")
+    if tenant_id not in _tenants():
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
     scope = form.get("scope", "")
     if scope == "global":
-        key = f"killswitch:global:{settings.tenant_id}"
+        key = f"killswitch:global:{tenant_id}"
     elif scope == "account":
         account_id = form.get("account_id", "")
         try:
-            uuid.UUID(account_id)
+            parsed_account_id = uuid.UUID(account_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_id") from exc
-        key = f"killswitch:account:{settings.tenant_id}:{account_id}"
+        async with get_session_factory()() as session:
+            account = await session.get(models.PlatformAccount, parsed_account_id)
+        if account is None or account.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="account_not_found")
+        key = f"killswitch:account:{tenant_id}:{account_id}"
     else:
         raise HTTPException(status_code=422, detail="invalid_killswitch_scope")
     redis = aioredis.from_url(settings.redis_url)

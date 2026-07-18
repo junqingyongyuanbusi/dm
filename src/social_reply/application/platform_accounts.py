@@ -6,6 +6,7 @@ from sqlalchemy import select
 from social_reply.domain.platform_accounts import LEGACY_ACTIVE_ACCOUNT_STATUSES
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle
 
 
 @dataclass(frozen=True)
@@ -23,7 +24,7 @@ class PlatformAppRuntime:
 
     @property
     def credential_bundle(self) -> dict[str, str]:
-        return {str(k): str(v) for k, v in self.credential_bundle_data.items() if v is not None}
+        return decrypt_secret_bundle(self.credential_bundle_data)
 
 
 @dataclass(frozen=True)
@@ -46,12 +47,11 @@ class PlatformAccountRuntime:
 
     @property
     def credential_bundle(self) -> dict[str, str]:
-        return {str(k): str(v) for k, v in self.credential_bundle_data.items() if v is not None}
+        return decrypt_secret_bundle(self.credential_bundle_data)
 
     @property
     def webhook_secret_bundle(self) -> dict[str, str]:
-        data = self.webhook_secret_bundle_data or {}
-        return {str(k): str(v) for k, v in data.items() if v is not None}
+        return decrypt_secret_bundle(self.webhook_secret_bundle_data)
 
     @property
     def webhook_secret(self) -> str:
@@ -140,13 +140,17 @@ async def list_active_accounts_by_platform(platform: str) -> list[PlatformAccoun
     """列出某平台所有活跃账号（DM 轮询等按平台批处理场景用）。"""
     async with get_session_factory()() as session:
         rows = (
-            await session.execute(
-                select(models.PlatformAccount).where(
-                    models.PlatformAccount.platform == platform,
-                    models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+            (
+                await session.execute(
+                    select(models.PlatformAccount).where(
+                        models.PlatformAccount.platform == platform,
+                        models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     return [rt for row in rows if (rt := _account_runtime(row)) is not None]
 
 

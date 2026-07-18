@@ -5,6 +5,7 @@ from sqlalchemy import insert, select
 from apps.api.main import create_app
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 pytestmark = pytest.mark.integration
 
@@ -68,21 +69,34 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
     )
     await session.execute(
         insert(models.PlatformAccount).values(
-            id=account_id, brand_id="b1", platform="telegram", name="acc",
-            public_id="p1", credential_bundle={"bot_token": "t"},
-            config={"delivery_mode": "direct"}, automation_default="BOT_ACTIVE", status="active",
+            id=account_id,
+            brand_id="b1",
+            platform="telegram",
+            name="acc",
+            public_id="p1",
+            credential_bundle=encrypt_secret_bundle({"bot_token": "t"}),
+            config={"delivery_mode": "direct"},
+            automation_default="BOT_ACTIVE",
+            status="active",
         )
     )
     await session.execute(
         insert(models.Contact).values(
-            id=contact_id, platform="telegram", platform_account_id=account_id,
-            external_user_id="u1", display_name="小明",
+            id=contact_id,
+            platform="telegram",
+            platform_account_id=account_id,
+            external_user_id="u1",
+            display_name="小明",
         )
     )
     await session.execute(
         insert(models.Conversation).values(
-            id=conv_id, brand_id="b1", platform="telegram", platform_account_id=account_id,
-            contact_id=contact_id, conversation_key="telegram:x:u1",
+            id=conv_id,
+            brand_id="b1",
+            platform="telegram",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key="telegram:x:u1",
         )
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
@@ -122,6 +136,7 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
             "/admin/knowledge/add",
             data={
                 "csrf_token": csrf,
+                "tenant_id": "default",
                 "question": "你们几点营业",
                 "reply": "每天 9:00-21:00",
                 "category": "常见",
@@ -149,7 +164,8 @@ async def test_killswitch_toggle_sets_flag(migrated_db):
         async with _app_client() as client:
             csrf = await _login(client)
             resp = await client.post(
-                "/admin/killswitch/toggle", data={"csrf_token": csrf, "scope": "global"}
+                "/admin/killswitch/toggle",
+                data={"csrf_token": csrf, "scope": "global", "tenant_id": settings.tenant_id},
             )
             assert resp.status_code == 303
         assert await redis.get(key) is not None  # 已置急停
@@ -157,7 +173,8 @@ async def test_killswitch_toggle_sets_flag(migrated_db):
         async with _app_client() as client:
             csrf = await _login(client)
             await client.post(
-                "/admin/killswitch/toggle", data={"csrf_token": csrf, "scope": "global"}
+                "/admin/killswitch/toggle",
+                data={"csrf_token": csrf, "scope": "global", "tenant_id": settings.tenant_id},
             )
         assert await redis.get(key) is None
     finally:

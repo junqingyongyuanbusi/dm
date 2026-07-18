@@ -30,6 +30,7 @@ def test_production_settings_require_https_public_base_url():
             admin_username="admin",
             admin_password="password",
             public_base_url="http://reply.example.com",
+            platform_secret_keys="Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
         )
 
 

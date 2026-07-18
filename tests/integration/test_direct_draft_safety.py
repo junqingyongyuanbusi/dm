@@ -6,6 +6,7 @@ from social_reply.application.reply_decision.persist import persist_decision
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 
 async def test_direct_platform_draft_never_creates_customer_outbox(migrated_db, session):
@@ -22,7 +23,7 @@ async def test_direct_platform_draft_never_creates_customer_outbox(migrated_db, 
             name="bot",
             external_account_id="42",
             public_id="tg_draft_safety",
-            credential_bundle={"bot_token": "not-read"},
+            credential_bundle=encrypt_secret_bundle({"bot_token": "not-read"}),
             config={"delivery_mode": "direct"},
             capability={"dm": True},
             automation_default="BOT_DRAFT_ONLY",

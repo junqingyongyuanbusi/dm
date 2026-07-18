@@ -150,13 +150,14 @@ async def run_and_persist_decision(
         )
     else:
         hits = await _fetch_knowledge(snapshot)
-        # 模板直答：仅当最高分命中是 verbatim_safe（精确匹配或达到相似度阈值的向量命中）
-        # 才原文外发；词法-only/低相似度命中只作为 LLM 上下文，不直接当答案发出。
-        verbatim = (
-            hits[0].reply
-            if hits and settings.knowledge_verbatim_reply and hits[0].verbatim_safe
-            else None
-        )
+        # 模板直答：必须基于「相似度最高」的命中判断，不能用 RRF 序的 hits[0]——
+        # RRF 分最高 ≠ 相似度最高，否则会误发词法命中的错模板，或漏发真正强命中的向量项。
+        # 仅精确匹配或达阈值向量命中（verbatim_safe）才原文外发；词法-only/低相似度只作 LLM 上下文。
+        verbatim = None
+        if hits and settings.knowledge_verbatim_reply:
+            top_by_similarity = max(hits, key=lambda h: h.similarity)
+            if top_by_similarity.verbatim_safe:
+                verbatim = top_by_similarity.reply
         decision = await run_decision_pipeline(
             snapshot,
             llm=_get_llm(),

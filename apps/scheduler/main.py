@@ -10,6 +10,7 @@ from social_reply.application.event_ingestion.x_dm_poll import poll_x_direct_mes
 from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision.jobs import sweep_decision_jobs
 from social_reply.infrastructure.queue.actor_loop import run_on_actor_loop
+from social_reply.shared.config import get_settings
 
 _INTERVAL_SECONDS = 3
 _SWEEPS: tuple[tuple[str, Callable[[], Awaitable[list]]], ...] = (
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    get_settings()  # Fail startup if encryption or production safety settings are invalid.
     while True:
         for name, sweep in _SWEEPS:
             try:

@@ -219,7 +219,8 @@ async def deliver_outbox(outbox_id: str) -> str:
                 )
             )
         ).scalar_one_or_none()
-        if is_public and state != "BOT_ACTIVE":
+        admin_approved_draft = payload.get("approval") == "admin" and state == "BOT_DRAFT_ONLY"
+        if is_public and state != "BOT_ACTIVE" and not admin_approved_draft:
             return await _stop_before_send(
                 session, oid, "CANCELLED", "TAKEOVER_AT_SEND", attempt_no
             )

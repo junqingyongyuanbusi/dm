@@ -7,6 +7,7 @@ from sqlalchemy import insert, select
 from social_reply.connectors import registry
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
@@ -22,8 +23,8 @@ async def test_telegram_webhook_direct_to_sent_outbox(session, monkeypatch):
             name="direct-bot",
             external_account_id="bot-1",
             public_id="primary",
-            credential_bundle={"bot_token": "token"},
-            webhook_secret_bundle={"secret": "secret-1"},
+            credential_bundle=encrypt_secret_bundle({"bot_token": "token"}),
+            webhook_secret_bundle=encrypt_secret_bundle({"secret": "secret-1"}),
             config={"delivery_mode": "direct", "api_base_url": "https://api.telegram.test"},
             capability={"dm": True, "max_text_length": 4096},
             chatwoot_inbox_id=None,

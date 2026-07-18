@@ -6,11 +6,10 @@ from social_reply.application.account_management import jobs
 from social_reply.application.account_management.service import AccountConnectionResult
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
 
 
-async def test_submit_job_stages_secret_inline_not_in_request(
-    migrated_db, tmp_path, monkeypatch
-):
+async def test_submit_job_stages_secret_inline_not_in_request(migrated_db, tmp_path, monkeypatch):
     from social_reply.shared.config import get_settings
 
     monkeypatch.setenv("ACCOUNT_SECRETS_ROOT", str(tmp_path))
@@ -29,16 +28,15 @@ async def test_submit_job_stages_secret_inline_not_in_request(
     # request 经 _safe_request 脱敏，不含 secret
     assert row.request == {"name": "Bot A"}
     assert "super-secret-token" not in str(row.request)
-    # secret 内联暂存进 staging_secret 列，供 worker 跨容器读取
-    assert row.staging_secret == {"token": "super-secret-token"}
+    assert row.staging_secret != {"token": "super-secret-token"}
+    assert "super-secret-token" not in str(row.staging_secret)
+    assert decrypt_secret_bundle(row.staging_secret) == {"token": "super-secret-token"}
     # public_job 白名单输出不得暴露 staging secret
     assert "super-secret-token" not in str(jobs.public_job(row))
     get_settings.cache_clear()
 
 
-async def test_process_job_completes_and_deletes_staging_secret(
-    migrated_db, tmp_path, monkeypatch
-):
+async def test_process_job_completes_and_deletes_staging_secret(migrated_db, tmp_path, monkeypatch):
     from social_reply.shared.config import get_settings
 
     monkeypatch.setenv("ACCOUNT_SECRETS_ROOT", str(tmp_path))
@@ -54,7 +52,7 @@ async def test_process_job_completes_and_deletes_staging_secret(
                 name="Bot",
                 external_account_id="42",
                 public_id="tg_public",
-                credential_bundle={"bot_token": "not-read"},
+                credential_bundle=encrypt_secret_bundle({"bot_token": "not-read"}),
                 config={"delivery_mode": "direct"},
                 capability={},
                 status="active",
@@ -84,7 +82,7 @@ async def test_process_job_completes_and_deletes_staging_secret(
     )
     async with get_session_factory()() as session:
         before = await session.get(models.ProvisioningJob, job_id)
-        assert before.staging_secret == {"token": "secret"}
+        assert decrypt_secret_bundle(before.staging_secret) == {"token": "secret"}
 
     assert await jobs.process_provisioning_job(str(job_id)) == "COMPLETED"
     async with get_session_factory()() as session:

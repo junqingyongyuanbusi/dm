@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     admin_allowed_tenants: str = "default"
     account_secrets_root: Path = Path(".secrets/accounts")
+    platform_secret_keys: SecretStr = SecretStr("")
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
@@ -75,6 +76,13 @@ class Settings(BaseSettings):
             raise ValueError("ADMIN_USERNAME/ADMIN_PASSWORD 未配置")
         if not self.testing and not self.public_base_url.startswith("https://"):
             raise ValueError("PUBLIC_BASE_URL 在生产环境必须使用 https://")
+        if not self.platform_secret_key_list:
+            raise ValueError("PLATFORM_SECRET_KEYS 未配置；平台凭证必须使用应用层加密")
+        from social_reply.infrastructure.secret_crypto import SecretCipher
+
+        SecretCipher(self.platform_secret_key_list)
+        if not self.testing and self.llm_provider == "stub":
+            raise ValueError("LLM_PROVIDER=stub 仅允许测试环境，生产环境禁止公开测试回复")
         # 生产环境启用 openai provider 时必须提供 API key
         if not self.testing and self.llm_provider == "openai" and self.openai_api_key == "":
             raise ValueError(
@@ -82,6 +90,13 @@ class Settings(BaseSettings):
             )
         return self
 
+    @property
+    def platform_secret_key_list(self) -> tuple[str, ...]:
+        return tuple(
+            key.strip()
+            for key in self.platform_secret_keys.get_secret_value().split(",")
+            if key.strip()
+        )
 
     @property
     def allowed_admin_tenants(self) -> frozenset[str]:

@@ -18,6 +18,7 @@ _TEST_DEFAULTS = {
     "PUBLIC_BASE_URL": "https://reply.example.com",
     "ADMIN_ALLOWED_TENANTS": "default,tenant-a,tenant-b",
     "LLM_PROVIDER": "stub",
+    "PLATFORM_SECRET_KEYS": "Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
     "OPENAI_API_KEY": "",
     "OPENAI_BASE_URL": "https://api.openai.com/v1",
     "KNOWLEDGE_RETRIEVAL_ENABLED": "false",

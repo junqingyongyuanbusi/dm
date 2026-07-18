@@ -40,8 +40,9 @@ class PlatformApp(Base):
     name: Mapped[str] = mapped_column(Text)
     external_app_id: Mapped[str | None] = mapped_column(Text)
     public_id: Mapped[str] = mapped_column(Text)
-    # Secret bundle 内联存储：无持久卷/跨容器（api 验签、worker 投递）共享的唯一可靠位置
-    credential_bundle: Mapped[dict] = mapped_column(JSONB, default=dict)
+    credential_ref: Mapped[str] = mapped_column(Text, default="")
+    # Application-encrypted envelope shared by API and workers; plaintext never enters PostgreSQL.
+    credential_bundle: Mapped[dict | None] = mapped_column(JSONB)
     config: Mapped[dict] = mapped_column(JSONB, default=dict)
     config_version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(Text, default="active")
@@ -62,8 +63,9 @@ class PlatformAccount(Base):
     name: Mapped[str] = mapped_column(Text)
     external_account_id: Mapped[str | None] = mapped_column(Text)
     public_id: Mapped[str | None] = mapped_column(Text)
-    # Secret bundle 内联存储（同 PlatformApp）：credential=平台凭证，webhook_secret=验签密钥
-    credential_bundle: Mapped[dict] = mapped_column(JSONB, default=dict)
+    credential_ref: Mapped[str | None] = mapped_column(Text)
+    webhook_secret_ref: Mapped[str | None] = mapped_column(Text)
+    credential_bundle: Mapped[dict | None] = mapped_column(JSONB)
     webhook_secret_bundle: Mapped[dict | None] = mapped_column(JSONB)
     config: Mapped[dict] = mapped_column(JSONB, default=dict)
     capability: Mapped[dict] = mapped_column(JSONB, default=dict)
@@ -232,7 +234,8 @@ class ProvisioningJob(Base):
     actor: Mapped[str] = mapped_column(Text)
     idempotency_key: Mapped[str] = mapped_column(Text)
     request: Mapped[dict] = mapped_column(JSONB)
-    # 用户提交的原始 secret，内联暂存；job 完成后置 NULL。绝不可经 _public_result 外泄
+    staging_secret_ref: Mapped[str] = mapped_column(Text, default="")
+    # Encrypted staging envelope; cleared atomically when provisioning completes.
     staging_secret: Mapped[dict | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(Text, default="PENDING")
     current_step: Mapped[str] = mapped_column(Text, default="QUEUED")
@@ -337,6 +340,7 @@ class KnowledgeDocument(Base):
 class KnowledgeChunk(Base):
     __tablename__ = "knowledge_chunks"
     __table_args__ = (
+        UniqueConstraint("tenant_id", "content_hash"),
         # 余弦相似度检索用 HNSW 索引
         Index(
             "ix_knowledge_chunks_embedding",
@@ -346,6 +350,7 @@ class KnowledgeChunk(Base):
         ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default")
     document_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True
     )
@@ -353,7 +358,7 @@ class KnowledgeChunk(Base):
     # 实际参与 embedding 的文本。非对称检索：只 embed question，与用户 query 同语义空间对齐，
     # 不让 answer 措辞稀释向量（见 importer）。历史行可能为 NULL（旧数据 embed 的是 content）。
     embed_text: Mapped[str | None] = mapped_column(Text)
-    content_hash: Mapped[str] = mapped_column(String(64), unique=True)  # sha256，导入幂等
+    content_hash: Mapped[str] = mapped_column(String(64))  # tenant-scoped sha256 idempotency
     embedding_version: Mapped[str] = mapped_column(String(32))  # 如 "text-embedding-3-small"
     embedding: Mapped[list[float]] = mapped_column(Vector(1536))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

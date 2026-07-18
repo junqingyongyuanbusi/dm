@@ -8,17 +8,20 @@ PORT="${PORT:-8000}"
 
 case "$ROLE" in
   api)
-    # 迁移只在 api 角色执行一次，避免多服务并发迁移冲突（DRY：单一迁移入口）。
-    echo "[entrypoint] running database migrations..."
-    alembic upgrade head
+    echo "[entrypoint] preparing database and encrypted secrets..."
+    python scripts/prepare_database.py
     echo "[entrypoint] starting API on port ${PORT}..."
     exec uvicorn apps.api.main:app --host 0.0.0.0 --port "${PORT}"
     ;;
   worker)
+    echo "[entrypoint] verifying database readiness..."
+    python scripts/assert_database_ready.py
     echo "[entrypoint] starting dramatiq worker..."
     exec dramatiq apps.worker.main
     ;;
   scheduler)
+    echo "[entrypoint] verifying database readiness..."
+    python scripts/assert_database_ready.py
     echo "[entrypoint] starting recovery scheduler..."
     exec python -m apps.scheduler.main
     ;;

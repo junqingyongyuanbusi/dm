@@ -7,6 +7,7 @@ from sqlalchemy import insert, select
 from social_reply.connectors import registry
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
@@ -26,8 +27,8 @@ async def test_two_telegram_accounts_route_and_send_with_isolated_credentials(se
                 name=name,
                 external_account_id=f"external-{name}",
                 public_id=name,
-                credential_bundle={"bot_token": f"token-{name}"},
-                webhook_secret_bundle={"secret": f"secret-{name}"},
+                credential_bundle=encrypt_secret_bundle({"bot_token": f"token-{name}"}),
+                webhook_secret_bundle=encrypt_secret_bundle({"secret": f"secret-{name}"}),
                 config={"delivery_mode": "direct"},
                 capability={"dm": True, "max_text_length": 4096},
                 automation_default="BOT_ACTIVE",

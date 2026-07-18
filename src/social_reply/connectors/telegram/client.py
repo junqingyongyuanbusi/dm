@@ -25,9 +25,7 @@ class TelegramClient:
         return f"/bot{self._token}/{method}"
 
     def sanitize_error(self, value: str) -> str:
-        return re.sub(r"/bot[^/]+/", "/bot<redacted>/", value).replace(
-            self._token, "<redacted>"
-        )
+        return re.sub(r"/bot[^/]+/", "/bot<redacted>/", value).replace(self._token, "<redacted>")
 
     async def get_me(self) -> dict:
         response = await self._client.get(self._path("getMe"))

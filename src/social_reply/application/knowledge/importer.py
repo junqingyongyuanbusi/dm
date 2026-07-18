@@ -94,7 +94,8 @@ async def import_knowledge_csv(
             (
                 await session.execute(
                     select(KnowledgeChunk.content_hash).where(
-                        KnowledgeChunk.content_hash.in_(hashes)
+                        KnowledgeChunk.tenant_id == tenant_id,
+                        KnowledgeChunk.content_hash.in_(hashes),
                     )
                 )
             ).scalars()
@@ -130,6 +131,7 @@ async def import_knowledge_csv(
             await session.flush()
             session.add(
                 KnowledgeChunk(
+                    tenant_id=tenant_id,
                     document_id=doc.id,
                     content=row.content,
                     embed_text=row.embed_text,

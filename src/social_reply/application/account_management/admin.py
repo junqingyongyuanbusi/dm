@@ -94,9 +94,7 @@ def _page(
     active: str = "",
 ) -> str:
     """Claude 风格页面外壳：暖米白底、衬线标题、赤陶橙点缀、大留白、零 JS。"""
-    refresh = (
-        f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
-    )
+    refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     logout = '<a class="nav-link" href="/admin/logout">退出</a>' if show_logout else ""
     tabs = (
         "".join(
@@ -291,13 +289,28 @@ def _input(name: str, label: str, *, secret: bool = False, required: bool = True
 
 
 _STATUS_TONES = {
-    "active": "ok", "CONNECTED": "ok", "COMPLETED": "ok", "SENT": "ok", "published": "ok",
-    "BOT_ACTIVE": "ok", "auto_reply": "ok",
-    "PENDING": "warn", "PROCESSING": "warn", "QUEUED": "warn", "SENDING": "warn",
-    "BOT_DRAFT_ONLY": "warn", "HANDOFF_PENDING": "warn", "draft": "warn", "handoff": "warn",
-    "FAILED": "err", "NEEDS_ACTION": "err", "NEEDS_REVIEW": "err",
+    "active": "ok",
+    "CONNECTED": "ok",
+    "COMPLETED": "ok",
+    "SENT": "ok",
+    "published": "ok",
+    "BOT_ACTIVE": "ok",
+    "auto_reply": "ok",
+    "PENDING": "warn",
+    "PROCESSING": "warn",
+    "QUEUED": "warn",
+    "SENDING": "warn",
+    "BOT_DRAFT_ONLY": "warn",
+    "HANDOFF_PENDING": "warn",
+    "draft": "warn",
+    "handoff": "warn",
+    "FAILED": "err",
+    "NEEDS_ACTION": "err",
+    "NEEDS_REVIEW": "err",
     "HUMAN_ACTIVE": "info",
-    "BOT_COOLDOWN": "neutral", "CLOSED": "neutral", "ignore": "neutral",
+    "BOT_COOLDOWN": "neutral",
+    "CLOSED": "neutral",
+    "ignore": "neutral",
 }
 
 
@@ -314,7 +327,9 @@ async def _submit_form(
         return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     form = form or await _form(request)
     _require_csrf(request, form)
-    tenant_id = form.get("tenant_id", "default") or "default"
+    tenant_id = (form.get("tenant_id") or "").strip()
+    if not tenant_id:
+        raise HTTPException(status_code=422, detail="tenant_id_required")
     if tenant_id not in get_settings().allowed_admin_tenants:
         raise HTTPException(status_code=403, detail="tenant_access_denied")
     brand_id = form.get("brand_id", "default") or "default"
@@ -378,9 +393,7 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
     retry = ""
     if job.status in {"FAILED", "NEEDS_ACTION"}:
         retry = f"""<form method="post" action="/admin/jobs/{job.id}/retry" style="max-width:200px"><input type="hidden" name="csrf_token" value="{csrf}"><button>重试任务</button></form>"""
-    refresh_note = (
-        '<p class="muted">任务运行中，页面每 4 秒自动刷新。</p>' if in_flight else ""
-    )
+    refresh_note = '<p class="muted">任务运行中，页面每 4 秒自动刷新。</p>' if in_flight else ""
     rows = "".join(
         f"<tr><th scope='row'>{html.escape(str(key))}</th>"
         + (

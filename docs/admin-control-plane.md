@@ -15,7 +15,7 @@ A Control Plane outage must not stop already-connected accounts from receiving o
 
 1. Browser administrators authenticate with a dedicated signed, HTTP-only session cookie. The browser never receives `CONTROL_API_KEY`.
 2. `CONTROL_API_KEY` remains a server-to-server credential for automation and future external admin services.
-3. Platform credentials are accepted only over TLS, staged in `SecretStore`, and represented in PostgreSQL by references. Job request/result JSON must never contain tokens or secrets.
+3. Platform credentials are accepted only over TLS and stored as application-encrypted Fernet envelopes in PostgreSQL. Encryption keys remain outside PostgreSQL in `PLATFORM_SECRET_KEYS`; job request/result JSON never contains credentials.
 4. Every mutation is tenant-scoped and audited with the human or service actor.
 5. Webhook route identifiers are globally unambiguous within their platform namespace.
 6. Sender instances are isolated by `(platform, platform_account_id, config_version)`.
@@ -25,7 +25,7 @@ A Control Plane outage must not stop already-connected accounts from receiving o
 ```text
 Admin Web / Provisioning API
   -> validate request and tenant authorization
-  -> stage secret bundle in SecretStore
+  -> encrypt staging bundle with PLATFORM_SECRET_KEYS
   -> insert ProvisioningJob(PENDING) and audit submission
   -> enqueue Dramatiq actor
   -> atomic claim PROCESSING
@@ -33,10 +33,10 @@ Admin Web / Provisioning API
   -> provision PlatformApp and/or PlatformAccount
   -> configure webhook where the platform permits automation
   -> persist sanitized result and audit completion
-  -> delete staging secret
+  -> clear encrypted staging bundle after completion
 ```
 
-Failed jobs retain their staging secret for controlled retry, use exponential backoff, and are recovered by the scheduler. Errors are normalized to codes and sanitized messages; raw HTTP requests and exception representations are not persisted.
+Failed jobs retain only the encrypted staging envelope for controlled retry, use exponential backoff, and are recovered by the scheduler. Errors are normalized to codes and sanitized messages; raw HTTP requests and exception representations are not persisted.
 
 ## Account model
 

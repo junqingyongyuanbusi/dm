@@ -10,6 +10,7 @@ _ENV_KEYS = [
     "CONTROL_API_KEY",
     "LLM_PROVIDER",
     "OPENAI_API_KEY",
+    "PLATFORM_SECRET_KEYS",
     "TESTING",
 ]
 
@@ -22,6 +23,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _make(**kwargs: object) -> Settings:
+    kwargs.setdefault("platform_secret_keys", "Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=")
     # 显式关闭 env 文件读取，纯用构造参数
     return Settings(_env_file=None, **kwargs)  # type: ignore[call-arg]
 
@@ -66,6 +68,21 @@ def test_非测试环境_凭证齐全通过() -> None:
         openai_api_key="sk-test",
     )
     assert settings.openai_api_key == "sk-test"
+
+
+def test_非测试环境_stub_provider_拒绝() -> None:
+    with pytest.raises(ValueError, match="LLM_PROVIDER=stub"):
+        _make(
+            testing=False,
+            chatwoot_webhook_secret="real-secret",
+            chatwoot_api_token="real-token",
+            control_api_key="control-token",
+            admin_session_secret="x" * 32,
+            admin_username="admin",
+            admin_password="password",
+            public_base_url="https://reply.example.com",
+            llm_provider="stub",
+        )
 
 
 def test_非测试环境_空_control_api_key_拒绝() -> None:

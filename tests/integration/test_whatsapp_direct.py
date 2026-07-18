@@ -9,6 +9,7 @@ from sqlalchemy import insert, select
 from apps.api.main import create_app
 from social_reply.connectors import registry
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
 
@@ -25,7 +26,9 @@ async def test_whatsapp_webhook_uses_shared_reply_core_and_sender(
             name="Meta",
             external_app_id="app-1",
             public_id="meta_whatsapp_test",
-            credential_bundle={"app_secret": "secret", "verify_token": "verify"},
+            credential_bundle=encrypt_secret_bundle(
+                {"app_secret": "secret", "verify_token": "verify"}
+            ),
             config={},
             status="active",
         )
@@ -40,7 +43,7 @@ async def test_whatsapp_webhook_uses_shared_reply_core_and_sender(
             name="Support",
             external_account_id="phone-1",
             public_id="wa_test",
-            credential_bundle={"access_token": "access"},
+            credential_bundle=encrypt_secret_bundle({"access_token": "access"}),
             config={"delivery_mode": "direct"},
             capability={"dm": True, "session_messages": True, "max_text_length": 4096},
             automation_default="BOT_ACTIVE",

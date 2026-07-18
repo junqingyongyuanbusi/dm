@@ -10,8 +10,11 @@ import httpx
 
 SECRET = sys.argv[1] if len(sys.argv) > 1 else "dev-local-secret"
 payload = {
-    "event": "message_created", "id": int(time.time()), "content": "冒烟测试：可以提现吗？",
-    "message_type": "incoming", "private": False,
+    "event": "message_created",
+    "id": int(time.time()),
+    "content": "冒烟测试：可以提现吗？",
+    "message_type": "incoming",
+    "private": False,
     "created_at": "2026-07-14T10:00:00Z",
     "sender": {"id": 9, "type": "contact", "name": "冒烟用户"},
     "conversation": {"id": 77, "inbox_id": 101, "status": "pending"},

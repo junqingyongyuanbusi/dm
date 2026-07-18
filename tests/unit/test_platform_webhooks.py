@@ -70,9 +70,7 @@ def test_meta_comment_conversation_key_is_thread_and_user_scoped():
             ],
         }
     )[0]
-    assert event.conversation_key == (
-        "instagram_comment:account-uuid:media-1:comment-root:user-1"
-    )
+    assert event.conversation_key == ("instagram_comment:account-uuid:media-1:comment-root:user-1")
 
 
 def test_x_self_echo_uses_external_account_id():
@@ -88,9 +86,7 @@ def test_x_self_echo_uses_external_account_id():
 
 
 def test_whatsapp_normalization():
-    events = WhatsAppWebhookAdapter(
-        account_id="account-1", phone_number_id="phone-1"
-    ).normalize(
+    events = WhatsAppWebhookAdapter(account_id="account-1", phone_number_id="phone-1").normalize(
         {
             "entry": [
                 {

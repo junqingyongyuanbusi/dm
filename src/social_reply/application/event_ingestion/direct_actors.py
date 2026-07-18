@@ -34,9 +34,7 @@ async def _process_events(raw_event_id: uuid.UUID, events: list[dict]) -> None:
         await session.execute(
             update(models.RawEvent)
             .where(models.RawEvent.id == raw_event_id)
-            .values(
-                processing_status="DECISION_PENDING" if jobs_pending else "PROCESSED"
-            )
+            .values(processing_status="DECISION_PENDING" if jobs_pending else "PROCESSED")
         )
         await session.commit()
 

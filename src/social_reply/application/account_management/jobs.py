@@ -18,6 +18,7 @@ from social_reply.application.account_management.service import (
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,7 @@ async def submit_provisioning_job(
                     actor=actor,
                     idempotency_key=key,
                     request=safe_request,
-                    staging_secret=secrets,
+                    staging_secret=encrypt_secret_bundle(secrets),
                     status="PENDING",
                     current_step="QUEUED",
                 )
@@ -112,16 +113,21 @@ async def submit_provisioning_job(
             job_id = existing.id
             existing_job = existing
         await session.commit()
-    if inserted is None and existing_job is not None and existing_job.status in {
-        "FAILED",
-        "NEEDS_ACTION",
-    }:
+    if (
+        inserted is None
+        and existing_job is not None
+        and existing_job.status
+        in {
+            "FAILED",
+            "NEEDS_ACTION",
+        }
+    ):
         async with get_session_factory()() as session:
             await session.execute(
                 update(models.ProvisioningJob)
                 .where(models.ProvisioningJob.id == job_id)
                 .values(
-                    staging_secret=secrets,
+                    staging_secret=encrypt_secret_bundle(secrets),
                     status="PENDING",
                     current_step="QUEUED",
                     next_attempt_at=None,
@@ -189,7 +195,7 @@ def _result_payload(result: AccountConnectionResult) -> dict[str, Any]:
 async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
     settings = get_settings()
     request = dict(job.request or {})
-    credentials = dict(job.staging_secret or {})
+    credentials = decrypt_secret_bundle(job.staging_secret)
     common = {
         "public_base_url": settings.public_base_url,
         "tenant_id": job.tenant_id,

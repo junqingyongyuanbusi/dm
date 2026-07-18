@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 
 def make_public_id(prefix: str) -> str:
@@ -75,8 +76,7 @@ async def provision_platform_app(
         "name": name,
         "external_app_id": external_app_id or (existing.external_app_id if existing else None),
         "public_id": resolved_public_id,
-        # Secret 内联入库；同事务 upsert，失败由 DB 事务回滚，无需手工文件回滚
-        "credential_bundle": credential_bundle,
+        "credential_bundle": encrypt_secret_bundle(credential_bundle),
         "config": config,
         "config_version": existing.config_version + 1 if existing is not None else 1,
         "status": existing.status if existing is not None else "active",
@@ -146,7 +146,7 @@ async def provision_direct_account(
     if webhook_secret_bundle is not None and not (
         existing is not None and preserve_existing_webhook_secret and webhook_bundle
     ):
-        webhook_bundle = webhook_secret_bundle
+        webhook_bundle = encrypt_secret_bundle(webhook_secret_bundle)
 
     values = {
         "id": account_id,
@@ -157,8 +157,7 @@ async def provision_direct_account(
         "name": name,
         "external_account_id": external_account_id,
         "public_id": resolved_public_id,
-        # Secret 内联入库；同事务 upsert，DB 事务保证原子回滚
-        "credential_bundle": credential_bundle,
+        "credential_bundle": encrypt_secret_bundle(credential_bundle),
         "webhook_secret_bundle": webhook_bundle,
         "config": {"delivery_mode": "direct", **config},
         "capability": capability,
