@@ -241,6 +241,23 @@ async def test_connect_error_marks_failed_with_backoff(session, monkeypatch):
     assert next_at > now  # 指数退避：下次尝试在未来
 
 
+async def test_retryable_platform_error_schedules_retry(session, monkeypatch):
+    from social_reply.connectors.chatwoot import client as cw
+    from social_reply.connectors.errors import RetryableSendError
+
+    _conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+
+    async def _limited(**_kwargs):
+        raise RetryableSendError("RATE_LIMITED")
+
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _limited)
+    assert await deliver_outbox(str(ob_id)) == "FAILED"
+    ob = (
+        await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))
+    ).scalar_one()
+    assert ob.status == "FAILED" and ob.next_attempt_at is not None
+
+
 async def test_unknown_send_error_fails_closed_as_ambiguous(session, monkeypatch):
     from social_reply.connectors.chatwoot import client as cw
 
@@ -291,3 +308,84 @@ async def test_finalize_does_not_overwrite_non_sending_row(session, monkeypatch,
     ).scalar_one()  # noqa: E501
     assert att.outcome == "STALE_FINALIZE" and att.error_code == "STALE_FINALIZE"
     assert att.chatwoot_message_id == 999
+
+
+async def _seed_direct_x(session):
+    """直连 X DM outbox（BOT_ACTIVE），用于验证发送侧永久/暂时错误分类。"""
+    account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            brand_id="b1",
+            platform="x",
+            name="x-bot",
+            status="active",
+            capability={"dm": True, "max_text_length": 10000},
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id, platform="x", platform_account_id=account_id, external_user_id="u1"
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conv_id,
+            brand_id="b1",
+            platform="x",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key="x_dm:acc:u1",
+        )
+    )
+    await ensure_state(session, conv_id, "BOT_ACTIVE")
+    ob_id = uuid.uuid4()
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=ob_id,
+            conversation_id=conv_id,
+            platform_account_id=account_id,
+            destination_type="x_dm",
+            destination_id="x_dm:acc:u1",
+            message_type="text",
+            payload={"text": "hi", "target": {"kind": "dm", "participant_id": "u1"}},
+            idempotency_key=str(ob_id),
+            status="PENDING",
+        )
+    )
+    await session.commit()
+    return account_id, ob_id
+
+
+async def test_permanent_send_error_marks_needs_review_no_retry(session, monkeypatch):
+    """X 349「对方不收 DM」→ 直接 NEEDS_REVIEW 并透传平台码,不进退避重试。"""
+    from social_reply.connectors import registry
+    from social_reply.connectors.errors import PermanentSendError
+
+    account_id, ob_id = await _seed_direct_x(session)
+
+    class _RejectingSender:
+        platform = "x"
+
+        async def send_text(self, *, target, text):
+            raise PermanentSendError("X_CANNOT_DM_349", "You cannot send messages to this user.")
+
+        async def aclose(self):
+            pass
+
+    async def _fake_get_sender(_account_id):
+        return _RejectingSender()
+
+    monkeypatch.setattr(registry, "get_platform_sender", _fake_get_sender)
+    monkeypatch.setattr(
+        "social_reply.application.message_delivery.outbox.get_platform_sender", _fake_get_sender
+    )
+
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    ob = (
+        await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))
+    ).scalar_one()
+    assert ob.status == "NEEDS_REVIEW"
+    assert ob.last_error_code == "X_CANNOT_DM_349"
+    assert ob.next_attempt_at is None  # 永久错不排重试

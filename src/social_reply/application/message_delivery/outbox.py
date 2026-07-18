@@ -7,6 +7,11 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
+from social_reply.connectors.errors import (
+    PermanentSendError,
+    PlatformSendError,
+    RetryableSendError,
+)
 from social_reply.connectors.registry import get_platform_sender
 from social_reply.domain.platform_accounts import is_active_account_status
 from social_reply.infrastructure.database import models
@@ -273,6 +278,17 @@ async def deliver_outbox(outbox_id: str) -> str:
             error_message=_safe_error(exc),
         )
 
+    async def fail_permanent(exc: PlatformSendError) -> str:
+        # 平台确定性拒绝(对方不收 DM、超出消息窗口、token 失效):消息未送达且重试无意义,
+        # 直接标 NEEDS_REVIEW 并把平台错误码透传给运营,不进退避重试队列。
+        return await _finalize(
+            oid,
+            "NEEDS_REVIEW",
+            attempt_no=attempt_no,
+            error_code=exc.code,
+            error_message=exc.message[:500],
+        )
+
     direct_target: dict | None = None
     if is_direct:
         try:
@@ -310,6 +326,10 @@ async def deliver_outbox(outbox_id: str) -> str:
         return await fail_retryable(exc)
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         return await ambiguous(exc)
+    except RetryableSendError as exc:
+        return await fail_retryable(exc)
+    except PermanentSendError as exc:
+        return await fail_permanent(exc)
     except httpx.HTTPStatusError as exc:
         return (
             await ambiguous(exc) if exc.response.status_code >= 500 else await fail_retryable(exc)
