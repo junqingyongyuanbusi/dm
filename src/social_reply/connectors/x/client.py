@@ -129,5 +129,26 @@ class XClient:
         payload = response.json()
         return payload.get("data", []), (payload.get("meta") or {}).get("next_token")
 
+    async def read_conversation_dm_events(
+        self, participant_id: str, *, max_results: int = 50
+    ) -> list[dict]:
+        """按会话拉取与指定用户的 DM 事件。
+
+        与全局 /2/dm_events 各自独立限流(实测各 15 req/15min),且实测中
+        全局端点有官方未修复的漏消息 bug,本端点可作对照/补拉来源(诊断脚本用)。
+        """
+        params = {
+            "max_results": str(max_results),
+            "event_types": "MessageCreate",
+            "dm_event.fields": "id,text,event_type,created_at,sender_id,dm_conversation_id",
+        }
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/2/dm_conversations/with/{participant_id}/dm_events"
+        url = f"{self._base_url}{path}?{query}"
+        _, headers, _ = self._auth.prepare("GET", url, {}, None)
+        response = await self._client.get(path, params=params, headers=headers)
+        response.raise_for_status()
+        return response.json().get("data", [])
+
     async def aclose(self) -> None:
         await self._client.aclose()

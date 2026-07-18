@@ -199,30 +199,98 @@ async def test_existing_cursor_implies_bootstrapped_during_rollout(session, monk
 
 
 async def test_poll_reads_all_pages_until_existing_cursor(session, monkeypatch):
+    """翻页直到越过游标回看窗口;窗口外旧事件不再收集。id 用真实雪花量级(回看窗口按时间位换算)。"""
     monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "false")
     get_settings.cache_clear()
     account_id = await _seed_x_account(session)
     account = await session.get(models.PlatformAccount, account_id)
-    account.config = {**account.config, "x_dm_cursor": "100", "x_dm_bootstrapped": True}
+    cursor = "2078000000000000000"
+    account.config = {**account.config, "x_dm_cursor": cursor, "x_dm_bootstrapped": True}
     await session.commit()
     calls: list[str | None] = []
 
     async def fake_read(self, *, max_results=50, pagination_token=None):
         calls.append(pagination_token)
         if pagination_token is None:
-            return ([{"id": "300", "sender_id": _USER, "text": "third"}], "next")
+            return ([{"id": "2078000300000000000", "sender_id": _USER, "text": "third"}], "next")
         return (
             [
-                {"id": "200", "sender_id": _USER, "text": "second"},
-                {"id": "100", "sender_id": _USER, "text": "old"},
+                {"id": "2078000200000000000", "sender_id": _USER, "text": "second"},
+                # 远早于游标回看窗口(floor = cursor - 5min 雪花偏移)的旧事件,触发停止翻页
+                {"id": "2077000000000000000", "sender_id": _USER, "text": "ancient"},
             ],
             "unused",
         )
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
     x_dm_poll._last_poll_at = 0.0
-    assert await x_dm_poll.poll_x_direct_messages() == ["200", "300"]
+    assert await x_dm_poll.poll_x_direct_messages() == [
+        "2078000200000000000",
+        "2078000300000000000",
+    ]
     assert calls == [None, "next"]
+
+
+async def test_late_arriving_event_within_lookback_is_recovered(session, monkeypatch):
+    """晚到事件(id < 游标但在回看窗口内)必须被捞回入站;游标不因此倒退。
+
+    X 全局端点有官方未修复的事件晚到问题:事件延迟出现且 id 小于已推进的游标,
+    严格 > cursor 过滤会永久丢弃它。
+    """
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "false")
+    get_settings.cache_clear()
+    account_id = await _seed_x_account(session)
+    account = await session.get(models.PlatformAccount, account_id)
+    cursor = "2078000300000000000"
+    account.config = {**account.config, "x_dm_cursor": cursor, "x_dm_bootstrapped": True}
+    await session.commit()
+
+    late_event = "2078000250000000000"  # < cursor,但在 5min 回看窗口内
+
+    async def fake_read(self, *, max_results=50, pagination_token=None):
+        return [{"id": late_event, "sender_id": _USER, "text": "late arrival"}], None
+
+    monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
+    x_dm_poll._last_poll_at = 0.0
+    assert await x_dm_poll.poll_x_direct_messages() == [late_event]
+
+    session.expire_all()
+    acc = await session.get(models.PlatformAccount, account_id)
+    assert acc.config.get("x_dm_cursor") == cursor  # 游标只进不退
+
+
+async def test_page_budget_caps_requests_per_poll(session, monkeypatch):
+    """深积压时单轮翻页受页帽限制,防止打爆 15 req/15min 限流。"""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "false")
+    get_settings.cache_clear()
+    account_id = await _seed_x_account(session)
+    account = await session.get(models.PlatformAccount, account_id)
+    account.config = {
+        **account.config,
+        "x_dm_cursor": "2070000000000000000",
+        "x_dm_bootstrapped": True,
+    }
+    await session.commit()
+
+    calls: list[str | None] = []
+    next_tokens = {None: "t1", "t1": "t2", "t2": "t3", "t3": "t4"}
+    base = 2078000300000000000
+
+    async def fake_read(self, *, max_results=50, pagination_token=None):
+        calls.append(pagination_token)
+        page_no = len(calls)
+        event_id = str(base - page_no * 10_000_000_000)  # 递减但均在游标回看窗口之上
+        return (
+            [{"id": event_id, "sender_id": _USER, "text": f"page {page_no}"}],
+            next_tokens[pagination_token],
+        )
+
+    monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
+    x_dm_poll._last_poll_at = 0.0
+    ingested = await x_dm_poll.poll_x_direct_messages()
+
+    assert calls == [None, "t1", "t2"]  # 页帽 3:恰好三次请求后截断
+    assert len(ingested) == 3  # 已拉到的三页事件正常入站
 
 
 async def test_poll_cursor_numeric_comparison(session, monkeypatch):

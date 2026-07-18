@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
 from social_reply.application.event_ingestion.reconcile import reconcile_chatwoot_messages
 from social_reply.application.event_ingestion.x_dm_poll import poll_x_direct_messages
+from social_reply.application.event_ingestion.x_webhook_health import ensure_x_webhooks_valid
 from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision.jobs import sweep_decision_jobs
 from social_reply.infrastructure.queue.actor_loop import run_on_actor_loop
@@ -18,8 +19,9 @@ _SWEEPS: tuple[tuple[str, Callable[[], Awaitable[list]]], ...] = (
     ("sweep_provisioning_jobs", sweep_provisioning_jobs),
     ("sweep_decision_jobs", sweep_decision_jobs),
     ("sweep_outbox", sweep_outbox),
-    # X DM webhook 投递不可靠，改用轮询拉取新 DM
+    # 秒级通道 = webhook 推送(健康自愈见下);轮询兜底防漏推,两路靠入站幂等去重
     ("poll_x_direct_messages", poll_x_direct_messages),
+    ("ensure_x_webhooks_valid", ensure_x_webhooks_valid),
 )
 
 logger = logging.getLogger(__name__)
