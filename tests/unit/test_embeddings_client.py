@@ -28,12 +28,15 @@ async def test_请求体与顺序映射():
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
         # 故意乱序返回，验证按 index 排序还原
-        return httpx.Response(200, json={
-            "data": [
-                {"index": 1, "embedding": [0.2, 0.2]},
-                {"index": 0, "embedding": [0.1, 0.1]},
-            ],
-        })
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": 1, "embedding": [0.2, 0.2]},
+                    {"index": 0, "embedding": [0.1, 0.1]},
+                ],
+            },
+        )
 
     vectors = await _client(handler).embed(["问一", "问二"])
     request = captured[0]

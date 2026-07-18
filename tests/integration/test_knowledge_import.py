@@ -34,6 +34,15 @@ async def test_导入三行并幂等重复跳过(migrated_db, session, csv_file)
     assert all(len(c.embedding) == 1536 for c in chunks)
     assert {d.category for d in docs} == {"账号", "售后", "物流"}
 
+    # 非对称嵌入：embed_text 只存 question（不含答案），content 仍是问+答拼接
+    by_q = {d.question: d for d in docs}
+    q = "怎么修改绑定邮箱"
+    doc = by_q[q]
+    chunk = next(c for c in chunks if c.document_id == doc.id)
+    assert chunk.embed_text == q  # 只嵌入问题
+    assert "答" not in chunk.embed_text  # 答案未混入向量文本
+    assert chunk.content.startswith("问：") and "答：" in chunk.content  # 展示文本仍含答案
+
     # 重复导入：content_hash 幂等，全部 skip 且不新增
     report2 = await import_knowledge_csv(csv_file, embedder=FakeEmbeddingClient())
     assert (report2.inserted, report2.skipped) == (0, 3)

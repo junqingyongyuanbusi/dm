@@ -33,7 +33,8 @@ class _Row:
     brand_id: str
     platform: str | None
     category: str | None
-    content: str
+    content: str  # 展示/LLM 上下文（问+答），也是幂等 content_hash 的来源
+    embed_text: str  # 实际送去 embedding 的文本（非对称：仅 question）
     content_hash: str
 
 
@@ -57,20 +58,28 @@ def _parse_rows(path: Path, brand_id_default: str) -> tuple[list[_Row], int]:
                 logger.warning("跳过空行（question/reply 为空）: %r", raw)
                 continue
             content = f"问：{question}\n答：{reply}"
-            rows.append(_Row(
-                question=question,
-                reply=reply,
-                brand_id=(raw.get("brand_id") or "").strip() or brand_id_default,
-                platform=(raw.get("platform") or "").strip() or None,
-                category=(raw.get("category") or "").strip() or None,
-                content=content,
-                content_hash=hashlib.sha256(content.encode()).hexdigest(),
-            ))
+            rows.append(
+                _Row(
+                    question=question,
+                    reply=reply,
+                    brand_id=(raw.get("brand_id") or "").strip() or brand_id_default,
+                    platform=(raw.get("platform") or "").strip() or None,
+                    category=(raw.get("category") or "").strip() or None,
+                    content=content,
+                    # 非对称嵌入：只 embed 问题，与用户 query 同分布；答案不参与向量
+                    embed_text=question,
+                    content_hash=hashlib.sha256(content.encode()).hexdigest(),
+                )
+            )
     return rows, blank
 
 
 async def import_knowledge_csv(
-    path: Path | str, *, embedder: EmbeddingClient, brand_id_default: str = "default",
+    path: Path | str,
+    *,
+    embedder: EmbeddingClient,
+    tenant_id: str = "default",
+    brand_id_default: str = "default",
 ) -> ImportReport:
     """导入回复模板 CSV：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
     path = Path(path)
@@ -82,10 +91,13 @@ async def import_knowledge_csv(
         # 幂等：已存在的 content_hash 直接 skip，不重复扣 embedding 费
         hashes = [r.content_hash for r in rows]
         existing = set(
-            (await session.execute(
-                select(KnowledgeChunk.content_hash)
-                .where(KnowledgeChunk.content_hash.in_(hashes))
-            )).scalars()
+            (
+                await session.execute(
+                    select(KnowledgeChunk.content_hash).where(
+                        KnowledgeChunk.content_hash.in_(hashes)
+                    )
+                )
+            ).scalars()
         )
         # CSV 内部重复也去重（保留首条）
         seen: set[str] = set()
@@ -98,14 +110,15 @@ async def import_knowledge_csv(
             seen.add(row.content_hash)
             new_rows.append(row)
 
-        # ≤100 条一批调用 embeddings，按顺序对齐
+        # ≤100 条一批调用 embeddings，按顺序对齐（非对称：只 embed 问题）
         embeddings: list[list[float]] = []
         for i in range(0, len(new_rows), _EMBED_BATCH_SIZE):
-            batch = new_rows[i:i + _EMBED_BATCH_SIZE]
-            embeddings.extend(await embedder.embed([r.content for r in batch]))
+            batch = new_rows[i : i + _EMBED_BATCH_SIZE]
+            embeddings.extend(await embedder.embed([r.embed_text for r in batch]))
 
         for row, embedding in zip(new_rows, embeddings, strict=True):
             doc = KnowledgeDocument(
+                tenant_id=tenant_id,
                 brand_id=row.brand_id,
                 platform=row.platform,
                 category=row.category,
@@ -115,15 +128,21 @@ async def import_knowledge_csv(
             )
             session.add(doc)
             await session.flush()
-            session.add(KnowledgeChunk(
-                document_id=doc.id,
-                content=row.content,
-                content_hash=row.content_hash,
-                embedding_version=embedding_version,
-                embedding=embedding,
-            ))
+            session.add(
+                KnowledgeChunk(
+                    document_id=doc.id,
+                    content=row.content,
+                    embed_text=row.embed_text,
+                    content_hash=row.content_hash,
+                    embedding_version=embedding_version,
+                    embedding=embedding,
+                )
+            )
         await session.commit()
 
     return ImportReport(
-        inserted=len(new_rows), skipped=skipped, blank=blank, total=len(rows) + blank,
+        inserted=len(new_rows),
+        skipped=skipped,
+        blank=blank,
+        total=len(rows) + blank,
     )

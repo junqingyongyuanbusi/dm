@@ -26,36 +26,40 @@ class OpenAIEmbeddingClient:
     """
 
     def __init__(
-        self, api_key: str, base_url: str, model: str = "text-embedding-3-small",
-        timeout: float = 30.0, transport: httpx.AsyncBaseTransport | None = None,
+        self,
+        api_key: str,
+        base_url: str,
+        model: str = "text-embedding-3-small",
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
         self._model = model
-        self._timeout = timeout
-        self._transport = transport
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            transport=transport,
+        )
         self.version = model  # 版本即模型名：换模型后旧向量按版本过滤不可比
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         payload = {"model": self._model, "input": texts}
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        async with httpx.AsyncClient(
-            timeout=self._timeout, transport=self._transport,
-        ) as client:
-            resp = await client.post(
-                f"{self._base_url}/embeddings", headers=headers, json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()["data"]
+        resp = await self._client.post("/embeddings", json=payload)
+        resp.raise_for_status()
+        data = resp.json()["data"]
         # OpenAI 文档保证 data 含 index；按 index 排序防乱序
         ordered = sorted(data, key=lambda item: item["index"])
         return [item["embedding"] for item in ordered]
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
 
 class FakeEmbeddingClient:
     """确定性伪向量：sha256 派生 1536 维并归一化，测试/无 key 环境使用"""
 
-    version = "fake-sha256"  # 与真实模型版本隔离：伪向量绝不与 OpenAI 向量混检（2c3 终审 I4）
+    version = "fake-sha256"  # 与真实模型版本隔离：伪向量绝不与 OpenAI 向量混检
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(text) for text in texts]

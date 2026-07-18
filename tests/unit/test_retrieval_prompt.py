@@ -26,12 +26,19 @@ async def _capture_system_prompt(context: LLMContext) -> str:
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return httpx.Response(200, json={"choices": [{"message": {
-            "role": "assistant", "content": json.dumps(_GOOD_OUTPUT)}}]})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": json.dumps(_GOOD_OUTPUT)}}]
+            },
+        )
 
     client = OpenAILLMClient(
-        api_key="sk-test", base_url="https://api.openai.com/v1",
-        model="gpt-4o-mini", timeout=5.0, transport=httpx.MockTransport(handler),
+        api_key="sk-test",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+        timeout=5.0,
+        transport=httpx.MockTransport(handler),
     )
     await client.decide(context)
     body = json.loads(captured[0].content)
@@ -42,10 +49,13 @@ async def _capture_system_prompt(context: LLMContext) -> str:
 
 @pytest.mark.asyncio
 async def test_knowledge_注入后_prompt_含模板文本与防注入声明():
-    prompt = await _capture_system_prompt(LLMContext(
-        text="几点营业", conversation_key="cw:1:2",
-        knowledge=(_TEMPLATE_1, _TEMPLATE_2),
-    ))
+    prompt = await _capture_system_prompt(
+        LLMContext(
+            text="几点营业",
+            conversation_key="cw:1:2",
+            knowledge=(_TEMPLATE_1, _TEMPLATE_2),
+        )
+    )
     # 基础 prompt 保留
     assert prompt.startswith(_SYSTEM_PROMPT)
     # 逐条模板文本注入
@@ -58,7 +68,10 @@ async def test_knowledge_注入后_prompt_含模板文本与防注入声明():
 
 @pytest.mark.asyncio
 async def test_knowledge_为空时_prompt_不变():
-    prompt = await _capture_system_prompt(LLMContext(
-        text="几点营业", conversation_key="cw:1:2",
-    ))
+    prompt = await _capture_system_prompt(
+        LLMContext(
+            text="几点营业",
+            conversation_key="cw:1:2",
+        )
+    )
     assert prompt == _SYSTEM_PROMPT
