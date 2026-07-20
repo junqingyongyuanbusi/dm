@@ -4,6 +4,7 @@ import uuid
 import httpx
 
 from social_reply.application.account_management import service
+from social_reply.application.platform_accounts import PlatformAccountRuntime
 
 
 async def test_connect_telegram_validates_and_configures_webhook(monkeypatch, tmp_path):
@@ -85,3 +86,76 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
     assert result.verify_token == "existing-verify-token"
     assert result.webhook_url == "https://reply.example.com/webhooks/meta/meta_public"
     assert result.platform_app_id == uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+
+async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypatch, tmp_path):
+    existing = PlatformAccountRuntime(
+        id=uuid.uuid4(),
+        tenant_id="default",
+        brand_id="default",
+        platform="x",
+        platform_app_id=None,
+        name="x-bot",
+        external_account_id="x-1",
+        public_id="primary",
+        credential_bundle_data={},
+        webhook_secret_bundle_data=None,
+        config={
+            "delivery_mode": "direct",
+            "xchat_enabled": True,
+            "xchat_cursors": {"x-1-peer": "123"},
+        },
+        capability={"dm": True, "x_chat": True},
+        config_version=1,
+        automation_default="BOT_ACTIVE",
+        status="active",
+    )
+    monkeypatch.setattr(
+        type(existing),
+        "credential_bundle",
+        property(
+            lambda self: {
+                "consumer_key": "old-ck",
+                "consumer_secret": "old-cs",
+                "access_token": "old-at",
+                "access_token_secret": "old-ats",
+                "xchat_private_keys_b64": "private",
+                "xchat_signing_key_version": "7",
+            }
+        ),
+    )
+
+    class FakeXClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get_me(self):
+            return {"id": "x-1", "username": "bot"}
+
+        async def aclose(self):
+            pass
+
+    async def fake_existing(**kwargs):
+        return existing
+
+    async def fake_provision(**kwargs):
+        assert kwargs["credential_bundle"]["xchat_private_keys_b64"] == "private"
+        assert kwargs["credential_bundle"]["xchat_signing_key_version"] == "7"
+        assert kwargs["config"]["xchat_cursors"] == {"x-1-peer": "123"}
+        assert kwargs["capability"]["x_chat"] is True
+        return uuid.uuid4(), "primary"
+
+    monkeypatch.setattr(service, "XClient", FakeXClient)
+    monkeypatch.setattr(service, "get_platform_account_runtime_by_external_id", fake_existing)
+    monkeypatch.setattr(service, "provision_direct_account", fake_provision)
+
+    result = await service.connect_x_account(
+        consumer_key="new-ck",
+        consumer_secret="new-cs",
+        access_token="new-at",
+        access_token_secret="new-ats",
+        environment="prod",
+        public_base_url="https://reply.example.com",
+        secrets_root=tmp_path,
+    )
+    assert "XChat 已解锁" in result.manual_steps[1]

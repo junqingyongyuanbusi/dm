@@ -9,6 +9,7 @@ from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.whatsapp.client import WhatsAppClient
 from social_reply.connectors.x.client import XClient
+from social_reply.connectors.xchat.sender import DualXSender, XChatSender
 
 _senders: dict[tuple[str, uuid.UUID, int], PlatformSender] = {}
 
@@ -64,11 +65,30 @@ def _build_sender(account: PlatformAccountRuntime) -> PlatformSender:
             api_version=account.config.get("api_version", "v23.0"),
         )
     if account.platform == "x":
-        return XClient(
+        legacy = XClient(
             consumer_key=credentials["consumer_key"],
             consumer_secret=credentials["consumer_secret"],
             access_token=credentials["access_token"],
             access_token_secret=credentials["access_token_secret"],
             api_base_url=account.config.get("api_base_url", "https://api.x.com"),
+        )
+        private_keys = credentials.get("xchat_private_keys_b64")
+        signing_version = credentials.get("xchat_signing_key_version")
+        if not private_keys or not signing_version:
+            return legacy
+        if not account.external_account_id:
+            raise LookupError(f"platform_external_account_id_missing:{account.id}")
+        return DualXSender(
+            legacy=legacy,
+            xchat=XChatSender(
+                consumer_key=credentials["consumer_key"],
+                consumer_secret=credentials["consumer_secret"],
+                access_token=credentials["access_token"],
+                access_token_secret=credentials["access_token_secret"],
+                external_account_id=account.external_account_id,
+                private_keys_b64=private_keys,
+                signing_key_version=signing_version,
+                api_base_url=account.config.get("api_base_url", "https://api.x.com"),
+            ),
         )
     raise LookupError(f"platform_sender_not_configured:{account.platform}:{account.id}")

@@ -126,7 +126,13 @@ async def persist_decision(
             elif account.platform == "whatsapp":
                 destination_type = "whatsapp_session_message"
             elif account.platform == "x":
-                destination_type = "x_post_reply" if kind == "reply" else "x_dm"
+                destination_type = (
+                    "x_post_reply"
+                    if kind == "reply"
+                    else "x_chat_message"
+                    if kind == "x_chat"
+                    else "x_dm"
+                )
             else:
                 raise ValueError(f"unsupported_direct_platform:{account.platform}")
             if destination_type == "meta_private_reply":

@@ -7,10 +7,15 @@ import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
 from social_reply.application.account_management.provisioning import provision_direct_account
-from social_reply.application.platform_accounts import get_platform_account_runtime
+from social_reply.application.platform_accounts import (
+    get_platform_account_runtime,
+    get_platform_account_runtime_by_external_id,
+)
 from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.x.client import XClient
+from social_reply.connectors.xchat.client import XChatClient
+from social_reply.connectors.xchat.setup import unlock_xchat_private_keys
 
 _AUTOMATION_DEFAULTS = {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
 _META_PLATFORMS = {"facebook", "instagram"}
@@ -230,6 +235,7 @@ async def connect_x_account(
     access_token_secret: str,
     public_base_url: str,
     environment: str,
+    xchat_pin: str | None = None,
     tenant_id: str = "default",
     brand_id: str = "default",
     name: str | None = None,
@@ -254,6 +260,39 @@ async def connect_x_account(
     finally:
         await client.aclose()
     external_account_id = str(me["id"])
+    existing_runtime = None
+    try:
+        existing_runtime = await get_platform_account_runtime_by_external_id(
+            tenant_id=tenant_id,
+            platform="x",
+            external_account_id=external_account_id,
+        )
+    except LookupError:
+        pass
+    existing_xchat_credentials = (
+        existing_runtime.credential_bundle if existing_runtime is not None else {}
+    )
+    xchat_enabled = bool(existing_xchat_credentials.get("xchat_private_keys_b64"))
+    if xchat_pin and xchat_pin.strip():
+        xchat = XChatClient(**credentials, api_base_url=api_base_url, transport=transport)
+        try:
+            private_keys, key_version = await unlock_xchat_private_keys(
+                client=xchat,
+                user_id=external_account_id,
+                pin=xchat_pin.strip(),
+            )
+        finally:
+            await xchat.aclose()
+        credentials["xchat_private_keys_b64"] = private_keys
+        credentials["xchat_signing_key_version"] = key_version
+        xchat_enabled = True
+    elif xchat_enabled:
+        credentials["xchat_private_keys_b64"] = existing_xchat_credentials[
+            "xchat_private_keys_b64"
+        ]
+        credentials["xchat_signing_key_version"] = existing_xchat_credentials[
+            "xchat_signing_key_version"
+        ]
     account_id, resolved_public_id = await provision_direct_account(
         platform="x",
         external_account_id=external_account_id,
@@ -265,8 +304,18 @@ async def connect_x_account(
         secrets_root=secrets_root,
         credential_bundle=credentials,
         webhook_secret_bundle={"consumer_secret": credentials["consumer_secret"]},
-        config={"api_base_url": api_base_url, "environment": environment},
-        capability={"dm": True, "mentions": True, "max_text_length": 280},
+        config={
+            **(existing_runtime.config if existing_runtime is not None else {}),
+            "api_base_url": api_base_url,
+            "environment": environment,
+            "xchat_enabled": xchat_enabled,
+        },
+        capability={
+            "dm": True,
+            "x_chat": xchat_enabled,
+            "mentions": True,
+            "max_text_length": 280,
+        },
         automation_default=automation_default,
     )
     return AccountConnectionResult(
@@ -278,7 +327,11 @@ async def connect_x_account(
         name=name or me.get("username") or me.get("name") or external_account_id,
         automation_default=automation_default,
         manual_steps=(
-            "在 X Developer Portal/Account Activity API 注册返回的 webhook_url。",
-            "为当前用户创建订阅；该步骤受 X 产品套餐和权限限制。",
+            "在 X Developer Portal 注册返回的 webhook_url，并保留 legacy 订阅。",
+            (
+                "XChat 已解锁：scheduler 将通过 Chat API 补拉加密消息。"
+                if xchat_enabled
+                else "尚未提供 XChat PIN：已迁移到 XChat 的私信仍无法解密；请重新接入并填写 PIN。"
+            ),
         ),
     )

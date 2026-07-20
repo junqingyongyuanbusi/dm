@@ -248,6 +248,7 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
         access_token=credentials["access_token"],
         access_token_secret=credentials["access_token_secret"],
         environment=str(request["environment"]),
+        xchat_pin=credentials.get("xchat_pin"),
         **common,
     )
 
@@ -261,6 +262,14 @@ async def process_provisioning_job(job_id: str) -> str:
         result = await _connect(job)
     except Exception as exc:  # noqa: BLE001 - platform boundary is normalized below
         error_code, message, retryable = _error(exc)
+        staging_secret = job.staging_secret
+        if job.platform == "x":
+            submitted_secrets = decrypt_secret_bundle(job.staging_secret)
+            if submitted_secrets.get("xchat_pin"):
+                # A PIN is a one-time unlock input. Never retain it after the first
+                # attempt, including NEEDS_ACTION failures; the operator must resubmit.
+                submitted_secrets.pop("xchat_pin", None)
+                staging_secret = encrypt_secret_bundle(submitted_secrets)
         next_attempt_at = None
         if retryable and job.attempt_count >= _MAX_ATTEMPTS:
             retryable = False
@@ -285,6 +294,7 @@ async def process_provisioning_job(job_id: str) -> str:
                     locked_by=None,
                     last_error_code=error_code,
                     last_error_message=message,
+                    staging_secret=staging_secret,
                 )
             )
             await session.commit()
@@ -401,6 +411,9 @@ def _public_result(value: Any) -> Any:
         "app_secret",
         "consumer_key",
         "consumer_secret",
+        "xchat_pin",
+        "xchat_private_keys_b64",
+        "xchat_signing_key_version",
     }
     if isinstance(value, dict):
         return {key: _public_result(item) for key, item in value.items() if key not in sensitive}

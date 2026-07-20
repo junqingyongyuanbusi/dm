@@ -88,6 +88,7 @@ class XAccountRequest(_BaseAccountRequest):
     access_token: SecretStr
     access_token_secret: SecretStr
     environment: str = Field(min_length=1, max_length=128)
+    xchat_pin: SecretStr | None = None
 
 
 class ProvisioningJobResponse(BaseModel):
@@ -141,6 +142,7 @@ def _split_request(platform: str, request: BaseModel) -> tuple[dict, dict[str, s
         "consumer_key",
         "consumer_secret",
         "access_token_secret",
+        "xchat_pin",
     ):
         value = values.get(key)
         if isinstance(value, SecretStr):

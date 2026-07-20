@@ -77,9 +77,8 @@ async def _poll_account(account) -> list[str]:
         await _save_cursor(account.id, newest_id, bootstrapped=True)
         return []
     if not events:
-        # 空转也要留痕:证明本轮确实调了 API 且无新于游标的事件。断流排查时,
-        # 该日志可区分「X 侧无新事件」与「轮询本身没跑」。X 侧无新事件的常见上游原因:
-        # 会话升级 XChat 加密后对 API 全盲(官方确认,无法关闭)、发送方被反垃圾拦截。
+        # 空转也要留痕:证明本轮确实调了 API 且无新于游标的 legacy 事件。
+        # XChat 使用独立的 Chat API；由 xchat_poll 负责补拉，不能据此判断 X 侧无消息。
         logger.info("x_dm_poll idle account=%s cursor=%s", account.id, cursor)
         return []
 

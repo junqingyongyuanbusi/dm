@@ -28,6 +28,7 @@ _DIRECT_CAPABILITY = {
     "meta_private_reply": "comments",
     "whatsapp_session_message": "session_messages",
     "x_dm": "dm",
+    "x_chat_message": "x_chat",
     "x_post_reply": "mentions",
 }
 
@@ -293,6 +294,9 @@ async def deliver_outbox(outbox_id: str) -> str:
     if is_direct:
         try:
             direct_target = dict(payload.get("target") or {})
+            if row.destination_type == "x_chat_message":
+                # Stable across retries so X can deduplicate an ambiguous send.
+                direct_target["message_id"] = str(row.id)
             if not direct_target and row.destination_type in {"telegram_chat", "telegram_dm"}:
                 direct_target = {"chat_id": int(row.destination_id.rsplit(":", 1)[-1])}
             if not direct_target:

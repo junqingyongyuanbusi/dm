@@ -490,7 +490,13 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
         if account.platform == "telegram":
             destination_type = "telegram_dm"
         elif account.platform == "x":
-            destination_type = "x_post_reply" if kind == "reply" else "x_dm"
+            destination_type = (
+                "x_post_reply"
+                if kind == "reply"
+                else "x_chat_message"
+                if kind == "x_chat"
+                else "x_dm"
+            )
         elif account.platform == "whatsapp":
             destination_type = "whatsapp_session_message"
         elif account.platform in {"facebook", "instagram"}:
@@ -776,18 +782,22 @@ async def delivery_page(request: Request) -> Response:
             await session.execute(
                 select(
                     models.RawEvent.source,
-                    func.count(func.distinct(models.RawEvent.id)),
+                    models.RawEvent.processing_status,
+                    func.count(models.RawEvent.id),
                     func.max(models.RawEvent.received_at),
                 )
-                .join(
+                .outerjoin(
                     models.NormalizedEvent,
                     models.NormalizedEvent.raw_event_id == models.RawEvent.id,
                 )
                 .where(
                     models.RawEvent.received_at >= day_ago,
-                    models.NormalizedEvent.tenant_id.in_(tenants),
+                    (
+                        models.NormalizedEvent.tenant_id.in_(tenants)
+                        | models.NormalizedEvent.id.is_(None)
+                    ),
                 )
-                .group_by(models.RawEvent.source)
+                .group_by(models.RawEvent.source, models.RawEvent.processing_status)
             )
         ).all()
     rows = (
@@ -809,15 +819,15 @@ async def delivery_page(request: Request) -> Response:
     )
     ingress_rows = (
         "".join(
-            f"<tr><td>{html.escape(source)}</td><td class='muted'>{count}</td>"
-            f"<td class='muted'>{_fmt(last_at)}</td></tr>"
-            for source, count, last_at in ingress
+            f"<tr><td>{html.escape(source)}</td><td>{_pill(processing_status)}</td>"
+            f"<td class='muted'>{count}</td><td class='muted'>{_fmt(last_at)}</td></tr>"
+            for source, processing_status, count, last_at in ingress
         )
-        or "<tr><td colspan='3' class='muted'>24 小时内无入站事件</td></tr>"
+        or "<tr><td colspan='4' class='muted'>24 小时内无入站事件</td></tr>"
     )
     body = f"""<h1>投递</h1><p class="lede">出站消息投递状态与入站事件健康度。</p>
 <section class="card"><h2>Outbox</h2><p class="hint">最近 50 条出站消息；失败可手动重试（由补扫循环拾取）。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>状态</th><th>目的地</th><th>内容</th><th>尝试</th><th>错误</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>
-<section class="card"><h2>入站健康（24h）</h2><div class="tablewrap"><table><thead><tr><th>来源</th><th>事件数</th><th>最后接收</th></tr></thead><tbody>{ingress_rows}</tbody></table></div></section>"""
+<section class="card"><h2>入站健康（24h）</h2><div class="tablewrap"><table><thead><tr><th>来源</th><th>处理状态</th><th>事件数</th><th>最后接收</th></tr></thead><tbody>{ingress_rows}</tbody></table></div></section>"""
     response = HTMLResponse(_page("投递", body, active="delivery"))
     return _ensure_csrf(response, request, csrf)
 
@@ -956,7 +966,7 @@ async def accounts_page(request: Request) -> Response:
 <form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<button class="btn-block">连接 Telegram</button></form>
 <form class="card" method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform"><option>facebook</option><option>instagram</option></select>{_input("external_account_id", "Page / IG Account ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 Meta</button></form>
 <form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
-<form class="card" method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}{_input("environment", "Account Activity Environment")}<button class="btn-block">连接 X</button></form>
+<form class="card" method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}{_input("environment", "Account Activity Environment")}{_input("xchat_pin", "XChat 4 位 PIN（启用加密私信，建议填写）", secret=True, required=False)}<button class="btn-block">连接 X</button></form>
 </div></div></details>"""
     body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>
 {killswitch_card}

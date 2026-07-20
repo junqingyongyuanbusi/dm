@@ -48,7 +48,13 @@ PLATFORM_SUBMISSIONS = {
     "x": PlatformSubmissionSpec(
         public_fields=_COMMON_PUBLIC | {"environment"},
         secret_fields=frozenset(
-            {"consumer_key", "consumer_secret", "access_token", "access_token_secret"}
+            {
+                "consumer_key",
+                "consumer_secret",
+                "access_token",
+                "access_token_secret",
+                "xchat_pin",
+            }
         ),
     ),
 }

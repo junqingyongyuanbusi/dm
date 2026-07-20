@@ -129,6 +129,22 @@ class XClient:
         payload = response.json()
         return payload.get("data", []), (payload.get("meta") or {}).get("next_token")
 
+    async def read_xchat_conversation_events(self, participant_id: str) -> dict:
+        """读取加密 XChat 会话历史（仍为密文，供诊断/专用解密器使用）。"""
+        path = f"/2/chat/conversations/{participant_id}/events"
+        params = {
+            "chat_message_event.fields": (
+                "conversation_id,conversation_token,created_at_msec,encoded_event,id,"
+                "is_trusted,message_event_signature,previous_id,sender_id"
+            )
+        }
+        query = "&".join(f"{key}={value}" for key, value in params.items())
+        url = f"{self._base_url}{path}?{query}"
+        _, headers, _ = self._auth.prepare("GET", url, {}, None)
+        response = await self._client.get(path, params=params, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
     async def read_conversation_dm_events(
         self, participant_id: str, *, max_results: int = 50
     ) -> list[dict]:

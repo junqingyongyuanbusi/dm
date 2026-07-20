@@ -154,6 +154,30 @@ async def list_active_accounts_by_platform(platform: str) -> list[PlatformAccoun
     return [rt for row in rows if (rt := _account_runtime(row)) is not None]
 
 
+async def get_platform_account_runtime_by_external_id(
+    *,
+    tenant_id: str,
+    platform: str,
+    external_account_id: str,
+) -> PlatformAccountRuntime:
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(
+                select(models.PlatformAccount).where(
+                    models.PlatformAccount.tenant_id == tenant_id,
+                    models.PlatformAccount.platform == platform,
+                    models.PlatformAccount.external_account_id == external_account_id,
+                )
+            )
+        ).scalar_one_or_none()
+    runtime = _account_runtime(row) if row is not None else None
+    if runtime is None:
+        raise LookupError(
+            f"platform_account_runtime_not_found:{tenant_id}:{platform}:{external_account_id}"
+        )
+    return runtime
+
+
 async def get_platform_account_runtime(account_id: uuid.UUID) -> PlatformAccountRuntime:
     async with get_session_factory()() as session:
         row = (

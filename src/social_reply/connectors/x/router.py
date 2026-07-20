@@ -43,11 +43,20 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
     ):
         raise HTTPException(status_code=401, detail="invalid_x_signature")
     payload = json.loads(body)
+    event_type = str((payload.get("data") or {}).get("event_type") or "")
+    is_xchat = event_type.startswith("chat.")
     adapter = XWebhookAdapter(
         account_id=str(account.id),
         external_account_id=account.external_account_id,
     )
     events = adapter.normalize(payload)
+    processing_status = (
+        "XCHAT_DECRYPTION_PENDING"
+        if is_xchat
+        else "PENDING"
+        if events
+        else "IGNORED_AT_INGRESS"
+    )
     async with get_session_factory()() as session:
         raw_event_id = (
             await session.execute(
@@ -55,12 +64,31 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
                 .values(
                     source="x",
                     payload=payload,
-                    headers={"signature_verified": True},
-                    processing_status="PENDING" if events else "IGNORED_AT_INGRESS",
+                    headers={
+                        "signature_verified": True,
+                        "event_type": event_type or None,
+                    },
+                    processing_status=processing_status,
                 )
                 .returning(models.RawEvent.id)
             )
         ).scalar_one()
+        if is_xchat:
+            await session.execute(
+                insert(models.AuditLog).values(
+                    tenant_id=account.tenant_id,
+                    category="ingestion",
+                    actor="system",
+                    action="XCHAT_EVENT_RECEIVED",
+                    subject_type="raw_event",
+                    subject_id=str(raw_event_id),
+                    detail={
+                        "account_id": str(account.id),
+                        "event_type": event_type,
+                        "event_uuid": (payload.get("data") or {}).get("event_uuid"),
+                    },
+                )
+            )
         await session.commit()
     serialized_events = [canonical_event_to_dict(event) for event in events]
     if serialized_events:
@@ -71,5 +99,13 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
             str(raw_event_id),
             serialized_events,
             inline=lambda: _process_events(raw_event_id, serialized_events),
+        )
+    elif is_xchat:
+        logger.error(
+            "XCHAT_EVENT_RECEIVED raw_event_id=%s account=%s event_type=%s event_uuid=%s",
+            raw_event_id,
+            account.id,
+            event_type,
+            (payload.get("data") or {}).get("event_uuid"),
         )
     return {"accepted": True}
