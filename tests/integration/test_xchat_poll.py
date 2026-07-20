@@ -141,3 +141,71 @@ async def test_xchat_poll_ingests_decrypted_text(session, monkeypatch):
     conversation = await session.get(models.Conversation, normalized.conversation_id)
     assert message.text == "follow-up"
     assert conversation.conversation_key.startswith("x_chat:")
+
+
+async def test_first_xchat_backfill_only_replies_to_newest_recent_inbound(
+    session, monkeypatch
+):
+    await _seed_account(session, bootstrapped=False)
+
+    async def fake_conversations(self, *, max_results=100, pagination_token=None):
+        return ([{"id": _CONVERSATION, "participant_ids": [_PEER], "type": "direct"}], None)
+
+    async def fake_events(self, conversation_id, *, pagination_token=None):
+        return (
+            [
+                {
+                    "id": "300",
+                    "sender_id": _PEER,
+                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "created_at": "2099-07-20T01:53:00Z",
+                    "encoded_event": "third",
+                },
+                {
+                    "id": "200",
+                    "sender_id": _PEER,
+                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "created_at": "2099-07-20T01:52:00Z",
+                    "encoded_event": "second",
+                },
+                {
+                    "id": "100",
+                    "sender_id": _PEER,
+                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "created_at": "2099-07-20T01:51:00Z",
+                    "encoded_event": "first",
+                },
+            ],
+            ["key-change"],
+            None,
+        )
+
+    async def fake_public_keys(self, user_id):
+        return []
+
+    def fake_decrypt(**kwargs):
+        return (
+            [
+                {
+                    "envelope": envelope,
+                    "event": {
+                        "type": "Message",
+                        "message_id": f"message-{envelope['id']}",
+                        "sender_id": _PEER,
+                        "content": {"content_type": "Text", "text": envelope["encoded_event"]},
+                        "verified": True,
+                    },
+                }
+                for envelope in kwargs["message_events"]
+            ],
+            {},
+            {},
+        )
+
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
+    monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
+    monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
+    xchat_poll._last_poll_at = 0.0
+
+    assert await xchat_poll.poll_xchat_messages() == ["message-300"]

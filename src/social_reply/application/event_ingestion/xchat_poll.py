@@ -160,22 +160,25 @@ async def _poll_conversation(
         )
 
     # Existing conversations may already contain encrypted messages that legacy
-    # /2/dm_events never exposed. After the operator explicitly supplies the
-    # XChat PIN, process that backlog rather than silently establishing a high-water mark.
-    ingested: list[str] = []
-    for item in sorted(
+    # /2/dm_events never exposed. On first unlock, reply only to the newest recent
+    # inbound message per conversation; replying to every historical turn would create
+    # a burst of stale automated messages. Future polls process every new event normally.
+    ordered = sorted(
         decrypted,
         key=lambda value: _as_int((value.get("envelope") or {}).get("id")) or 0,
-    ):
+    )
+    if not bootstrapped:
+        recent_inbound = [
+            item
+            for item in ordered
+            if str((item.get("envelope") or {}).get("sender_id"))
+            != str(account.external_account_id)
+            and _within_backfill_reply_window(item.get("envelope") or {})
+        ]
+        ordered = recent_inbound[-1:]
+    ingested: list[str] = []
+    for item in ordered:
         envelope = item["envelope"]
-        if not bootstrapped and not _within_backfill_reply_window(envelope):
-            logger.info(
-                "xchat backfill skips stale message account=%s conversation=%s event=%s",
-                account.id,
-                conversation_id,
-                envelope.get("id"),
-            )
-            continue
         canonical = canonical_from_decrypted(
             account_id=str(account.id),
             external_account_id=str(account.external_account_id),
