@@ -46,6 +46,9 @@ class XChatSender:
         conversation_id = str(target["conversation_id"])
         events = await self._read_history(conversation_id)
         chat = import_private_key_b64(self._private_keys_b64)
+        # import_keys restores private material but not the public signing-key
+        # version required when creating a signed outgoing event.
+        chat.set_key_version(self._signing_key_version)
         extracted = chat.extract_conversation_keys(events)
         keys = dict(extracted.get("keys") or {})
         version = extracted.get("latest_version")

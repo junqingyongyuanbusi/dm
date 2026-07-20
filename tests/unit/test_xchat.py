@@ -10,6 +10,7 @@ from social_reply.connectors.xchat.crypto import (
     import_private_key_b64,
     signing_key_entries,
 )
+from social_reply.connectors.xchat.sender import XChatSender
 
 
 def test_xchat_adapter_normalizes_verified_text_message():
@@ -163,3 +164,57 @@ async def test_xchat_client_sends_json_body_for_subscription():
         await client.aclose()
     assert result["data"]["subscription"]["subscription_id"] == "subscription-1"
     assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_xchat_sender_restores_signing_key_version(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    class FakeChat:
+        def set_key_version(self, version):
+            calls.append(("set_key_version", version))
+
+        def extract_conversation_keys(self, events):
+            calls.append(("extract_conversation_keys", events[0]))
+            return {"keys": {"9": b"key"}, "latest_version": "9"}
+
+        def encrypt_message(self, *args):
+            assert calls[0] == ("set_key_version", "17")
+            return type(
+                "Payload",
+                (),
+                {"encrypted_content": "encrypted", "encoded_event_signature": "signature"},
+            )()
+
+    monkeypatch.setattr(
+        "social_reply.connectors.xchat.sender.import_private_key_b64",
+        lambda value: FakeChat(),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"data": [], "meta": {"conversation_key_events": ["event"]}},
+            )
+        return httpx.Response(201, json={"data": {"id": "sent-1"}})
+
+    sender = XChatSender(
+        consumer_key="ck",
+        consumer_secret="cs",
+        access_token="at",
+        access_token_secret="ats",
+        external_account_id="bot-1",
+        private_keys_b64="private",
+        signing_key_version="17",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        sent = await sender.send_text(
+            target={"kind": "x_chat", "conversation_id": "bot-1:user-1"},
+            text="hello",
+        )
+    finally:
+        await sender.aclose()
+    assert sent == "sent-1"
+    assert calls[0] == ("set_key_version", "17")
