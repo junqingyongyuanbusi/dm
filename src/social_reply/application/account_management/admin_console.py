@@ -964,9 +964,16 @@ async def accounts_page(request: Request) -> Response:
         + _input("brand_id", "Brand", required=True)
         + _input("name", "显示名称（可选）", required=False)
     )
+    oauth_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/x/callback"
+    oauth_common = (
+        f'<input type="hidden" name="csrf_token" value="{csrf}">'
+        + _input("tenant_id", "Tenant", required=True)
+        + _input("brand_id", "Brand", required=True)
+    )
     connect_forms = f"""<details class="collapse"><summary>接入新平台账号</summary><div class="inner">
 <p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。</p>
 <div class="grid">
+<form class="card" method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{_input("xchat_pin", "XChat 4 位 PIN（可选，启用加密私信）", secret=True, required=False)}<p class="hint">跳转 X 授权页，用要接入的账号登录并授权，凭证自动换取入库。前提（一次性）：X 开发者后台该 App 开启 User authentication，回调 URL 登记 <code>{html.escape(oauth_callback)}</code>，App 类型选 Native App。</p><button class="btn-block">跳转 X 授权</button></form>
 <form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<button class="btn-block">连接 Telegram</button></form>
 <form class="card" method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform"><option>facebook</option><option>instagram</option></select>{_input("external_account_id", "Page / IG Account ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 Meta</button></form>
 <form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
