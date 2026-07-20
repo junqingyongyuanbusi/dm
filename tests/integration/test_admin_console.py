@@ -60,6 +60,26 @@ async def test_console_pages_render_after_login(migrated_db):
             assert marker in resp.text
 
 
+async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
+    """账号页 web UI 与 OAuth 模块同步:两张 OAuth 推荐卡 + Telegram 指引都要渲染出来。"""
+    async with _app_client() as client:
+        await _login(client)
+        resp = await client.get("/admin/accounts")
+    assert resp.status_code == 200
+    html = resp.text
+    # OAuth 一键授权卡片(发起端点 + 推荐标记)
+    assert 'action="/admin/oauth/x/start"' in html
+    assert 'action="/admin/oauth/meta/start"' in html
+    assert html.count("OAuth 一键授权（推荐）") == 2
+    # Meta OAuth 卡片提供 facebook / instagram 两个平台选项
+    assert 'name="platform"' in html and "Instagram（专业账号" in html
+    # 回调 URL 直接渲染在页面,便于登记到平台后台
+    assert "/admin/oauth/x/callback" in html
+    assert "/admin/oauth/meta/callback" in html
+    # Telegram 无 OAuth,给 BotFather 指引 + 手工表单
+    assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
+
+
 async def test_conversation_state_flip_takeover(session, migrated_db):
     # 构造一个 BOT_ACTIVE 会话，验证人工接管把状态翻到 HUMAN_ACTIVE
     account_id, contact_id, conv_id = (
