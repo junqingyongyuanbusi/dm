@@ -16,6 +16,9 @@ from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.x.client import XClient
 from social_reply.connectors.xchat.client import XChatClient
 from social_reply.connectors.xchat.setup import unlock_xchat_private_keys
+from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 _AUTOMATION_DEFAULTS = {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
 _META_PLATFORMS = {"facebook", "instagram"}
@@ -225,6 +228,44 @@ async def connect_meta_account(
             "为账号订阅 messages/comments 等所需字段，并完成 App Review/Advanced Access。",
         ),
     )
+
+
+async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
+    account = await get_platform_account_runtime(account_id)
+    if account.platform != "x" or not account.external_account_id:
+        raise ValueError("x_account_not_found")
+    credentials = account.credential_bundle
+    client = XChatClient(
+        consumer_key=credentials["consumer_key"],
+        consumer_secret=credentials["consumer_secret"],
+        access_token=credentials["access_token"],
+        access_token_secret=credentials["access_token_secret"],
+        api_base_url=(account.config or {}).get("api_base_url", "https://api.x.com"),
+    )
+    try:
+        private_keys, key_version = await unlock_xchat_private_keys(
+            client=client,
+            user_id=account.external_account_id,
+            pin=_require_secret(pin, "xchat_pin"),
+        )
+    finally:
+        await client.aclose()
+    credentials["xchat_private_keys_b64"] = private_keys
+    credentials["xchat_signing_key_version"] = key_version
+    config = {**account.config, "xchat_enabled": True}
+    capability = {**account.capability, "x_chat": True}
+    async with get_session_factory()() as session:
+        await session.execute(
+            models.PlatformAccount.__table__.update()
+            .where(models.PlatformAccount.id == account_id)
+            .values(
+                credential_bundle=encrypt_secret_bundle(credentials),
+                config=config,
+                capability=capability,
+                config_version=models.PlatformAccount.config_version + 1,
+            )
+        )
+        await session.commit()
 
 
 async def connect_x_account(

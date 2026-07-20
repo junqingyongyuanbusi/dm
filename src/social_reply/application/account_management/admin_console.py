@@ -26,6 +26,7 @@ from social_reply.application.account_management.admin import (
     _secure_cookie,
     html,
 )
+from social_reply.application.account_management.service import enable_xchat_for_account
 from social_reply.application.reply_decision.persist import _idempotency_key
 from social_reply.domain.automation.state_machine import AutomationStateEnum, can_transition
 from social_reply.infrastructure.database import models
@@ -936,11 +937,14 @@ async def accounts_page(request: Request) -> Response:
         ks_cls = "btn-ghost" if stopped else "btn-danger"
         auto_target = "BOT_DRAFT_ONLY" if a.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
         auto_label = "切为草稿" if a.automation_default == "BOT_ACTIVE" else "切为自动"
+        xchat_form = ""
+        if a.platform == "x" and not (a.capability or {}).get("x_chat", False):
+            xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="csrf_token" value="{csrf}"><input type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><button class="btn-sm btn-ghost">启用 XChat</button></form>"""
         account_rows += (
             f"<tr><td>{html.escape(a.platform)}</td><td>{html.escape(a.name)}</td>"
             f"<td>{_pill(a.status)}</td><td>{_pill(a.automation_default)}</td><td>{ks_pill}</td>"
             f"""<td><form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>
-<form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="account"><input type="hidden" name="account_id" value="{a.id}"><input type="hidden" name="tenant_id" value="{html.escape(a.tenant_id)}"><button class="btn-sm {ks_cls}">{ks_btn}</button></form></td></tr>"""
+<form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="account"><input type="hidden" name="account_id" value="{a.id}"><input type="hidden" name="tenant_id" value="{html.escape(a.tenant_id)}"><button class="btn-sm {ks_cls}">{ks_btn}</button></form>{xchat_form}</td></tr>"""
         )
     account_rows = account_rows or "<tr><td colspan='6' class='muted'>尚未连接账号</td></tr>"
 
@@ -975,6 +979,26 @@ async def accounts_page(request: Request) -> Response:
 {connect_forms}"""
     response = HTMLResponse(_page("账号", body, active="accounts"))
     return _ensure_csrf(response, request, csrf)
+
+
+@router.post("/accounts/{account_id}/xchat")
+async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Response:
+    if _current_actor(request) is None:
+        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    form = await _form(request)
+    _require_csrf(request, form)
+    async with get_session_factory()() as session:
+        account = await session.get(models.PlatformAccount, account_id)
+    if account is None or account.tenant_id not in _tenants() or account.platform != "x":
+        raise HTTPException(status_code=404, detail="x_account_not_found")
+    pin = (form.get("xchat_pin") or "").strip()
+    if len(pin) != 4 or not pin.isdigit():
+        raise HTTPException(status_code=422, detail="invalid_xchat_pin")
+    try:
+        await enable_xchat_for_account(account_id=account_id, pin=pin)
+    except Exception as exc:  # noqa: BLE001 - show a stable operator error, never echo PIN
+        raise HTTPException(status_code=422, detail="xchat_unlock_failed") from exc
+    return RedirectResponse("/admin/accounts", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/accounts/{account_id}/automation")

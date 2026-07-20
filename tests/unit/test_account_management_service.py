@@ -159,3 +159,83 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         secrets_root=tmp_path,
     )
     assert "XChat 已解锁" in result.manual_steps[1]
+
+
+async def test_enable_xchat_updates_existing_account_without_persisting_pin(monkeypatch):
+    existing = PlatformAccountRuntime(
+        id=uuid.uuid4(),
+        tenant_id="default",
+        brand_id="default",
+        platform="x",
+        platform_app_id=None,
+        name="x-bot",
+        external_account_id="x-1",
+        public_id="primary",
+        credential_bundle_data={},
+        webhook_secret_bundle_data=None,
+        config={"delivery_mode": "direct"},
+        capability={"dm": True},
+        config_version=1,
+        automation_default="BOT_ACTIVE",
+        status="active",
+    )
+    monkeypatch.setattr(
+        type(existing),
+        "credential_bundle",
+        property(
+            lambda self: {
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+            }
+        ),
+    )
+
+    class FakeXChatClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def aclose(self):
+            pass
+
+    async def fake_runtime(account_id):
+        return existing
+
+    async def fake_unlock(**kwargs):
+        assert kwargs["pin"] == "1234"
+        return "private", "7"
+
+    class FakeResult:
+        pass
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def execute(self, statement):
+            self.statement = statement
+            return FakeResult()
+
+        async def commit(self):
+            pass
+
+    fake_session = FakeSession()
+    monkeypatch.setattr(service, "get_platform_account_runtime", fake_runtime)
+    monkeypatch.setattr(service, "XChatClient", FakeXChatClient)
+    monkeypatch.setattr(service, "unlock_xchat_private_keys", fake_unlock)
+    monkeypatch.setattr(service, "get_session_factory", lambda: lambda: fake_session)
+    encrypted = {}
+    monkeypatch.setattr(
+        service,
+        "encrypt_secret_bundle",
+        lambda value: encrypted.update(value) or {"__encrypted__": "cipher"},
+    )
+
+    await service.enable_xchat_for_account(account_id=existing.id, pin="1234")
+    assert encrypted["xchat_private_keys_b64"] == "private"
+    assert encrypted["xchat_signing_key_version"] == "7"
+    assert "1234" not in encrypted.values()
