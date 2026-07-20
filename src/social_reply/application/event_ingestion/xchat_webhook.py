@@ -8,6 +8,7 @@ from social_reply.application.platform_accounts import get_platform_account_runt
 from social_reply.connectors.xchat.adapter import canonical_from_decrypted
 from social_reply.connectors.xchat.client import XChatClient
 from social_reply.connectors.xchat.crypto import decrypt_live_event, signing_key_entries
+from social_reply.connectors.xchat.key_cache import save_conversation_key_events
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 
@@ -35,7 +36,14 @@ async def process_xchat_raw_event(raw_event_id: uuid.UUID, account_id: uuid.UUID
         )
         return
     sender_id = str(encrypted.get("sender_id") or "")
+    conversation_id = str(encrypted.get("conversation_id") or "")
     if not sender_id or not encrypted.get("encoded_event"):
+        await _mark(raw_event_id, "XCHAT_UNSUPPORTED_EVENT")
+        return
+    key_change = encrypted.get("conversation_key_change_event")
+    if conversation_id and key_change:
+        await save_conversation_key_events(account.id, conversation_id, [str(key_change)])
+    if not conversation_id:
         await _mark(raw_event_id, "XCHAT_UNSUPPORTED_EVENT")
         return
 

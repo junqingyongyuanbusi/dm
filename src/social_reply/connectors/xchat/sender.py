@@ -48,6 +48,8 @@ class XChatSender:
         conversation_id = str(target["conversation_id"])
         events = list(self._conversation_key_events.get(conversation_id) or [])
         if not events:
+            events = await self._load_persisted_key_events(conversation_id)
+        if not events:
             events = await self._read_history(conversation_id)
             if events:
                 self._conversation_key_events[conversation_id] = events
@@ -97,6 +99,25 @@ class XChatSender:
         response.raise_for_status()
         data = response.json().get("data") or response.json()
         return str(data.get("id") or data.get("message_id") or message_id)
+
+    async def _load_persisted_key_events(self, conversation_id: str) -> list[str]:
+        from sqlalchemy import select
+
+        from social_reply.infrastructure.database import models
+        from social_reply.infrastructure.database.engine import get_session_factory
+
+        async with get_session_factory()() as session:
+            config = await session.scalar(
+                select(models.PlatformAccount.config).where(
+                    models.PlatformAccount.external_account_id == self._external_account_id,
+                    models.PlatformAccount.platform == "x",
+                )
+            )
+        cached = dict((config or {}).get("xchat_conversation_key_events") or {})
+        events = [str(item) for item in cached.get(conversation_id) or [] if item]
+        if events:
+            self._conversation_key_events[conversation_id] = events
+        return events
 
     async def _read_history(self, conversation_id: str) -> list[str]:
         path_id = conversation_id.replace(":", "-")
