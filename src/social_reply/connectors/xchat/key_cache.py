@@ -1,6 +1,6 @@
 import json
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -23,7 +23,13 @@ async def save_conversation_key_events(
     if not values:
         return
     async with get_session_factory()() as session:
-        row = await session.get(models.PlatformAccount, account_id)
+        row = (
+            await session.execute(
+                select(models.PlatformAccount)
+                .where(models.PlatformAccount.id == account_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if row is None:
             return
         config = dict(row.config or {})
@@ -35,6 +41,9 @@ async def save_conversation_key_events(
         await session.execute(
             update(models.PlatformAccount)
             .where(models.PlatformAccount.id == account_id)
-            .values(config=json.loads(json.dumps(config)))
+            .values(
+                config=json.loads(json.dumps(config)),
+                config_version=models.PlatformAccount.config_version + 1,
+            )
         )
         await session.commit()
