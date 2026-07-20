@@ -76,7 +76,7 @@ class XChatClient:
         if pagination_token:
             params["pagination_token"] = pagination_token
         params["chat_message_event.fields"] = (
-            "conversation_id,conversation_token,created_at_msec,encoded_event,id,"
+            "conversation_id,conversation_token,created_at,encoded_event,id,"
             "is_trusted,message_event_signature,previous_id,sender_id"
         )
         # The live X API currently exposes the dedicated /events route. xdk 0.9.0

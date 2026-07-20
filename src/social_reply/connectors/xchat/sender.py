@@ -94,7 +94,7 @@ class XChatSender:
         path = f"/2/chat/conversations/{path_id}/events"
         params = {
             "chat_message_event.fields": (
-                "conversation_id,conversation_token,created_at_msec,encoded_event,id,"
+                "conversation_id,conversation_token,created_at,encoded_event,id,"
                 "is_trusted,message_event_signature,previous_id,sender_id"
             )
         }
