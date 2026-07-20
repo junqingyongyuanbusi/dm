@@ -101,7 +101,18 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
             inline=lambda: _process_events(raw_event_id, serialized_events),
         )
     elif is_xchat:
-        logger.error(
+        from social_reply.application.event_ingestion.xchat_actors import process_xchat_event
+        from social_reply.application.event_ingestion.xchat_webhook import (
+            process_xchat_raw_event,
+        )
+
+        await dispatch_actor(
+            process_xchat_event,
+            str(raw_event_id),
+            str(account.id),
+            inline=lambda: process_xchat_raw_event(raw_event_id, account.id),
+        )
+        logger.info(
             "XCHAT_EVENT_RECEIVED raw_event_id=%s account=%s event_type=%s event_uuid=%s",
             raw_event_id,
             account.id,
