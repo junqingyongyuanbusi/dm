@@ -139,6 +139,15 @@ class XChatClient:
         response.raise_for_status()
         return response.json()
 
+    async def list_webhooks(self) -> list[dict]:
+        bearer = await self._app_bearer_token()
+        response = await self._app.get(
+            "/2/webhooks",
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        response.raise_for_status()
+        return list(response.json().get("data") or [])
+
     async def list_subscriptions(self) -> list[dict]:
         bearer = await self._app_bearer_token()
         response = await self._app.get(
