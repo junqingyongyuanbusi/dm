@@ -13,7 +13,7 @@ pytestmark = pytest.mark.integration
 
 _SELF = "1740258119773458432"
 _PEER = "1831625034739412993"
-_CONVERSATION = f"{_SELF}-{_PEER}"
+_CONVERSATION = f"{_SELF}:{_PEER}"
 
 
 async def _seed_account(session, *, bootstrapped: bool) -> uuid.UUID:
@@ -91,7 +91,7 @@ async def test_xchat_poll_ingests_decrypted_text(session, monkeypatch):
                 {
                     "id": "200",
                     "sender_id": _PEER,
-                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "conversation_id": _CONVERSATION,
                     "conversation_token": "token",
                     "created_at": "2026-07-20T01:51:31Z",
                     "encoded_event": "cipher",
@@ -157,21 +157,21 @@ async def test_first_xchat_backfill_only_replies_to_newest_recent_inbound(
                 {
                     "id": "300",
                     "sender_id": _PEER,
-                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "conversation_id": _CONVERSATION,
                     "created_at": "2099-07-20T01:53:00Z",
                     "encoded_event": "third",
                 },
                 {
                     "id": "200",
                     "sender_id": _PEER,
-                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "conversation_id": _CONVERSATION,
                     "created_at": "2099-07-20T01:52:00Z",
                     "encoded_event": "second",
                 },
                 {
                     "id": "100",
                     "sender_id": _PEER,
-                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "conversation_id": _CONVERSATION,
                     "created_at": "2099-07-20T01:51:00Z",
                     "encoded_event": "first",
                 },
@@ -223,14 +223,14 @@ async def test_first_xchat_backfill_skips_when_latest_event_is_ours(session, mon
                 {
                     "id": "200",
                     "sender_id": _SELF,
-                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "conversation_id": _CONVERSATION,
                     "created_at": "2099-07-20T01:52:00Z",
                     "encoded_event": "our reply",
                 },
                 {
                     "id": "100",
                     "sender_id": _PEER,
-                    "conversation_id": _CONVERSATION.replace("-", ":"),
+                    "conversation_id": _CONVERSATION,
                     "created_at": "2099-07-20T01:51:00Z",
                     "encoded_event": "question",
                 },

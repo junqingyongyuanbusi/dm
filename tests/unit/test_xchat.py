@@ -10,6 +10,7 @@ from social_reply.connectors.xchat.crypto import (
     import_private_key_b64,
     signing_key_entries,
 )
+from social_reply.connectors.xchat.key_cache import canonical_conversation_id
 from social_reply.connectors.xchat.sender import XChatSender
 
 
@@ -101,6 +102,15 @@ def test_xchat_private_key_roundtrip():
     restored = import_private_key_b64(encoded)
     assert restored.has_identity_key()
     assert bytes(restored.export_keys()) == bytes(original.export_keys())
+
+
+def test_xchat_conversation_ids_use_canonical_colon_form():
+    assert canonical_conversation_id("1740258119773458432-2041798240056598528") == (
+        "1740258119773458432:2041798240056598528"
+    )
+    assert canonical_conversation_id("1740258119773458432:2041798240056598528") == (
+        "1740258119773458432:2041798240056598528"
+    )
 
 
 def test_signing_key_entries_maps_api_fields():

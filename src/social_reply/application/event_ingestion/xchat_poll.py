@@ -18,14 +18,18 @@ from social_reply.application.platform_accounts import list_active_accounts_by_p
 from social_reply.connectors.xchat.adapter import canonical_from_decrypted
 from social_reply.connectors.xchat.client import XChatClient
 from social_reply.connectors.xchat.crypto import decrypt_history, signing_key_entries
-from social_reply.connectors.xchat.key_cache import save_conversation_key_events
+from social_reply.connectors.xchat.key_cache import (
+    canonical_conversation_id,
+    save_conversation_key_events,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 
 logger = logging.getLogger(__name__)
 
-_POLL_INTERVAL_SECONDS = int(os.getenv("XCHAT_POLL_INTERVAL_SECONDS", "90"))
+_POLL_INTERVAL_SECONDS = int(os.getenv("XCHAT_POLL_INTERVAL_SECONDS", "900"))
 _MAX_CONVERSATION_PAGES = 3
+_MAX_CONVERSATIONS_PER_POLL = int(os.getenv("XCHAT_MAX_CONVERSATIONS_PER_POLL", "10"))
 _MAX_EVENT_PAGES = 3
 _BACKFILL_REPLY_WINDOW = timedelta(hours=24)
 _last_poll_at: float = 0.0
@@ -69,9 +73,12 @@ async def _poll_account(account) -> list[str]:
     )
     try:
         conversations = await _read_conversations(client)
+        conversations.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         ingested: list[str] = []
-        for conversation in conversations:
-            conversation_id = str(conversation.get("id") or "")
+        for conversation in conversations[:_MAX_CONVERSATIONS_PER_POLL]:
+            conversation_id = canonical_conversation_id(
+                str(conversation.get("id") or "")
+            )
             if not conversation_id:
                 continue
             participant_ids = [str(value) for value in conversation.get("participant_ids") or []]

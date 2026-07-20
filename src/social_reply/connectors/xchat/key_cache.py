@@ -8,9 +8,14 @@ from social_reply.infrastructure.database.engine import get_session_factory
 _CONFIG_FIELD = "xchat_conversation_key_events"
 
 
+def canonical_conversation_id(value: str) -> str:
+    return str(value).replace("-", ":")
+
+
 def conversation_key_events(config: dict, conversation_id: str) -> list[str]:
     cached = dict(config.get(_CONFIG_FIELD) or {})
-    value = cached.get(conversation_id) or []
+    canonical_id = canonical_conversation_id(conversation_id)
+    value = cached.get(canonical_id) or cached.get(conversation_id) or []
     return [str(item) for item in value if item]
 
 
@@ -19,6 +24,7 @@ async def save_conversation_key_events(
     conversation_id: str,
     events: list[str],
 ) -> None:
+    conversation_id = canonical_conversation_id(conversation_id)
     values = list(dict.fromkeys(str(item) for item in events if item))
     if not values:
         return
