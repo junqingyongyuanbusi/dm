@@ -5,56 +5,48 @@
 四元组 → 组装成与手工表单同构的提交,复用 provisioning 管道(凭证校验、加密
 落库、webhook 订阅、审计与任务进度页全部共用,OAuth 层只负责"授权换凭证")。
 
-中间态(request token secret + 发起上下文)经 Fernet 加密存 10 分钟 cookie:
-callback 由 X 302 跳回,属跨站顶级导航,admin 会话 cookie(SameSite=Strict)
-不随行,因此 callback 的授权凭据是这枚加密 state cookie 本身(内含发起者身份
-与租户上下文),SameSite=Lax、一次性、绑定 oauth_token,不依赖登录会话。
-
 前提(需在 X 开发者后台完成一次):App 开启 User authentication,登记回调
 URL {PUBLIC_BASE_URL}/admin/oauth/x/callback;App 类型选 Native App(选
 Web App/Automated App or Bot 会导致 OAuth1 签名校验失败 error 32)。
 """
 
 import logging
-import time
 
 from authlib.integrations.httpx_client import AsyncOAuth1Client
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
 from social_reply.application.account_management.admin import (
     _current_actor,
     _form,
-    _page,
     _require_csrf,
-    _secure_cookie,
-    html,
 )
 from social_reply.application.account_management.jobs import submit_provisioning_job
+from social_reply.application.account_management.oauth.common import (
+    admin_callback_url,
+    notice,
+    read_state,
+    write_state,
+)
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
+from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
 
 _STATE_COOKIE = "reply_x_oauth_state"
-_STATE_TTL_SECONDS = 600
 _X_OAUTH_BASE = "https://api.x.com"
 
 
 def _oauth1_client(**kwargs) -> AsyncOAuth1Client:
     """工厂:测试经 monkeypatch 注入 MockTransport。"""
     return AsyncOAuth1Client(timeout=15, **kwargs)
-
-
-def _callback_url() -> str:
-    return f"{get_settings().public_base_url.rstrip('/')}/admin/oauth/x/callback"
 
 
 async def _x_consumer_credentials() -> tuple[str, str] | None:
@@ -89,13 +81,6 @@ async def _x_consumer_credentials() -> tuple[str, str] | None:
     return None
 
 
-def _notice(title: str, message: str, *, status_code: int = 200) -> HTMLResponse:
-    body = f"""<a class="back" href="/admin/accounts">← 返回账号页</a>
-<section class="card"><h1 style="font-size:24px">{html.escape(title)}</h1>
-<p>{html.escape(message)}</p></section>"""
-    return HTMLResponse(_page(title, body, active="accounts"), status_code=status_code)
-
-
 @router.post("/oauth/x/start")
 async def x_oauth_start(request: Request) -> Response:
     actor = _current_actor(request)
@@ -112,14 +97,14 @@ async def x_oauth_start(request: Request) -> Response:
 
     credentials = await _x_consumer_credentials()
     if credentials is None:
-        return _notice(
+        return notice(
             "无法发起授权",
             "未找到 X App 的 consumer 凭证:请先用手工表单接入至少一个 X 账号,"
             "或在 platform_apps 中配置 App 凭证。",
             status_code=422,
         )
     consumer_key, consumer_secret = credentials
-    callback_url = _callback_url()
+    callback_url = admin_callback_url("/admin/oauth/x/callback")
     try:
         async with _oauth1_client(
             client_id=consumer_key, client_secret=consumer_secret, redirect_uri=callback_url
@@ -131,7 +116,7 @@ async def x_oauth_start(request: Request) -> Response:
             )
     except Exception as exc:  # noqa: BLE001 - 面向运营的失败提示,不区分底层异常类型
         logger.warning("x oauth request_token failed: %s", exc)
-        return _notice(
+        return notice(
             "发起授权失败",
             f"向 X 换取 request token 失败({exc.__class__.__name__})。最常见原因:"
             f"该 App 未开启 User authentication,或未登记回调 URL {callback_url},"
@@ -139,7 +124,11 @@ async def x_oauth_start(request: Request) -> Response:
             status_code=502,
         )
 
-    state = encrypt_secret_bundle(
+    response = RedirectResponse(authorize_url, status_code=status.HTTP_303_SEE_OTHER)
+    write_state(
+        response,
+        request,
+        _STATE_COOKIE,
         {
             "oauth_token": request_token["oauth_token"],
             "oauth_token_secret": request_token["oauth_token_secret"],
@@ -147,17 +136,7 @@ async def x_oauth_start(request: Request) -> Response:
             "brand_id": brand_id,
             "actor": actor,
             "xchat_pin": form.get("xchat_pin", ""),
-            "ts": str(int(time.time())),
-        }
-    )
-    response = RedirectResponse(authorize_url, status_code=status.HTTP_303_SEE_OTHER)
-    response.set_cookie(
-        _STATE_COOKIE,
-        state["__encrypted__"],
-        max_age=_STATE_TTL_SECONDS,
-        httponly=True,
-        samesite="lax",
-        secure=_secure_cookie(request),
+        },
     )
     return response
 
@@ -165,31 +144,24 @@ async def x_oauth_start(request: Request) -> Response:
 @router.get("/oauth/x/callback")
 async def x_oauth_callback(request: Request) -> Response:
     if request.query_params.get("denied"):
-        return _notice("授权已取消", "你在 X 上取消了授权,未做任何变更。")
-    cookie = request.cookies.get(_STATE_COOKIE)
-    if not cookie:
-        return _notice(
-            "授权会话缺失",
-            "找不到发起记录(已超时或浏览器拦截了 Cookie),请回到账号页重新发起。",
+        return notice("授权已取消", "你在 X 上取消了授权,未做任何变更。")
+    state = read_state(request, _STATE_COOKIE)
+    if state is None:
+        return notice(
+            "授权会话无效",
+            "发起记录缺失、已过期(10 分钟)或校验失败,请回到账号页重新发起。",
             status_code=400,
         )
-    try:
-        state = decrypt_secret_bundle({"__encrypted__": cookie})
-    except ValueError:
-        return _notice("授权状态无效", "状态校验失败,请重新发起授权。", status_code=400)
-    issued_at = int(state.get("ts") or 0)
-    if issued_at + _STATE_TTL_SECONDS < int(time.time()):
-        return _notice("授权会话过期", "发起已超过 10 分钟,请重新发起授权。", status_code=400)
     oauth_token = request.query_params.get("oauth_token", "")
     verifier = request.query_params.get("oauth_verifier", "")
     if not oauth_token or not verifier or oauth_token != state.get("oauth_token"):
-        return _notice(
+        return notice(
             "授权参数不匹配", "回调参数与发起记录不一致,请重新发起授权。", status_code=400
         )
 
     credentials = await _x_consumer_credentials()
     if credentials is None:
-        return _notice("无法完成授权", "X App consumer 凭证不可用。", status_code=422)
+        return notice("无法完成授权", "X App consumer 凭证不可用。", status_code=422)
     consumer_key, consumer_secret = credentials
     try:
         async with _oauth1_client(
@@ -201,7 +173,7 @@ async def x_oauth_callback(request: Request) -> Response:
             token = await client.fetch_access_token(f"{_X_OAUTH_BASE}/oauth/access_token", verifier)
     except Exception as exc:  # noqa: BLE001 - request token 一次性,失败只能重新发起
         logger.warning("x oauth access_token failed: %s", exc)
-        return _notice(
+        return notice(
             "换取凭证失败",
             f"向 X 换取 access token 失败({exc.__class__.__name__})。"
             "request token 已失效,请重新发起授权。",
@@ -210,8 +182,6 @@ async def x_oauth_callback(request: Request) -> Response:
 
     screen_name = token.get("screen_name", "")
     submission = {
-        "tenant_id": state["tenant_id"],
-        "brand_id": state.get("brand_id", "default"),
         "name": f"@{screen_name}" if screen_name else "x-oauth",
         "environment": "",
         "consumer_key": consumer_key,

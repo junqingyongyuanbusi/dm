@@ -12,7 +12,7 @@ from authlib.integrations.httpx_client import AsyncOAuth1Client
 from sqlalchemy import insert
 
 from apps.api.main import create_app
-from social_reply.application.account_management import oauth_connect
+from social_reply.application.account_management.oauth import x as oauth_connect
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 

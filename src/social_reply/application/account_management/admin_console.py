@@ -965,16 +965,18 @@ async def accounts_page(request: Request) -> Response:
         + _input("name", "显示名称（可选）", required=False)
     )
     oauth_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/x/callback"
+    meta_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/meta/callback"
     oauth_common = (
         f'<input type="hidden" name="csrf_token" value="{csrf}">'
         + _input("tenant_id", "Tenant", required=True)
         + _input("brand_id", "Brand", required=True)
     )
     connect_forms = f"""<details class="collapse"><summary>接入新平台账号</summary><div class="inner">
-<p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。</p>
+<p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。OAuth 卡片会跳转平台授权页自动换取凭证；手工卡片用于粘贴已有凭证。</p>
 <div class="grid">
 <form class="card" method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{_input("xchat_pin", "XChat 4 位 PIN（可选，启用加密私信）", secret=True, required=False)}<p class="hint">跳转 X 授权页，用要接入的账号登录并授权，凭证自动换取入库。前提（一次性）：X 开发者后台该 App 开启 User authentication，回调 URL 登记 <code>{html.escape(oauth_callback)}</code>，App 类型选 Native App。</p><button class="btn-block">跳转 X 授权</button></form>
-<form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<button class="btn-block">连接 Telegram</button></form>
+<form class="card" method="post" action="/admin/oauth/meta/start"><h3>Facebook / Instagram · OAuth 一键授权（推荐）</h3>{oauth_common}<label for="f-oauth-meta-platform">平台</label><select id="f-oauth-meta-platform" name="platform"><option value="facebook">Facebook Page</option><option value="instagram">Instagram（专业账号，经 Facebook 授权）</option></select><p class="hint">跳转 Meta 授权页，授权后自动列出你管理的 Page（多个时可选择），凭证自动换取入库。前提（一次性）：Meta App 添加 Facebook Login 产品，Valid OAuth Redirect URIs 登记 <code>{html.escape(meta_callback)}</code>；需已用手工表单接入过一次（创建 App 凭证记录）；App 未过审时仅 App 角色账号可授权。Instagram 需为专业账号并关联 Facebook Page。</p><button class="btn-block">跳转 Meta 授权</button></form>
+<form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<p class="hint">Telegram 无 OAuth：在 Telegram 中找 @BotFather 发送 /newbot 创建机器人，把返回的 Token 粘贴到上方，提交后自动校验并注册 webhook。</p><button class="btn-block">连接 Telegram</button></form>
 <form class="card" method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform"><option>facebook</option><option>instagram</option></select>{_input("external_account_id", "Page / IG Account ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 Meta</button></form>
 <form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
 <form class="card" method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}{_input("environment", "Account Activity Environment")}{_input("xchat_pin", "XChat 4 位 PIN（启用加密私信，建议填写）", secret=True, required=False)}<button class="btn-block">连接 X</button></form>
