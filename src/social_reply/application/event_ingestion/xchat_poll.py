@@ -168,14 +168,22 @@ async def _poll_conversation(
         key=lambda value: _as_int((value.get("envelope") or {}).get("id")) or 0,
     )
     if not bootstrapped:
-        recent_inbound = [
-            item
-            for item in ordered
-            if str((item.get("envelope") or {}).get("sender_id"))
-            != str(account.external_account_id)
-            and _within_backfill_reply_window(item.get("envelope") or {})
-        ]
-        ordered = recent_inbound[-1:]
+        # If the newest history event is ours, the conversation has already been
+        # answered in XChat and no historical inbound should trigger another reply.
+        newest_sender = (
+            str((ordered[-1].get("envelope") or {}).get("sender_id")) if ordered else ""
+        )
+        if newest_sender == str(account.external_account_id):
+            ordered = []
+        else:
+            recent_inbound = [
+                item
+                for item in ordered
+                if str((item.get("envelope") or {}).get("sender_id"))
+                != str(account.external_account_id)
+                and _within_backfill_reply_window(item.get("envelope") or {})
+            ]
+            ordered = recent_inbound[-1:]
     ingested: list[str] = []
     for item in ordered:
         envelope = item["envelope"]
