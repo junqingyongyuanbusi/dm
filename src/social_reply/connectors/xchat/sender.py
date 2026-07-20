@@ -20,6 +20,7 @@ class XChatSender:
         external_account_id: str,
         private_keys_b64: str,
         signing_key_version: str,
+        conversation_key_events: dict[str, list[str]] | None = None,
         api_base_url: str = "https://api.x.com",
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -27,6 +28,7 @@ class XChatSender:
         self._external_account_id = external_account_id
         self._private_keys_b64 = private_keys_b64
         self._signing_key_version = signing_key_version
+        self._conversation_key_events = dict(conversation_key_events or {})
         self._auth = ClientAuth(
             consumer_key,
             consumer_secret,
@@ -44,7 +46,11 @@ class XChatSender:
         if target.get("kind") != "x_chat":
             raise ValueError(f"unsupported_xchat_target:{target.get('kind')}")
         conversation_id = str(target["conversation_id"])
-        events = await self._read_history(conversation_id)
+        events = list(self._conversation_key_events.get(conversation_id) or [])
+        if not events:
+            events = await self._read_history(conversation_id)
+            if events:
+                self._conversation_key_events[conversation_id] = events
         chat = import_private_key_b64(self._private_keys_b64)
         # import_keys restores private material but not the public signing-key
         # version required when creating a signed outgoing event.

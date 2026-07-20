@@ -18,6 +18,7 @@ from social_reply.application.platform_accounts import list_active_accounts_by_p
 from social_reply.connectors.xchat.adapter import canonical_from_decrypted
 from social_reply.connectors.xchat.client import XChatClient
 from social_reply.connectors.xchat.crypto import decrypt_history, signing_key_entries
+from social_reply.connectors.xchat.key_cache import save_conversation_key_events
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 
@@ -150,6 +151,8 @@ async def _poll_conversation(
         key_change_events=key_changes,
         signing_keys=signing_keys,
     )
+    if key_changes:
+        await save_conversation_key_events(account.id, conversation_id, key_changes)
     if errors:
         logger.error(
             "xchat decrypt errors account=%s conversation=%s count=%d indexes=%s",

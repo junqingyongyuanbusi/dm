@@ -88,6 +88,7 @@ def _build_sender(account: PlatformAccountRuntime) -> PlatformSender:
                 external_account_id=account.external_account_id,
                 private_keys_b64=private_keys,
                 signing_key_version=signing_version,
+                conversation_key_events=account.config.get("xchat_conversation_key_events"),
                 api_base_url=account.config.get("api_base_url", "https://api.x.com"),
             ),
         )

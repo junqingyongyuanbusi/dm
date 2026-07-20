@@ -207,6 +207,7 @@ async def test_xchat_sender_restores_signing_key_version(monkeypatch):
         external_account_id="bot-1",
         private_keys_b64="private",
         signing_key_version="17",
+        conversation_key_events={"bot-1:user-1": ["event"]},
         transport=httpx.MockTransport(handler),
     )
     try:
@@ -218,3 +219,4 @@ async def test_xchat_sender_restores_signing_key_version(monkeypatch):
         await sender.aclose()
     assert sent == "sent-1"
     assert calls[0] == ("set_key_version", "17")
+    assert calls[1] == ("extract_conversation_keys", "event")
