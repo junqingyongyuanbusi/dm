@@ -1,10 +1,6 @@
 import uuid
 
-from sqlalchemy import select
-
 from social_reply.application.account_management.provisioning import provision_platform_app
-from social_reply.infrastructure.database import models
-from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
 _X_APP_PUBLIC_ID = "x_oauth"
@@ -43,18 +39,3 @@ async def ensure_x_platform_app(
         },
         config={"api_base_url": _X_API_BASE_URL},
     )
-
-
-async def x_platform_app_id(*, tenant_id: str) -> uuid.UUID | None:
-    credentials = x_app_credentials()
-    if credentials is None:
-        return None
-    consumer_key, _consumer_secret = credentials
-    async with get_session_factory()() as session:
-        return await session.scalar(
-            select(models.PlatformApp.id).where(
-                models.PlatformApp.tenant_id == tenant_id,
-                models.PlatformApp.platform_family == "x",
-                models.PlatformApp.external_app_id == consumer_key,
-            )
-        )
