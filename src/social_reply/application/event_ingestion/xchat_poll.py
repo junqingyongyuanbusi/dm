@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 from sqlalchemy import update
 
+from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.event_ingestion.direct import ingest_canonical_event
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 from social_reply.connectors.xchat.adapter import canonical_from_decrypted
@@ -44,7 +45,7 @@ async def poll_xchat_messages() -> list[str]:
 
     ingested: list[str] = []
     for account in await list_active_accounts_by_platform("x"):
-        if not account.credential_bundle.get("xchat_private_keys_b64"):
+        if not x_credentials(account).get("xchat_private_keys_b64"):
             continue
         try:
             ingested.extend(await _poll_account(account))
@@ -64,11 +65,12 @@ async def _poll_account(account) -> list[str]:
     if not self_id:
         logger.warning("xchat account %s has no external_account_id", account.id)
         return []
+    credentials = x_credentials(account)
     client = XChatClient(
-        consumer_key=account.credential_bundle["consumer_key"],
-        consumer_secret=account.credential_bundle["consumer_secret"],
-        access_token=account.credential_bundle["access_token"],
-        access_token_secret=account.credential_bundle["access_token_secret"],
+        consumer_key=credentials["consumer_key"],
+        consumer_secret=credentials["consumer_secret"],
+        access_token=credentials["access_token"],
+        access_token_secret=credentials["access_token_secret"],
         api_base_url=(account.config or {}).get("api_base_url", "https://api.x.com"),
     )
     try:
@@ -129,6 +131,7 @@ async def _poll_conversation(
     conversation_id: str,
     peer_id: str,
 ) -> list[str]:
+    credentials = x_credentials(account)
     cursor = ((account.config or {}).get("xchat_cursors") or {}).get(conversation_id)
     bootstrapped = bool(
         ((account.config or {}).get("xchat_bootstrapped") or {}).get(conversation_id)
@@ -153,7 +156,7 @@ async def _poll_conversation(
             signing_key_entries(sender_id, await client.get_user_public_keys(sender_id))
         )
     decrypted, _keys, errors = decrypt_history(
-        private_keys_b64=account.credential_bundle["xchat_private_keys_b64"],
+        private_keys_b64=credentials["xchat_private_keys_b64"],
         message_events=envelopes,
         key_change_events=key_changes,
         signing_keys=signing_keys,

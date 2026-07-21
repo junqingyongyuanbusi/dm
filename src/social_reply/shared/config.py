@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     admin_password: SecretStr = SecretStr("")
     public_base_url: str = "http://localhost:8000"
     admin_allowed_tenants: str = "default"
+    # X App-level OAuth 1.0a credentials. Like Postiz, these belong to the
+    # deployment, while each authorized account stores only its user token pair.
+    x_api_key: SecretStr = SecretStr("")
+    x_api_secret: SecretStr = SecretStr("")
     account_secrets_root: Path = Path(".secrets/accounts")
     platform_secret_keys: SecretStr = SecretStr("")
     openai_api_key: str = ""
@@ -76,6 +80,10 @@ class Settings(BaseSettings):
             raise ValueError("ADMIN_USERNAME/ADMIN_PASSWORD 未配置")
         if not self.testing and not self.public_base_url.startswith("https://"):
             raise ValueError("PUBLIC_BASE_URL 在生产环境必须使用 https://")
+        x_key = self.x_api_key.get_secret_value()
+        x_secret = self.x_api_secret.get_secret_value()
+        if bool(x_key) != bool(x_secret):
+            raise ValueError("X_API_KEY 与 X_API_SECRET 必须同时配置或同时留空")
         if not self.platform_secret_key_list:
             raise ValueError("PLATFORM_SECRET_KEYS 未配置；平台凭证必须使用应用层加密")
         from social_reply.infrastructure.secret_crypto import SecretCipher
@@ -97,6 +105,12 @@ class Settings(BaseSettings):
             for key in self.platform_secret_keys.get_secret_value().split(",")
             if key.strip()
         )
+
+    @property
+    def x_app_credentials(self) -> tuple[str, str] | None:
+        key = self.x_api_key.get_secret_value().strip()
+        secret = self.x_api_secret.get_secret_value().strip()
+        return (key, secret) if key and secret else None
 
     @property
     def allowed_admin_tenants(self) -> frozenset[str]:

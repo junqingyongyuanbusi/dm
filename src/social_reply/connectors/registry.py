@@ -1,5 +1,6 @@
 import uuid
 
+from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.platform_accounts import (
     PlatformAccountRuntime,
     get_platform_account_runtime,
@@ -65,6 +66,7 @@ def _build_sender(account: PlatformAccountRuntime) -> PlatformSender:
             api_version=account.config.get("api_version", "v23.0"),
         )
     if account.platform == "x":
+        credentials = x_credentials(account)
         legacy = XClient(
             consumer_key=credentials["consumer_key"],
             consumer_secret=credentials["consumer_secret"],

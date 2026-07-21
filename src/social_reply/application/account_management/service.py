@@ -7,6 +7,8 @@ import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
 from social_reply.application.account_management.provisioning import provision_direct_account
+from social_reply.application.account_management.x_app import ensure_x_platform_app
+from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.platform_accounts import (
     get_platform_account_runtime,
     get_platform_account_runtime_by_external_id,
@@ -234,7 +236,7 @@ async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
     account = await get_platform_account_runtime(account_id)
     if account.platform != "x" or not account.external_account_id:
         raise ValueError("x_account_not_found")
-    credentials = account.credential_bundle
+    credentials = x_credentials(account)
     client = XChatClient(
         consumer_key=credentials["consumer_key"],
         consumer_secret=credentials["consumer_secret"],
@@ -334,6 +336,11 @@ async def connect_x_account(
         credentials["xchat_signing_key_version"] = existing_xchat_credentials[
             "xchat_signing_key_version"
         ]
+    platform_app_id, app_public_id = await ensure_x_platform_app(
+        tenant_id=tenant_id,
+        consumer_key=credentials["consumer_key"],
+        consumer_secret=credentials["consumer_secret"],
+    )
     account_id, resolved_public_id = await provision_direct_account(
         platform="x",
         external_account_id=external_account_id,
@@ -358,15 +365,18 @@ async def connect_x_account(
             "max_text_length": 280,
         },
         automation_default=automation_default,
+        platform_app_id=platform_app_id,
     )
     return AccountConnectionResult(
         account_id=account_id,
         platform="x",
         external_account_id=external_account_id,
         public_id=resolved_public_id,
-        webhook_url=_webhook_url(public_base_url, f"/webhooks/x/{resolved_public_id}"),
+        webhook_url=_webhook_url(public_base_url, f"/webhooks/x/{app_public_id}"),
         name=name or me.get("username") or me.get("name") or external_account_id,
         automation_default=automation_default,
+        platform_app_id=platform_app_id,
+        app_public_id=app_public_id,
         manual_steps=(
             "在 X Developer Portal 注册返回的 webhook_url，并保留 legacy 订阅。",
             (

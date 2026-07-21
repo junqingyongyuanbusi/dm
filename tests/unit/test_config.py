@@ -11,6 +11,8 @@ _ENV_KEYS = [
     "LLM_PROVIDER",
     "OPENAI_API_KEY",
     "PLATFORM_SECRET_KEYS",
+    "X_API_KEY",
+    "X_API_SECRET",
     "TESTING",
 ]
 
@@ -68,6 +70,14 @@ def test_非测试环境_凭证齐全通过() -> None:
         openai_api_key="sk-test",
     )
     assert settings.openai_api_key == "sk-test"
+
+
+def test_x_app_credentials_must_be_configured_as_a_pair() -> None:
+    with pytest.raises(ValueError, match="X_API_KEY"):
+        _make(testing=True, x_api_key="key-only")
+
+    settings = _make(testing=True, x_api_key="key", x_api_secret="secret")
+    assert settings.x_app_credentials == ("key", "secret")
 
 
 def test_非测试环境_stub_provider_拒绝() -> None:

@@ -3,6 +3,7 @@ import uuid
 
 from sqlalchemy import update
 
+from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.event_ingestion.direct import ingest_canonical_event
 from social_reply.application.platform_accounts import get_platform_account_runtime
 from social_reply.connectors.xchat.adapter import canonical_from_decrypted
@@ -27,7 +28,7 @@ async def process_xchat_raw_event(raw_event_id: uuid.UUID, account_id: uuid.UUID
         payload = dict(raw.payload or {})
     data = payload.get("data") or {}
     encrypted = data.get("payload") or {}
-    credentials = account.credential_bundle
+    credentials = x_credentials(account)
     private_keys = credentials.get("xchat_private_keys_b64")
     if not private_keys:
         await _mark(raw_event_id, "XCHAT_PIN_REQUIRED")

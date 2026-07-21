@@ -145,8 +145,14 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         assert kwargs["capability"]["x_chat"] is True
         return uuid.uuid4(), "primary"
 
+    app_id = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+
+    async def fake_x_app(**kwargs):
+        return app_id, "x_oauth"
+
     monkeypatch.setattr(service, "XClient", FakeXClient)
     monkeypatch.setattr(service, "get_platform_account_runtime_by_external_id", fake_existing)
+    monkeypatch.setattr(service, "ensure_x_platform_app", fake_x_app)
     monkeypatch.setattr(service, "provision_direct_account", fake_provision)
 
     result = await service.connect_x_account(
@@ -159,6 +165,9 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         secrets_root=tmp_path,
     )
     assert "XChat 已解锁" in result.manual_steps[1]
+    assert result.platform_app_id == app_id
+    assert result.app_public_id == "x_oauth"
+    assert result.webhook_url == "https://reply.example.com/webhooks/x/x_oauth"
 
 
 async def test_enable_xchat_updates_existing_account_without_persisting_pin(monkeypatch):

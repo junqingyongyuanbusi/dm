@@ -13,6 +13,7 @@ import time
 
 import httpx
 
+from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ async def ensure_x_webhooks_valid() -> list[str]:
     revalidated: list[str] = []
     seen_apps: set[str] = set()
     for account in await list_active_accounts_by_platform("x"):
-        creds = account.credential_bundle
+        creds = x_credentials(account)
         consumer_key = creds.get("consumer_key")
         consumer_secret = creds.get("consumer_secret")
         if not consumer_key or not consumer_secret or consumer_key in seen_apps:

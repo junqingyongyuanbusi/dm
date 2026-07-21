@@ -5,7 +5,11 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy import insert
 
 from social_reply.application.event_ingestion.direct_actors import process_direct_event
-from social_reply.application.platform_accounts import find_platform_account_by_public_id
+from social_reply.application.platform_accounts import (
+    find_platform_account_by_external_id,
+    find_platform_account_by_public_id,
+    find_platform_app_by_public_id,
+)
 from social_reply.connectors.x.adapter import XWebhookAdapter
 from social_reply.connectors.x.signature import crc_response, verify_x_signature
 from social_reply.domain.messages.canonical import canonical_event_to_dict
@@ -17,14 +21,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _webhook_secret(public_id: str) -> str:
+    app = await find_platform_app_by_public_id(platform_family="x", public_id=public_id)
+    if app is not None:
+        return app.credential_bundle["consumer_secret"]
+    account = await find_platform_account_by_public_id(platform="x", public_id=public_id)
+    if account is not None:
+        return account.webhook_secret_bundle["consumer_secret"]
+    raise HTTPException(status_code=404, detail="x_webhook_not_found")
+
+
+async def _event_account(public_id: str, payload: dict):
+    app = await find_platform_app_by_public_id(platform_family="x", public_id=public_id)
+    if app is None:
+        return await find_platform_account_by_public_id(platform="x", public_id=public_id)
+    data = payload.get("data") or {}
+    external_account_id = str(
+        payload.get("for_user_id") or (data.get("filter") or {}).get("user_id") or ""
+    )
+    if not external_account_id:
+        return None
+    return await find_platform_account_by_external_id(
+        platform="x",
+        external_account_id=external_account_id,
+        platform_app_id=app.id,
+    )
+
+
 @router.get("/webhooks/x/{public_id}")
 async def x_crc(public_id: str, crc_token: str = Query()) -> dict[str, str]:
-    account = await find_platform_account_by_public_id(platform="x", public_id=public_id)
-    if account is None:
-        raise HTTPException(status_code=404, detail="x_account_not_found")
     return {
         "response_token": crc_response(
-            consumer_secret=account.webhook_secret_bundle["consumer_secret"],
+            consumer_secret=await _webhook_secret(public_id),
             crc_token=crc_token,
         )
     }
@@ -32,17 +60,17 @@ async def x_crc(public_id: str, crc_token: str = Query()) -> dict[str, str]:
 
 @router.post("/webhooks/x/{public_id}")
 async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
-    account = await find_platform_account_by_public_id(platform="x", public_id=public_id)
-    if account is None:
-        raise HTTPException(status_code=404, detail="x_account_not_found")
     body = await request.body()
     if not verify_x_signature(
-        consumer_secret=account.webhook_secret_bundle["consumer_secret"],
+        consumer_secret=await _webhook_secret(public_id),
         body=body,
         signature=request.headers.get("X-Twitter-Webhooks-Signature"),
     ):
         raise HTTPException(status_code=401, detail="invalid_x_signature")
     payload = json.loads(body)
+    account = await _event_account(public_id, payload)
+    if account is None:
+        raise HTTPException(status_code=404, detail="x_event_account_not_found")
     event_type = str((payload.get("data") or {}).get("event_type") or "")
     is_xchat = event_type.startswith("chat.")
     adapter = XWebhookAdapter(

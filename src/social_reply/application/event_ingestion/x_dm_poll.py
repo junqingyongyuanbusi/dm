@@ -7,6 +7,7 @@ import time
 import httpx
 from sqlalchemy import update
 
+from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.event_ingestion.direct import ingest_canonical_event
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 from social_reply.connectors.x.adapter import XWebhookAdapter
@@ -61,11 +62,12 @@ async def _poll_account(account) -> list[str]:
     cursor = config.get("x_dm_cursor")
     # Existing deployments already persisted a cursor before the explicit bootstrap marker existed.
     bootstrapped = bool(config.get("x_dm_bootstrapped")) or cursor is not None
+    credentials = x_credentials(account)
     client = XClient(
-        consumer_key=account.credential_bundle["consumer_key"],
-        consumer_secret=account.credential_bundle["consumer_secret"],
-        access_token=account.credential_bundle["access_token"],
-        access_token_secret=account.credential_bundle["access_token_secret"],
+        consumer_key=credentials["consumer_key"],
+        consumer_secret=credentials["consumer_secret"],
+        access_token=credentials["access_token"],
+        access_token_secret=credentials["access_token_secret"],
         api_base_url=account.config.get("api_base_url", "https://api.x.com"),
     )
     try:

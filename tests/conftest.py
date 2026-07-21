@@ -17,6 +17,8 @@ _TEST_DEFAULTS = {
     "ADMIN_PASSWORD": "test-admin-password",
     "PUBLIC_BASE_URL": "https://reply.example.com",
     "ADMIN_ALLOWED_TENANTS": "default,tenant-a,tenant-b",
+    "X_API_KEY": "ck-app",
+    "X_API_SECRET": "cs-app",
     "LLM_PROVIDER": "stub",
     "PLATFORM_SECRET_KEYS": "Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
     "OPENAI_API_KEY": "",

@@ -79,7 +79,7 @@ async def test_sweep_throttles_and_dedupes_by_consumer_key(monkeypatch):
 
     x_webhook_health._last_check_at = 0.0
     await x_webhook_health.ensure_x_webhooks_valid()
-    assert checked == ["ck"]  # 同 consumer_key 只查一次
+    assert checked == ["ck"]  # 同 consumer key 的账号只查一次
 
     await x_webhook_health.ensure_x_webhooks_valid()  # 间隔内:节流跳过
     assert checked == ["ck"]
