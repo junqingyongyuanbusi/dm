@@ -13,10 +13,10 @@ A Control Plane outage must not stop already-connected accounts from receiving o
 
 ## Trust boundaries
 
-1. Browser administrators authenticate with a dedicated signed, HTTP-only session cookie. The browser never receives `CONTROL_API_KEY`.
+1. Browser administrators authenticate through PostgreSQL-backed server-side sessions. The browser receives only an opaque, HTTP-only session token; PostgreSQL stores its HMAC digest, never the raw token. The browser never receives `CONTROL_API_KEY`.
 2. `CONTROL_API_KEY` remains a server-to-server credential for automation and future external admin services.
 3. Platform credentials are accepted only over TLS and stored as application-encrypted Fernet envelopes in PostgreSQL. Encryption keys remain outside PostgreSQL in `PLATFORM_SECRET_KEYS`; job request/result JSON never contains credentials.
-4. Every mutation is tenant-scoped and audited with the human or service actor.
+4. `ADMIN_USERNAME` / `ADMIN_PASSWORD` remain the bootstrap superadmin and may access every tenant in `ADMIN_ALLOWED_TENANTS`. Database users are bound to exactly one tenant; every read and mutation is scoped to the current Principal and audited with the human or service actor.
 5. Webhook route identifiers are globally unambiguous within their platform namespace.
 6. Sender instances are isolated by `(platform, platform_account_id, config_version)`.
 
@@ -72,12 +72,16 @@ At delivery time the system revalidates account status, tenant/account/conversat
 
 The built-in administration surface provides:
 
-- login/logout with a signed HTTP-only cookie and CSRF checks;
+- bootstrap-superadmin and tenant-user login/logout with opaque HTTP-only cookies, server-side revocation, and CSRF checks;
+- superadmin-only direct user creation at `/admin/users`, with no email/invitation flow;
+- mandatory first-login password change for newly created tenant users;
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
 - account enable/disable and health checks;
 - no account-creation CLI requirement.
+
+OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.
 
 Production deployments should put `/admin` behind an identity-aware proxy or replace the local administrator login with OIDC/MFA. The service API and data-plane webhooks remain separate.
 

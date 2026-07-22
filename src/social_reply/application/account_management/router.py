@@ -53,6 +53,7 @@ class MetaAccountRequest(_BaseAccountRequest):
     verify_token: SecretStr
     api_version: str = Field(default="v23.0", pattern=r"^v\d+\.\d+$")
     instagram_login_mode: Literal["facebook_login", "instagram_login"] = "facebook_login"
+    page_id: str | None = Field(default=None, min_length=1, max_length=255)
     enable_dm: bool = True
     enable_comments: bool = True
 

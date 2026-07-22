@@ -13,6 +13,13 @@ _ENV_KEYS = [
     "PLATFORM_SECRET_KEYS",
     "X_API_KEY",
     "X_API_SECRET",
+    "FACEBOOK_APP_ID",
+    "FACEBOOK_APP_SECRET",
+    "META_VERIFY_TOKEN",
+    "INSTAGRAM_APP_ID",
+    "INSTAGRAM_APP_SECRET",
+    "INSTAGRAM_VERIFY_TOKEN",
+    "ADMIN_ALLOWED_TENANTS",
     "TESTING",
 ]
 
@@ -78,6 +85,40 @@ def test_x_app_credentials_must_be_configured_as_a_pair() -> None:
 
     settings = _make(testing=True, x_api_key="key", x_api_secret="secret")
     assert settings.x_app_credentials == ("key", "secret")
+
+
+def test_meta_app_credentials_must_be_configured_as_pairs() -> None:
+    with pytest.raises(ValueError, match="FACEBOOK_APP_ID"):
+        _make(testing=True, facebook_app_id="facebook-only")
+    with pytest.raises(ValueError, match="INSTAGRAM_APP_ID"):
+        _make(testing=True, instagram_app_secret="instagram-secret-only")
+
+    settings = _make(
+        testing=True,
+        facebook_app_id="facebook-app",
+        facebook_app_secret="facebook-secret",
+        instagram_app_id="instagram-app",
+        instagram_app_secret="instagram-secret",
+    )
+    assert settings.facebook_app_credentials == ("facebook-app", "facebook-secret")
+    assert settings.instagram_app_credentials == ("instagram-app", "instagram-secret")
+
+
+def test_非测试环境_空_admin_allowed_tenants_拒绝() -> None:
+    with pytest.raises(ValueError, match="ADMIN_ALLOWED_TENANTS"):
+        _make(
+            testing=False,
+            chatwoot_webhook_secret="real-secret",
+            chatwoot_api_token="real-token",
+            control_api_key="control-token",
+            admin_session_secret="x" * 32,
+            admin_username="admin",
+            admin_password="password",
+            public_base_url="https://reply.example.com",
+            admin_allowed_tenants="",
+            llm_provider="openai",
+            openai_api_key="sk-test",
+        )
 
 
 def test_非测试环境_stub_provider_拒绝() -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
+from social_reply.application.account_management.meta_subscription import subscribe_meta_account
 from social_reply.application.account_management.provisioning import provision_direct_account
 from social_reply.application.account_management.x_app import ensure_x_platform_app
 from social_reply.application.account_management.x_credentials import x_credentials
@@ -143,9 +144,10 @@ async def connect_meta_account(
     app_name: str | None = None,
     public_id: str | None = None,
     secrets_root: Path = Path(".secrets/accounts"),
-    graph_base_url: str = "https://graph.facebook.com",
+    graph_base_url: str | None = None,
     api_version: str = "v23.0",
     instagram_login_mode: str = "facebook_login",
+    page_id: str | None = None,
     enable_dm: bool = True,
     enable_comments: bool = True,
     automation_default: str = "BOT_DRAFT_ONLY",
@@ -156,6 +158,11 @@ async def connect_meta_account(
         raise ValueError(f"unsupported_meta_platform:{platform}")
     if instagram_login_mode not in {"facebook_login", "instagram_login"}:
         raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
+    graph_base_url = graph_base_url or (
+        "https://graph.instagram.com"
+        if platform == "instagram" and instagram_login_mode == "instagram_login"
+        else "https://graph.facebook.com"
+    )
     if not enable_dm and not enable_comments:
         raise ValueError("meta_account_requires_dm_or_comments")
     _validate_automation_default(automation_default)
@@ -168,6 +175,8 @@ async def connect_meta_account(
         external_account_id=external_account_id,
         graph_base_url=graph_base_url,
         api_version=api_version,
+        instagram_login_mode=instagram_login_mode,
+        page_id=page_id,
         transport=transport,
     )
     try:
@@ -187,6 +196,11 @@ async def connect_meta_account(
         secrets_root=secrets_root,
         graph_base_url=graph_base_url,
         api_version=api_version,
+        platform_family=(
+            "instagram"
+            if platform == "instagram" and instagram_login_mode == "instagram_login"
+            else "meta"
+        ),
     )
     # Meta App 与账号分两次幂等 upsert：账号落库失败时 App 仍可安全复用，
     # 但不向调用方返回成功；下次请求会使用相同 app_id/public_id 收敛。
@@ -205,6 +219,7 @@ async def connect_meta_account(
             "graph_base_url": graph_base_url,
             "api_version": api_version,
             "instagram_login_mode": instagram_login_mode,
+            **({"page_id": page_id} if page_id else {}),
         },
         capability={
             "dm": enable_dm,
@@ -213,6 +228,21 @@ async def connect_meta_account(
         },
         automation_default=automation_default,
         platform_app_id=platform_app_id,
+    )
+    subscribed_fields = await subscribe_meta_account(
+        platform=platform,
+        access_token=access_token,
+        external_account_id=(
+            page_id
+            if platform == "instagram" and instagram_login_mode == "facebook_login" and page_id
+            else external_account_id
+        ),
+        instagram_login_mode=instagram_login_mode,
+        graph_base_url=graph_base_url,
+        api_version=api_version,
+        enable_dm=enable_dm,
+        enable_comments=enable_comments,
+        transport=transport,
     )
     return AccountConnectionResult(
         account_id=account_id,
@@ -227,7 +257,8 @@ async def connect_meta_account(
         verify_token=resolved_verify_token,
         manual_steps=(
             "在 Meta App Dashboard 配置返回的 webhook_url 与 verify_token。",
-            "为账号订阅 messages/comments 等所需字段，并完成 App Review/Advanced Access。",
+            f"账号已自动订阅 webhook 字段：{', '.join(subscribed_fields)}。",
+            "上线前完成 App Review / Advanced Access，并将 App 切换为 Live。",
         ),
     )
 

@@ -1,3 +1,4 @@
+import hashlib
 import secrets
 import uuid
 from pathlib import Path  # noqa: F401  secrets_root 参数签名保留（内联存储后不再使用）
@@ -12,6 +13,20 @@ from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 def make_public_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(12).replace('-', '_')}"
+
+
+def tenant_public_id(prefix: str, tenant_id: str) -> str:
+    safe_tenant = "".join(
+        character
+        if character.isascii() and (character.isalnum() or character in {"_", "-"})
+        else "_"
+        for character in tenant_id
+    ).strip("_")
+    safe_tenant = safe_tenant or "tenant"
+    if safe_tenant != tenant_id:
+        digest = hashlib.sha256(tenant_id.encode()).hexdigest()[:8]
+        safe_tenant = f"{safe_tenant}_{digest}"
+    return f"{prefix}_{safe_tenant}"
 
 
 async def provision_platform_app(

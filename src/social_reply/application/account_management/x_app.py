@@ -1,6 +1,9 @@
 import uuid
 
-from social_reply.application.account_management.provisioning import provision_platform_app
+from social_reply.application.account_management.provisioning import (
+    provision_platform_app,
+    tenant_public_id,
+)
 from social_reply.shared.config import get_settings
 
 _X_APP_PUBLIC_ID = "x_oauth"
@@ -30,7 +33,7 @@ async def ensure_x_platform_app(
         external_app_id=consumer_key,
         tenant_id=tenant_id,
         name="X OAuth App",
-        public_id=_X_APP_PUBLIC_ID,
+        public_id=tenant_public_id(_X_APP_PUBLIC_ID, tenant_id),
         public_id_prefix="xapp",
         secrets_root=get_settings().account_secrets_root,
         credential_bundle={

@@ -21,12 +21,18 @@ class MetaGraphClient:
         external_account_id: str,
         graph_base_url: str = "https://graph.facebook.com",
         api_version: str = "v23.0",
+        instagram_login_mode: str = "facebook_login",
+        page_id: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if platform not in {"facebook", "instagram"}:
             raise ValueError(f"unsupported_meta_platform:{platform}")
+        if instagram_login_mode not in {"facebook_login", "instagram_login"}:
+            raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
         self.platform = platform
         self._external_account_id = external_account_id
+        self._instagram_login_mode = instagram_login_mode
+        self._page_id = page_id
         self._client = httpx.AsyncClient(
             base_url=f"{graph_base_url.rstrip('/')}/{api_version.strip('/')}",
             timeout=httpx.Timeout(connect=3.0, read=10.0, write=10.0, pool=2.0),
@@ -35,11 +41,20 @@ class MetaGraphClient:
             headers={"Authorization": f"Bearer {access_token}"},
         )
 
+    def _messaging_sender_id(self) -> str:
+        if (
+            self.platform == "instagram"
+            and self._instagram_login_mode == "facebook_login"
+            and self._page_id
+        ):
+            return self._page_id
+        return self._external_account_id
+
     async def send_text(self, *, target: dict, text: str) -> str:
         kind = target.get("kind", "dm")
         if kind == "dm":
             response = await self._client.post(
-                f"/{self._external_account_id}/messages",
+                f"/{self._messaging_sender_id()}/messages",
                 json={"recipient": {"id": target["recipient_id"]}, "message": {"text": text}},
             )
         elif kind == "comment":
@@ -49,7 +64,7 @@ class MetaGraphClient:
             )
         elif kind == "private_reply":
             response = await self._client.post(
-                f"/{self._external_account_id}/messages",
+                f"/{self._messaging_sender_id()}/messages",
                 json={"recipient": {"comment_id": target["comment_id"]}, "message": {"text": text}},
             )
         else:
@@ -85,6 +100,22 @@ class MetaGraphClient:
             raise PermanentSendError(f"{label}:{subcode}" if subcode else label, detail)
 
     async def get_account(self) -> dict:
+        if self.platform == "instagram" and self._instagram_login_mode == "instagram_login":
+            response = await self._client.get(
+                "/me",
+                params={"fields": "user_id,username,name"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data")
+            if isinstance(data, list) and data:
+                payload = data[0]
+            account_id = str(payload.get("user_id") or payload.get("id") or "")
+            return {
+                **payload,
+                "id": account_id,
+                "name": payload.get("name") or payload.get("username") or account_id,
+            }
         response = await self._client.get(
             f"/{self._external_account_id}",
             params={"fields": "id,name"},

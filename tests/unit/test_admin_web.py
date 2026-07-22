@@ -18,7 +18,24 @@ async def test_admin_dashboard_redirects_to_login():
     assert response.headers["location"] == "/admin/login"
 
 
-async def test_admin_login_sets_http_only_session_cookie():
+async def test_admin_login_sets_http_only_session_cookie(monkeypatch):
+    from social_reply.application.account_management import admin
+    from social_reply.application.account_management.auth import Principal
+
+    async def fake_authenticate(username, password):
+        assert username == "admin"
+        assert password == "test-admin-password"
+        return (
+            Principal(
+                session_id=__import__("uuid").uuid4(),
+                username="admin",
+                actor="user:admin",
+                allowed_tenants=frozenset({"default"}),
+            ),
+            "opaque-session-token",
+        )
+
+    monkeypatch.setattr(admin, "authenticate", fake_authenticate)
     async with await _client() as client:
         page = await client.get("/admin/login")
         csrf = client.cookies["reply_admin_csrf"]
@@ -36,10 +53,13 @@ async def test_admin_login_sets_http_only_session_cookie():
     assert "reply_admin_session=" in cookie
     assert "HttpOnly" in cookie
     assert "SameSite=strict" in cookie
+    assert "opaque-session-token" in cookie
+    assert "admin" not in cookie.split("reply_admin_session=", 1)[1].split(";", 1)[0]
 
 
 async def test_admin_meta_submission_parses_form_once(monkeypatch):
     from social_reply.application.account_management import admin
+    from social_reply.application.account_management.auth import Principal
 
     captured = {}
 
@@ -50,6 +70,21 @@ async def test_admin_meta_submission_parses_form_once(monkeypatch):
     async def fake_process(_job_id):
         return "COMPLETED"
 
+    principal = Principal(
+        session_id=__import__("uuid").uuid4(),
+        username="admin",
+        actor="user:admin",
+        allowed_tenants=frozenset({"default"}),
+    )
+
+    async def fake_authenticate(_username, _password):
+        return principal, "opaque-session-token"
+
+    async def fake_current_principal(_request):
+        return principal
+
+    monkeypatch.setattr(admin, "authenticate", fake_authenticate)
+    monkeypatch.setattr(admin, "current_principal", fake_current_principal)
     monkeypatch.setattr(admin, "submit_provisioning_job", fake_submit)
     monkeypatch.setattr(
         "social_reply.application.account_management.jobs.process_provisioning_job",

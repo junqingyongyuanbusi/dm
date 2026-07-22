@@ -55,6 +55,10 @@ def _build_sender(account: PlatformAccountRuntime) -> PlatformSender:
             external_account_id=account.external_account_id,
             graph_base_url=account.config.get("graph_base_url", "https://graph.facebook.com"),
             api_version=account.config.get("api_version", "v23.0"),
+            instagram_login_mode=account.config.get(
+                "instagram_login_mode", "facebook_login"
+            ),
+            page_id=account.config.get("page_id"),
         )
     if account.platform == "whatsapp":
         if not account.external_account_id:

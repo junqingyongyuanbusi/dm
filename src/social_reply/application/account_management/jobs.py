@@ -9,6 +9,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.application.account_management.audit import record_account_management_audit
+from social_reply.application.account_management.auth import principal_from_session_row
 from social_reply.application.account_management.service import (
     AccountConnectionResult,
     connect_meta_account,
@@ -62,6 +63,7 @@ async def submit_provisioning_job(
     actor: str,
     request: dict[str, Any],
     secrets: dict[str, str],
+    admin_session_id: uuid.UUID | str | None = None,
 ) -> uuid.UUID:
     if platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
         raise ValueError(f"unsupported_platform:{platform}")
@@ -74,6 +76,13 @@ async def submit_provisioning_job(
     # Secret 内联暂存进 provisioning_jobs 行；job 完成后置 NULL（见 process_provisioning_job）
     safe_request = _safe_request(platform, request)
     async with get_session_factory()() as session:
+        if admin_session_id is not None:
+            principal = await principal_from_session_row(
+                session, admin_session_id, for_update=True
+            )
+            if principal is None or tenant_id not in principal.allowed_tenants:
+                raise PermissionError("admin_session_invalid")
+            actor = principal.actor
         inserted = (
             await session.execute(
                 pg_insert(models.ProvisioningJob)
@@ -224,6 +233,7 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
             verify_token=credentials["verify_token"],
             api_version=request.get("api_version", "v23.0"),
             instagram_login_mode=request.get("instagram_login_mode", "facebook_login"),
+            page_id=request.get("page_id"),
             enable_dm=bool(request.get("enable_dm", True)),
             enable_comments=bool(request.get("enable_comments", True)),
             **common,

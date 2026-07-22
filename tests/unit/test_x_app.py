@@ -25,6 +25,7 @@ async def test_ensure_x_platform_app_persists_shared_app(monkeypatch, tmp_path):
     assert captured["platform_family"] == "x"
     assert captured["external_app_id"] == "key"
     assert captured["tenant_id"] == "tenant-a"
+    assert captured["public_id"] == "x_oauth_tenant-a"
     assert captured["credential_bundle"] == {
         "consumer_key": "key",
         "consumer_secret": "secret",

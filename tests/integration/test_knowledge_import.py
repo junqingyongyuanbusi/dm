@@ -1,9 +1,15 @@
 """回复模板 CSV 导入集成测试（Fake embedder）"""
 
+import io
+
 import pytest
 from sqlalchemy import select
 
-from social_reply.application.knowledge.importer import import_knowledge_csv
+from social_reply.application.knowledge.importer import (
+    MAX_IMPORT_ROWS,
+    import_knowledge_csv,
+    import_knowledge_rows,
+)
 from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
 from social_reply.infrastructure.database.models import KnowledgeChunk, KnowledgeDocument
 
@@ -50,6 +56,18 @@ async def test_导入三行并幂等重复跳过(migrated_db, session, csv_file)
     assert len(docs2) == 3
 
 
+async def test_文本流入口基本导入(migrated_db, session):
+    report = await import_knowledge_rows(
+        io.StringIO(_CSV),
+        source_name="stream.csv",
+        embedder=FakeEmbeddingClient(),
+    )
+    assert (report.inserted, report.skipped, report.blank) == (3, 0, 0)
+    docs = (await session.execute(select(KnowledgeDocument))).scalars().all()
+    assert len(docs) == 3
+    assert all(d.source_file == "stream.csv" for d in docs)
+
+
 async def test_空行与空字段跳过计数(migrated_db, tmp_path):
     path = tmp_path / "bad.csv"
     path.write_text("question,reply\nq1,r1\n,r2\nq3,\n", encoding="utf-8")
@@ -63,3 +81,13 @@ async def test_缺表头中文报错(migrated_db, tmp_path):
     path.write_text("q,a\nx,y\n", encoding="utf-8")
     with pytest.raises(ValueError, match="表头"):
         await import_knowledge_csv(path, embedder=FakeEmbeddingClient())
+
+
+async def test_超行数上限报错(migrated_db):
+    lines = ["question,reply"] + [f"q{i},r{i}" for i in range(MAX_IMPORT_ROWS + 1)]
+    with pytest.raises(ValueError, match="上限"):
+        await import_knowledge_rows(
+            io.StringIO("\n".join(lines) + "\n"),
+            source_name="too-many.csv",
+            embedder=FakeEmbeddingClient(),
+        )

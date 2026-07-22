@@ -33,6 +33,61 @@ async def test_meta_client_sends_dm_and_comment():
     await client.aclose()
 
 
+async def test_facebook_login_instagram_sends_dm_through_page_id():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"message_id": "mid-page"})
+
+    client = MetaGraphClient(
+        platform="instagram",
+        access_token="page-token",
+        external_account_id="ig-1",
+        page_id="page-1",
+        transport=httpx.MockTransport(handler),
+    )
+    assert (
+        await client.send_text(target={"kind": "dm", "recipient_id": "igsid-1"}, text="hi")
+        == "mid-page"
+    )
+    assert requests[0].url.path == "/v23.0/page-1/messages"
+    await client.aclose()
+
+
+async def test_standalone_instagram_client_uses_instagram_graph_endpoints():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"user_id": "ig-1", "username": "shop"})
+        return httpx.Response(200, json={"message_id": "mid-1"})
+
+    client = MetaGraphClient(
+        platform="instagram",
+        access_token="token",
+        external_account_id="ig-1",
+        graph_base_url="https://graph.instagram.com",
+        instagram_login_mode="instagram_login",
+        transport=httpx.MockTransport(handler),
+    )
+    assert await client.get_account() == {
+        "user_id": "ig-1",
+        "username": "shop",
+        "id": "ig-1",
+        "name": "shop",
+    }
+    assert (
+        await client.send_text(target={"kind": "dm", "recipient_id": "igsid-1"}, text="hi")
+        == "mid-1"
+    )
+    assert requests[0].url.host == "graph.instagram.com"
+    assert requests[0].url.path == "/v23.0/me"
+    assert requests[1].url.path == "/v23.0/ig-1/messages"
+    await client.aclose()
+
+
 async def test_x_client_sends_dm_and_reply():
     requests: list[httpx.Request] = []
 

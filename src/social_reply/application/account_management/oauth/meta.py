@@ -1,60 +1,41 @@
-"""Meta(Facebook Page / Instagram 专业账号)OAuth 2.0 授权接入。
-
-一条 Facebook Login 流覆盖两个平台:dialog 授权 → code 换短期 user token →
-fb_exchange_token 换长期 user token → GET /me/accounts 一次取回 Page id/name/
-Page access token/关联 IG 账号。platform=facebook 落 Page 本身;
-platform=instagram 只保留关联了 IG 专业账号的 Page,并以 IG 账号 id 落库
-(入站 webhook entry.id 与发送端点用的都是它)。长期 user token 换出的
-Page token 无固定过期时间,无需刷新任务。
-
-App 凭证(app_id=external_app_id、app_secret、verify_token)取自 platform_apps
-(platform_family=meta,与手工接入创建的是同一行),OAuth 账号与手工账号共享
-webhook challenge 验证(verify_token 是 App 级的)。
-
-多 Page 时渲染选择页:候选(含 Page token)Fernet 加密存 10 分钟一次性
-cookie,浏览器端只见 Page 名称,token 不出服务端信任边界。
-
-前提(Meta App 后台一次性):Facebook Login 产品已添加,Valid OAuth Redirect
-URIs 登记 {PUBLIC_BASE_URL}/admin/oauth/meta/callback;App 未过审时仅
-App 角色(管理员/开发者/测试员)可完成授权。
-"""
+"""Facebook Page and Facebook-connected Instagram OAuth account connection."""
 
 import hashlib
 import hmac
-import json
 import logging
-import secrets as py_secrets
-from dataclasses import dataclass
+import secrets
 from urllib.parse import quote, urlencode
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import select
+from redis.exceptions import RedisError
 
 from social_reply.application.account_management.admin import (
     _CSRF_COOKIE,
     _csrf,
-    _current_actor,
     _form,
     _page,
     _require_csrf,
     _secure_cookie,
+    _web_principal,
     html,
 )
+from social_reply.application.account_management.auth import Principal
 from social_reply.application.account_management.jobs import submit_provisioning_job
+from social_reply.application.account_management.meta_credentials import (
+    MetaAppCredentials,
+    facebook_app_credentials,
+)
 from social_reply.application.account_management.oauth.common import (
     admin_callback_url,
     notice,
-    read_state,
-    write_state,
+    principal_from_oauth_context,
+    store_oauth_state,
+    take_oauth_state,
 )
 from social_reply.application.account_management.submissions import split_submission
-from social_reply.infrastructure.database import models
-from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle
-from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
@@ -65,62 +46,82 @@ _API_VERSION = "v23.0"
 _DIALOG_URL = f"https://www.facebook.com/{_API_VERSION}/dialog/oauth"
 _GRAPH_BASE = f"https://graph.facebook.com/{_API_VERSION}"
 _SCOPES = {
-    "facebook": "pages_show_list,pages_messaging,pages_manage_metadata,pages_read_engagement",
-    "instagram": "pages_show_list,pages_manage_metadata,instagram_basic,instagram_manage_messages",
+    "facebook": (
+        "pages_show_list,pages_messaging,pages_manage_metadata,"
+        "pages_read_engagement,pages_manage_engagement"
+    ),
+    "instagram": (
+        "pages_show_list,pages_manage_metadata,pages_read_engagement,"
+        "instagram_basic,instagram_manage_messages,instagram_manage_comments"
+    ),
 }
 
 
 def _graph_client(**kwargs) -> httpx.AsyncClient:
-    """工厂:测试经 monkeypatch 注入 MockTransport。"""
     return httpx.AsyncClient(base_url=_GRAPH_BASE, timeout=15, **kwargs)
 
 
-@dataclass(frozen=True)
-class _MetaApp:
-    external_app_id: str
-    app_secret: str
-    verify_token: str
-    public_id: str
-
-
-async def _meta_app() -> _MetaApp | None:
-    """取 Meta App 凭证:与手工接入共用 platform_apps(family=meta)同一行。"""
-    async with get_session_factory()() as session:
-        apps = (
-            (
-                await session.execute(
-                    select(models.PlatformApp).where(
-                        models.PlatformApp.platform_family == "meta",
-                        models.PlatformApp.status == "active",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-    for app in apps:
-        try:
-            bundle = decrypt_secret_bundle(app.credential_bundle)
-        except ValueError:
-            logger.warning("platform_app %s has undecryptable credential bundle", app.id)
-            continue
-        app_secret = bundle.get("app_secret")
-        verify_token = bundle.get("verify_token")
-        if app.external_app_id and app_secret and verify_token:
-            return _MetaApp(app.external_app_id, app_secret, verify_token, app.public_id)
-    return None
-
-
 def _proof(token: str, app_secret: str) -> str:
-    """appsecret_proof:服务端 Graph 调用防 token 挪用(App 开启强制校验时必需)。"""
     return hmac.new(app_secret.encode(), token.encode(), hashlib.sha256).hexdigest()
+
+
+async def _exchange_code(
+    *, app: MetaAppCredentials, code: str, redirect_uri: str
+) -> list[dict]:
+    async with _graph_client() as client:
+        short_response = await client.get(
+            "/oauth/access_token",
+            params={
+                "client_id": app.app_id,
+                "client_secret": app.app_secret,
+                "redirect_uri": redirect_uri,
+                "code": code,
+            },
+        )
+        short_response.raise_for_status()
+        short_token = short_response.json()["access_token"]
+        long_response = await client.get(
+            "/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": app.app_id,
+                "client_secret": app.app_secret,
+                "fb_exchange_token": short_token,
+            },
+        )
+        long_response.raise_for_status()
+        long_token = long_response.json()["access_token"]
+        return await _fetch_pages(client, long_token, app.app_secret)
+
+
+async def _fetch_pages(
+    client: httpx.AsyncClient, user_token: str, app_secret: str
+) -> list[dict]:
+    params = {
+        "fields": "id,name,access_token,instagram_business_account{id,username}",
+        "access_token": user_token,
+        "appsecret_proof": _proof(user_token, app_secret),
+        "limit": "100",
+    }
+    response = await client.get("/me/accounts", params=params)
+    response.raise_for_status()
+    payload = response.json()
+    pages = list(payload.get("data") or [])
+    next_url = ((payload.get("paging") or {}).get("next"))
+    while next_url:
+        response = await client.get(next_url)
+        response.raise_for_status()
+        payload = response.json()
+        pages.extend(payload.get("data") or [])
+        next_url = ((payload.get("paging") or {}).get("next"))
+    return pages
 
 
 @router.post("/oauth/meta/start")
 async def meta_oauth_start(request: Request) -> Response:
-    actor = _current_actor(request)
-    if actor is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     platform = form.get("platform", "")
@@ -129,210 +130,224 @@ async def meta_oauth_start(request: Request) -> Response:
     tenant_id = (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
-    if tenant_id not in get_settings().allowed_admin_tenants:
-        raise HTTPException(status_code=403, detail="tenant_access_denied")
-    brand_id = form.get("brand_id", "default") or "default"
+    principal.require_tenant(tenant_id)
 
-    app = await _meta_app()
+    app = await facebook_app_credentials(tenant_id)
     if app is None:
         return notice(
             "无法发起授权",
-            "未找到 Meta App 凭证:请先用手工表单接入一次(会创建 platform_apps 记录,"
-            "含 App ID / App Secret / Verify Token),之后即可 OAuth 一键接入。",
+            "未找到 Meta App 凭证。请配置 FACEBOOK_APP_ID、FACEBOOK_APP_SECRET 和 "
+            "META_VERIFY_TOKEN，或保留一个旧版 Meta PlatformApp。",
             status_code=422,
         )
-    state_token = py_secrets.token_urlsafe(24)
-    dialog_url = (
-        _DIALOG_URL
-        + "?"
-        + urlencode(
+    state_token = secrets.token_urlsafe(32)
+    try:
+        await store_oauth_state(
+            "meta",
+            state_token,
             {
-                "client_id": app.external_app_id,
-                "redirect_uri": admin_callback_url("/admin/oauth/meta/callback"),
-                "state": state_token,
-                "response_type": "code",
-                "scope": _SCOPES[platform],
+                "platform": platform,
+                "tenant_id": tenant_id,
+                "brand_id": (form.get("brand_id") or "default").strip() or "default",
+                "session_id": str(principal.session_id),
             },
-            quote_via=quote,
         )
-    )
-    response = RedirectResponse(dialog_url, status_code=status.HTTP_303_SEE_OTHER)
-    write_state(
-        response,
-        request,
-        _STATE_COOKIE,
+    except (OSError, RedisError) as exc:
+        logger.warning("meta oauth state storage failed: %s", exc)
+        return notice("发起授权失败", "OAuth 临时状态存储不可用，请稍后重试。", status_code=503)
+
+    dialog_url = _DIALOG_URL + "?" + urlencode(
         {
+            "client_id": app.app_id,
+            "redirect_uri": admin_callback_url("/admin/oauth/meta/callback"),
             "state": state_token,
-            "platform": platform,
-            "tenant_id": tenant_id,
-            "brand_id": brand_id,
-            "actor": actor,
+            "response_type": "code",
+            "scope": _SCOPES[platform],
         },
+        quote_via=quote,
     )
-    return response
+    return RedirectResponse(dialog_url, status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.get("/oauth/meta/callback")
 async def meta_oauth_callback(request: Request) -> Response:
+    state_token = request.query_params.get("state", "")
     if request.query_params.get("error"):
+        if state_token:
+            await take_oauth_state("meta", state_token)
         return notice(
             "授权已取消",
-            f"Meta 返回:{request.query_params.get('error_description') or '用户取消了授权'}。"
-            "未做任何变更。",
+            f"Meta 返回：{request.query_params.get('error_description') or '用户取消了授权'}。",
         )
-    state = read_state(request, _STATE_COOKIE)
+    state = await take_oauth_state("meta", state_token) if state_token else None
     if state is None:
         return notice(
             "授权会话无效",
-            "发起记录缺失、已过期(10 分钟)或校验失败,请回到账号页重新发起。",
+            "发起记录缺失、已使用或已过期，请回到账号页重新发起。",
             status_code=400,
         )
-    code = request.query_params.get("code", "")
-    query_state = request.query_params.get("state", "")
-    if not code or not query_state or query_state != state.get("state"):
+    principal = await principal_from_oauth_context(state)
+    if principal is None:
         return notice(
-            "授权参数不匹配", "回调参数与发起记录不一致,请重新发起授权。", status_code=400
+            "授权会话已失效",
+            "管理员会话已退出、过期或失去 Tenant 权限，请重新登录并发起授权。",
+            status_code=403,
         )
-    app = await _meta_app()
+    code = request.query_params.get("code", "")
+    if not code:
+        return notice("授权参数不完整", "请重新发起授权。", status_code=400)
+    app = await facebook_app_credentials(state["tenant_id"])
     if app is None:
-        return notice("无法完成授权", "Meta App 凭证不可用。", status_code=422)
+        return notice("无法完成授权", "Facebook App 凭证当前不可用。", status_code=422)
 
     redirect_uri = admin_callback_url("/admin/oauth/meta/callback")
     try:
-        async with _graph_client() as client:
-            short_response = await client.get(
-                "/oauth/access_token",
-                params={
-                    "client_id": app.external_app_id,
-                    "client_secret": app.app_secret,
-                    "redirect_uri": redirect_uri,
-                    "code": code,
-                },
-            )
-            short_response.raise_for_status()
-            short_token = short_response.json()["access_token"]
-            long_response = await client.get(
-                "/oauth/access_token",
-                params={
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app.external_app_id,
-                    "client_secret": app.app_secret,
-                    "fb_exchange_token": short_token,
-                },
-            )
-            long_response.raise_for_status()
-            long_token = long_response.json()["access_token"]
-            pages_response = await client.get(
-                "/me/accounts",
-                params={
-                    "fields": "id,name,access_token,instagram_business_account{id,username}",
-                    "access_token": long_token,
-                    "appsecret_proof": _proof(long_token, app.app_secret),
-                    "limit": "100",
-                },
-            )
-            pages_response.raise_for_status()
-            pages = pages_response.json().get("data", [])
-    except Exception as exc:  # noqa: BLE001 - code 一次性,失败只能重新发起
-        logger.warning("meta oauth exchange failed: %s", exc)
+        pages = await _exchange_code(
+            app=app,
+            code=code,
+            redirect_uri=redirect_uri,
+        )
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        logger.warning(
+            "meta oauth exchange failed type=%s status=%s",
+            exc.__class__.__name__,
+            status_code,
+        )
         return notice(
             "换取凭证失败",
-            f"与 Meta 交换 token 失败({exc.__class__.__name__})。常见原因:App 后台"
-            f"未登记回调 URL {redirect_uri},或授权账号不是 App 角色(开发模式限制)。",
+            f"与 Meta 交换 Token 失败（{exc.__class__.__name__}）。请检查回调地址、"
+            "权限和 App Review 状态。",
             status_code=502,
         )
 
-    platform = state["platform"]
+    principal = await principal_from_oauth_context(state)
+    if principal is None:
+        return notice(
+            "授权会话已失效",
+            "管理员会话在授权期间已退出、过期或失去 Tenant 权限，请重新发起。",
+            status_code=403,
+        )
+
+    candidates = _candidates(pages, state["platform"])
+    if not candidates:
+        return notice(
+            "没有可接入的目标",
+            (
+                "没有找到关联 Facebook Page 的 Instagram 专业账号。"
+                if state["platform"] == "instagram"
+                else "没有找到当前用户可管理的 Facebook Page。"
+            ),
+            status_code=422,
+        )
+    if len(candidates) == 1:
+        return await _finalize(candidates[0], state, app, principal)
+    return await _picker(request, candidates, state)
+
+
+def _candidates(pages: list[dict], platform: str) -> list[dict[str, str]]:
     candidates = [
         {
-            "id": str(page.get("id", "")),
-            "name": str(page.get("name", "")),
-            "access_token": str(page.get("access_token", "")),
-            "ig_id": str((page.get("instagram_business_account") or {}).get("id", "")),
-            "ig_username": str((page.get("instagram_business_account") or {}).get("username", "")),
+            "id": str(page.get("id") or ""),
+            "name": str(page.get("name") or ""),
+            "access_token": str(page.get("access_token") or ""),
+            "ig_id": str((page.get("instagram_business_account") or {}).get("id") or ""),
+            "ig_username": str(
+                (page.get("instagram_business_account") or {}).get("username") or ""
+            ),
         }
         for page in pages
         if page.get("id") and page.get("access_token")
     ]
     if platform == "instagram":
-        candidates = [candidate for candidate in candidates if candidate["ig_id"]]
-    if not candidates:
-        return notice(
-            "没有可接入的目标",
-            (
-                "该 Meta 账号名下没有关联 Instagram 专业账号的 Page。请先在 Instagram "
-                "把账号转为专业账号并关联 Facebook Page。"
-                if platform == "instagram"
-                else "该 Meta 账号名下没有可管理的 Facebook Page。"
-            ),
-            status_code=422,
-        )
-    if len(candidates) == 1:
-        return await _finalize(candidates[0], state, app)
+        return [candidate for candidate in candidates if candidate["ig_id"]]
+    return candidates
 
-    # 多个候选:渲染选择页;候选(含 Page token)加密进一次性 cookie,不出服务端
+
+async def _picker(request: Request, candidates: list[dict], context: dict) -> Response:
+    pick_token = secrets.token_urlsafe(32)
+    try:
+        await store_oauth_state(
+            "meta-pick",
+            pick_token,
+            {"candidates": candidates, **context},
+        )
+    except (OSError, RedisError) as exc:
+        logger.warning("meta picker state storage failed: %s", exc)
+        return notice("无法显示账号列表", "OAuth 临时状态存储不可用。", status_code=503)
+
     csrf = _csrf(request)
     rows = "".join(
         f'<label style="display:block;margin:8px 0"><input type="radio" name="choice" '
         f'value="{index}" required> {html.escape(candidate["name"])} '
         f'<span class="muted">(Page {html.escape(candidate["id"])}'
-        + (f" · IG @{html.escape(candidate['ig_username'])}" if candidate["ig_id"] else "")
+        + (
+            f" · IG @{html.escape(candidate['ig_username'])}"
+            if candidate["ig_id"]
+            else ""
+        )
         + ")</span></label>"
         for index, candidate in enumerate(candidates)
     )
-    target_label = "Instagram 账号" if platform == "instagram" else "Facebook Page"
+    label = "Instagram 账号" if context["platform"] == "instagram" else "Facebook Page"
     body = f"""<a class="back" href="/admin/accounts">← 返回账号页</a>
-<section class="card"><h1 style="font-size:24px">选择要接入的 {target_label}</h1>
+<section class="card"><h1 style="font-size:24px">选择要接入的 {label}</h1>
 <form method="post" action="/admin/oauth/meta/select">
-<input type="hidden" name="csrf_token" value="{csrf}">{rows}
+<input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="pick_token" value="{pick_token}">{rows}
 <button class="btn-block">接入所选</button></form></section>"""
     response = HTMLResponse(_page("选择接入目标", body, active="accounts"))
-    write_state(
-        response,
-        request,
+    response.set_cookie(
         _PICK_COOKIE,
-        {
-            "candidates": json.dumps(candidates, ensure_ascii=False),
-            "platform": platform,
-            "tenant_id": state["tenant_id"],
-            "brand_id": state.get("brand_id", "default"),
-            "actor": state.get("actor", ""),
-        },
+        pick_token,
+        max_age=600,
+        httponly=True,
+        samesite="strict",
+        secure=_secure_cookie(request),
     )
     if not request.cookies.get(_CSRF_COOKIE):
         response.set_cookie(
-            _CSRF_COOKIE, csrf, httponly=False, samesite="strict", secure=_secure_cookie(request)
+            _CSRF_COOKIE,
+            csrf,
+            httponly=False,
+            samesite="strict",
+            secure=_secure_cookie(request),
         )
-    response.delete_cookie(_STATE_COOKIE)
     return response
 
 
 @router.post("/oauth/meta/select")
 async def meta_oauth_select(request: Request) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
-    pick = read_state(request, _PICK_COOKIE)
+    pick_token = form.get("pick_token", "") or request.cookies.get(_PICK_COOKIE, "")
+    pick = await take_oauth_state("meta-pick", pick_token)
     if pick is None:
-        return notice(
-            "选择会话无效",
-            "候选记录缺失或已过期(10 分钟),请回到账号页重新发起授权。",
-            status_code=400,
-        )
+        return notice("选择会话无效", "候选记录已使用或过期，请重新授权。", status_code=400)
+    if str(principal.session_id) != str(pick.get("session_id")):
+        return notice("选择会话无效", "请使用发起授权的同一登录会话完成选择。", status_code=403)
+    principal.require_tenant(str(pick.get("tenant_id") or ""))
     try:
-        candidates = json.loads(pick["candidates"])
-        candidate = candidates[int(form.get("choice", ""))]
-    except (KeyError, ValueError, IndexError):
-        return notice("选择无效", "所选目标不存在,请重新发起授权。", status_code=400)
-    app = await _meta_app()
+        candidate = pick["candidates"][int(form.get("choice", ""))]
+    except (KeyError, TypeError, ValueError, IndexError):
+        return notice("选择无效", "所选目标不存在，请重新发起授权。", status_code=400)
+    app = await facebook_app_credentials(pick["tenant_id"])
     if app is None:
-        return notice("无法完成接入", "Meta App 凭证不可用。", status_code=422)
-    return await _finalize(candidate, pick, app)
+        return notice("无法完成接入", "Facebook App 凭证当前不可用。", status_code=422)
+    response = await _finalize(candidate, pick, app, principal)
+    response.delete_cookie(_PICK_COOKIE)
+    return response
 
 
-async def _finalize(candidate: dict, context: dict[str, str], app: _MetaApp) -> Response:
-    """组装与手工 Meta 表单同构的提交,复用 provisioning 管道落库。"""
+async def _finalize(
+    candidate: dict,
+    context: dict,
+    app: MetaAppCredentials,
+    principal: Principal,
+) -> Response:
     platform = context["platform"]
     if platform == "instagram":
         external_account_id = candidate["ig_id"]
@@ -345,9 +360,11 @@ async def _finalize(candidate: dict, context: dict[str, str], app: _MetaApp) -> 
     submission = {
         "name": display_name,
         "external_account_id": external_account_id,
-        "app_id": app.external_app_id,
+        "app_id": app.app_id,
         "app_public_id": app.public_id,
         "api_version": _API_VERSION,
+        "instagram_login_mode": "facebook_login",
+        "page_id": candidate["id"],
         "access_token": candidate["access_token"],
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,
@@ -357,9 +374,10 @@ async def _finalize(candidate: dict, context: dict[str, str], app: _MetaApp) -> 
         tenant_id=context["tenant_id"],
         brand_id=context.get("brand_id", "default"),
         platform=platform,
-        actor=context.get("actor") or "user:oauth",
+        actor=principal.actor,
         request=request_data,
         secrets=secrets_data,
+        admin_session_id=principal.session_id,
     )
     from social_reply.application.account_management.actors import process_platform_provisioning
     from social_reply.application.account_management.jobs import process_provisioning_job
@@ -369,7 +387,4 @@ async def _finalize(candidate: dict, context: dict[str, str], app: _MetaApp) -> 
         str(job_id),
         inline=lambda: process_provisioning_job(str(job_id)),
     )
-    response = RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
-    response.delete_cookie(_STATE_COOKIE)
-    response.delete_cookie(_PICK_COOKIE)
-    return response
+    return RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)

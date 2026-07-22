@@ -21,5 +21,7 @@ docs/
 !README.md
 *.csv
 
-# 测试不进运行镜像
+# 测试与本地/VPS 运维文件不进运行镜像
+# deploy/vps 可能包含操作员从模板复制后填写的本地配置，必须始终排除。
 tests/
+deploy/vps/

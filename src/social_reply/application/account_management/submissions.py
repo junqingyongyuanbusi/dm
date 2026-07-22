@@ -38,7 +38,7 @@ PLATFORM_SUBMISSIONS = {
     "instagram": PlatformSubmissionSpec(
         public_fields=_COMMON_PUBLIC
         | _META_APP_PUBLIC
-        | {"enable_dm", "enable_comments", "instagram_login_mode"},
+        | {"enable_dm", "enable_comments", "instagram_login_mode", "page_id"},
         secret_fields=frozenset({"access_token", "app_secret", "verify_token"}),
     ),
     "whatsapp": PlatformSubmissionSpec(

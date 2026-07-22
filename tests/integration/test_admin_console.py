@@ -61,21 +61,26 @@ async def test_console_pages_render_after_login(migrated_db):
 
 
 async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
-    """账号页 web UI 与 OAuth 模块同步:两张 OAuth 推荐卡 + Telegram 指引都要渲染出来。"""
+    """账号页展示 X、Facebook Login、Instagram Login 三种自动授权入口。"""
     async with _app_client() as client:
         await _login(client)
         resp = await client.get("/admin/accounts")
     assert resp.status_code == 200
     html = resp.text
-    # OAuth 一键授权卡片(发起端点 + 推荐标记)
     assert 'action="/admin/oauth/x/start"' in html
     assert 'action="/admin/oauth/meta/start"' in html
-    assert html.count("OAuth 一键授权（推荐）") == 2
-    # Meta OAuth 卡片提供 facebook / instagram 两个平台选项
-    assert 'name="platform"' in html and "Instagram（专业账号" in html
-    # 回调 URL 直接渲染在页面,便于登记到平台后台
+    assert 'action="/admin/oauth/instagram/start"' in html
+    assert '<option value="default">default</option>' in html
+    assert 'name="brand_id" value="default"' in html
+    assert "Facebook Login · 多账号 OAuth" in html
+    assert "Instagram Login · 独立账号 OAuth" in html
+    assert 'name="platform"' in html and "关联 Facebook Page" in html
+    # 回调及共享 webhook URL 直接渲染在页面,便于登记到平台后台
     assert "/admin/oauth/x/callback" in html
     assert "/admin/oauth/meta/callback" in html
+    assert "/admin/oauth/instagram/callback" in html
+    assert "/webhooks/meta/meta_oauth_default" in html
+    assert "/webhooks/meta/instagram_oauth_default" in html
     # Telegram 无 OAuth,给 BotFather 指引 + 手工表单
     assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
 
@@ -169,6 +174,103 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
     assert any(d.question == "你们几点营业" for d in docs)
     chunk = (await session.execute(select(models.KnowledgeChunk))).scalars().first()
     assert chunk.embed_text == "你们几点营业"  # 非对称嵌入：只嵌问题
+
+
+
+async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatch):
+    from social_reply.application.reply_decision import runner
+    from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
+
+    monkeypatch.setattr(runner, "_embedder", FakeEmbeddingClient())
+    csv_body = (
+        "question,reply,category\n"
+        "怎么退款,3-5 个工作日原路退回,售后\n"
+        "发货多久,48 小时内发货,物流\n"
+        ",\n"
+    )
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        resp = await client.post(
+            "/admin/knowledge/import",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "default"},
+            files={"file": ("templates.csv", csv_body.encode("utf-8"), "text/csv")},
+        )
+        assert resp.status_code == 303
+        loc = resp.headers["location"]
+        assert "notice=imported" in loc
+        assert "inserted=2" in loc
+        assert "skipped=0" in loc
+        assert "blank=1" in loc
+
+    docs = (await session.execute(select(models.KnowledgeDocument))).scalars().all()
+    assert len(docs) == 2
+    chunks = (await session.execute(select(models.KnowledgeChunk))).scalars().all()
+    assert len(chunks) == 2
+    assert all(len(c.embedding) == 1536 for c in chunks)
+    assert all(d.source_file == "templates.csv" for d in docs)
+
+    # 重复上传：全部 skipped，不新增
+    async with _app_client() as client:
+        csrf = await _login(client)
+        resp = await client.post(
+            "/admin/knowledge/import",
+            data={"csrf_token": csrf, "tenant_id": "default"},
+            files={"file": ("templates.csv", csv_body.encode("utf-8"), "text/csv")},
+        )
+        assert resp.status_code == 303
+        loc = resp.headers["location"]
+        assert "notice=imported" in loc
+        assert "inserted=0" in loc
+        assert "skipped=2" in loc
+    docs2 = (await session.execute(select(models.KnowledgeDocument))).scalars().all()
+    assert len(docs2) == 2
+
+
+async def test_knowledge_csv_import_bad_header(session, migrated_db, monkeypatch):
+    from social_reply.application.reply_decision import runner
+    from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
+
+    monkeypatch.setattr(runner, "_embedder", FakeEmbeddingClient())
+    async with _app_client() as client:
+        csrf = await _login(client)
+        resp = await client.post(
+            "/admin/knowledge/import",
+            data={"csrf_token": csrf, "tenant_id": "default"},
+            files={"file": ("bad.csv", b"q,a\nx,y\n", "text/csv")},
+        )
+        assert resp.status_code == 303
+        assert "notice=import_bad_csv" in resp.headers["location"]
+
+    page = None
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get("/admin/knowledge?notice=import_bad_csv")
+    assert page is not None and page.status_code == 200
+    assert "CSV 无效" in page.text
+
+
+async def test_knowledge_csv_import_rejects_bad_tenant_and_csrf(migrated_db, monkeypatch):
+    from social_reply.application.reply_decision import runner
+    from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
+
+    monkeypatch.setattr(runner, "_embedder", FakeEmbeddingClient())
+    payload = b"question,reply\nq1,r1\n"
+    async with _app_client() as client:
+        csrf = await _login(client)
+        bad_tenant = await client.post(
+            "/admin/knowledge/import",
+            data={"csrf_token": csrf, "tenant_id": "not-allowed"},
+            files={"file": ("t.csv", payload, "text/csv")},
+        )
+        assert bad_tenant.status_code == 403
+
+        no_csrf = await client.post(
+            "/admin/knowledge/import",
+            data={"csrf_token": "wrong", "tenant_id": "default"},
+            files={"file": ("t.csv", payload, "text/csv")},
+        )
+        assert no_csrf.status_code == 403
 
 
 async def test_killswitch_toggle_sets_flag(migrated_db):

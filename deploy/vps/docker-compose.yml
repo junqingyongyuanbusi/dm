@@ -1,0 +1,109 @@
+# Reply Core · VPS 生产部署(Ubuntu + Docker Compose + Cloudflare Tunnel)
+#
+# 拓扑:cloudflared 出站穿透 → api(:8000);worker/scheduler 消费队列;
+#       postgres(pgvector)与 redis 仅内网互通,全栈零入站端口暴露。
+# 启动顺序由健康检查 + 各角色 entrypoint 自协调:api 负责迁移与凭证加密自检,
+# worker/scheduler 的 assert_database_ready 未就绪即退出,restart 策略自动重试。
+
+x-app-base: &app-base
+  image: zhiyangxiaozi/reply-core:latest
+  env_file: .env
+  restart: unless-stopped
+  logging: &log-limited
+    # scheduler 每 3s 心跳,不限日志大小会吃满 VPS 磁盘
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+x-app-env: &app-env
+  # 指向 compose 内部服务名;PG_PASSWORD 由 compose 从 .env 展开
+  DATABASE_URL: postgresql+asyncpg://app:${PG_PASSWORD}@postgres:5432/social_reply
+  REDIS_URL: redis://redis:6379/0
+
+x-app-depends: &app-depends
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
+services:
+  postgres:
+    # 必须用带 pgvector 的镜像:知识库 embedding 依赖 vector 扩展,普通 postgres 镜像迁移会失败。
+    # pg18 与 Railway 生产一致,pg_dump/restore 无版本冲突。不映射 ports,数据库不出内网。
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_DB: social_reply
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    volumes:
+      # PG18+ 镜像约定:挂载点是 /var/lib/postgresql(不带 /data),数据存于
+      # 版本化子目录(如 18/docker),便于将来 pg_upgrade --link 跨版本升级。
+      # 挂到旧路径 /var/lib/postgresql/data 会被 18+ 镜像检测并拒绝启动。
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d social_reply"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    logging: *log-limited
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    logging: *log-limited
+
+  api:
+    <<: *app-base
+    environment:
+      <<: *app-env
+      SERVICE_ROLE: api
+      PORT: "8000"
+    ports:
+      # 仅绑宿主机回环,供 VPS 本机 curl 调试(curl localhost:8000/healthz);
+      # 不暴露公网。cloudflared 走内网 api:8000,不依赖此映射,不需要可删。
+      - "127.0.0.1:8000:8000"
+    depends_on: *app-depends
+
+  worker:
+    <<: *app-base
+    environment:
+      <<: *app-env
+      SERVICE_ROLE: worker
+    depends_on:
+      <<: *app-depends
+      api:
+        condition: service_started
+
+  scheduler:
+    <<: *app-base
+    environment:
+      <<: *app-env
+      SERVICE_ROLE: scheduler
+    depends_on:
+      <<: *app-depends
+      api:
+        condition: service_started
+
+  cloudflared:
+    # Zero Trust 后台创建 Tunnel 后拿 token;public hostname 指向 http://api:8000
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?required}
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    logging: *log-limited
+
+volumes:
+  pgdata:
+  redisdata:

@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from apps.api.main import create_app
+from social_reply.application.account_management.oauth import common as oauth_common
 from social_reply.application.account_management.oauth import x as oauth_connect
 from social_reply.shared.config import get_settings
 
@@ -107,7 +108,7 @@ def oauth_env(monkeypatch):
         "_http_client",
         lambda: httpx.AsyncClient(transport=transport, timeout=15),
     )
-    monkeypatch.setattr(oauth_connect, "_redis", lambda: redis)
+    monkeypatch.setattr(oauth_common, "oauth_redis", lambda: redis)
 
     submitted: dict = {}
     job_id = uuid.uuid4()
@@ -124,7 +125,7 @@ def oauth_env(monkeypatch):
     return {"calls": calls, "submitted": submitted, "job_id": job_id, "redis": redis}
 
 
-async def test_full_oauth_flow_uses_env_app_credentials(oauth_env):
+async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="https://test",
@@ -167,23 +168,24 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env):
         "/oauth/access_token",
     ]
     assert oauth_env["calls"][0].content == b"x_auth_access_type=write"
+    assert "x_auth_access_type" not in oauth_env["calls"][0].url.params
     assert oauth_env["calls"][0].headers["authorization"].startswith("OAuth ")
 
 
 async def test_state_is_one_time_and_supports_parallel_account_flows(oauth_env):
-    await oauth_connect._store_state("token-a", {"request_token_secret": "secret-a"})
-    await oauth_connect._store_state("token-b", {"request_token_secret": "secret-b"})
+    await oauth_common.store_oauth_state("x", "token-a", {"request_token_secret": "secret-a"})
+    await oauth_common.store_oauth_state("x", "token-b", {"request_token_secret": "secret-b"})
 
-    assert await oauth_connect._take_state("token-a") == {
+    assert await oauth_common.take_oauth_state("x", "token-a") == {
         "request_token_secret": "secret-a"
     }
-    assert await oauth_connect._take_state("token-a") is None
-    assert await oauth_connect._take_state("token-b") == {
+    assert await oauth_common.take_oauth_state("x", "token-a") is None
+    assert await oauth_common.take_oauth_state("x", "token-b") == {
         "request_token_secret": "secret-b"
     }
 
 
-async def test_start_requires_login_csrf_and_config(oauth_env, monkeypatch):
+async def test_start_requires_login_csrf_and_config(oauth_env, monkeypatch, migrated_db):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="https://test",
@@ -210,7 +212,7 @@ async def test_start_requires_login_csrf_and_config(oauth_env, monkeypatch):
         assert "X_API_KEY" in missing.text
 
 
-async def test_callback_rejects_replay_and_handles_denial(oauth_env):
+async def test_callback_rejects_replay_and_handles_denial(oauth_env, migrated_db):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="https://test",
@@ -223,6 +225,45 @@ async def test_callback_rejects_replay_and_handles_denial(oauth_env):
             "/admin/oauth/x/callback?oauth_token=missing&oauth_verifier=v"
         )
         assert no_state.status_code == 400
+
+
+async def test_callback_rejects_revoked_admin_session(oauth_env, migrated_db):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        start = await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "b"},
+        )
+        assert start.status_code == 303
+        logout = await client.get("/admin/logout")
+        assert logout.status_code == 303
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=v"
+        )
+    assert callback.status_code == 403
+    assert oauth_env["submitted"] == {}
+    assert [request.url.path for request in oauth_env["calls"]] == ["/oauth/request_token"]
+
+
+def test_x_error_detail_extracts_xml_message():
+    request = httpx.Request("POST", "https://api.x.com/oauth/request_token")
+    response = httpx.Response(
+        403,
+        request=request,
+        text=(
+            "<?xml version='1.0'?><errors><error code=\"415\">"
+            "Callback URL not approved for this client application"
+            "</error></errors>"
+        ),
+    )
+    error = httpx.HTTPStatusError("forbidden", request=request, response=response)
+    assert oauth_connect._x_error_detail(error) == (
+        "Callback URL not approved for this client application"
+    )
 
 
 def test_settings_expose_postiz_style_x_app_credentials():

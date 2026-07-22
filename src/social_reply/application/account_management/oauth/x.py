@@ -7,50 +7,53 @@ Repeating the flow connects another X account; reconnecting the same account
 updates the existing database row by external account ID.
 """
 
-import json
 import logging
+import re
 from urllib.parse import parse_qsl, urlencode
 
 import httpx
-import redis.asyncio as aioredis
 from authlib.oauth1 import ClientAuth
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from redis.exceptions import RedisError
 
 from social_reply.application.account_management.admin import (
-    _current_actor,
     _form,
     _require_csrf,
+    _web_principal,
 )
 from social_reply.application.account_management.jobs import submit_provisioning_job
 from social_reply.application.account_management.oauth.common import (
-    STATE_TTL_SECONDS,
     admin_callback_url,
     notice,
+    principal_from_oauth_context,
+    store_oauth_state,
+    take_oauth_state,
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.x_app import x_app_credentials
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
 
 _X_OAUTH_BASE = "https://api.x.com"
-_STATE_PREFIX = "oauth:x:"
 
 
 def _oauth1_auth(**kwargs) -> ClientAuth:
     return ClientAuth(signature_type="HEADER", **kwargs)
 
 
-def _redis():
-    return aioredis.from_url(get_settings().redis_url)
-
-
 def _http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=15)
+
+
+def _x_error_detail(exc: Exception) -> str:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return ""
+    body = exc.response.text.strip()
+    match = re.search(r"<error\b[^>]*>(.*?)</error>", body, flags=re.DOTALL)
+    return (match.group(1) if match else body)[:300]
 
 
 async def _request_token(
@@ -62,7 +65,7 @@ async def _request_token(
         redirect_uri=callback_url,
     )
     body = urlencode({"x_auth_access_type": "write"})
-    _url, headers, _body = auth.prepare(
+    signed_url, headers, signed_body = auth.prepare(
         "POST",
         f"{_X_OAUTH_BASE}/oauth/request_token",
         {"Content-Type": "application/x-www-form-urlencoded"},
@@ -70,8 +73,8 @@ async def _request_token(
     )
     async with _http_client() as client:
         response = await client.post(
-            f"{_X_OAUTH_BASE}/oauth/request_token",
-            content=body,
+            signed_url,
+            content=signed_body,
             headers=headers,
         )
     response.raise_for_status()
@@ -116,49 +119,17 @@ async def _access_token(
     return result
 
 
-async def _store_state(oauth_token: str, state: dict[str, str]) -> None:
-    redis = _redis()
-    try:
-        await redis.set(
-            f"{_STATE_PREFIX}{oauth_token}",
-            json.dumps(state, separators=(",", ":")),
-            ex=STATE_TTL_SECONDS,
-        )
-    finally:
-        await redis.aclose()
-
-
-async def _take_state(oauth_token: str) -> dict[str, str] | None:
-    redis = _redis()
-    key = f"{_STATE_PREFIX}{oauth_token}"
-    try:
-        async with redis.pipeline(transaction=True) as pipe:
-            pipe.get(key)
-            pipe.delete(key)
-            value, _deleted = await pipe.execute()
-    finally:
-        await redis.aclose()
-    if value is None:
-        return None
-    try:
-        decoded = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    return decoded if isinstance(decoded, dict) else None
-
-
 @router.post("/oauth/x/start")
 async def x_oauth_start(request: Request) -> Response:
-    actor = _current_actor(request)
-    if actor is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     tenant_id = (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
-    if tenant_id not in get_settings().allowed_admin_tenants:
-        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    principal.require_tenant(tenant_id)
 
     credentials = x_app_credentials()
     if credentials is None:
@@ -176,21 +147,24 @@ async def x_oauth_start(request: Request) -> Response:
             callback_url=callback_url,
         )
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("x oauth request token failed: %s", exc)
+        detail = _x_error_detail(exc)
+        logger.warning("x oauth request token failed: %s body=%s", exc, detail)
         return notice(
             "发起授权失败",
-            f"X OAuth request token 失败（{exc.__class__.__name__}）。请检查 X App 的 "
-            f"Read and Write 权限、Native App 类型及回调地址 {callback_url}。",
+            f"X OAuth request token 失败（{exc.__class__.__name__}"
+            f"{f': {detail}' if detail else ''}）。请检查 X App 的 Read and Write 权限、"
+            f"Web App 类型及回调地址 {callback_url}。",
             status_code=502,
         )
     try:
-        await _store_state(
+        await store_oauth_state(
+            "x",
             token["oauth_token"],
             {
                 "request_token_secret": token["oauth_token_secret"],
                 "tenant_id": tenant_id,
                 "brand_id": (form.get("brand_id") or "default").strip() or "default",
-                "actor": actor,
+                "session_id": str(principal.session_id),
                 "xchat_pin": form.get("xchat_pin", ""),
             },
         )
@@ -208,19 +182,26 @@ async def x_oauth_start(request: Request) -> Response:
 async def x_oauth_callback(request: Request) -> Response:
     denied = request.query_params.get("denied", "")
     if denied:
-        await _take_state(denied)
+        await take_oauth_state("x", denied)
         return notice("授权已取消", "你在 X 上取消了授权，未做任何变更。")
 
     oauth_token = request.query_params.get("oauth_token", "")
     verifier = request.query_params.get("oauth_verifier", "")
     if not oauth_token or not verifier:
         return notice("授权参数不完整", "请回到账号页重新发起授权。", status_code=400)
-    state = await _take_state(oauth_token)
+    state = await take_oauth_state("x", oauth_token)
     if state is None:
         return notice(
             "授权会话无效",
             "发起记录缺失、已使用或已过期，请回到账号页重新发起。",
             status_code=400,
+        )
+    principal = await principal_from_oauth_context(state)
+    if principal is None:
+        return notice(
+            "授权会话已失效",
+            "管理员会话已退出、过期或失去 Tenant 权限，请重新登录并发起授权。",
+            status_code=403,
         )
 
     credentials = x_app_credentials()
@@ -236,11 +217,24 @@ async def x_oauth_callback(request: Request) -> Response:
             verifier=verifier,
         )
     except (httpx.HTTPError, KeyError, ValueError) as exc:
-        logger.warning("x oauth access token failed: %s", exc)
+        status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        logger.warning(
+            "x oauth access token failed type=%s status=%s",
+            exc.__class__.__name__,
+            status_code,
+        )
         return notice(
             "换取凭证失败",
             f"X OAuth access token 失败（{exc.__class__.__name__}），请重新授权。",
             status_code=502,
+        )
+
+    principal = await principal_from_oauth_context(state)
+    if principal is None:
+        return notice(
+            "授权会话已失效",
+            "管理员会话在授权期间已退出、过期或失去 Tenant 权限，请重新发起。",
+            status_code=403,
         )
 
     screen_name = token.get("screen_name", "")
@@ -259,9 +253,10 @@ async def x_oauth_callback(request: Request) -> Response:
         tenant_id=state["tenant_id"],
         brand_id=state.get("brand_id", "default"),
         platform="x",
-        actor=state.get("actor") or "user:oauth",
+        actor=principal.actor,
         request=request_data,
         secrets=secrets_data,
+        admin_session_id=principal.session_id,
     )
     from social_reply.application.account_management.actors import process_platform_provisioning
     from social_reply.application.account_management.jobs import process_provisioning_job

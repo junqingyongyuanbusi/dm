@@ -5,6 +5,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 from sqlalchemy import select
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _REQUIRED_HEADERS = {"question", "reply"}
 _EMBED_BATCH_SIZE = 100  # 单次 embeddings 请求上限，防超大 CSV 打爆单请求
+MAX_IMPORT_ROWS = 2000
 
 
 @dataclass(frozen=True)
@@ -38,52 +40,53 @@ class _Row:
     content_hash: str
 
 
-def _parse_rows(path: Path, brand_id_default: str) -> tuple[list[_Row], int]:
-    """解析 CSV，返回 (有效行, 空行数)；表头缺失抛 ValueError"""
-    with path.open(encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        headers = set(reader.fieldnames or [])
-        missing = _REQUIRED_HEADERS - headers
-        if missing:
-            raise ValueError(
-                f"CSV 表头缺少必需列: {'、'.join(sorted(missing))}（必需 question,reply）"
+def _parse_rows(f: TextIO, brand_id_default: str) -> tuple[list[_Row], int]:
+    """解析 CSV，返回 (有效行, 空行数)；表头缺失或超行数抛 ValueError"""
+    reader = csv.DictReader(f)
+    headers = set(reader.fieldnames or [])
+    missing = _REQUIRED_HEADERS - headers
+    if missing:
+        raise ValueError(
+            f"CSV 表头缺少必需列: {'、'.join(sorted(missing))}（必需 question,reply）"
+        )
+    rows: list[_Row] = []
+    blank = 0
+    for raw in reader:
+        question = (raw.get("question") or "").strip()
+        reply = (raw.get("reply") or "").strip()
+        if not question or not reply:
+            blank += 1
+            logger.warning("跳过空行（question/reply 为空）: %r", raw)
+            continue
+        content = f"问：{question}\n答：{reply}"
+        rows.append(
+            _Row(
+                question=question,
+                reply=reply,
+                brand_id=(raw.get("brand_id") or "").strip() or brand_id_default,
+                platform=(raw.get("platform") or "").strip() or None,
+                category=(raw.get("category") or "").strip() or None,
+                content=content,
+                # 非对称嵌入：只 embed 问题，与用户 query 同分布；答案不参与向量
+                embed_text=question,
+                content_hash=hashlib.sha256(content.encode()).hexdigest(),
             )
-        rows: list[_Row] = []
-        blank = 0
-        for raw in reader:
-            question = (raw.get("question") or "").strip()
-            reply = (raw.get("reply") or "").strip()
-            if not question or not reply:
-                blank += 1
-                logger.warning("跳过空行（question/reply 为空）: %r", raw)
-                continue
-            content = f"问：{question}\n答：{reply}"
-            rows.append(
-                _Row(
-                    question=question,
-                    reply=reply,
-                    brand_id=(raw.get("brand_id") or "").strip() or brand_id_default,
-                    platform=(raw.get("platform") or "").strip() or None,
-                    category=(raw.get("category") or "").strip() or None,
-                    content=content,
-                    # 非对称嵌入：只 embed 问题，与用户 query 同分布；答案不参与向量
-                    embed_text=question,
-                    content_hash=hashlib.sha256(content.encode()).hexdigest(),
-                )
-            )
+        )
+    if len(rows) + blank > MAX_IMPORT_ROWS:
+        raise ValueError(f"CSV 超过上限 {MAX_IMPORT_ROWS} 行（当前 {len(rows) + blank} 行）")
     return rows, blank
 
 
-async def import_knowledge_csv(
-    path: Path | str,
+async def import_knowledge_rows(
+    f: TextIO,
     *,
+    source_name: str,
     embedder: EmbeddingClient,
     tenant_id: str = "default",
     brand_id_default: str = "default",
 ) -> ImportReport:
-    """导入回复模板 CSV：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
-    path = Path(path)
-    rows, blank = _parse_rows(path, brand_id_default)
+    """导入回复模板（文本流）：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
+    rows, blank = _parse_rows(f, brand_id_default)
     # 版本以 embedder 自身为准（Fake 记 fake-sha256），保证入库版本与实际向量来源一致
     embedding_version = embedder.version
 
@@ -125,7 +128,7 @@ async def import_knowledge_csv(
                 category=row.category,
                 question=row.question,
                 reply=row.reply,
-                source_file=path.name,
+                source_file=source_name,
             )
             session.add(doc)
             await session.flush()
@@ -148,3 +151,22 @@ async def import_knowledge_csv(
         blank=blank,
         total=len(rows) + blank,
     )
+
+
+async def import_knowledge_csv(
+    path: Path | str,
+    *,
+    embedder: EmbeddingClient,
+    tenant_id: str = "default",
+    brand_id_default: str = "default",
+) -> ImportReport:
+    """导入回复模板 CSV 文件：打开路径后委托 import_knowledge_rows"""
+    path = Path(path)
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        return await import_knowledge_rows(
+            f,
+            source_name=path.name,
+            embedder=embedder,
+            tenant_id=tenant_id,
+            brand_id_default=brand_id_default,
+        )

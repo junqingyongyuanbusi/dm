@@ -50,7 +50,7 @@ https://<PUBLIC_BASE_URL>/admin
 
 控制面与 webhook 数据面分离：
 
-- Web 控制面：`/admin`，签名 HTTP-only 管理员会话、CSRF 防护；
+- Web 控制面：`/admin`，PostgreSQL 服务端会话（浏览器仅持有 opaque HTTP-only Cookie）、CSRF 防护；
 - Provisioning API：`/api/v1/platform-accounts/*`，使用独立 `CONTROL_API_KEY`，只供服务间调用；
 - 数据面：`/webhooks/telegram/*`、`/webhooks/meta/*`、`/webhooks/x/*`；
 - Durable provisioning：提交后返回 `202 + job_id`，Worker 执行平台验证/落库/Webhook 配置，Scheduler 恢复失败或中断任务；
@@ -64,11 +64,12 @@ CONTROL_API_KEY=<服务间强随机值>
 ADMIN_SESSION_SECRET=<至少 32 字节强随机值>
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=<强密码>
+ADMIN_ALLOWED_TENANTS=default,tenant-a
 PUBLIC_BASE_URL=https://reply.example.com
 ACCOUNT_SECRETS_ROOT=/secure/social-reply/accounts
 ```
 
-生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` 是 bootstrap 超级管理员：可查看 `ADMIN_ALLOWED_TENANTS` 中全部数据，并在 `/admin/users` 直接创建绑定到单一 Tenant 的普通用户。普通用户首次登录必须修改初始密码；系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
 
 Provisioning API 请求使用：
 

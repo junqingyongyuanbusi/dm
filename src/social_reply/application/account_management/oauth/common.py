@@ -1,16 +1,20 @@
-"""OAuth 接入流共享设施:加密 state cookie、统一提示页、回调 URL。
+"""Short-lived OAuth state stored encrypted in Redis.
 
-state cookie 是各平台授权流的安全承重件:callback 由平台 302 跳回,属跨站顶级
-导航,admin 会话 cookie(SameSite=Strict)不随行,授权凭据即这枚 Fernet 加密的
-state 本身(内含发起者与租户上下文)。SameSite=Lax、10 分钟 TTL、用后即删。
+The random state value sent through the browser is only a lookup key. Sensitive
+values such as request-token secrets and account tokens are encrypted with the
+same application key ring used for persisted platform credentials. States are
+consumed atomically and expire after ten minutes.
 """
 
-import time
+import json
+from collections.abc import Mapping
+from typing import Any
 
-from fastapi import Request, Response
+import redis.asyncio as aioredis
 from fastapi.responses import HTMLResponse
 
-from social_reply.application.account_management.admin import _page, _secure_cookie, html
+from social_reply.application.account_management.admin import _page, html
+from social_reply.application.account_management.auth import Principal, principal_from_session_id
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
@@ -21,32 +25,60 @@ def admin_callback_url(path: str) -> str:
     return f"{get_settings().public_base_url.rstrip('/')}{path}"
 
 
-def write_state(
-    response: Response, request: Request, cookie_name: str, payload: dict[str, str]
-) -> None:
-    envelope = encrypt_secret_bundle({**payload, "ts": str(int(time.time()))})
-    response.set_cookie(
-        cookie_name,
-        envelope["__encrypted__"],
-        max_age=STATE_TTL_SECONDS,
-        httponly=True,
-        samesite="lax",
-        secure=_secure_cookie(request),
+def oauth_redis():
+    return aioredis.from_url(get_settings().redis_url)
+
+
+async def store_oauth_state(namespace: str, key: str, payload: Mapping[str, Any]) -> None:
+    encrypted = encrypt_secret_bundle(
+        {"payload": json.dumps(dict(payload), separators=(",", ":"))}
     )
+    if encrypted is None:
+        raise ValueError("oauth_state_encryption_failed")
+    redis = oauth_redis()
+    try:
+        await redis.set(
+            f"oauth:{namespace}:{key}",
+            json.dumps(encrypted, separators=(",", ":")),
+            ex=STATE_TTL_SECONDS,
+        )
+    finally:
+        await redis.aclose()
 
 
-def read_state(request: Request, cookie_name: str) -> dict[str, str] | None:
-    """缺失/篡改/过期一律返回 None,调用方给统一的「重新发起」提示。"""
-    cookie = request.cookies.get(cookie_name)
-    if not cookie:
+async def take_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
+    if not key:
+        return None
+    redis = oauth_redis()
+    redis_key = f"oauth:{namespace}:{key}"
+    try:
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.get(redis_key)
+            pipe.delete(redis_key)
+            value, _deleted = await pipe.execute()
+    finally:
+        await redis.aclose()
+    if value is None:
         return None
     try:
-        state = decrypt_secret_bundle({"__encrypted__": cookie})
-    except ValueError:
+        envelope = json.loads(value)
+        if not isinstance(envelope, dict):
+            return None
+        decrypted = decrypt_secret_bundle(envelope)
+        payload = decrypted.get("payload")
+        return json.loads(payload) if isinstance(payload, str) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
         return None
-    if int(state.get("ts") or 0) + STATE_TTL_SECONDS < int(time.time()):
+
+
+async def principal_from_oauth_context(context: Mapping[str, Any]) -> Principal | None:
+    principal = await principal_from_session_id(context.get("session_id"))
+    if principal is None or principal.must_change_password:
         return None
-    return state
+    tenant_id = context.get("tenant_id")
+    if not isinstance(tenant_id, str) or tenant_id not in principal.allowed_tenants:
+        return None
+    return principal
 
 
 def notice(title: str, message: str, *, status_code: int = 200) -> HTMLResponse:

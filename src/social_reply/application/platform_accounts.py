@@ -192,17 +192,18 @@ async def get_platform_account_runtime(account_id: uuid.UUID) -> PlatformAccount
 
 
 async def find_platform_app_by_public_id(
-    *, platform_family: str, public_id: str
+    *, platform_family: str, public_id: str, tenant_id: str | None = None
 ) -> PlatformAppRuntime | None:
+    filters = [
+        models.PlatformApp.platform_family == platform_family,
+        models.PlatformApp.public_id == public_id,
+        models.PlatformApp.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+    ]
+    if tenant_id is not None:
+        filters.append(models.PlatformApp.tenant_id == tenant_id)
     async with get_session_factory()() as session:
         row = (
-            await session.execute(
-                select(models.PlatformApp).where(
-                    models.PlatformApp.platform_family == platform_family,
-                    models.PlatformApp.public_id == public_id,
-                    models.PlatformApp.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
-                )
-            )
+            await session.execute(select(models.PlatformApp).where(*filters))
         ).scalar_one_or_none()
     return _app_runtime(row) if row is not None else None
 

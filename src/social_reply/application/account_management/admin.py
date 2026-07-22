@@ -1,14 +1,23 @@
-import hashlib
-import hmac
 import html
 import secrets
-import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import delete, select
 
+from social_reply.application.account_management.auth import (
+    Principal,
+    _credential_fingerprint,
+    _token_digest,
+    authenticate,
+    current_principal,
+    hash_password,
+    revoke_session,
+    verify_password,
+)
 from social_reply.application.account_management.jobs import (
     public_job,
     retry_provisioning_job,
@@ -26,30 +35,17 @@ _CSRF_COOKIE = "reply_admin_csrf"
 _SESSION_TTL_SECONDS = 8 * 60 * 60
 
 
-def _signature(value: str) -> str:
-    key = get_settings().admin_session_secret.get_secret_value().encode()
-    return hmac.new(key, value.encode(), hashlib.sha256).hexdigest()
-
-
-def _session_value(username: str, expires_at: int) -> str:
-    payload = f"{username}:{expires_at}"
-    return f"{payload}:{_signature(payload)}"
-
-
-def _current_actor(request: Request) -> str | None:
-    value = request.cookies.get(_SESSION_COOKIE)
-    if not value:
-        return None
-    try:
-        username, expires, signature = value.rsplit(":", 2)
-    except ValueError:
-        return None
-    payload = f"{username}:{expires}"
-    if not hmac.compare_digest(signature, _signature(payload)):
-        return None
-    if int(expires) < int(time.time()):
-        return None
-    return f"user:{username}"
+async def _web_principal(
+    request: Request, *, allow_password_change: bool = False
+) -> Principal | Response:
+    principal = await current_principal(request)
+    if principal is None:
+        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    if principal.must_change_password and not allow_password_change:
+        return RedirectResponse(
+            "/admin/change-password", status_code=status.HTTP_303_SEE_OTHER
+        )
+    return principal
 
 
 def _csrf(request: Request) -> str:
@@ -92,14 +88,16 @@ def _page(
     show_logout: bool = True,
     refresh_seconds: int = 0,
     active: str = "",
+    show_users: bool = False,
 ) -> str:
     """Claude 风格页面外壳：暖米白底、衬线标题、赤陶橙点缀、大留白、零 JS。"""
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     logout = '<a class="nav-link" href="/admin/logout">退出</a>' if show_logout else ""
+    nav_items = _NAV_ITEMS + (("users", "/admin/users", "用户"),) if show_users else _NAV_ITEMS
     tabs = (
         "".join(
             f'<a class="tab{" active" if key == active else ""}" href="{href}">{label}</a>'
-            for key, href, label in _NAV_ITEMS
+            for key, href, label in nav_items
         )
         if show_logout
         else ""
@@ -243,12 +241,9 @@ async def login_page(request: Request) -> HTMLResponse:
 async def login(request: Request) -> Response:
     form = await _form(request)
     _require_csrf(request, form)
-    settings = get_settings()
-    valid_user = secrets.compare_digest(form.get("username", ""), settings.admin_username)
-    valid_password = secrets.compare_digest(
-        form.get("password", ""), settings.admin_password.get_secret_value()
-    )
-    if not valid_user or not valid_password:
+    username = (form.get("username") or "").strip()
+    password = form.get("password") or ""
+    if len(username) > 128 or len(password) > 128:
         return HTMLResponse(
             _page(
                 "登录失败",
@@ -258,11 +253,23 @@ async def login(request: Request) -> Response:
             ),
             401,
         )
-    expires = int(time.time()) + _SESSION_TTL_SECONDS
-    response = RedirectResponse("/admin", status_code=status.HTTP_303_SEE_OTHER)
+    result = await authenticate(username, password)
+    if result is None:
+        return HTMLResponse(
+            _page(
+                "登录失败",
+                """<div class="login-wrap"><section class="card login-card"><h1>登录失败</h1>
+<p class="hint">用户名或密码错误。</p><p><a href="/admin/login">返回重试</a></p></section></div>""",
+                show_logout=False,
+            ),
+            401,
+        )
+    principal, raw_token = result
+    target = "/admin/change-password" if principal.must_change_password else "/admin"
+    response = RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         _SESSION_COOKIE,
-        _session_value(settings.admin_username, expires),
+        raw_token,
         httponly=True,
         samesite="strict",
         secure=_secure_cookie(request),
@@ -272,19 +279,133 @@ async def login(request: Request) -> Response:
 
 
 @router.get("/logout")
-async def logout() -> Response:
+async def logout(request: Request) -> Response:
+    await revoke_session(request.cookies.get(_SESSION_COOKIE, ""))
     response = RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie(_SESSION_COOKIE)
     return response
 
 
-def _input(name: str, label: str, *, secret: bool = False, required: bool = True) -> str:
+@router.get("/change-password", response_class=HTMLResponse)
+async def change_password_page(request: Request) -> Response:
+    principal = await _web_principal(request, allow_password_change=True)
+    if isinstance(principal, Response):
+        return principal
+    if principal.is_superadmin or not principal.must_change_password:
+        return RedirectResponse("/admin", status_code=status.HTTP_303_SEE_OTHER)
+    csrf = _csrf(request)
+    response = HTMLResponse(
+        _page(
+            "首次修改密码",
+            f"""<div class="login-wrap"><section class="card login-card"><h1>首次修改密码</h1>
+<p class="hint">为保护账号，首次登录必须设置个人密码（12–128 个字符）。</p>
+<form method="post" action="/admin/change-password"><input type="hidden" name="csrf_token" value="{csrf}">
+<label for="f-current-password">初始密码</label><input id="f-current-password" name="current_password" type="password" autocomplete="current-password" required>
+<label for="f-new-password">新密码</label><input id="f-new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required>
+<label for="f-confirm-password">确认新密码</label><input id="f-confirm-password" name="confirm_password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required>
+<button type="submit" class="btn-block">保存新密码</button></form></section></div>""",
+            show_logout=False,
+        )
+    )
+    if not request.cookies.get(_CSRF_COOKIE):
+        response.set_cookie(
+            _CSRF_COOKIE,
+            csrf,
+            httponly=False,
+            samesite="strict",
+            secure=_secure_cookie(request),
+        )
+    return response
+
+
+@router.post("/change-password")
+async def change_password(request: Request) -> Response:
+    principal = await _web_principal(request, allow_password_change=True)
+    if isinstance(principal, Response):
+        return principal
+    if principal.is_superadmin or principal.user_id is None:
+        raise HTTPException(status_code=403, detail="password_change_not_available")
+    form = await _form(request)
+    _require_csrf(request, form)
+    new_password = form.get("new_password") or ""
+    if new_password != (form.get("confirm_password") or ""):
+        raise HTTPException(status_code=422, detail="password_confirmation_mismatch")
+    async with get_session_factory()() as session:
+        user = (
+            await session.execute(
+                select(models.AdminUser)
+                .where(models.AdminUser.id == principal.user_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        current_password = form.get("current_password") or ""
+        if user is None or not await verify_password(user.password_hash, current_password):
+            raise HTTPException(status_code=401, detail="current_password_invalid")
+        if secrets.compare_digest(new_password, current_password):
+            raise HTTPException(status_code=422, detail="new_password_must_be_different")
+        try:
+            user.password_hash = await hash_password(new_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        user.must_change_password = False
+        user.password_changed_at = datetime.now(UTC)
+        await session.execute(
+            delete(models.AdminSession).where(models.AdminSession.user_id == user.id)
+        )
+        raw_token = secrets.token_urlsafe(32)
+        new_session_id = uuid.uuid4()
+        session.add(
+            models.AdminSession(
+                id=new_session_id,
+                token_digest=_token_digest(raw_token),
+                user_id=user.id,
+                bootstrap_fingerprint=None,
+                credential_fingerprint=_credential_fingerprint(user.password_hash),
+                expires_at=datetime.now(UTC) + timedelta(hours=8),
+            )
+        )
+        session.add(
+            models.AuditLog(
+                tenant_id=user.tenant_id,
+                category="user_management",
+                actor=principal.actor,
+                action="CHANGE_PASSWORD",
+                subject_type="admin_user",
+                subject_id=str(user.id),
+                detail={"first_login": True},
+            )
+        )
+        await session.commit()
+    response = RedirectResponse("/admin", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(
+        _SESSION_COOKIE,
+        raw_token,
+        httponly=True,
+        samesite="strict",
+        secure=_secure_cookie(request),
+        max_age=_SESSION_TTL_SECONDS,
+    )
+    return response
+
+
+def _input(
+    name: str,
+    label: str,
+    *,
+    secret: bool = False,
+    required: bool = True,
+    value: str = "",
+    readonly: bool = False,
+) -> str:
     field_id = f"f-{name}-{secrets.token_hex(3)}"  # 同名字段出现在多个表单，id 需唯一
     required_attr = "required" if required else ""
     input_type = "password" if secret else "text"
+    value_attr = f' value="{html.escape(value, quote=True)}"' if value else ""
+    readonly_attr = "readonly" if readonly else ""
     return (
         f'<label for="{field_id}">{html.escape(label)}</label>'
-        f'<input id="{field_id}" type="{input_type}" name="{name}" {required_attr}>'
+        f'<input id="{field_id}" type="{input_type}" name="{name}"{value_attr} '
+        f'{required_attr} {readonly_attr}>'
     )
 
 
@@ -323,25 +444,25 @@ def _pill(status: str) -> str:
 async def _submit_form(
     request: Request, platform: str, form: dict[str, str] | None = None
 ) -> Response:
-    actor = _current_actor(request)
-    if actor is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = form or await _form(request)
     _require_csrf(request, form)
     tenant_id = (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
-    if tenant_id not in get_settings().allowed_admin_tenants:
-        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    principal.require_tenant(tenant_id)
     brand_id = form.get("brand_id", "default") or "default"
     request_data, secrets_data = split_submission(platform, form)
     job_id = await submit_provisioning_job(
         tenant_id=tenant_id,
         brand_id=brand_id,
         platform=platform,
-        actor=actor,
+        actor=principal.actor,
         request=request_data,
         secrets=secrets_data,
+        admin_session_id=principal.session_id,
     )
     from social_reply.application.account_management.actors import process_platform_provisioning
     from social_reply.application.account_management.jobs import process_provisioning_job
@@ -380,14 +501,13 @@ async def admin_connect_x(request: Request) -> Response:
 
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
 async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     async with get_session_factory()() as session:
         job = await session.get(models.ProvisioningJob, job_id)
-    if job is None:
+    if job is None or job.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
-    if job.tenant_id not in get_settings().allowed_admin_tenants:
-        raise HTTPException(status_code=403, detail="tenant_access_denied")
     data = public_job(job)
     csrf = _csrf(request)
     in_flight = job.status in {"PENDING", "PROCESSING"}
@@ -413,22 +533,22 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
 <div class="tablewrap"><table class="kv">{rows}</table></div>{retry}</section>""",
             refresh_seconds=4 if in_flight else 0,
             active="accounts",
+            show_users=principal.is_superadmin,
         )
     )
 
 
 @router.post("/jobs/{job_id}/retry")
 async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         job = await session.get(models.ProvisioningJob, job_id)
-    if job is None:
+    if job is None or job.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
-    if job.tenant_id not in get_settings().allowed_admin_tenants:
-        raise HTTPException(status_code=403, detail="tenant_access_denied")
     await retry_provisioning_job(job_id)
     from social_reply.application.account_management.actors import process_platform_provisioning
     from social_reply.application.account_management.jobs import process_provisioning_job

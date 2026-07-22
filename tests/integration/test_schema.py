@@ -10,6 +10,8 @@ from social_reply.infrastructure.database.engine import get_engine
 pytestmark = pytest.mark.integration
 
 EXPECTED_TABLES = {
+    "admin_users",
+    "admin_sessions",
     "platform_apps",
     "platform_accounts",
     "contacts",
@@ -26,6 +28,50 @@ EXPECTED_TABLES = {
     "reply_decisions",
     "delivery_attempts",
 }
+
+
+async def test_admin_auth_tables_have_constraints_and_indexes(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        user_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='admin_users'"
+                )
+            )
+        }
+        session_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='admin_sessions'"
+                )
+            )
+        }
+        session_columns = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='admin_sessions'"
+                )
+            )
+        }
+        session_indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='admin_sessions'")
+            )
+        }
+    assert any("username" in name for name in user_constraints)
+    assert any("tenant_id" in name for name in user_constraints)
+    assert "credential_fingerprint" in session_columns
+    assert "ck_admin_sessions_single_identity" in session_constraints
+    assert "ix_admin_sessions_user_id" in session_indexes
+    assert "ix_admin_sessions_expires_at" in session_indexes
 
 
 async def test_platform_apps_and_account_fk_exist(migrated_db):

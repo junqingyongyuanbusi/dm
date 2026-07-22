@@ -64,12 +64,17 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
         assert kwargs["platform_app_id"] == uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
         return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), "ig_public"
 
+    async def fake_subscribe(**kwargs):
+        assert kwargs["external_account_id"] == "page-1"
+        return ("messages", "comments")
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer access-token"
         return httpx.Response(200, json={"id": "ig-1", "name": "IG Account"})
 
     monkeypatch.setattr(service, "provision_meta_app", fake_provision_meta_app)
     monkeypatch.setattr(service, "provision_direct_account", fake_provision_account)
+    monkeypatch.setattr(service, "subscribe_meta_account", fake_subscribe)
 
     result = await service.connect_meta_account(
         platform="instagram",
@@ -78,6 +83,7 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
         app_secret="app-secret",
         app_public_id="meta_public",
         verify_token="existing-verify-token",
+        page_id="page-1",
         public_base_url="https://reply.example.com",
         secrets_root=tmp_path,
         transport=httpx.MockTransport(handler),

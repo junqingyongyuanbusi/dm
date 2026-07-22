@@ -34,6 +34,7 @@ async def provision_meta_app(
     secrets_root: Path,
     graph_base_url: str,
     api_version: str,
+    platform_family: str = "meta",
 ) -> tuple[object, str, str]:
     app_id = app_id.strip() if app_id else None
     app_public_id = app_public_id.strip() if app_public_id else None
@@ -42,12 +43,14 @@ async def provision_meta_app(
     existing_app = None
     if app_public_id:
         existing_app = await find_platform_app_by_public_id(
-            platform_family="meta", public_id=app_public_id
+            platform_family=platform_family,
+            public_id=app_public_id,
+            tenant_id=tenant_id,
         )
         if not app_id:
             app_id = await _find_platform_app_external_id(
                 tenant_id=tenant_id,
-                platform_family="meta",
+                platform_family=platform_family,
                 public_id=app_public_id,
             )
             if not app_id:
@@ -58,14 +61,16 @@ async def provision_meta_app(
                 await session.execute(
                     select(models.PlatformApp).where(
                         models.PlatformApp.tenant_id == tenant_id,
-                        models.PlatformApp.platform_family == "meta",
+                        models.PlatformApp.platform_family == platform_family,
                         models.PlatformApp.external_app_id == app_id,
                     )
                 )
             ).scalar_one_or_none()
         if row is not None:
             existing_app = await find_platform_app_by_public_id(
-                platform_family="meta", public_id=row.public_id
+                platform_family=platform_family,
+                public_id=row.public_id,
+                tenant_id=tenant_id,
             )
             app_public_id = row.public_id
 
@@ -78,12 +83,12 @@ async def provision_meta_app(
             raise ValueError("meta_verify_token_rotation_not_supported")
         resolved_verify_token = stored_token
     platform_app_id, resolved_public_id = await provision_platform_app(
-        platform_family="meta",
+        platform_family=platform_family,
         external_app_id=app_id,
         tenant_id=tenant_id,
         name=app_name or f"Meta App {app_id}",
         public_id=app_public_id,
-        public_id_prefix="meta",
+        public_id_prefix="meta" if platform_family == "meta" else "igapp",
         secrets_root=secrets_root,
         credential_bundle={"app_secret": app_secret, "verify_token": resolved_verify_token},
         config={"graph_base_url": graph_base_url, "api_version": api_version},

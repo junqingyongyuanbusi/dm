@@ -26,6 +26,16 @@ Legacy files are not automatically deleted. They are retained as rollback eviden
 removed only after encrypted-runtime acceptance and backup verification. Restrict them to mode
 0600 in the meantime.
 
+## Admin users and server-side sessions
+
+Revision `da4e19c7b203` adds `admin_users` and `admin_sessions`. It does not modify existing platform, conversation, delivery, or credential rows.
+
+- `ADMIN_USERNAME` / `ADMIN_PASSWORD` remain environment-backed bootstrap superadmin credentials and are never copied into PostgreSQL.
+- Existing signed `/admin` cookies are intentionally invalid after the application switches to opaque database sessions; administrators must log in once again.
+- Do not run old and new API images together for an extended rolling window: they interpret the same Cookie name differently. Upgrade the database first, then replace API replicas together.
+- Ordinary users are created at `/admin/users`, have exactly one Tenant, and must change their initial password on first login.
+- Back up `admin_users` before downgrading this revision; downgrade removes both user and session tables.
+
 ## Rollback
 
 Revision `c9e83a4d1f20` intentionally has no in-place downgrade because tenant-scoped knowledge

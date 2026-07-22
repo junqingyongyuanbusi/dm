@@ -1,7 +1,6 @@
-"""运营后台控制台：总览 / 对话收件箱 / 决策审核 / 知识库 / 投递监控 / 账号与急停。
+"""运营后台控制台：总览 / 对话 / 决策 / 知识库 / 投递 / 账号与急停。
 
-与 admin.py 共享会话与 CSRF 机制；全部服务端渲染零 JS，复用 _page 外壳。
-所有查询按 allowed_admin_tenants 过滤（与既有 admin 一致的租户边界）。
+与 admin.py 共享服务端会话与 CSRF；全部查询和写操作按当前 Principal 租户范围过滤。
 """
 
 import hashlib
@@ -17,15 +16,17 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from social_reply.application.account_management.admin import (
     _CSRF_COOKIE,
     _csrf,
-    _current_actor,
     _form,
     _input,
     _page,
     _pill,
     _require_csrf,
     _secure_cookie,
+    _web_principal,
     html,
 )
+from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.provisioning import tenant_public_id
 from social_reply.application.account_management.service import enable_xchat_for_account
 from social_reply.application.reply_decision.persist import _idempotency_key
 from social_reply.domain.automation.state_machine import AutomationStateEnum, can_transition
@@ -35,8 +36,6 @@ from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
 router = APIRouter(prefix="/admin", tags=["admin-console"])
-
-_LOGIN = "/admin/login"
 
 
 def _fmt(dt: datetime | None) -> str:
@@ -51,8 +50,22 @@ def _ensure_csrf(response: Response, request: Request, csrf: str) -> Response:
     return response
 
 
-def _tenants() -> frozenset[str]:
-    return get_settings().allowed_admin_tenants
+def _tenant_input(principal: Principal) -> str:
+    if principal.tenant_id is not None:
+        return _input(
+            "tenant_id",
+            "Tenant",
+            value=principal.tenant_id,
+            readonly=True,
+        )
+    options = "".join(
+        f'<option value="{html.escape(tenant)}">{html.escape(tenant)}</option>'
+        for tenant in sorted(principal.allowed_tenants)
+    )
+    return (
+        '<label for="f-tenant-select">Tenant</label>'
+        f'<select id="f-tenant-select" name="tenant_id" required>{options}</select>'
+    )
 
 
 # ---------- 总览 ----------
@@ -60,9 +73,10 @@ def _tenants() -> frozenset[str]:
 
 @router.get("", response_class=HTMLResponse)
 async def overview(request: Request) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
-    tenants = _tenants()
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    tenants = principal.allowed_tenants
     now = datetime.now(UTC)
     today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
@@ -181,7 +195,9 @@ async def overview(request: Request) -> Response:
 <section class="card"><h2>决策分布</h2><p class="hint">近 7 日各动作占比。</p>{bars}</section>
 <section class="card"><h2>最近决策</h2><p class="hint">最新 8 条 AI 决策。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复预览</th><th></th></tr></thead><tbody>{recent_rows}</tbody></table></div></section>
 </div>"""
-    return HTMLResponse(_page("总览", body, active="overview"))
+    return HTMLResponse(
+        _page("总览", body, active="overview", show_users=principal.is_superadmin)
+    )
 
 
 # ---------- 对话收件箱 ----------
@@ -189,9 +205,10 @@ async def overview(request: Request) -> Response:
 
 @router.get("/conversations", response_class=HTMLResponse)
 async def conversations_page(request: Request) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
-    tenants = _tenants()
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    tenants = principal.allowed_tenants
     last_msg = (
         select(
             models.Message.conversation_id.label("cid"),
@@ -240,7 +257,9 @@ async def conversations_page(request: Request) -> Response:
     )
     body = f"""<h1>对话</h1><p class="lede">最近活跃的客户对话；点击进入线程查看与接管。</p>
 <section class="card"><div class="tablewrap"><table><thead><tr><th>平台</th><th>联系人</th><th>账号</th><th>自动化状态</th><th>最后活跃</th></tr></thead><tbody>{trs}</tbody></table></div></section>"""
-    return HTMLResponse(_page("对话", body, active="conversations"))
+    return HTMLResponse(
+        _page("对话", body, active="conversations", show_users=principal.is_superadmin)
+    )
 
 
 _TRANSITION_LABELS = {
@@ -253,12 +272,13 @@ _TRANSITION_LABELS = {
 
 @router.get("/conversations/{conversation_id}", response_class=HTMLResponse)
 async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     csrf = _csrf(request)
     async with get_session_factory()() as session:
         conv = await session.get(models.Conversation, conversation_id)
-        if conv is None or conv.tenant_id not in _tenants():
+        if conv is None or conv.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         contact = await session.get(models.Contact, conv.contact_id)
         state_row = (
@@ -331,14 +351,22 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
 <div style="margin:6px 0 4px">{buttons}</div>
 <div class="thread">{bubbles}</div></section>
 <section class="card"><h2>本会话决策</h2><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复</th><th>置信度</th></tr></thead><tbody>{decision_rows}</tbody></table></div></section>"""
-    response = HTMLResponse(_page("对话详情", body, active="conversations"))
+    response = HTMLResponse(
+        _page(
+            "对话详情",
+            body,
+            active="conversations",
+            show_users=principal.is_superadmin,
+        )
+    )
     return _ensure_csrf(response, request, csrf)
 
 
 @router.post("/conversations/{conversation_id}/state")
 async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     target, expect = form.get("target", ""), form.get("expect", "")
@@ -348,7 +376,7 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
         raise HTTPException(status_code=422, detail="transition_not_allowed")
     async with get_session_factory()() as session:
         conv = await session.get(models.Conversation, conversation_id)
-        if conv is None or conv.tenant_id not in _tenants():
+        if conv is None or conv.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         # CAS：仅当仍处于提交时看到的状态才翻转（防并发接管竞态）
         await session.execute(
@@ -374,10 +402,11 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
 
 @router.get("/decisions", response_class=HTMLResponse)
 async def decisions_page(request: Request, action: str = "") -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     csrf = _csrf(request)
-    tenants = _tenants()
+    tenants = principal.allowed_tenants
     valid_actions = ("auto_reply", "draft", "handoff", "ignore")
     action = action if action in valid_actions else ""
     async with get_session_factory()() as session:
@@ -448,13 +477,17 @@ async def decisions_page(request: Request, action: str = "") -> Response:
     body = f"""<h1>决策</h1><p class="lede">AI 决策日志与草稿人工审核。</p>
 <section class="card"><h2>待审核草稿</h2><p class="hint">草稿模式下生成的回复；采纳后按原文投递给客户。</p>{draft_cards}</section>
 <section class="card"><h2>决策日志</h2>{chips}<div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复预览</th><th>来源</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
-    response = HTMLResponse(_page("决策", body, active="decisions"))
+    response = HTMLResponse(
+        _page("决策", body, active="decisions", show_users=principal.is_superadmin)
+    )
     return _ensure_csrf(response, request, csrf)
 
 
-async def _load_draft(session, decision_id: uuid.UUID) -> models.ReplyDecision:
+async def _load_draft(
+    session, decision_id: uuid.UUID, principal: Principal
+) -> models.ReplyDecision:
     decision = await session.get(models.ReplyDecision, decision_id)
-    if decision is None or decision.tenant_id not in _tenants():
+    if decision is None or decision.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="decision_not_found")
     if decision.action != "draft" or decision.outbox_id is not None:
         raise HTTPException(status_code=409, detail="decision_not_pending_draft")
@@ -463,12 +496,13 @@ async def _load_draft(session, decision_id: uuid.UUID) -> models.ReplyDecision:
 
 @router.post("/decisions/{decision_id}/approve")
 async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
-        decision = await _load_draft(session, decision_id)
+        decision = await _load_draft(session, decision_id, principal)
         conv = await session.get(models.Conversation, decision.conversation_id)
         if conv is None or conv.tenant_id != decision.tenant_id:
             raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
@@ -537,7 +571,7 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
                         "visibility": visibility,
                         "target": reply_target,
                         "approval": "admin",
-                        "approved_by": _current_actor(request),
+                        "approved_by": principal.actor,
                     },
                     idempotency_key=_idempotency_key(
                         account.id, conv.id, decision.message_id or conv.id, "draft_approved"
@@ -559,7 +593,7 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
                 models.AuditLog.__table__.insert().values(
                     tenant_id=account.tenant_id,
                     category="admin_action",
-                    actor=_current_actor(request) or "admin",
+                    actor=principal.actor,
                     action="APPROVE_DRAFT",
                     subject_type="reply_decision",
                     subject_id=str(decision_id),
@@ -581,12 +615,13 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
 
 @router.post("/decisions/{decision_id}/discard")
 async def discard_draft(request: Request, decision_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
-        decision = await _load_draft(session, decision_id)
+        decision = await _load_draft(session, decision_id, principal)
         await session.execute(
             update(models.ReplyDecision)
             .where(models.ReplyDecision.id == decision_id)
@@ -604,15 +639,30 @@ _KB_BANNERS = {
     "embed_failed": ("err", "向量化失败：请检查 Embedding 服务配置后重试。"),
     "toggled": ("ok", "状态已更新。"),
     "deleted": ("ok", "条目已删除。"),
+    "import_bad_csv": (
+        "err",
+        "CSV 无效：需 UTF-8 编码，必需列 question,reply，最多 2000 行。",
+    ),
+    "import_too_large": ("err", "文件过大：请上传不超过 2MB 的 CSV。"),
 }
+
+_MAX_IMPORT_BYTES = 2 * 1024 * 1024
+
+
+def _query_int(request: Request, name: str) -> int:
+    try:
+        return max(0, int(request.query_params.get(name) or 0))
+    except ValueError:
+        return 0
 
 
 @router.get("/knowledge", response_class=HTMLResponse)
 async def knowledge_page(request: Request, notice: str = "") -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     csrf = _csrf(request)
-    tenants = _tenants()
+    tenants = principal.allowed_tenants
     async with get_session_factory()() as session:
         docs = (
             (
@@ -627,7 +677,14 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
             .all()
         )
     banner = ""
-    if notice in _KB_BANNERS:
+    if notice == "imported":
+        n = _query_int(request, "inserted")
+        s = _query_int(request, "skipped")
+        b = _query_int(request, "blank")
+        banner = (
+            f'<div class="banner ok">导入完成：新增 {n} 条，跳过 {s} 条重复，忽略 {b} 条空行</div>'
+        )
+    elif notice in _KB_BANNERS:
         tone, text = _KB_BANNERS[notice]
         banner = f'<div class="banner {tone}">{text}</div>'
     rows = (
@@ -644,25 +701,35 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
     )
     add_form = f"""<details class="collapse"><summary>新增知识条目</summary><div class="inner">
 <form method="post" action="/admin/knowledge/add"><input type="hidden" name="csrf_token" value="{csrf}">
-{_input("tenant_id", "Tenant")}{_input("question", "触发问题（用户会怎么问）")}
+{_tenant_input(principal)}{_input("question", "触发问题（用户会怎么问）")}
 <label for="f-kb-reply">标准回复（命中后原文发送）</label><textarea id="f-kb-reply" name="reply" required></textarea>
 {_input("category", "分类（可选）", required=False)}{_input("brand_id", "Brand（默认 default）", required=False)}
 <button class="btn-block">添加并向量化</button></form></div></details>"""
+    import_form = f"""<details class="collapse"><summary>批量导入 CSV</summary><div class="inner">
+<form method="post" action="/admin/knowledge/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{csrf}">
+{_tenant_input(principal)}{_input("brand_id", "Brand（默认 default）", required=False)}
+<label for="f-kb-csv">CSV 文件</label><input id="f-kb-csv" type="file" name="file" accept=".csv" required>
+<p class="hint">必需列 question,reply；可选 brand_id,platform,category。UTF-8 编码，最多 2000 行 / 2MB。</p>
+<button class="btn-block">上传并导入</button></form></div></details>"""
     body = f"""<h1>知识库</h1><p class="lede">回复模板管理：命中即原文直答；下架条目不参与检索。</p>{banner}
 {add_form}
+{import_form}
 <section class="card"><h2>模板列表</h2><p class="hint">共 {len(docs)} 条（最多显示 200）。</p><div class="tablewrap"><table><thead><tr><th>问题</th><th>回复</th><th>分类</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
-    response = HTMLResponse(_page("知识库", body, active="knowledge"))
+    response = HTMLResponse(
+        _page("知识库", body, active="knowledge", show_users=principal.is_superadmin)
+    )
     return _ensure_csrf(response, request, csrf)
 
 
 @router.post("/knowledge/add")
 async def knowledge_add(request: Request) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     tenant_id = (form.get("tenant_id") or "").strip()
-    if tenant_id not in _tenants():
+    if tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=403, detail="tenant_access_denied")
     question = (form.get("question") or "").strip()
     reply = (form.get("reply") or "").strip()
@@ -722,15 +789,79 @@ async def knowledge_add(request: Request) -> Response:
     return RedirectResponse("/admin/knowledge?notice=added", status_code=status.HTTP_303_SEE_OTHER)
 
 
+@router.post("/knowledge/import")
+async def knowledge_import(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await request.form()
+    _require_csrf(request, {"csrf_token": str(form.get("csrf_token") or "")})
+    tenant_id = str(form.get("tenant_id") or "").strip()
+    if tenant_id not in principal.allowed_tenants:
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    upload = form.get("file")
+    filename = getattr(upload, "filename", None)
+    read = getattr(upload, "read", None)
+    if not callable(read):
+        return RedirectResponse(
+            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
+        )
+    raw = await read(_MAX_IMPORT_BYTES + 1)
+    if len(raw) > _MAX_IMPORT_BYTES:
+        return RedirectResponse(
+            "/admin/knowledge?notice=import_too_large", status_code=status.HTTP_303_SEE_OTHER
+        )
+    if not raw:
+        return RedirectResponse(
+            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
+        )
+    try:
+        text_csv = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return RedirectResponse(
+            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
+        )
+    brand_id_default = str(form.get("brand_id") or "").strip() or "default"
+    source_name = (str(filename or "").strip() or "import.csv")[:256]
+    import io
+
+    from social_reply.application.knowledge.importer import import_knowledge_rows
+    from social_reply.application.reply_decision.runner import _get_embedder
+
+    try:
+        embedder = _get_embedder()
+        report = await import_knowledge_rows(
+            io.StringIO(text_csv),
+            source_name=source_name,
+            embedder=embedder,
+            tenant_id=tenant_id,
+            brand_id_default=brand_id_default,
+        )
+    except ValueError:
+        return RedirectResponse(
+            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
+        )
+    except Exception:
+        return RedirectResponse(
+            "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
+        )
+    return RedirectResponse(
+        f"/admin/knowledge?notice=imported&inserted={report.inserted}"
+        f"&skipped={report.skipped}&blank={report.blank}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @router.post("/knowledge/{doc_id}/status")
 async def knowledge_toggle(request: Request, doc_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         doc = await session.get(models.KnowledgeDocument, doc_id)
-        if doc is None or doc.tenant_id not in _tenants():
+        if doc is None or doc.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="knowledge_not_found")
         doc.status = "draft" if doc.status == "published" else "published"
         await session.commit()
@@ -741,13 +872,14 @@ async def knowledge_toggle(request: Request, doc_id: uuid.UUID) -> Response:
 
 @router.post("/knowledge/{doc_id}/delete")
 async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         doc = await session.get(models.KnowledgeDocument, doc_id)
-        if doc is None or doc.tenant_id not in _tenants():
+        if doc is None or doc.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="knowledge_not_found")
         await session.delete(doc)  # chunk 级联删除（FK ondelete=CASCADE）
         await session.commit()
@@ -761,10 +893,11 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
 
 @router.get("/delivery", response_class=HTMLResponse)
 async def delivery_page(request: Request) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     csrf = _csrf(request)
-    tenants = _tenants()
+    tenants = principal.allowed_tenants
     day_ago = datetime.now(UTC) - timedelta(hours=24)
     async with get_session_factory()() as session:
         outbox = (
@@ -795,7 +928,11 @@ async def delivery_page(request: Request) -> Response:
                     models.RawEvent.received_at >= day_ago,
                     (
                         models.NormalizedEvent.tenant_id.in_(tenants)
-                        | models.NormalizedEvent.id.is_(None)
+                        | (
+                            models.NormalizedEvent.id.is_(None)
+                            if principal.is_superadmin
+                            else False
+                        )
                     ),
                 )
                 .group_by(models.RawEvent.source, models.RawEvent.processing_status)
@@ -829,19 +966,22 @@ async def delivery_page(request: Request) -> Response:
     body = f"""<h1>投递</h1><p class="lede">出站消息投递状态与入站事件健康度。</p>
 <section class="card"><h2>Outbox</h2><p class="hint">最近 50 条出站消息；失败可手动重试（由补扫循环拾取）。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>状态</th><th>目的地</th><th>内容</th><th>尝试</th><th>错误</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="card"><h2>入站健康（24h）</h2><div class="tablewrap"><table><thead><tr><th>来源</th><th>处理状态</th><th>事件数</th><th>最后接收</th></tr></thead><tbody>{ingress_rows}</tbody></table></div></section>"""
-    response = HTMLResponse(_page("投递", body, active="delivery"))
+    response = HTMLResponse(
+        _page("投递", body, active="delivery", show_users=principal.is_superadmin)
+    )
     return _ensure_csrf(response, request, csrf)
 
 
 @router.post("/delivery/{outbox_id}/retry")
 async def delivery_retry(request: Request, outbox_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         row = await session.get(models.OutboxMessage, outbox_id)
-        if row is None or row.tenant_id not in _tenants():
+        if row is None or row.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="outbox_not_found")
         if row.status != "FAILED":
             raise HTTPException(status_code=409, detail="outbox_not_retryable")
@@ -854,7 +994,7 @@ async def delivery_retry(request: Request, outbox_id: uuid.UUID) -> Response:
             models.AuditLog.__table__.insert().values(
                 tenant_id=row.tenant_id,
                 category="admin_action",
-                actor=_current_actor(request) or "admin",
+                actor=principal.actor,
                 action="RETRY_CONFIRMED_FAILURE",
                 subject_type="outbox",
                 subject_id=str(outbox_id),
@@ -876,11 +1016,12 @@ def _kill_keys(tenant: str, account_ids: list[str]) -> list[str]:
 
 @router.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     csrf = _csrf(request)
     settings = get_settings()
-    tenants = _tenants()
+    tenants = principal.allowed_tenants
     async with get_session_factory()() as session:
         accounts = (
             (
@@ -958,25 +1099,42 @@ async def accounts_page(request: Request) -> Response:
         )
         or "<tr><td colspan='5' class='muted'>暂无任务</td></tr>"
     )
+    default_tenant = "default" if "default" in tenants else sorted(tenants)[0]
     common = (
         f'<input type="hidden" name="csrf_token" value="{csrf}">'
-        + _input("tenant_id", "Tenant", required=True)
-        + _input("brand_id", "Brand", required=True)
+        + _tenant_input(principal)
+        + _input("brand_id", "Brand", required=True, value="default")
         + _input("name", "显示名称（可选）", required=False)
     )
+    webhook_tenant = default_tenant
     oauth_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/x/callback"
-    x_webhook = f"{settings.public_base_url.rstrip('/')}/webhooks/x/x_oauth"
+    x_webhook = (
+        f"{settings.public_base_url.rstrip('/')}/webhooks/x/"
+        f"{tenant_public_id('x_oauth', webhook_tenant)}"
+    )
     meta_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/meta/callback"
+    meta_webhook = (
+        f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
+        f"{tenant_public_id('meta_oauth', webhook_tenant)}"
+    )
+    instagram_callback = (
+        f"{settings.public_base_url.rstrip('/')}/admin/oauth/instagram/callback"
+    )
+    instagram_webhook = (
+        f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
+        f"{tenant_public_id('instagram_oauth', webhook_tenant)}"
+    )
     oauth_common = (
         f'<input type="hidden" name="csrf_token" value="{csrf}">'
-        + _input("tenant_id", "Tenant", required=True)
-        + _input("brand_id", "Brand", required=True)
+        + _tenant_input(principal)
+        + _input("brand_id", "Brand", required=True, value="default")
     )
     connect_forms = f"""<details class="collapse"><summary>接入新平台账号</summary><div class="inner">
 <p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。OAuth 卡片会跳转平台授权页自动换取凭证；手工卡片用于粘贴已有凭证。</p>
 <div class="grid">
-<form class="card" method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{_input("xchat_pin", "XChat 4 位 PIN（可选，启用加密私信）", secret=True, required=False)}<p class="hint">使用环境变量 <code>X_API_KEY</code> / <code>X_API_SECRET</code> 作为共享 X App 凭证；每次点击都可授权一个账号，账号 Token 会独立加密入库。X Developer Portal 中将 App permissions 设为 Read and Write、Type of App 设为 Native App，并登记 Callback URI <code>{html.escape(oauth_callback)}</code>。Activity/Webhook URL 使用 <code>{html.escape(x_webhook)}</code>。</p><button class="btn-block">授权新的 X 账号</button></form>
-<form class="card" method="post" action="/admin/oauth/meta/start"><h3>Facebook / Instagram · OAuth 一键授权（推荐）</h3>{oauth_common}<label for="f-oauth-meta-platform">平台</label><select id="f-oauth-meta-platform" name="platform"><option value="facebook">Facebook Page</option><option value="instagram">Instagram（专业账号，经 Facebook 授权）</option></select><p class="hint">跳转 Meta 授权页，授权后自动列出你管理的 Page（多个时可选择），凭证自动换取入库。前提（一次性）：Meta App 添加 Facebook Login 产品，Valid OAuth Redirect URIs 登记 <code>{html.escape(meta_callback)}</code>；需已用手工表单接入过一次（创建 App 凭证记录）；App 未过审时仅 App 角色账号可授权。Instagram 需为专业账号并关联 Facebook Page。</p><button class="btn-block">跳转 Meta 授权</button></form>
+<form class="card" method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{_input("xchat_pin", "XChat 4 位 PIN（可选，启用加密私信）", secret=True, required=False)}<p class="hint">使用环境变量 <code>X_API_KEY</code> / <code>X_API_SECRET</code> 中的 Consumer Keys；每次点击都可授权一个账号，账号 Token 会独立加密入库。X Developer Portal 中将 App permissions 设为 Read and Write、App type 设为 Web App，并精确登记 Callback URI <code>{html.escape(oauth_callback)}</code>。Activity/Webhook URL 使用 <code>{html.escape(x_webhook)}</code>。</p><button class="btn-block">授权新的 X 账号</button></form>
+<form class="card" method="post" action="/admin/oauth/meta/start"><h3>Facebook Login · 多账号 OAuth</h3>{oauth_common}<label for="f-oauth-meta-platform">目标</label><select id="f-oauth-meta-platform" name="platform"><option value="facebook">Facebook Page</option><option value="instagram">关联 Facebook Page 的 Instagram 专业账号</option></select><p class="hint">使用部署级 <code>FACEBOOK_APP_ID</code> / <code>FACEBOOK_APP_SECRET</code> / <code>META_VERIFY_TOKEN</code>，授权后列出全部可管理目标并选择一个接入，可反复授权多个账号。Callback：<code>{html.escape(meta_callback)}</code>；Webhook：<code>{html.escape(meta_webhook)}</code>。</p><button class="btn-block">跳转 Facebook 授权</button></form>
+<form class="card" method="post" action="/admin/oauth/instagram/start"><h3>Instagram Login · 独立账号 OAuth</h3>{oauth_common}<p class="hint">无需 Facebook Page，适用于 Instagram 专业账号。使用 <code>INSTAGRAM_APP_ID</code> / <code>INSTAGRAM_APP_SECRET</code>；Callback：<code>{html.escape(instagram_callback)}</code>；Webhook：<code>{html.escape(instagram_webhook)}</code>。</p><button class="btn-block">跳转 Instagram 授权</button></form>
 <form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<p class="hint">Telegram 无 OAuth：在 Telegram 中找 @BotFather 发送 /newbot 创建机器人，把返回的 Token 粘贴到上方，提交后自动校验并注册 webhook。</p><button class="btn-block">连接 Telegram</button></form>
 <form class="card" method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform"><option>facebook</option><option>instagram</option></select>{_input("external_account_id", "Page / IG Account ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 Meta</button></form>
 <form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
@@ -987,19 +1145,22 @@ async def accounts_page(request: Request) -> Response:
 <section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
 <section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>
 {connect_forms}"""
-    response = HTMLResponse(_page("账号", body, active="accounts"))
+    response = HTMLResponse(
+        _page("账号", body, active="accounts", show_users=principal.is_superadmin)
+    )
     return _ensure_csrf(response, request, csrf)
 
 
 @router.post("/accounts/{account_id}/xchat")
 async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         account = await session.get(models.PlatformAccount, account_id)
-    if account is None or account.tenant_id not in _tenants() or account.platform != "x":
+    if account is None or account.tenant_id not in principal.allowed_tenants or account.platform != "x":
         raise HTTPException(status_code=404, detail="x_account_not_found")
     pin = (form.get("xchat_pin") or "").strip()
     if len(pin) != 4 or not pin.isdigit():
@@ -1013,8 +1174,9 @@ async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Respo
 
 @router.post("/accounts/{account_id}/automation")
 async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     target = form.get("target", "")
@@ -1022,7 +1184,7 @@ async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Re
         raise HTTPException(status_code=422, detail="invalid_automation_default")
     async with get_session_factory()() as session:
         account = await session.get(models.PlatformAccount, account_id)
-        if account is None or account.tenant_id not in _tenants():
+        if account is None or account.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="account_not_found")
         account.automation_default = target
         await session.commit()
@@ -1031,13 +1193,14 @@ async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Re
 
 @router.post("/killswitch/toggle")
 async def killswitch_toggle(request: Request) -> Response:
-    if _current_actor(request) is None:
-        return RedirectResponse(_LOGIN, status_code=status.HTTP_303_SEE_OTHER)
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
     form = await _form(request)
     _require_csrf(request, form)
     settings = get_settings()
     tenant_id = form.get("tenant_id", "")
-    if tenant_id not in _tenants():
+    if tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=403, detail="tenant_access_denied")
     scope = form.get("scope", "")
     if scope == "global":

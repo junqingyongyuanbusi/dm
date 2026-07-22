@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _find_meta_app(public_id: str):
+    for family in ("meta", "instagram"):
+        app = await find_platform_app_by_public_id(
+            platform_family=family,
+            public_id=public_id,
+        )
+        if app is not None:
+            return app
+    raise HTTPException(status_code=404, detail="meta_app_not_found")
+
+
 @router.get("/webhooks/meta/{app_public_id}")
 async def verify_meta_webhook(
     app_public_id: str,
@@ -28,9 +39,7 @@ async def verify_meta_webhook(
     hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
     hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
 ) -> Response:
-    app = await find_platform_app_by_public_id(platform_family="meta", public_id=app_public_id)
-    if app is None:
-        raise HTTPException(status_code=404, detail="meta_app_not_found")
+    app = await _find_meta_app(app_public_id)
     challenge = verify_meta_challenge(
         verify_token=app.credential_bundle["verify_token"],
         mode=hub_mode,
@@ -44,9 +53,7 @@ async def verify_meta_webhook(
 
 @router.post("/webhooks/meta/{app_public_id}")
 async def meta_webhook(app_public_id: str, request: Request) -> Response:
-    app = await find_platform_app_by_public_id(platform_family="meta", public_id=app_public_id)
-    if app is None:
-        raise HTTPException(status_code=404, detail="meta_app_not_found")
+    app = await _find_meta_app(app_public_id)
     body = await request.body()
     if not verify_meta_signature(
         app_secret=app.credential_bundle["app_secret"],

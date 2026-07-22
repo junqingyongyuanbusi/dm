@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import insert
 
 from apps.api.main import create_app
+from social_reply.application.account_management.meta_credentials import MetaAppCredentials
 from social_reply.application.account_management.oauth import meta
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
@@ -65,6 +66,17 @@ async def _login(client: httpx.AsyncClient) -> str:
 @pytest.fixture
 def meta_env(monkeypatch):
     calls: list[str] = []
+
+    async def stored_app(_tenant_id: str):
+        return MetaAppCredentials(
+            app_id="app-123",
+            app_secret="meta-app-secret",
+            verify_token="vt-1",
+            public_id="meta_app",
+            platform_family="meta",
+        )
+
+    monkeypatch.setattr(meta, "facebook_app_credentials", stored_app)
     pages_holder: dict = {"pages": []}
 
     def factory(**kwargs):
@@ -203,6 +215,7 @@ async def test_instagram_select_finalizes_with_ig_id(session, meta_env):
     assert submitted["platform"] == "instagram"
     # 选了第二个(index 1)= Shop C,落库用 IG 账号 id,不是 Page id
     assert submitted["request"]["external_account_id"] == "ig-c"
+    assert submitted["request"]["page_id"] == "page-c"
     assert submitted["request"]["name"] == "@shopc"
     assert submitted["secrets"]["access_token"] == "T-C"
 
@@ -230,7 +243,11 @@ async def test_start_requires_login_csrf_and_valid_platform(session, meta_env):
         assert bad_platform.status_code == 422
 
 
-async def test_start_without_meta_app_shows_guidance(session, meta_env):
+async def test_start_without_meta_app_shows_guidance(session, meta_env, monkeypatch):
+    async def no_app(_tenant_id: str):
+        return None
+
+    monkeypatch.setattr(meta, "facebook_app_credentials", no_app)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="https://test",
