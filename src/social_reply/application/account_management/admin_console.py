@@ -1050,22 +1050,29 @@ async def accounts_page(request: Request) -> Response:
     try:
         account_keys = [f"killswitch:account:{a.tenant_id}:{a.id}" for a in accounts]
         account_flags = await redis.mget(account_keys) if account_keys else []
-        global_flags = await redis.mget([f"killswitch:global:{tenant}" for tenant in tenants])
+        global_flags = (
+            await redis.mget([f"killswitch:global:{tenant}" for tenant in tenants])
+            if principal.is_superadmin
+            else []
+        )
     finally:
         await redis.aclose()
     account_stopped = {
         str(account.id): account_flags[index] is not None for index, account in enumerate(accounts)
     }
-    global_rows = "".join(
-        f"<form class='inline' method='post' action='/admin/killswitch/toggle'>"
-        f"<input type='hidden' name='csrf_token' value='{csrf}'>"
-        f"<input type='hidden' name='scope' value='global'>"
-        f"<input type='hidden' name='tenant_id' value='{html.escape(tenant)}'>"
-        f"<button class='btn-sm {'btn-ghost' if global_flags[index] else 'btn-danger'}'>"
-        f"{html.escape(tenant)}：{'解除急停' if global_flags[index] else '全局急停'}</button></form>"
-        for index, tenant in enumerate(tenants)
-    )
-    killswitch_card = f"""<section class="card"><h2>自动回复总开关</h2>
+    killswitch_card = ""
+    if principal.is_superadmin:
+        global_rows = "".join(
+            f"<form class='inline' method='post' action='/admin/killswitch/toggle'>"
+            f"<input type='hidden' name='csrf_token' value='{csrf}'>"
+            f"<input type='hidden' name='scope' value='global'>"
+            f"<input type='hidden' name='tenant_id' value='{html.escape(tenant)}'>"
+            f"<button class='btn-sm {'btn-ghost' if global_flags[index] else 'btn-danger'}'>"
+            f"{html.escape(tenant)}："
+            f"{'解除急停' if global_flags[index] else '全局急停'}</button></form>"
+            for index, tenant in enumerate(tenants)
+        )
+        killswitch_card = f"""<section class="card"><h2>自动回复总开关</h2>
 <p class="hint">急停按租户隔离，启用后该租户自动回复降级为草稿。</p>{global_rows}</section>"""
 
     account_rows = ""
@@ -1129,7 +1136,9 @@ async def accounts_page(request: Request) -> Response:
         + _tenant_input(principal)
         + _input("brand_id", "Brand", required=True, value="default")
     )
-    connect_forms = f"""<details class="collapse"><summary>接入新平台账号</summary><div class="inner">
+    connect_open = "" if principal.is_superadmin else " open"
+    connect_title = "接入新平台账号" if principal.is_superadmin else "授权新平台账号"
+    connect_forms = f"""<details class="collapse"{connect_open}><summary>{connect_title}</summary><div class="inner">
 <p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。OAuth 卡片会跳转平台授权页自动换取凭证；手工卡片用于粘贴已有凭证。</p>
 <div class="grid">
 <form class="card" method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{_input("xchat_pin", "XChat 4 位 PIN（可选，启用加密私信）", secret=True, required=False)}<p class="hint">使用环境变量 <code>X_API_KEY</code> / <code>X_API_SECRET</code> 中的 Consumer Keys；每次点击都可授权一个账号，账号 Token 会独立加密入库。X Developer Portal 中将 App permissions 设为 Read and Write、App type 设为 Web App，并精确登记 Callback URI <code>{html.escape(oauth_callback)}</code>。Activity/Webhook URL 使用 <code>{html.escape(x_webhook)}</code>。</p><button class="btn-block">授权新的 X 账号</button></form>
@@ -1140,11 +1149,14 @@ async def accounts_page(request: Request) -> Response:
 <form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
 <form class="card" method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}{_input("environment", "Account Activity Environment")}{_input("xchat_pin", "XChat 4 位 PIN（启用加密私信，建议填写）", secret=True, required=False)}<button class="btn-block">连接 X</button></form>
 </div></div></details>"""
-    body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>
-{killswitch_card}
-<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>
-{connect_forms}"""
+    account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
+    jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
+    if principal.is_superadmin:
+        body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>
+{killswitch_card}{account_card}{jobs_card}{connect_forms}"""
+    else:
+        body = f"""<h1>账号授权</h1><p class="lede">授权并管理当前 Tenant 的平台账号。</p>
+{connect_forms}{account_card}{jobs_card}"""
     response = HTMLResponse(
         _page("账号", body, active="accounts", show_users=principal.is_superadmin)
     )
@@ -1204,6 +1216,8 @@ async def killswitch_toggle(request: Request) -> Response:
         raise HTTPException(status_code=403, detail="tenant_access_denied")
     scope = form.get("scope", "")
     if scope == "global":
+        if not principal.is_superadmin:
+            raise HTTPException(status_code=403, detail="superadmin_required")
         key = f"killswitch:global:{tenant_id}"
     elif scope == "account":
         account_id = form.get("account_id", "")

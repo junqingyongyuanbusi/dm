@@ -75,6 +75,8 @@ The built-in administration surface provides:
 - bootstrap-superadmin and tenant-user login/logout with opaque HTTP-only cookies, server-side revocation, and CSRF checks;
 - superadmin-only direct user creation at `/admin/users`, with no email/invitation flow;
 - mandatory first-login password change for newly created tenant users;
+- tenant-user self-service account authorization for the user's assigned tenant, including OAuth starts and tenant-scoped provisioning jobs;
+- superadmin-only tenant-wide automation kill switch; tenant users retain account-level controls for their own accounts;
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
