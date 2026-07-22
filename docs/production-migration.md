@@ -28,7 +28,7 @@ removed only after encrypted-runtime acceptance and backup verification. Restric
 
 ## Admin users and server-side sessions
 
-Revision `da4e19c7b203` adds `admin_users` and `admin_sessions`. It does not modify existing platform, conversation, delivery, or credential rows.
+Revision `da4e19c7b203` adds `admin_users` and `admin_sessions`. Revision `e7b2c4d9a610` repairs VPS databases that applied an earlier form of `da4e19c7b203` without `admin_sessions.credential_fingerprint`; it conditionally adds the column and is a no-op when the column already exists. Neither revision modifies existing platform, conversation, delivery, or credential rows.
 
 - `ADMIN_USERNAME` / `ADMIN_PASSWORD` remain environment-backed bootstrap superadmin credentials and are never copied into PostgreSQL.
 - Existing signed `/admin` cookies are intentionally invalid after the application switches to opaque database sessions; administrators must log in once again.

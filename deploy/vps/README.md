@@ -84,11 +84,29 @@ docker compose up -d --force-recreate api worker scheduler
 
 ## 日常运维
 
-**更新发布**(本机构建推送后,VPS 两条命令):
+**更新发布**（API 先迁移，Worker/Scheduler 后启动）：
 
 ```bash
-docker compose pull && docker compose up -d
+cd ~/reply-core
+mkdir -p backups
+docker compose exec -T postgres pg_dump -U app -Fc social_reply \
+  > "backups/pre-upgrade-$(date +%F-%H%M%S).dump"
+
+docker compose stop worker scheduler
+docker compose pull api worker scheduler
+docker compose up -d --no-deps --force-recreate api
+docker compose logs --tail=80 api
+
+# 确认迁移到当前 head 后再启动后台进程
+docker compose exec -T postgres psql -U app -d social_reply -Atc \
+  'SELECT version_num FROM alembic_version;'
+docker compose up -d --no-deps --force-recreate worker scheduler
+curl -fsS http://127.0.0.1:8000/healthz
 ```
+
+当前多用户后台修复后的 Alembic head 为 `e7b2c4d9a610`。若 VPS 曾应用早期的
+`da4e19c7b203` 但缺少 `admin_sessions.credential_fingerprint`，该后续迁移会自动补列。
+不要只执行 `docker compose restart`：它不会拉取 Docker Hub 上更新后的标签。
 
 **每日自动备份**(crontab -e):
 
