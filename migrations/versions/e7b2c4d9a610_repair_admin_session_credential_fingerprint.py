@@ -27,5 +27,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if "credential_fingerprint" in _admin_session_columns():
-        op.drop_column("admin_sessions", "credential_fingerprint")
+    # da4e19c7b203's canonical schema already includes this column. This repair
+    # revision only normalizes databases created by an earlier deployed variant.
+    pass
