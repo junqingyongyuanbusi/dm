@@ -20,6 +20,8 @@ _ENV_KEYS = [
     "INSTAGRAM_APP_SECRET",
     "INSTAGRAM_VERIFY_TOKEN",
     "ADMIN_ALLOWED_TENANTS",
+    "CONVERSATION_HISTORY_LIMIT",
+    "CONVERSATION_HISTORY_MAX_CHARS",
     "TESTING",
 ]
 
@@ -77,6 +79,20 @@ def test_非测试环境_凭证齐全通过() -> None:
         openai_api_key="sk-test",
     )
     assert settings.openai_api_key == "sk-test"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("conversation_history_limit", -1),
+        ("conversation_history_limit", 51),
+        ("conversation_history_max_chars", -1),
+        ("conversation_history_max_chars", 50001),
+    ],
+)
+def test_conversation_history_bounds_are_validated(name: str, value: int) -> None:
+    with pytest.raises(ValueError):
+        _make(testing=True, **{name: value})
 
 
 def test_x_app_credentials_must_be_configured_as_a_pair() -> None:

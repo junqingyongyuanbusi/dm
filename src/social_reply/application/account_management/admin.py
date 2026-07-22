@@ -428,6 +428,7 @@ _STATUS_TONES = {
     "FAILED": "err",
     "NEEDS_ACTION": "err",
     "NEEDS_REVIEW": "err",
+    "DECISION_NEEDS_REVIEW": "err",
     "XCHAT_DECRYPTION_PENDING": "err",
     "HUMAN_ACTIVE": "info",
     "BOT_COOLDOWN": "neutral",

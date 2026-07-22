@@ -59,6 +59,29 @@ async def test_agent_reply_does_not_trigger_decision(session):
     assert await count_rows(session, models.DecisionJob) == 1
 
 
+async def test_context_scope_failure_requires_review_without_retry(session, monkeypatch):
+    from social_reply.application.reply_decision.runner import DecisionContextScopeError
+
+    await seed_chatwoot_account(session, "BOT_ACTIVE")
+
+    async def fail(*_args, **_kwargs):
+        raise DecisionContextScopeError("decision_context_scope_mismatch")
+
+    monkeypatch.setattr(
+        "social_reply.application.reply_decision.jobs.run_and_persist_decision", fail
+    )
+    await process_raw_event(await seed_raw_event(session, chatwoot_payload()))
+
+    session.expire_all()
+    job = (await session.execute(select(models.DecisionJob))).scalar_one()
+    assert job.status == "NEEDS_REVIEW"
+    assert job.next_attempt_at is None
+    assert job.last_error == "decision_context_scope_mismatch"
+    raw = (await session.execute(select(models.RawEvent))).scalar_one()
+    assert raw.processing_status == "DECISION_NEEDS_REVIEW"
+    assert await count_rows(session, models.ReplyDecision) == 0
+
+
 async def test_decision_failure_is_persisted_for_retry(session, monkeypatch):
     await seed_chatwoot_account(session, "BOT_ACTIVE")
 

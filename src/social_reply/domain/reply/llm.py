@@ -15,6 +15,9 @@ class LLMContext:
     conversation_key: str
     # 检索命中的官方回复模板文本（默认空，向后兼容）
     knowledge: tuple[str, ...] = ()
+    # 同会话历史消息（按时间升序），元素为 (role, text)：
+    # role ∈ {"user", "assistant"}，不含当前这条。默认空 → 单轮行为不变。
+    history: tuple[tuple[str, str], ...] = ()
 
 
 class LLMClient(Protocol):

@@ -5,7 +5,10 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import or_, select, update
 
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
-from social_reply.application.reply_decision.runner import run_and_persist_decision
+from social_reply.application.reply_decision.runner import (
+    DecisionContextScopeError,
+    run_and_persist_decision,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 
@@ -85,6 +88,33 @@ async def process_decision_job(job_id: str) -> bool:
             claimed.message_id,
             claimed.account_id,
         )
+    except DecisionContextScopeError as exc:
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(models.DecisionJob)
+                .where(
+                    models.DecisionJob.id == jid,
+                    models.DecisionJob.status == "PROCESSING",
+                )
+                .values(
+                    status="NEEDS_REVIEW",
+                    next_attempt_at=None,
+                    locked_at=None,
+                    last_error=str(exc)[:2000],
+                )
+            )
+            if claimed.raw_event_id is not None:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == claimed.raw_event_id)
+                    .values(
+                        processing_status="DECISION_NEEDS_REVIEW",
+                        processed_at=datetime.now(UTC),
+                    )
+                )
+            await session.commit()
+        logger.error("decision context scope mismatch job_id=%s error=%s", jid, exc)
+        return False
     except Exception as exc:
         retry_at = datetime.now(UTC) + timedelta(
             seconds=min(2 ** min(claimed.attempt_count, 8), _MAX_BACKOFF_SECONDS)

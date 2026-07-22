@@ -1,7 +1,7 @@
 import uuid
 
 import dramatiq
-from sqlalchemy import update
+from sqlalchemy import case, select, update
 
 import social_reply.infrastructure.queue.broker  # noqa: F401  确保 broker 先初始化
 from social_reply.infrastructure.database import models
@@ -20,21 +20,35 @@ async def _process_events(raw_event_id: uuid.UUID, events: list[dict]) -> None:
         )
 
     async with get_session_factory()() as session:
-        jobs_pending = (
-            await session.execute(
-                models.DecisionJob.__table__.select()
-                .with_only_columns(models.DecisionJob.id)
-                .where(
-                    models.DecisionJob.raw_event_id == raw_event_id,
-                    models.DecisionJob.status != "COMPLETED",
+        statuses = set(
+            (
+                await session.execute(
+                    select(models.DecisionJob.status).where(
+                        models.DecisionJob.raw_event_id == raw_event_id
+                    )
                 )
-                .limit(1)
             )
-        ).first()
+            .scalars()
+            .all()
+        )
+        if "NEEDS_REVIEW" in statuses:
+            processing_status = "DECISION_NEEDS_REVIEW"
+        elif statuses - {"COMPLETED"}:
+            processing_status = "DECISION_PENDING"
+        else:
+            processing_status = "PROCESSED"
         await session.execute(
             update(models.RawEvent)
             .where(models.RawEvent.id == raw_event_id)
-            .values(processing_status="DECISION_PENDING" if jobs_pending else "PROCESSED")
+            .values(
+                processing_status=case(
+                    (
+                        models.RawEvent.processing_status == "DECISION_NEEDS_REVIEW",
+                        "DECISION_NEEDS_REVIEW",
+                    ),
+                    else_=processing_status,
+                )
+            )
         )
         await session.commit()
 
@@ -44,7 +58,15 @@ async def _mark_failed(raw_event_id: uuid.UUID) -> None:
         await session.execute(
             update(models.RawEvent)
             .where(models.RawEvent.id == raw_event_id)
-            .values(processing_status="FAILED")
+            .values(
+                processing_status=case(
+                    (
+                        models.RawEvent.processing_status == "DECISION_NEEDS_REVIEW",
+                        "DECISION_NEEDS_REVIEW",
+                    ),
+                    else_="FAILED",
+                )
+            )
         )
         await session.commit()
 

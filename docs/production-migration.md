@@ -36,6 +36,12 @@ Revision `da4e19c7b203` adds `admin_users` and `admin_sessions`. Revision `e7b2c
 - Ordinary users are created at `/admin/users`, have exactly one Tenant, and must change their initial password on first login.
 - Back up `admin_users` before downgrading this revision; downgrade removes both user and session tables.
 
+## Message history context
+
+Revision `f3a6c1d8e250` adds a database-generated `messages.history_seq`, the `messages.source_outbox_id` provenance key, and a `(conversation_id, history_seq)` index. During the migration it briefly locks `messages` and `outbox_messages`, backfills already-confirmed `SENT` text Outbox rows as outbound conversation facts, and assigns the combined timeline a deterministic order. Take a database backup first and deploy the API migrator before starting the new Worker/Scheduler versions.
+
+History sent to an external LLM is bounded by `CONVERSATION_HISTORY_LIMIT` and `CONVERSATION_HISTORY_MAX_CHARS`; set the limit to `0` to disable multi-turn history. Customer text is retained unchanged in PostgreSQL but email and long-number patterns are redacted in the external LLM request.
+
 ## Rollback
 
 Revision `c9e83a4d1f20` intentionally has no in-place downgrade because tenant-scoped knowledge

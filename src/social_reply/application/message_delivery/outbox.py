@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 from sqlalchemy import insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
@@ -87,11 +88,22 @@ async def _record_outcome(
     statement = update(models.OutboxMessage).where(models.OutboxMessage.id == outbox_id)
     if require_sending:
         statement = statement.where(models.OutboxMessage.status == "SENDING")
-    result = await session.execute(statement.values(**values))
+    finalized = (
+        await session.execute(
+            statement.values(**values).returning(
+                models.OutboxMessage.conversation_id,
+                models.OutboxMessage.message_type,
+                models.OutboxMessage.payload,
+                models.OutboxMessage.sent_at,
+                models.OutboxMessage.chatwoot_message_id,
+                models.OutboxMessage.platform_message_id,
+            )
+        )
+    ).first()
     actual_status = status
     actual_error_code = error_code
     actual_error_message = error_message
-    if result.rowcount == 0:
+    if finalized is None:
         current_status = await session.scalar(
             select(models.OutboxMessage.status).where(models.OutboxMessage.id == outbox_id)
         )
@@ -104,6 +116,27 @@ async def _record_outcome(
         actual_status = "STALE_FINALIZE"
         actual_error_code = "STALE_FINALIZE"
         actual_error_message = f"requested={status}; current={current_status}"
+    elif status == "SENT" and finalized.message_type == "text":
+        payload = dict(finalized.payload or {})
+        text = payload.get("text")
+        if isinstance(text, str) and text:
+            await session.execute(
+                pg_insert(models.Message)
+                .values(
+                    id=uuid.uuid4(),
+                    conversation_id=finalized.conversation_id,
+                    direction="outbound",
+                    sender_type="agent" if payload.get("approval") == "admin" else "bot",
+                    text=text,
+                    chatwoot_message_id=finalized.chatwoot_message_id,
+                    platform_message_id=finalized.platform_message_id,
+                    source_outbox_id=outbox_id,
+                    reply_target=dict(payload.get("target") or {}),
+                    private=False,
+                    occurred_at=finalized.sent_at,
+                )
+                .on_conflict_do_nothing(index_elements=["source_outbox_id"])
+            )
     await session.execute(
         insert(models.DeliveryAttempt).values(
             outbox_id=outbox_id,

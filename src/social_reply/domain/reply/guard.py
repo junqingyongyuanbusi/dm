@@ -3,17 +3,20 @@ from dataclasses import replace
 
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 
-# 账户号/长数字串、邮箱——公开回复禁止回显
-_LONG_DIGITS = re.compile(r"\d{6,}")
+# 账户号/长数字串、邮箱——公开回复禁止回显，发送给外部 LLM 前也需脱敏。
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-# 去分隔符归一化：抹掉空白与常见分组符，防"138 0013 8000 / 8812-3456-7890"式绕过
-_SEPARATORS = re.compile(r"[\s\-–—.·]")
+# 连续或带常见分组符的 6 位以上数字，例如 123456、138 0013 8000。
+_GROUPED_DIGITS = re.compile(r"(?<!\d)\d(?:[\s\-–—.·]*\d){5,}(?!\d)")
 
 
 def _has_pii(text: str) -> bool:
-    """原文与归一化文本都跑长数字串；email 只跑原文（归一化会破坏 email 结构）。"""
-    normalized = _SEPARATORS.sub("", text)
-    return bool(_LONG_DIGITS.search(text) or _LONG_DIGITS.search(normalized) or _EMAIL.search(text))
+    return bool(_GROUPED_DIGITS.search(text) or _EMAIL.search(text))
+
+
+def redact_pii(text: str) -> str:
+    """最小化发送给外部 LLM 的自由文本，不修改数据库中的原始会话记录。"""
+    redacted = _EMAIL.sub("[REDACTED_EMAIL]", text)
+    return _GROUPED_DIGITS.sub("[REDACTED_NUMBER]", redacted)
 
 
 _MAX_TEXT_LENGTH = {"telegram": 4096, "facebook": 2000, "instagram": 1000, "x": 280}

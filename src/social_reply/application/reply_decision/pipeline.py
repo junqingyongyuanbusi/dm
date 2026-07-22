@@ -1,7 +1,7 @@
 from dataclasses import dataclass, replace
 
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
-from social_reply.domain.reply.guard import run_final_guard
+from social_reply.domain.reply.guard import redact_pii, run_final_guard
 from social_reply.domain.reply.llm import LLMClient, LLMContext
 from social_reply.domain.reply.rules import apply_rules
 
@@ -29,6 +29,7 @@ async def run_decision_pipeline(
     knowledge: tuple[str, ...] = (),
     require_knowledge: bool = False,
     verbatim_reply: str | None = None,
+    history: tuple[tuple[str, str], ...] = (),
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
@@ -72,11 +73,17 @@ async def run_decision_pipeline(
             action=ReplyAction.HANDOFF, reason_codes=("INSUFFICIENT_KNOWLEDGE",), source="rule"
         )
     else:
+        safe_history = tuple(
+            (role, redact_pii(text))
+            for role, text in history
+            if role in {"user", "assistant"} and text
+        )
         decision = await llm.decide(
             LLMContext(
-                text=snapshot.text or "",
+                text=redact_pii(snapshot.text or ""),
                 conversation_key=snapshot.conversation_key,
                 knowledge=knowledge,
+                history=safe_history,
             )
         )
         if knowledge:

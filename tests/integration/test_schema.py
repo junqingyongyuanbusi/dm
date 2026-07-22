@@ -151,6 +151,39 @@ async def test_all_core_tables_exist(migrated_db):
     assert EXPECTED_TABLES <= tables
 
 
+async def test_message_history_columns_and_indexes(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        cols = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='messages'"
+                )
+            )
+        }
+        indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='messages'")
+            )
+        }
+        constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='messages'"
+                )
+            )
+        }
+    assert {"history_seq", "source_outbox_id"} <= cols
+    assert "ix_messages_conversation_history" in indexes
+    assert "uq_messages_history_seq" in constraints
+    assert "uq_messages_source_outbox_id" in constraints
+
+
 async def test_reply_decisions_columns_and_message_index(migrated_db):
     engine = get_engine()
     async with engine.connect() as conn:

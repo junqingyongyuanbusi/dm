@@ -2,7 +2,7 @@ from social_reply.application.reply_decision.pipeline import (
     DecisionSnapshot,
     run_decision_pipeline,
 )
-from social_reply.domain.reply.decision import ReplyAction
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.llm import StubLLMClient
 
 
@@ -38,6 +38,30 @@ async def test_bot_active_normal_question_auto_replies_via_llm():
     d = await run_decision_pipeline(_snap(), llm=StubLLMClient(), killswitch=_OpenSwitch())
     assert d.action is ReplyAction.AUTO_REPLY
     assert "STUB_LLM" in d.reason_codes
+
+
+async def test_llm_context_redacts_current_and_history_pii():
+    captured = {}
+
+    class _CaptureLLM:
+        async def decide(self, context):
+            captured["context"] = context
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="已收到",
+                reason_codes=("TEST",),
+                source="llm",
+            )
+
+    await run_decision_pipeline(
+        _snap(text="邮箱 alice@example.com"),
+        llm=_CaptureLLM(),
+        killswitch=_OpenSwitch(),
+        history=(("user", "手机号 138 0013 8000"),),
+    )
+    context = captured["context"]
+    assert context.text == "邮箱 [REDACTED_EMAIL]"
+    assert context.history == (("user", "手机号 [REDACTED_NUMBER]"),)
 
 
 async def test_human_active_forces_ignore():

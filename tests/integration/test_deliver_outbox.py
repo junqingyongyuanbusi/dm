@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import insert, select
 
 from social_reply.application.message_delivery.outbox import deliver_outbox
+from social_reply.application.reply_decision import runner
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.domain.automation.state_machine import ensure_state, flip_to_human_active
 from social_reply.infrastructure.database import models
@@ -91,6 +92,34 @@ async def test_bot_active_text_delivers_and_marks_sent(session):
         )
     ).scalar_one()  # noqa: E501
     assert att.outcome == "SENT"
+    sent_message = (
+        await session.execute(
+            select(models.Message).where(models.Message.source_outbox_id == ob_id)
+        )
+    ).scalar_one()
+    assert sent_message.conversation_id == conv_id
+    assert sent_message.direction == "outbound"
+    assert sent_message.sender_type == "bot"
+    assert sent_message.text == "您好，请提供订单号。"
+    assert sent_message.chatwoot_message_id == ob.chatwoot_message_id
+
+    current_seq = (
+        await session.execute(
+            insert(models.Message)
+            .values(
+                id=uuid.uuid4(),
+                conversation_id=conv_id,
+                direction="inbound",
+                sender_type="contact",
+                text="那上一条是什么意思？",
+            )
+            .returning(models.Message.history_seq)
+        )
+    ).scalar_one()
+    await session.commit()
+    assert await runner._fetch_history(conv_id, current_seq) == (
+        ("assistant", "您好，请提供订单号。"),
+    )
 
 
 async def test_private_note_delivers_as_private(session):
@@ -98,6 +127,11 @@ async def test_private_note_delivers_as_private(session):
     assert await deliver_outbox(str(ob_id)) == "SENT"
     fake = get_chatwoot_client()
     assert fake.sent[-1]["private"] is True
+    assert (
+        await session.execute(
+            select(models.Message).where(models.Message.source_outbox_id == ob_id)
+        )
+    ).first() is None
 
 
 async def test_defense2_cancels_text_when_not_bot_active(session):
@@ -308,6 +342,11 @@ async def test_finalize_does_not_overwrite_non_sending_row(session, monkeypatch,
     ).scalar_one()  # noqa: E501
     assert att.outcome == "STALE_FINALIZE" and att.error_code == "STALE_FINALIZE"
     assert att.chatwoot_message_id == 999
+    assert (
+        await session.execute(
+            select(models.Message).where(models.Message.source_outbox_id == ob_id)
+        )
+    ).first() is None
 
 
 async def _seed_direct_x(session):

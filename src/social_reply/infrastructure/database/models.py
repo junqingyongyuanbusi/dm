@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Sequence,
     String,
     Text,
     UniqueConstraint,
@@ -23,6 +24,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     pass
+
+
+_MESSAGE_HISTORY_SEQUENCE = Sequence("messages_history_seq_seq")
 
 
 def _uuid_pk() -> Mapped[uuid.UUID]:
@@ -158,13 +162,26 @@ class ConversationMapping(Base):
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        UniqueConstraint("history_seq", name="uq_messages_history_seq"),
+        UniqueConstraint("source_outbox_id", name="uq_messages_source_outbox_id"),
+        Index("ix_messages_conversation_history", "conversation_id", "history_seq"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
+    history_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        _MESSAGE_HISTORY_SEQUENCE,
+        server_default=_MESSAGE_HISTORY_SEQUENCE.next_value(),
+    )
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"), index=True)
     direction: Mapped[str] = mapped_column(Text)  # inbound / outbound
     sender_type: Mapped[str] = mapped_column(Text)  # contact / agent / bot
     text: Mapped[str | None] = mapped_column(Text)
     chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     platform_message_id: Mapped[str | None] = mapped_column(Text, index=True)
+    source_outbox_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("outbox_messages.id")
+    )
     reply_target: Mapped[dict] = mapped_column(JSONB, default=dict)
     private: Mapped[bool] = mapped_column(Boolean, default=False)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

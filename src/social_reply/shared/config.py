@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     knowledge_verbatim_reply: bool = False
     # true 时检索无命中直接 HANDOFF/INSUFFICIENT_KNOWLEDGE，不调 LLM（省 token，§十三）
     require_knowledge: bool = False
+    # 决策时注入同会话最近历史消息（不含当前这条）；0 关闭多轮上下文。
+    conversation_history_limit: int = Field(default=20, ge=0, le=50)
+    # 历史总字符预算，避免长会话放大请求成本或超过模型上下文。
+    conversation_history_max_chars: int = Field(default=12000, ge=0, le=50000)
     testing: bool = False
 
     @model_validator(mode="after")

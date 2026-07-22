@@ -104,8 +104,10 @@ docker compose up -d --no-deps --force-recreate worker scheduler
 curl -fsS http://127.0.0.1:8000/healthz
 ```
 
-当前多用户后台修复后的 Alembic head 为 `e7b2c4d9a610`。若 VPS 曾应用早期的
-`da4e19c7b203` 但缺少 `admin_sessions.credential_fingerprint`，该后续迁移会自动补列。
+当前 Alembic head 为 `f3a6c1d8e250`。升级会短暂锁定 `messages` 与
+`outbox_messages`，为现有消息回填稳定历史序号，并把已确认 `SENT` 的文本 Outbox
+补成 assistant 历史。若 VPS 曾应用早期的 `da4e19c7b203` 但缺少
+`admin_sessions.credential_fingerprint`，前一修复 revision 也会自动补列。
 不要只执行 `docker compose restart`：它不会拉取 Docker Hub 上更新后的标签。
 
 **每日自动备份**(crontab -e):

@@ -3,6 +3,7 @@ import time
 import uuid
 
 import redis.asyncio as aioredis
+from sqlalchemy import select
 
 from social_reply.application.knowledge.retrieval import (
     KnowledgeHit,
@@ -16,8 +17,11 @@ from social_reply.application.reply_decision.pipeline import (
 )
 from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.openai_client import OpenAILLMClient
+from social_reply.domain.reply.rules import apply_rules
+from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.killswitch import KillSwitchChecker
 from social_reply.shared.config import get_settings
@@ -99,7 +103,7 @@ async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[KnowledgeHit, ..
             hits = [exact]
         else:
             embedder = _get_embedder()
-            query_embedding = (await embedder.embed([snapshot.text or ""]))[0]
+            query_embedding = (await embedder.embed([redact_pii(snapshot.text or "")]))[0]
             async with get_session_factory()() as session:
                 # 混合检索：向量 + 词法 RRF 融合扩大召回；verbatim_safe 标记保护原文直答闸门
                 hits = await retrieve_hybrid_knowledge(
@@ -130,6 +134,121 @@ async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[KnowledgeHit, ..
     return tuple(hits)
 
 
+class DecisionContextScopeError(RuntimeError):
+    pass
+
+
+async def _validate_decision_scope(
+    snapshot: DecisionSnapshot,
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    account_id: uuid.UUID,
+) -> int:
+    """Validate every durable identifier before any customer text leaves the process."""
+    if snapshot.account_id != str(account_id):
+        raise DecisionContextScopeError("snapshot_account_mismatch")
+    async with get_session_factory()() as session:
+        current = (
+            await session.execute(
+                select(models.Message.history_seq, models.Message.text)
+                .join(
+                    models.Conversation,
+                    models.Message.conversation_id == models.Conversation.id,
+                )
+                .join(
+                    models.PlatformAccount,
+                    models.Conversation.platform_account_id == models.PlatformAccount.id,
+                )
+                .where(
+                    models.Message.id == message_id,
+                    models.Message.conversation_id == conversation_id,
+                    models.Message.direction == "inbound",
+                    models.Message.private.is_(False),
+                    models.Conversation.id == conversation_id,
+                    models.Conversation.tenant_id == snapshot.tenant_id,
+                    models.Conversation.brand_id == snapshot.brand_id,
+                    models.Conversation.platform == snapshot.platform,
+                    models.Conversation.platform_account_id == account_id,
+                    models.Conversation.conversation_key == snapshot.conversation_key,
+                    models.PlatformAccount.id == account_id,
+                    models.PlatformAccount.tenant_id == snapshot.tenant_id,
+                    models.PlatformAccount.brand_id == snapshot.brand_id,
+                    models.PlatformAccount.platform == snapshot.platform,
+                )
+            )
+        ).one_or_none()
+    if current is None or current.text != snapshot.text:
+        raise DecisionContextScopeError("decision_context_scope_mismatch")
+    return int(current.history_seq)
+
+
+async def _fetch_history(
+    conversation_id: uuid.UUID, cutoff_seq: int
+) -> tuple[tuple[str, str], ...]:
+    """Read the immutable message prefix before the current inbound message."""
+    settings = get_settings()
+    limit = settings.conversation_history_limit
+    max_chars = settings.conversation_history_max_chars
+    if limit <= 0 or max_chars <= 0:
+        return ()
+    try:
+        async with get_session_factory()() as session:
+            rows = (
+                await session.execute(
+                    select(models.Message.direction, models.Message.text)
+                    .where(
+                        models.Message.conversation_id == conversation_id,
+                        models.Message.history_seq < cutoff_seq,
+                        models.Message.private.is_(False),
+                        models.Message.text.isnot(None),
+                    )
+                    .order_by(models.Message.history_seq.desc())
+                    .limit(limit)
+                )
+            ).all()
+    except Exception:
+        logger.warning(
+            "会话历史读取失败，按无历史继续: conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
+        return ()
+
+    remaining = max_chars
+    newest_first: list[tuple[str, str]] = []
+    truncated = False
+    for direction, text in rows:
+        if direction == "inbound":
+            role = "user"
+        elif direction == "outbound":
+            role = "assistant"
+        else:
+            logger.warning(
+                "忽略未知消息方向: conversation_id=%s direction=%s",
+                conversation_id,
+                direction,
+            )
+            continue
+        if remaining <= 0:
+            truncated = True
+            break
+        if not text:
+            continue
+        safe_text = redact_pii(text)
+        selected = safe_text[:remaining]
+        if len(selected) < len(safe_text):
+            truncated = True
+        newest_first.append((role, selected))
+        remaining -= len(selected)
+    if truncated:
+        logger.info(
+            "会话历史按字符预算截断: conversation_id=%s max_chars=%d",
+            conversation_id,
+            max_chars,
+        )
+    return tuple(reversed(newest_first))
+
+
 async def run_and_persist_decision(
     snapshot: DecisionSnapshot,
     conversation_id: uuid.UUID,
@@ -140,6 +259,9 @@ async def run_and_persist_decision(
     返回 outbox_id（供后续投递入队）。"""
     started = time.perf_counter()
     settings = get_settings()
+    cutoff_seq = await _validate_decision_scope(
+        snapshot, conversation_id, message_id, account_id
+    )
     try:
         killswitch = _make_killswitch()
     except Exception:
@@ -149,7 +271,11 @@ async def run_and_persist_decision(
             action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule"
         )
     else:
-        hits = await _fetch_knowledge(snapshot)
+        deterministic_rule = apply_rules(snapshot.text)
+        should_retrieve = (
+            snapshot.automation_state != "HUMAN_ACTIVE" and deterministic_rule is None
+        )
+        hits = await _fetch_knowledge(snapshot) if should_retrieve else ()
         # 模板直答：必须基于「相似度最高」的命中判断，不能用 RRF 序的 hits[0]——
         # RRF 分最高 ≠ 相似度最高，否则会误发词法命中的错模板，或漏发真正强命中的向量项。
         # 仅精确匹配或达阈值向量命中（verbatim_safe）才原文外发；词法-only/低相似度只作 LLM 上下文。
@@ -158,14 +284,27 @@ async def run_and_persist_decision(
             top_by_similarity = max(hits, key=lambda h: h.similarity)
             if top_by_similarity.verbatim_safe:
                 verbatim = top_by_similarity.reply
+        require_knowledge = (
+            settings.knowledge_retrieval_enabled and settings.require_knowledge
+        )
+        needs_llm_history = (
+            should_retrieve
+            and verbatim is None
+            and not (require_knowledge and not hits)
+        )
+        history = (
+            await _fetch_history(conversation_id, cutoff_seq)
+            if needs_llm_history
+            else ()
+        )
         decision = await run_decision_pipeline(
             snapshot,
             llm=_get_llm(),
             killswitch=killswitch,
             knowledge=tuple(h.content for h in hits),
-            # require_knowledge 仅在检索开启时生效，否则会把所有消息误降级为转人工
-            require_knowledge=settings.knowledge_retrieval_enabled and settings.require_knowledge,
+            require_knowledge=require_knowledge,
             verbatim_reply=verbatim,
+            history=history,
         )
         # 低风险 LLM 不确定不应静默、也不应永久锁死会话。仅把 LLM 自身给出的
         # handoff 转为公开兜底；风险词、知识不足强制转人工、Guard 失败仍保持 handoff。
