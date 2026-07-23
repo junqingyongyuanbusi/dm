@@ -7,6 +7,7 @@ import time
 from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 from social_reply.connectors.xchat.client import XChatClient
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,9 @@ _last_check_at: float = 0.0
 
 async def ensure_xchat_subscriptions() -> list[str]:
     global _last_check_at
+    settings = get_settings()
+    if not settings.x_activity_enabled or not settings.xchat_enabled:
+        return []
     now = time.monotonic()
     if now - _last_check_at < _CHECK_INTERVAL_SECONDS:
         return []
@@ -25,6 +29,12 @@ async def ensure_xchat_subscriptions() -> list[str]:
     seen_apps: dict[str, list[dict]] = {}
     for account in await list_active_accounts_by_platform("x"):
         credentials = x_credentials(account)
+        if not (account.capability or {}).get("x_chat"):
+            continue
+        if not credentials.get("xchat_private_keys_b64") or not credentials.get(
+            "xchat_signing_key_version"
+        ):
+            continue
         consumer_key = credentials.get("consumer_key")
         consumer_secret = credentials.get("consumer_secret")
         external_account_id = account.external_account_id
@@ -55,7 +65,7 @@ async def ensure_xchat_subscriptions() -> list[str]:
                 webhook_id=str(webhook_id),
                 tag=f"reply-core:{account.public_id}",
             )
-            subscription = ((result.get("data") or {}).get("subscription") or {})
+            subscription = (result.get("data") or {}).get("subscription") or {}
             subscription_id = str(subscription.get("subscription_id") or "")
             if subscription_id:
                 subscriptions.append(subscription)

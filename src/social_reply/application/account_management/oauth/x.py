@@ -43,6 +43,7 @@ from social_reply.application.account_management.x_app import x_app_credentials
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
@@ -287,6 +288,11 @@ async def x_oauth_start(request: Request) -> Response:
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
     principal.require_tenant(tenant_id)
+    settings = get_settings()
+    if not settings.x_integration_enabled:
+        return notice("X 集成已关闭", "当前环境未启用任何 X 消息栈。", status_code=503)
+    if (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
+        return notice("XChat 已关闭", "当前环境不接受 XChat PIN。", status_code=422)
 
     credentials = x_app_credentials()
     if credentials is None:
@@ -458,6 +464,36 @@ async def x_oauth_callback(request: Request) -> Response:
             return_to=state.get("return_to"),
         )
 
+    settings = get_settings()
+    if not settings.x_integration_enabled:
+        _log_callback(
+            request,
+            stage="validate_features",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="x_integration_disabled",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="x_integration_disabled",
+            return_to=state.get("return_to"),
+        )
+    if state.get("xchat_pin") and not settings.xchat_enabled:
+        _log_callback(
+            request,
+            stage="validate_features",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="xchat_disabled",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="xchat_disabled",
+            return_to=state.get("return_to"),
+        )
+
     credentials = x_app_credentials()
     if credentials is None:
         _log_callback(
@@ -514,7 +550,7 @@ async def x_oauth_callback(request: Request) -> Response:
         "access_token": token["oauth_token"],
         "access_token_secret": token["oauth_token_secret"],
     }
-    if state.get("xchat_pin"):
+    if settings.xchat_enabled and state.get("xchat_pin"):
         submission["xchat_pin"] = state["xchat_pin"]
     request_data, secrets_data = split_submission("x", submission)
     try:

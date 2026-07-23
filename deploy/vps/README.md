@@ -71,6 +71,8 @@ curl -s https://relay.nexory.top/healthz   # {"status":"ok"}(经 Cloudflare 全�
 
 ### X OAuth 配置
 
+三个角色必须使用相同的 `X_LEGACY_DM_ENABLED`、`X_ACTIVITY_ENABLED`、`XCHAT_ENABLED`。现有部署升级时显式保持当前能力；新部署建议先用 `XCHAT_ENABLED=false`，仅为测试账号开启实验性的 XChat 密钥链路。关闭任一发送栈会把对应 Outbox 暂停为可恢复状态，不会删除 token、游标或私钥。为避免 durable checkpoint 上线前形成不可追赶缺口，已有且已验证能力的账号仍执行低频 reconciliation。
+
 `.env` 中的 `X_API_KEY` / `X_API_SECRET` 必须来自 X Developer Portal 的
 **Consumer Keys**，不能填写 OAuth 2.0 Client ID / Client Secret。User authentication
 settings 使用 **OAuth 1.0a**，App permissions 设为

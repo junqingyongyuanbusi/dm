@@ -14,14 +14,14 @@ from social_reply.application.event_ingestion.xchat_subscription import (
 from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision.jobs import sweep_decision_jobs
 from social_reply.infrastructure.queue.actor_loop import run_on_actor_loop
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import Settings, get_settings
 
 _INTERVAL_SECONDS = 3
 
 
-def _build_sweeps(chatwoot_enabled: bool) -> tuple[tuple[str, Callable[[], Awaitable[list]]], ...]:
+def _build_sweeps(settings: Settings) -> tuple[tuple[str, Callable[[], Awaitable[list]]], ...]:
     sweeps: list[tuple[str, Callable[[], Awaitable[list]]]] = []
-    if chatwoot_enabled:
+    if settings.chatwoot_enabled:
         from social_reply.application.event_ingestion.reconcile import (
             reconcile_chatwoot_messages,
         )
@@ -31,18 +31,22 @@ def _build_sweeps(chatwoot_enabled: bool) -> tuple[tuple[str, Callable[[], Await
         (
             ("sweep_provisioning_jobs", sweep_provisioning_jobs),
             ("sweep_decision_jobs", sweep_decision_jobs),
-            ("sweep_outbox", sweep_outbox),
-            # Legacy DM 与 XChat 是两套互不兼容的消息栈，必须分别补拉。
-            ("poll_x_direct_messages", poll_x_direct_messages),
-            ("poll_xchat_messages", poll_xchat_messages),
-            ("ensure_xchat_subscriptions", ensure_xchat_subscriptions),
-            ("ensure_x_webhooks_valid", ensure_x_webhooks_valid),
         )
     )
+    # 轮询在 feature flag 关闭时仍为已有可用账号做低频对账，避免在 durable
+    # checkpoint/backfill 上线前因长时间暂停放大平台历史窗口缺口。
+    sweeps.append(("poll_x_direct_messages", poll_x_direct_messages))
+    sweeps.append(("poll_xchat_messages", poll_xchat_messages))
+    if settings.x_activity_enabled and settings.xchat_enabled:
+        sweeps.append(("ensure_xchat_subscriptions", ensure_xchat_subscriptions))
+    if settings.x_activity_enabled:
+        sweeps.append(("ensure_x_webhooks_valid", ensure_x_webhooks_valid))
+    # Capability reconciliation must run before paused X Outbox rows are released.
+    sweeps.append(("sweep_outbox", sweep_outbox))
     return tuple(sweeps)
 
 
-_SWEEPS = _build_sweeps(get_settings().chatwoot_enabled)
+_SWEEPS = _build_sweeps(get_settings())
 
 logger = logging.getLogger(__name__)
 

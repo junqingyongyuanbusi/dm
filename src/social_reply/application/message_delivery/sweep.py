@@ -15,16 +15,30 @@ async def sweep_outbox() -> list[uuid.UUID]:
     """补扫：滞留 SENDING 转 NEEDS_REVIEW（不自动重发，防重复）；
     PENDING / 退避到期 FAILED 重新入队。返回本轮入队的 outbox id。"""
     now = datetime.now(UTC)
+    settings = get_settings()
+    recoverable_routes = []
+    if settings.chatwoot_enabled:
+        recoverable_routes.append(("chatwoot_conversation", "CHATWOOT_DISABLED", None))
+    if settings.x_legacy_dm_enabled:
+        recoverable_routes.append(("x_dm", "X_LEGACY_DM_DISABLED", "dm"))
+    if settings.xchat_enabled:
+        recoverable_routes.append(("x_chat_message", "XCHAT_DISABLED", "x_chat"))
     async with get_session_factory()() as session:
-        if get_settings().chatwoot_enabled:
-            await session.execute(
-                update(models.OutboxMessage)
-                .where(
-                    models.OutboxMessage.status == "NEEDS_REVIEW",
-                    models.OutboxMessage.destination_type == "chatwoot_conversation",
-                    models.OutboxMessage.last_error_code == "CHATWOOT_DISABLED",
+        for destination_type, error_code, capability_key in recoverable_routes:
+            statement = update(models.OutboxMessage).where(
+                models.OutboxMessage.status == "NEEDS_REVIEW",
+                models.OutboxMessage.destination_type == destination_type,
+                models.OutboxMessage.last_error_code == error_code,
+            )
+            if capability_key is not None:
+                capable_accounts = select(models.PlatformAccount.id).where(
+                    models.PlatformAccount.capability[capability_key].as_boolean().is_(True)
                 )
-                .values(
+                statement = statement.where(
+                    models.OutboxMessage.platform_account_id.in_(capable_accounts)
+                )
+            await session.execute(
+                statement.values(
                     status="PENDING",
                     next_attempt_at=None,
                     locked_at=None,

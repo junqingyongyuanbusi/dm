@@ -68,6 +68,57 @@ async def test_meta_account_api_rejects_missing_app_identity():
     assert response.status_code == 422
 
 
+async def test_x_account_api_rejects_disabled_features(monkeypatch):
+    settings = account_router.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": False,
+            "x_activity_enabled": False,
+            "xchat_enabled": False,
+        }
+    )
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/x",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+                "environment": "oauth",
+            },
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "x_integration_disabled"
+
+
+async def test_x_account_api_rejects_pin_when_xchat_disabled(monkeypatch):
+    settings = account_router.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": True,
+            "x_activity_enabled": True,
+            "xchat_enabled": False,
+        }
+    )
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/x",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+                "environment": "oauth",
+                "xchat_pin": "1234",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "xchat_disabled"
+
+
 async def test_whatsapp_account_api_submits_phone_number_job(monkeypatch):
     captured = {}
 

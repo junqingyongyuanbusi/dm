@@ -14,6 +14,9 @@ _ENV_KEYS = [
     "PLATFORM_SECRET_KEYS",
     "X_API_KEY",
     "X_API_SECRET",
+    "X_LEGACY_DM_ENABLED",
+    "X_ACTIVITY_ENABLED",
+    "XCHAT_ENABLED",
     "X_OAUTH_LEGACY_STATE_WRITE",
     "FACEBOOK_APP_ID",
     "FACEBOOK_APP_SECRET",
@@ -49,6 +52,10 @@ def test_testing_true_默认值可用() -> None:
     assert settings.openai_base_url == "https://api.openai.com/v1"
     assert settings.openai_model == "gpt-4o-mini"
     assert settings.openai_timeout_seconds == 30.0
+    assert settings.x_legacy_dm_enabled is True
+    assert settings.x_activity_enabled is True
+    assert settings.xchat_enabled is True
+    assert settings.x_integration_enabled is True
 
 
 def test_非测试环境_默认_chatwoot_api_token_拒绝() -> None:
@@ -127,6 +134,27 @@ def test_x_app_credentials_must_be_configured_as_a_pair() -> None:
 
     settings = _make(testing=True, x_api_key="key", x_api_secret="secret")
     assert settings.x_app_credentials == ("key", "secret")
+
+
+def test_x_feature_flags_are_independent() -> None:
+    settings = _make(
+        testing=True,
+        x_legacy_dm_enabled=False,
+        x_activity_enabled=False,
+        xchat_enabled=True,
+    )
+    assert settings.x_legacy_dm_enabled is False
+    assert settings.x_activity_enabled is False
+    assert settings.xchat_enabled is True
+    assert settings.x_integration_enabled is True
+
+    disabled = _make(
+        testing=True,
+        x_legacy_dm_enabled=False,
+        x_activity_enabled=False,
+        xchat_enabled=False,
+    )
+    assert disabled.x_integration_enabled is False
 
 
 def test_x_oauth_legacy_state_write_is_typed_setting() -> None:

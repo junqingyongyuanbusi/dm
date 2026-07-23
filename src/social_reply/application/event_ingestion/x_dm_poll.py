@@ -14,6 +14,7 @@ from social_reply.connectors.x.adapter import XWebhookAdapter
 from social_reply.connectors.x.client import XClient
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ _CURSOR_LOOKBACK_MS = 5 * 60 * 1000
 
 async def poll_x_direct_messages() -> list[str]:
     global _last_poll_at
+    settings = get_settings()
     now = time.monotonic()
     if now - _last_poll_at < _POLL_INTERVAL_SECONDS:
         return []
@@ -36,8 +38,16 @@ async def poll_x_direct_messages() -> list[str]:
 
     ingested: list[str] = []
     for account in await list_active_accounts_by_platform("x"):
+        dm_capable = bool((account.capability or {}).get("dm"))
+        if not settings.x_legacy_dm_enabled and not dm_capable:
+            continue
         try:
-            ingested.extend(await _poll_account(account))
+            ingested.extend(
+                await _poll_account(
+                    account,
+                    reconcile_capability=settings.x_legacy_dm_enabled and not dm_capable,
+                )
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 logger.warning("x dm poll rate-limited account=%s", account.id)
@@ -52,7 +62,7 @@ async def poll_x_direct_messages() -> list[str]:
     return ingested
 
 
-async def _poll_account(account) -> list[str]:
+async def _poll_account(account, *, reconcile_capability: bool = False) -> list[str]:
     self_id = account.external_account_id
     if not self_id:
         logger.warning("x account %s has no external_account_id; skipping poll", account.id)
@@ -74,6 +84,8 @@ async def _poll_account(account) -> list[str]:
         events = await _read_until_cursor(client, cursor, bootstrap=not bootstrapped)
     finally:
         await client.aclose()
+    if reconcile_capability:
+        await _mark_dm_capable(account.id)
     if not bootstrapped:
         newest_id = _max_event_id(events)
         await _save_cursor(account.id, newest_id, bootstrapped=True)
@@ -166,6 +178,19 @@ def _as_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+async def _mark_dm_capable(account_id) -> None:
+    async with get_session_factory()() as session:
+        await session.execute(
+            update(models.PlatformAccount)
+            .where(models.PlatformAccount.id == account_id)
+            .values(
+                capability=models.PlatformAccount.capability.op("||")({"dm": True}),
+                config_version=models.PlatformAccount.config_version + 1,
+            )
+        )
+        await session.commit()
 
 
 async def _save_cursor(

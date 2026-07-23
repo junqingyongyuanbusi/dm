@@ -540,6 +540,12 @@ async def _submit_form(
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
     principal.require_tenant(tenant_id)
+    if platform == "x":
+        settings = get_settings()
+        if not settings.x_integration_enabled:
+            raise HTTPException(status_code=503, detail="x_integration_disabled")
+        if (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
+            raise HTTPException(status_code=422, detail="xchat_disabled")
     brand_id = form.get("brand_id", "default") or "default"
     request_data, secrets_data = split_submission(platform, form)
     job_id = await submit_provisioning_job(

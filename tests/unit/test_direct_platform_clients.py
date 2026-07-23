@@ -1,8 +1,11 @@
 import json
+import uuid
 
 import httpx
 import pytest
 
+from social_reply.application.platform_accounts import PlatformAccountRuntime
+from social_reply.connectors import registry
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
 from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.x.client import XClient
@@ -86,6 +89,49 @@ async def test_standalone_instagram_client_uses_instagram_graph_endpoints():
     assert requests[0].url.path == "/v23.0/me"
     assert requests[1].url.path == "/v23.0/ig-1/messages"
     await client.aclose()
+
+
+async def test_xchat_sender_is_not_built_when_globally_disabled(monkeypatch):
+    account = PlatformAccountRuntime(
+        id=uuid.uuid4(),
+        tenant_id="default",
+        brand_id="default",
+        platform="x",
+        platform_app_id=None,
+        name="x",
+        external_account_id="x-1",
+        public_id="x-public",
+        credential_bundle_data={},
+        webhook_secret_bundle_data=None,
+        config={"delivery_mode": "direct"},
+        capability={"dm": True, "x_chat": True},
+        config_version=1,
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    monkeypatch.setattr(
+        type(account),
+        "credential_bundle",
+        property(
+            lambda self: {
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+                "xchat_private_keys_b64": "private",
+                "xchat_signing_key_version": "7",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        registry,
+        "get_settings",
+        lambda: type("Settings", (), {"xchat_enabled": False})(),
+    )
+
+    sender = registry._build_sender(account)
+    assert isinstance(sender, XClient)
+    await sender.aclose()
 
 
 async def test_x_client_sends_dm_and_reply():

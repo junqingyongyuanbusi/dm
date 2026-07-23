@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     # deployment, while each authorized account stores only its user token pair.
     x_api_key: SecretStr = SecretStr("")
     x_api_secret: SecretStr = SecretStr("")
+    x_legacy_dm_enabled: bool = True
+    x_activity_enabled: bool = True
+    xchat_enabled: bool = True
     x_oauth_legacy_state_write: bool = False
     facebook_app_id: str = ""
     facebook_app_secret: SecretStr = SecretStr("")
@@ -133,6 +136,10 @@ class Settings(BaseSettings):
         key = self.x_api_key.get_secret_value().strip()
         secret = self.x_api_secret.get_secret_value().strip()
         return (key, secret) if key and secret else None
+
+    @property
+    def x_integration_enabled(self) -> bool:
+        return self.x_legacy_dm_enabled or self.x_activity_enabled or self.xchat_enabled
 
     @property
     def facebook_app_credentials(self) -> tuple[str, str] | None:

@@ -78,9 +78,7 @@ async def _poll_account(account) -> list[str]:
         conversations.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         ingested: list[str] = []
         for conversation in conversations[:_MAX_CONVERSATIONS_PER_POLL]:
-            conversation_id = canonical_conversation_id(
-                str(conversation.get("id") or "")
-            )
+            conversation_id = canonical_conversation_id(str(conversation.get("id") or ""))
             if not conversation_id:
                 continue
             participant_ids = [str(value) for value in conversation.get("participant_ids") or []]
@@ -136,9 +134,7 @@ async def _poll_conversation(
     bootstrapped = bool(
         ((account.config or {}).get("xchat_bootstrapped") or {}).get(conversation_id)
     )
-    envelopes, key_changes, complete = await _read_until_cursor(
-        client, conversation_id, cursor
-    )
+    envelopes, key_changes, complete = await _read_until_cursor(client, conversation_id, cursor)
     newest_id = _max_event_id(envelopes)
     if not envelopes:
         if not bootstrapped:
@@ -183,9 +179,7 @@ async def _poll_conversation(
     if not bootstrapped:
         # If the newest history event is ours, the conversation has already been
         # answered in XChat and no historical inbound should trigger another reply.
-        newest_sender = (
-            str((ordered[-1].get("envelope") or {}).get("sender_id")) if ordered else ""
-        )
+        newest_sender = str((ordered[-1].get("envelope") or {}).get("sender_id")) if ordered else ""
         if newest_sender == str(account.external_account_id):
             ordered = []
         else:

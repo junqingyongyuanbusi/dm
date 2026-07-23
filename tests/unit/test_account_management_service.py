@@ -96,6 +96,10 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
 
 
 async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypatch, tmp_path):
+    settings = service.get_settings().model_copy(
+        update={"x_legacy_dm_enabled": False, "xchat_enabled": True}
+    )
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
     existing = PlatformAccountRuntime(
         id=uuid.uuid4(),
         tenant_id="default",
@@ -153,6 +157,7 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         assert kwargs["credential_bundle"]["xchat_private_keys_b64"] == "private"
         assert kwargs["credential_bundle"]["xchat_signing_key_version"] == "7"
         assert kwargs["config"]["xchat_cursors"] == {"x-1-peer": "123"}
+        assert kwargs["capability"]["dm"] is True
         assert kwargs["capability"]["x_chat"] is True
         return uuid.uuid4(), "primary"
 
@@ -181,9 +186,11 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
     assert result.webhook_url == "https://reply.example.com/webhooks/x/x_oauth"
 
 
-async def test_connect_x_rejects_app_without_direct_message_permission(
-    monkeypatch, tmp_path
-):
+async def test_connect_x_rejects_app_without_direct_message_permission(monkeypatch, tmp_path):
+    settings = service.get_settings().model_copy(
+        update={"x_legacy_dm_enabled": False, "xchat_enabled": True}
+    )
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
     closed = False
 
     class FakeXClient:
@@ -222,6 +229,111 @@ async def test_connect_x_rejects_app_without_direct_message_permission(
             secrets_root=tmp_path,
         )
     assert closed is True
+
+
+@pytest.mark.parametrize(
+    ("settings_values", "xchat_pin", "error"),
+    [
+        (
+            {
+                "x_integration_enabled": False,
+                "x_legacy_dm_enabled": False,
+                "x_activity_enabled": False,
+                "xchat_enabled": False,
+            },
+            None,
+            "x_integration_disabled",
+        ),
+        (
+            {
+                "x_integration_enabled": True,
+                "x_legacy_dm_enabled": True,
+                "x_activity_enabled": True,
+                "xchat_enabled": False,
+            },
+            "1234",
+            "xchat_disabled",
+        ),
+    ],
+)
+async def test_connect_x_rechecks_feature_flags_at_execution(
+    monkeypatch, tmp_path, settings_values, xchat_pin, error
+):
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: type("Settings", (), settings_values)(),
+    )
+    with pytest.raises(ValueError, match=error):
+        await service.connect_x_account(
+            consumer_key="ck",
+            consumer_secret="cs",
+            access_token="at",
+            access_token_secret="ats",
+            environment="oauth",
+            xchat_pin=xchat_pin,
+            public_base_url="https://reply.example.com",
+            secrets_root=tmp_path,
+        )
+
+
+async def test_connect_x_skips_legacy_probe_when_disabled(monkeypatch, tmp_path):
+    class FakeXClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get_me(self):
+            return {"id": "x-1", "username": "bot"}
+
+        async def read_dm_events(self, *, max_results):
+            raise AssertionError("legacy DM probe must be disabled")
+
+        async def aclose(self):
+            pass
+
+    async def missing_existing(**kwargs):
+        raise LookupError("missing")
+
+    async def fake_x_app(**kwargs):
+        return uuid.uuid4(), "x_oauth"
+
+    async def fake_provision(**kwargs):
+        assert kwargs["capability"]["dm"] is False
+        return uuid.uuid4(), "x_public"
+
+    monkeypatch.setattr(
+        service,
+        "get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "x_legacy_dm_enabled": False,
+                "x_activity_enabled": True,
+                "xchat_enabled": False,
+                "x_integration_enabled": True,
+            },
+        )(),
+    )
+    monkeypatch.setattr(service, "XClient", FakeXClient)
+    monkeypatch.setattr(
+        service,
+        "get_platform_account_runtime_by_external_id",
+        missing_existing,
+    )
+    monkeypatch.setattr(service, "ensure_x_platform_app", fake_x_app)
+    monkeypatch.setattr(service, "provision_direct_account", fake_provision)
+
+    result = await service.connect_x_account(
+        consumer_key="ck",
+        consumer_secret="cs",
+        access_token="at",
+        access_token_secret="ats",
+        environment="oauth",
+        public_base_url="https://reply.example.com",
+        secrets_root=tmp_path,
+    )
+    assert result.public_id == "x_public"
 
 
 async def test_enable_xchat_updates_existing_account_without_persisting_pin(monkeypatch):
@@ -302,3 +414,4 @@ async def test_enable_xchat_updates_existing_account_without_persisting_pin(monk
     assert encrypted["xchat_private_keys_b64"] == "private"
     assert encrypted["xchat_signing_key_version"] == "7"
     assert "1234" not in encrypted.values()
+    assert str(fake_session.statement).count("||") == 2

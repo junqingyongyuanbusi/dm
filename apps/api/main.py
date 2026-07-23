@@ -10,7 +10,6 @@ from social_reply.application.account_management.router import router as account
 from social_reply.application.account_management.users import router as admin_users_router
 from social_reply.connectors.meta.router import router as meta_router
 from social_reply.connectors.telegram.router import router as telegram_router
-from social_reply.connectors.x.router import router as x_router
 from social_reply.shared.config import Settings, get_settings
 
 _X_OAUTH_CALLBACK_PATH = "/admin/oauth/x/callback"
@@ -98,7 +97,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(ingestion_router)
     app.include_router(telegram_router)
     app.include_router(meta_router)
-    app.include_router(x_router)
+    if settings.x_activity_enabled:
+        from social_reply.connectors.x.router import router as x_router
+
+        app.include_router(x_router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

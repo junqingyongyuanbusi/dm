@@ -11,6 +11,7 @@ from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.whatsapp.client import WhatsAppClient
 from social_reply.connectors.x.client import XClient
 from social_reply.connectors.xchat.sender import DualXSender, XChatSender
+from social_reply.shared.config import get_settings
 
 _senders: dict[tuple[str, uuid.UUID, int], PlatformSender] = {}
 
@@ -55,9 +56,7 @@ def _build_sender(account: PlatformAccountRuntime) -> PlatformSender:
             external_account_id=account.external_account_id,
             graph_base_url=account.config.get("graph_base_url", "https://graph.facebook.com"),
             api_version=account.config.get("api_version", "v23.0"),
-            instagram_login_mode=account.config.get(
-                "instagram_login_mode", "facebook_login"
-            ),
+            instagram_login_mode=account.config.get("instagram_login_mode", "facebook_login"),
             page_id=account.config.get("page_id"),
         )
     if account.platform == "whatsapp":
@@ -78,6 +77,8 @@ def _build_sender(account: PlatformAccountRuntime) -> PlatformSender:
             access_token_secret=credentials["access_token_secret"],
             api_base_url=account.config.get("api_base_url", "https://api.x.com"),
         )
+        if not get_settings().xchat_enabled:
+            return legacy
         private_keys = credentials.get("xchat_private_keys_b64")
         signing_version = credentials.get("xchat_signing_key_version")
         if not private_keys or not signing_version:

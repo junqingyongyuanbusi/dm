@@ -274,7 +274,7 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
         consumer_secret=credentials["consumer_secret"],
         access_token=credentials["access_token"],
         access_token_secret=credentials["access_token_secret"],
-        environment=str(request["environment"]),
+        environment=str(request.get("environment") or "oauth"),
         xchat_pin=credentials.get("xchat_pin"),
         **common,
     )

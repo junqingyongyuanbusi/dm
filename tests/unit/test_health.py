@@ -4,11 +4,12 @@ from apps.api.main import create_app
 from social_reply.shared.config import Settings
 
 
-def _settings(*, chatwoot_enabled: bool) -> Settings:
+def _settings(*, chatwoot_enabled: bool, x_activity_enabled: bool = True) -> Settings:
     return Settings(
         _env_file=None,
         testing=True,
         chatwoot_enabled=chatwoot_enabled,
+        x_activity_enabled=x_activity_enabled,
         platform_secret_keys="Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
     )
 
@@ -36,3 +37,25 @@ async def test_chatwoot_router_follows_feature_flag():
 
     assert disabled.status_code == 404
     assert enabled.status_code != 404
+
+
+async def test_x_activity_router_follows_feature_flag():
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=create_app(_settings(chatwoot_enabled=False, x_activity_enabled=False))
+        ),
+        base_url="http://test",
+    ) as client:
+        disabled = await client.get("/webhooks/x/missing", params={"crc_token": "token"})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=create_app(_settings(chatwoot_enabled=False, x_activity_enabled=True))
+        ),
+        base_url="http://test",
+    ) as client:
+        enabled = await client.get("/webhooks/x/missing", params={"crc_token": "token"})
+
+    assert disabled.status_code == 404
+    assert disabled.json()["detail"] == "Not Found"
+    assert enabled.status_code == 404
+    assert enabled.json()["detail"] == "x_webhook_not_found"

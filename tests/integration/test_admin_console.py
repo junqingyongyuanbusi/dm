@@ -88,6 +88,33 @@ async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
     assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
 
 
+async def test_accounts_page_hides_x_forms_when_all_stacks_disabled(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": False,
+            "x_activity_enabled": False,
+            "xchat_enabled": False,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    assert (
+        '<form class="card" style="display:none" method="post" '
+        'action="/admin/oauth/x/start">' in response.text
+    )
+    assert (
+        '<form class="card" style="display:none" method="post" '
+        'action="/admin/connect/x">' in response.text
+    )
+    assert "XChat 4 位 PIN" not in response.text
+
+
 async def test_accounts_page_renders_x_oauth_result_banner(migrated_db):
     async with _app_client() as client:
         await _login(client)

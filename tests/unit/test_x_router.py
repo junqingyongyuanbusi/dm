@@ -5,6 +5,51 @@ from fastapi import HTTPException
 from social_reply.connectors.x import router
 
 
+def test_ingress_plan_filters_disabled_legacy_dm_but_keeps_mentions():
+    payload = {
+        "direct_message_events": [
+            {
+                "id": "dm-1",
+                "message_create": {
+                    "sender_id": "user-1",
+                    "message_data": {"text": "dm"},
+                },
+            }
+        ],
+        "tweet_create_events": [{"id_str": "post-1", "user_id_str": "user-1", "text": "mention"}],
+    }
+    events = router.XWebhookAdapter(
+        account_id="account-1",
+        external_account_id="bot-1",
+    ).normalize(payload)
+
+    filtered, status, dispatch_xchat = router._ingress_plan(
+        payload,
+        "",
+        events,
+        legacy_enabled=False,
+        xchat_enabled=True,
+    )
+
+    assert [event.reply_target["kind"] for event in filtered] == ["reply"]
+    assert status == "PENDING"
+    assert dispatch_xchat is False
+
+
+def test_ingress_plan_drops_disabled_xchat_before_dispatch():
+    events, status, dispatch_xchat = router._ingress_plan(
+        {"data": {"event_type": "chat.received"}},
+        "chat.received",
+        [],
+        legacy_enabled=True,
+        xchat_enabled=False,
+    )
+
+    assert events == []
+    assert status == "IGNORED_XCHAT_DISABLED"
+    assert dispatch_xchat is False
+
+
 async def test_x_app_webhook_routes_activity_event_to_authorized_account(monkeypatch):
     app = SimpleNamespace(id="app-id", credential_bundle={"consumer_secret": "secret"})
     account = SimpleNamespace(id="account-id")

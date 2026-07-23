@@ -27,6 +27,19 @@ compatibility Actor long enough to drain already queued RawEvents; their deliver
 deliveries move to `NEEDS_REVIEW/CHATWOOT_DISABLED` while disabled and are safely returned to the
 Outbox queue after re-enable. Database fields and conversation mappings remain intact.
 
+## X stack feature flags
+
+This release adds `X_LEGACY_DM_ENABLED`, `X_ACTIVITY_ENABLED`, and `XCHAT_ENABLED`. Their code
+defaults are `true` for upgrade compatibility, but new deployment templates explicitly keep XChat
+disabled because its key workflow remains experimental. API, Worker, and Scheduler must receive the
+same values.
+
+A disabled stack keeps credentials, cursors, subscriptions, and XChat key material intact. Matching
+Outbox rows move to a recoverable `NEEDS_REVIEW` state and return to `PENDING` after re-enable.
+Workers continue registering all durable actors so already accepted work can drain. Until durable
+checkpoint/backfill lands, verified accounts retain low-frequency reconciliation to avoid enlarging
+provider-history gaps. `x_post_reply` is independent of the Legacy DM flag.
+
 ### Previously released `a3f9c2e14b78` databases
 
 An earlier implementation dropped `credential_ref`, `webhook_secret_ref`, and

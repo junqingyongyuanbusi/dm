@@ -88,7 +88,7 @@ class XAccountRequest(_BaseAccountRequest):
     consumer_secret: SecretStr
     access_token: SecretStr
     access_token_secret: SecretStr
-    environment: str = Field(min_length=1, max_length=128)
+    environment: str = Field(default="oauth", min_length=1, max_length=128)
     xchat_pin: SecretStr | None = None
 
 
@@ -227,6 +227,11 @@ async def create_or_update_x_account(
     request: XAccountRequest,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> ProvisioningJobResponse:
+    settings = get_settings()
+    if not settings.x_integration_enabled:
+        raise HTTPException(status_code=503, detail="x_integration_disabled")
+    if request.xchat_pin is not None and not settings.xchat_enabled:
+        raise HTTPException(status_code=422, detail="xchat_disabled")
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request("x", request)
     job_id = await submit_provisioning_job(

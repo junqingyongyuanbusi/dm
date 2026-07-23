@@ -24,6 +24,7 @@ from social_reply.connectors.xchat.client import XChatClient
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
+from social_reply.shared.config import get_settings
 
 _AUTOMATION_DEFAULTS = {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
 _META_PLATFORMS = {"facebook", "instagram"}
@@ -287,16 +288,14 @@ async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
         await client.aclose()
     credentials["xchat_private_keys_b64"] = private_keys
     credentials["xchat_signing_key_version"] = key_version
-    config = {**account.config, "xchat_enabled": True}
-    capability = {**account.capability, "x_chat": True}
     async with get_session_factory()() as session:
         await session.execute(
             models.PlatformAccount.__table__.update()
             .where(models.PlatformAccount.id == account_id)
             .values(
                 credential_bundle=encrypt_secret_bundle(credentials),
-                config=config,
-                capability=capability,
+                config=models.PlatformAccount.config.op("||")({"xchat_enabled": True}),
+                capability=models.PlatformAccount.capability.op("||")({"x_chat": True}),
                 config_version=models.PlatformAccount.config_version + 1,
             )
         )
@@ -323,6 +322,11 @@ async def connect_x_account(
 ) -> AccountConnectionResult:
     """验证 X OAuth 1.0a 凭证并登记 Account Activity webhook 路由。"""
     _validate_automation_default(automation_default)
+    settings = get_settings()
+    if not settings.x_integration_enabled:
+        raise ValueError("x_integration_disabled")
+    if xchat_pin and xchat_pin.strip() and not settings.xchat_enabled:
+        raise ValueError("xchat_disabled")
     environment = _require_secret(environment, "x_environment")
     credentials = {
         "consumer_key": _require_secret(consumer_key, "x_consumer_key"),
@@ -331,24 +335,25 @@ async def connect_x_account(
         "access_token_secret": _require_secret(access_token_secret, "x_access_token_secret"),
     }
     client = XClient(**credentials, api_base_url=api_base_url, transport=transport)
+    dm_capable = False
     try:
         me = await client.get_me()
-        try:
-            await client.read_dm_events(max_results=10)
-        except httpx.HTTPStatusError as exc:
-            error_type = ""
+        if settings.x_legacy_dm_enabled or settings.xchat_enabled:
             try:
-                error_type = str(exc.response.json().get("type") or "")
-            except ValueError:
-                pass
-            if exc.response.status_code == 403 and error_type.endswith(
-                "/oauth1-permissions"
-            ):
-                raise ValueError(
-                    "x_direct_message_permission_missing: set X App permissions to "
-                    "Read and write and Direct message, then re-authorize the account"
-                ) from exc
-            raise
+                await client.read_dm_events(max_results=10)
+                dm_capable = True
+            except httpx.HTTPStatusError as exc:
+                error_type = ""
+                try:
+                    error_type = str(exc.response.json().get("type") or "")
+                except ValueError:
+                    pass
+                if exc.response.status_code == 403 and error_type.endswith("/oauth1-permissions"):
+                    raise ValueError(
+                        "x_direct_message_permission_missing: set X App permissions to "
+                        "Read and write and Direct message, then re-authorize the account"
+                    ) from exc
+                raise
     finally:
         await client.aclose()
     external_account_id = str(me["id"])
@@ -379,9 +384,7 @@ async def connect_x_account(
         credentials["xchat_signing_key_version"] = key_version
         xchat_enabled = True
     elif xchat_enabled:
-        credentials["xchat_private_keys_b64"] = existing_xchat_credentials[
-            "xchat_private_keys_b64"
-        ]
+        credentials["xchat_private_keys_b64"] = existing_xchat_credentials["xchat_private_keys_b64"]
         credentials["xchat_signing_key_version"] = existing_xchat_credentials[
             "xchat_signing_key_version"
         ]
@@ -408,7 +411,7 @@ async def connect_x_account(
             "xchat_enabled": xchat_enabled,
         },
         capability={
-            "dm": True,
+            "dm": dm_capable,
             "x_chat": xchat_enabled,
             "mentions": True,
             "max_text_length": 280,
@@ -427,9 +430,15 @@ async def connect_x_account(
         platform_app_id=platform_app_id,
         app_public_id=app_public_id,
         manual_steps=(
-            "在 X Developer Portal 注册返回的 webhook_url，并保留 legacy 订阅。",
             (
-                "XChat 已解锁：scheduler 将通过 Chat API 补拉加密消息。"
+                "在 X Developer Portal 注册返回的共享 webhook_url。"
+                if settings.x_activity_enabled
+                else "X Activity webhook 已关闭；当前仅使用启用中的轮询栈。"
+            ),
+            (
+                "XChat 全局开关已关闭，密钥材料会保留但不会补拉或发送。"
+                if not settings.xchat_enabled
+                else "XChat 已解锁：scheduler 将通过 Chat API 补拉加密消息。"
                 if xchat_enabled
                 else "尚未提供 XChat PIN：已迁移到 XChat 的私信仍无法解密；请重新接入并填写 PIN。"
             ),

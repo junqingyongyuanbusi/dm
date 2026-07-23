@@ -14,7 +14,7 @@ def test_has_received_subscription_matches_user():
     assert not xchat_subscription._has_received_subscription(subscriptions, "user-2")
 
 
-async def test_subscription_reconciliation_creates_missing(monkeypatch):
+async def test_subscription_reconciliation_skips_account_without_keys(monkeypatch):
     account = SimpleNamespace(
         id="account-1",
         public_id="primary",
@@ -26,6 +26,37 @@ async def test_subscription_reconciliation_creates_missing(monkeypatch):
             "access_token_secret": "ats",
         },
         config={},
+        capability={"x_chat": True},
+    )
+
+    async def fake_accounts(platform):
+        return [account]
+
+    class UnexpectedClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("account without XChat keys must not be subscribed")
+
+    monkeypatch.setattr(xchat_subscription, "list_active_accounts_by_platform", fake_accounts)
+    monkeypatch.setattr(xchat_subscription, "XChatClient", UnexpectedClient)
+    xchat_subscription._last_check_at = 0.0
+    assert await xchat_subscription.ensure_xchat_subscriptions() == []
+
+
+async def test_subscription_reconciliation_creates_missing(monkeypatch):
+    account = SimpleNamespace(
+        id="account-1",
+        public_id="primary",
+        external_account_id="user-1",
+        credential_bundle={
+            "consumer_key": "ck",
+            "consumer_secret": "cs",
+            "access_token": "at",
+            "access_token_secret": "ats",
+            "xchat_private_keys_b64": "private",
+            "xchat_signing_key_version": "7",
+        },
+        config={},
+        capability={"x_chat": True},
     )
 
     async def fake_accounts(platform):

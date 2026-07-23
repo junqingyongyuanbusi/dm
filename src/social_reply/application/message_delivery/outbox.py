@@ -73,14 +73,16 @@ async def _record_outcome(
     platform_message_id: str | None = None,
     next_attempt_at: datetime | None = None,
     require_sending: bool = True,
+    count_attempt: bool = True,
 ) -> str:
     values: dict = {
         "status": status,
-        "attempt_count": attempt_no,
         "last_error_code": error_code,
         "last_error_message": error_message,
         "next_attempt_at": next_attempt_at,
     }
+    if count_attempt:
+        values["attempt_count"] = attempt_no
     if chatwoot_message_id is not None:
         values["chatwoot_message_id"] = chatwoot_message_id
     if platform_message_id is not None:
@@ -164,6 +166,8 @@ async def _stop_before_send(
     status: str,
     error_code: str,
     attempt_no: int,
+    *,
+    count_attempt: bool = True,
 ) -> str:
     return await _record_outcome(
         session,
@@ -171,6 +175,7 @@ async def _stop_before_send(
         status,
         attempt_no=attempt_no,
         error_code=error_code,
+        count_attempt=count_attempt,
     )
 
 
@@ -253,9 +258,28 @@ async def deliver_outbox(outbox_id: str) -> str:
             return await _stop_before_send(
                 session, oid, "CANCELLED", "DIRECT_DRAFT_BLOCKED", attempt_no
             )
-        if not is_direct and not get_settings().chatwoot_enabled:
+        settings = get_settings()
+        if not is_direct and not settings.chatwoot_enabled:
             return await _stop_before_send(
                 session, oid, "NEEDS_REVIEW", "CHATWOOT_DISABLED", attempt_no
+            )
+        if row.destination_type == "x_dm" and not settings.x_legacy_dm_enabled:
+            return await _stop_before_send(
+                session,
+                oid,
+                "NEEDS_REVIEW",
+                "X_LEGACY_DM_DISABLED",
+                attempt_no,
+                count_attempt=False,
+            )
+        if row.destination_type == "x_chat_message" and not settings.xchat_enabled:
+            return await _stop_before_send(
+                session,
+                oid,
+                "NEEDS_REVIEW",
+                "XCHAT_DISABLED",
+                attempt_no,
+                count_attempt=False,
             )
         state = (
             await session.execute(

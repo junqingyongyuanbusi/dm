@@ -512,6 +512,93 @@ async def test_start_requires_login_csrf_and_config(oauth_env, monkeypatch, migr
         assert "X_API_KEY" in missing.text
 
 
+async def test_oauth_callback_rechecks_feature_flags(oauth_env, migrated_db, monkeypatch):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "b"},
+        )
+        settings = get_settings().model_copy(
+            update={
+                "x_legacy_dm_enabled": False,
+                "x_activity_enabled": False,
+                "xchat_enabled": False,
+            }
+        )
+        monkeypatch.setattr(oauth_connect, "get_settings", lambda: settings)
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=v"
+        )
+
+    assert callback.status_code == 303
+    assert "x_integration_disabled" in callback.headers["location"]
+    assert [request.url.path for request in oauth_env["calls"]] == ["/oauth/request_token"]
+    assert "processed_job_id" not in oauth_env["submitted"]
+
+
+async def test_oauth_callback_rejects_pin_when_xchat_was_disabled_mid_flow(
+    oauth_env, migrated_db, monkeypatch
+):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={
+                "csrf_token": csrf,
+                "tenant_id": "default",
+                "brand_id": "b",
+                "xchat_pin": "1234",
+            },
+        )
+        settings = get_settings().model_copy(
+            update={"x_legacy_dm_enabled": True, "xchat_enabled": False}
+        )
+        monkeypatch.setattr(oauth_connect, "get_settings", lambda: settings)
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=v"
+        )
+
+    assert callback.status_code == 303
+    assert "xchat_disabled" in callback.headers["location"]
+    assert [request.url.path for request in oauth_env["calls"]] == ["/oauth/request_token"]
+    assert "processed_job_id" not in oauth_env["submitted"]
+
+
+async def test_oauth_start_rejects_when_all_x_stacks_are_disabled(
+    oauth_env, migrated_db, monkeypatch
+):
+    settings = get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": False,
+            "x_activity_enabled": False,
+            "xchat_enabled": False,
+        }
+    )
+    monkeypatch.setattr(oauth_connect, "get_settings", lambda: settings)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        response = await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "b"},
+        )
+    assert response.status_code == 503
+    assert "X 集成已关闭" in response.text
+    assert oauth_env["calls"] == []
+
+
 async def test_callback_rejects_replay_and_handles_denial(oauth_env, migrated_db):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),

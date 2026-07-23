@@ -99,7 +99,15 @@ async def test_disabled_chatwoot_outbox_fails_closed(session, monkeypatch):
     assert attempt.error_code == "CHATWOOT_DISABLED"
 
     def enabled():
-        return type("Settings", (), {"chatwoot_enabled": True})()
+        return type(
+            "Settings",
+            (),
+            {
+                "chatwoot_enabled": True,
+                "x_legacy_dm_enabled": True,
+                "xchat_enabled": True,
+            },
+        )()
 
     monkeypatch.setattr(outbox_module, "get_settings", enabled)
     monkeypatch.setattr(sweep_module, "get_settings", enabled)
@@ -402,8 +410,14 @@ async def test_finalize_does_not_overwrite_non_sending_row(session, monkeypatch,
     ).first() is None
 
 
-async def _seed_direct_x(session):
-    """直连 X DM outbox（BOT_ACTIVE），用于验证发送侧永久/暂时错误分类。"""
+async def _seed_direct_x(
+    session,
+    *,
+    destination_type="x_dm",
+    capability=None,
+    target=None,
+):
+    """直连 X outbox（BOT_ACTIVE），用于验证发送侧错误分类和功能开关。"""
     account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -412,7 +426,7 @@ async def _seed_direct_x(session):
             platform="x",
             name="x-bot",
             status="active",
-            capability={"dm": True, "max_text_length": 10000},
+            capability=capability or {"dm": True, "max_text_length": 10000},
         )
     )
     await session.execute(
@@ -437,16 +451,167 @@ async def _seed_direct_x(session):
             id=ob_id,
             conversation_id=conv_id,
             platform_account_id=account_id,
-            destination_type="x_dm",
+            destination_type=destination_type,
             destination_id="x_dm:acc:u1",
             message_type="text",
-            payload={"text": "hi", "target": {"kind": "dm", "participant_id": "u1"}},
+            payload={
+                "text": "hi",
+                "target": target or {"kind": "dm", "participant_id": "u1"},
+            },
             idempotency_key=str(ob_id),
             status="PENDING",
         )
     )
     await session.commit()
     return account_id, ob_id
+
+
+@pytest.mark.parametrize(
+    ("destination_type", "settings_values", "error_code", "capability", "target"),
+    [
+        (
+            "x_dm",
+            {"x_legacy_dm_enabled": False, "xchat_enabled": True},
+            "X_LEGACY_DM_DISABLED",
+            {"dm": True, "max_text_length": 10000},
+            {"kind": "dm", "participant_id": "u1"},
+        ),
+        (
+            "x_chat_message",
+            {"x_legacy_dm_enabled": True, "xchat_enabled": False},
+            "XCHAT_DISABLED",
+            {"x_chat": True, "max_text_length": 10000},
+            {"kind": "x_chat", "conversation_id": "u1-u2"},
+        ),
+    ],
+)
+async def test_x_stack_disabled_outbox_pauses_and_recovers(
+    session,
+    monkeypatch,
+    destination_type,
+    settings_values,
+    error_code,
+    capability,
+    target,
+):
+    _account_id, ob_id = await _seed_direct_x(
+        session,
+        destination_type=destination_type,
+        capability=capability,
+        target=target,
+    )
+
+    def settings(**overrides):
+        values = {
+            "chatwoot_enabled": True,
+            "x_legacy_dm_enabled": True,
+            "xchat_enabled": True,
+            **settings_values,
+            **overrides,
+        }
+        return type("Settings", (), values)()
+
+    monkeypatch.setattr(outbox_module, "get_settings", settings)
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    paused = await session.get(models.OutboxMessage, ob_id)
+    assert paused.attempt_count == 0
+    assert paused.last_error_code == error_code
+
+    recovered_values = (
+        {"x_legacy_dm_enabled": True} if destination_type == "x_dm" else {"xchat_enabled": True}
+    )
+
+    def recovered_settings():
+        return settings(**recovered_values)
+
+    monkeypatch.setattr(outbox_module, "get_settings", recovered_settings)
+    monkeypatch.setattr(sweep_module, "get_settings", recovered_settings)
+    assert ob_id in await sweep_outbox()
+    session.expire_all()
+    recovered = await session.get(models.OutboxMessage, ob_id)
+    assert recovered.status == "PENDING"
+    assert recovered.last_error_code is None
+
+
+async def test_x_paused_outbox_waits_for_capability_reconciliation(session, monkeypatch):
+    _account_id, ob_id = await _seed_direct_x(
+        session,
+        capability={"dm": False, "max_text_length": 10000},
+    )
+
+    def disabled_settings():
+        return type(
+            "Settings",
+            (),
+            {
+                "chatwoot_enabled": True,
+                "x_legacy_dm_enabled": False,
+                "xchat_enabled": True,
+            },
+        )()
+
+    def enabled_settings():
+        return type(
+            "Settings",
+            (),
+            {
+                "chatwoot_enabled": True,
+                "x_legacy_dm_enabled": True,
+                "xchat_enabled": True,
+            },
+        )()
+
+    monkeypatch.setattr(outbox_module, "get_settings", disabled_settings)
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    monkeypatch.setattr(sweep_module, "get_settings", enabled_settings)
+    assert ob_id not in await sweep_outbox()
+    session.expire_all()
+    paused = await session.get(models.OutboxMessage, ob_id)
+    assert paused.status == "NEEDS_REVIEW"
+    assert paused.last_error_code == "X_LEGACY_DM_DISABLED"
+
+
+async def test_x_post_reply_is_not_blocked_by_legacy_dm_flag(session, monkeypatch):
+    from social_reply.connectors import registry
+
+    account_id, ob_id = await _seed_direct_x(
+        session,
+        destination_type="x_post_reply",
+        capability={"mentions": True, "max_text_length": 10000},
+        target={"kind": "reply", "in_reply_to_post_id": "post-1"},
+    )
+
+    class Sender:
+        platform = "x"
+
+        async def send_text(self, *, target, text):
+            return "post-reply-1"
+
+        async def aclose(self):
+            pass
+
+    async def get_sender(_account_id):
+        assert _account_id == account_id
+        return Sender()
+
+    monkeypatch.setattr(
+        outbox_module,
+        "get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "chatwoot_enabled": True,
+                "x_legacy_dm_enabled": False,
+                "xchat_enabled": False,
+            },
+        )(),
+    )
+    monkeypatch.setattr(registry, "get_platform_sender", get_sender)
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+
+    assert await deliver_outbox(str(ob_id)) == "SENT"
 
 
 async def test_permanent_send_error_marks_needs_review_no_retry(session, monkeypatch):

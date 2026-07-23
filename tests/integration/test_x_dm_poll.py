@@ -14,7 +14,7 @@ _SELF = "1740258119773458432"
 _USER = "2041798240056598528"
 
 
-async def _seed_x_account(session) -> uuid.UUID:
+async def _seed_x_account(session, *, dm_capable: bool = True) -> uuid.UUID:
     account_id = uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -34,7 +34,7 @@ async def _seed_x_account(session) -> uuid.UUID:
             ),
             webhook_secret_bundle=encrypt_secret_bundle({"consumer_secret": "cs"}),
             config={"delivery_mode": "direct"},
-            capability={"dm": True},
+            capability={"dm": dm_capable, "x_chat": True},
             chatwoot_inbox_id=None,
             automation_default="BOT_ACTIVE",
             status="active",
@@ -42,6 +42,46 @@ async def _seed_x_account(session) -> uuid.UUID:
     )
     await session.commit()
     return account_id
+
+
+async def test_legacy_reenable_reconciles_unknown_dm_capability(session, monkeypatch):
+    x_dm_poll._last_poll_at = 0.0
+    account_id = await _seed_x_account(session, dm_capable=False)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def read_dm_events(self, *, max_results=100, pagination_token=None):
+            return [], None
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(x_dm_poll, "XClient", FakeClient)
+    assert await x_dm_poll.poll_x_direct_messages() == []
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.capability["dm"] is True
+    assert account.capability["x_chat"] is True
+    assert account.config_version == 2
+
+
+async def test_legacy_disabled_skips_account_without_verified_capability(session, monkeypatch):
+    x_dm_poll._last_poll_at = 0.0
+    await _seed_x_account(session, dm_capable=False)
+    monkeypatch.setattr(
+        x_dm_poll,
+        "get_settings",
+        lambda: type("Settings", (), {"x_legacy_dm_enabled": False})(),
+    )
+
+    class UnexpectedClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("unverified legacy account must not be polled while disabled")
+
+    monkeypatch.setattr(x_dm_poll, "XClient", UnexpectedClient)
+    assert await x_dm_poll.poll_x_direct_messages() == []
 
 
 async def test_poll_ingests_user_dm_skips_self_and_advances_cursor(session, monkeypatch):
