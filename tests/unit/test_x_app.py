@@ -30,3 +30,4 @@ async def test_ensure_x_platform_app_persists_shared_app(monkeypatch, tmp_path):
         "consumer_key": "key",
         "consumer_secret": "secret",
     }
+    assert captured["allow_external_app_id_rotation"] is True

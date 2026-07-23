@@ -40,8 +40,10 @@ async def provision_platform_app(
     secrets_root: Path,
     credential_bundle: dict[str, str],
     config: dict,
+    allow_external_app_id_rotation: bool = False,
 ) -> tuple[uuid.UUID, str]:
     """幂等创建共享平台 App/Webhook；一个 App 可挂接多个平台账号。"""
+    rotating_external_app_id = False
     async with get_session_factory()() as session:
         existing = None
         if external_app_id:
@@ -75,7 +77,12 @@ async def provision_platform_app(
                 )
             ).scalar_one_or_none()
             if public_id_owner is not None and public_id_owner.external_app_id != external_app_id:
-                raise ValueError("platform_app_public_id_external_id_mismatch")
+                if not allow_external_app_id_rotation:
+                    raise ValueError("platform_app_public_id_external_id_mismatch")
+                if existing is not None and existing.id != public_id_owner.id:
+                    raise ValueError("platform_app_external_id_already_bound")
+                existing = public_id_owner
+                rotating_external_app_id = True
             if existing is not None and existing.public_id != public_id:
                 raise ValueError("platform_app_public_id_is_immutable")
 
@@ -96,6 +103,35 @@ async def provision_platform_app(
         "config_version": existing.config_version + 1 if existing is not None else 1,
         "status": existing.status if existing is not None else "active",
     }
+    if rotating_external_app_id:
+        async with get_session_factory()() as session:
+            async with session.begin():
+                row = (
+                    await session.execute(
+                        select(models.PlatformApp)
+                        .where(models.PlatformApp.id == app_id)
+                        .with_for_update()
+                    )
+                ).scalar_one()
+                conflict = (
+                    await session.execute(
+                        select(models.PlatformApp.id).where(
+                            models.PlatformApp.tenant_id == tenant_id,
+                            models.PlatformApp.platform_family == platform_family,
+                            models.PlatformApp.external_app_id == external_app_id,
+                            models.PlatformApp.id != app_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if conflict is not None:
+                    raise ValueError("platform_app_external_id_already_bound")
+                row.name = name
+                row.external_app_id = external_app_id
+                row.credential_bundle = values["credential_bundle"]
+                row.config = config
+                row.config_version += 1
+        return app_id, resolved_public_id
+
     async with get_session_factory()() as session:
         statement = pg_insert(models.PlatformApp).values(**values)
         if external_app_id:

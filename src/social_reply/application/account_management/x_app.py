@@ -41,4 +41,5 @@ async def ensure_x_platform_app(
             "consumer_secret": consumer_secret,
         },
         config={"api_base_url": _X_API_BASE_URL},
+        allow_external_app_id_rotation=True,
     )
