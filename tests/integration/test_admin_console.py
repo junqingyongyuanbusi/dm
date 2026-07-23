@@ -85,6 +85,113 @@ async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
     assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
 
 
+async def test_xchat_activation_error_renders_operator_notice(
+    session, migrated_db, monkeypatch
+):
+    import uuid
+
+    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management.xchat_activation import (
+        XChatActivationError,
+    )
+
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            name="@xbot",
+            external_account_id="x-1",
+            public_id="x-public",
+            credential_bundle=encrypt_secret_bundle(
+                {
+                    "consumer_key": "ck",
+                    "consumer_secret": "cs",
+                    "access_token": "at",
+                    "access_token_secret": "ats",
+                }
+            ),
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "x_chat": False},
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async def fail_activation(**kwargs):
+        raise XChatActivationError(
+            "XCHAT_DM_PERMISSION_REQUIRED",
+            "请配置 Read and write and Direct message。",
+        )
+
+    monkeypatch.setattr(admin_console, "enable_xchat_for_account", fail_activation)
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        response = await client.post(
+            f"/admin/accounts/{account_id}/xchat",
+            data={"csrf_token": csrf, "xchat_pin": "1234"},
+        )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("text/html")
+    assert "XCHAT_DM_PERMISSION_REQUIRED" in response.text
+    assert "Read and write and Direct message" in response.text
+    assert "1234" not in response.text
+
+
+async def test_pin_provisioning_job_requires_secret_resubmission(
+    session, migrated_db
+):
+    import uuid
+
+    job_id = uuid.uuid4()
+    await session.execute(
+        insert(models.ProvisioningJob).values(
+            id=job_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            actor="user:admin",
+            idempotency_key="pin-resubmit",
+            request={"environment": "oauth"},
+            staging_secret=encrypt_secret_bundle(
+                {
+                    "consumer_key": "ck",
+                    "consumer_secret": "cs",
+                    "access_token": "at",
+                    "access_token_secret": "ats",
+                }
+            ),
+            status="NEEDS_ACTION",
+            current_step="FAILED",
+            result={
+                "requires_secret_resubmission": True,
+                "required_secret": "xchat_pin",
+            },
+            last_error_code="XCHAT_PIN_INVALID",
+            last_error_message="PIN 不正确",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get(f"/admin/jobs/{job_id}")
+        retry = await client.post(
+            f"/admin/jobs/{job_id}/retry",
+            data={"csrf_token": csrf},
+        )
+
+    assert page.status_code == 200
+    assert "返回账号页重新提交 PIN 或凭证" in page.text
+    assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
+    assert retry.status_code == 409
+    assert retry.json()["detail"] == "provisioning_secret_resubmission_required"
+
+
 async def test_conversation_state_flip_takeover(session, migrated_db):
     # 构造一个 BOT_ACTIVE 会话，验证人工接管把状态翻到 HUMAN_ACTIVE
     account_id, contact_id, conv_id = (

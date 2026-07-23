@@ -1,5 +1,8 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 
+import httpx
+import pytest
 from sqlalchemy import select
 
 from social_reply.application.account_management import jobs
@@ -93,6 +96,139 @@ async def test_process_job_completes_and_deletes_staging_secret(migrated_db, tmp
     # 完成后内联 staging secret 被清除
     assert row.staging_secret is None
     get_settings.cache_clear()
+
+
+async def test_xchat_failure_requires_pin_resubmission_instead_of_auto_retry(
+    migrated_db, monkeypatch
+):
+    async def fail_connect(_job):
+        request = httpx.Request("GET", "https://api.x.com/2/users/me")
+        raise httpx.ConnectError("connection failed", request=request)
+
+    monkeypatch.setattr(jobs, "_connect", fail_connect)
+    job_id = await jobs.submit_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform="x",
+        actor="user:admin",
+        request={"environment": "oauth", "idempotency_key": "xchat-retry"},
+        secrets={
+            "consumer_key": "ck",
+            "consumer_secret": "cs",
+            "access_token": "at",
+            "access_token_secret": "ats",
+            "xchat_pin": "1234",
+        },
+    )
+
+    assert await jobs.process_provisioning_job(str(job_id)) == "NEEDS_ACTION"
+    assert await jobs.process_provisioning_job(str(job_id)) == "SKIPPED_NOT_CLAIMABLE"
+
+    async with get_session_factory()() as session:
+        row = await session.get(models.ProvisioningJob, job_id)
+    assert row.status == "NEEDS_ACTION"
+    assert row.next_attempt_at is None
+    assert row.last_error_code == "PLATFORM_UNAVAILABLE"
+    assert row.account_id is None
+    assert row.result == {
+        "requires_secret_resubmission": True,
+        "required_secret": "xchat_pin",
+    }
+    staged = decrypt_secret_bundle(row.staging_secret)
+    assert "xchat_pin" not in staged
+    assert staged["access_token"] == "at"
+
+    with pytest.raises(
+        ValueError, match="provisioning_secret_resubmission_required"
+    ):
+        await jobs.retry_provisioning_job(job_id)
+
+    with pytest.raises(
+        ValueError, match="provisioning_secret_resubmission_required"
+    ):
+        await jobs.submit_provisioning_job(
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="x",
+            actor="user:admin",
+            request={"environment": "oauth", "idempotency_key": "xchat-retry"},
+            secrets={
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+            },
+        )
+    async with get_session_factory()() as session:
+        unchanged = await session.get(models.ProvisioningJob, job_id)
+    assert unchanged.status == "NEEDS_ACTION"
+    assert unchanged.result["requires_secret_resubmission"] is True
+
+    resubmitted = await jobs.submit_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform="x",
+        actor="user:admin",
+        request={"environment": "oauth", "idempotency_key": "xchat-retry"},
+        secrets={
+            "consumer_key": "ck",
+            "consumer_secret": "cs",
+            "access_token": "at",
+            "access_token_secret": "ats",
+            "xchat_pin": "5678",
+        },
+    )
+    assert resubmitted == job_id
+    async with get_session_factory()() as session:
+        refreshed = await session.get(models.ProvisioningJob, job_id)
+    assert refreshed.status == "PENDING"
+    assert refreshed.result == {}
+    assert decrypt_secret_bundle(refreshed.staging_secret)["xchat_pin"] == "5678"
+
+
+async def test_stale_xchat_job_clears_pin_and_requires_resubmission(migrated_db):
+    job_id = uuid.uuid4()
+    async with get_session_factory()() as session:
+        session.add(
+            models.ProvisioningJob(
+                id=job_id,
+                tenant_id="tenant-a",
+                brand_id="brand-a",
+                platform="x",
+                actor="user:admin",
+                idempotency_key="stale-xchat",
+                request={"environment": "oauth"},
+                staging_secret=encrypt_secret_bundle(
+                    {
+                        "consumer_key": "ck",
+                        "consumer_secret": "cs",
+                        "access_token": "at",
+                        "access_token_secret": "ats",
+                        "xchat_pin": "1234",
+                    }
+                ),
+                status="PROCESSING",
+                current_step="VALIDATE_CREDENTIAL",
+                locked_at=datetime.now(UTC) - timedelta(minutes=10),
+                locked_by="dead-worker",
+            )
+        )
+        await session.commit()
+
+    recovered = await jobs.sweep_provisioning_jobs()
+
+    assert job_id not in recovered
+    async with get_session_factory()() as session:
+        row = await session.get(models.ProvisioningJob, job_id)
+    assert row.status == "NEEDS_ACTION"
+    assert row.next_attempt_at is None
+    assert row.locked_at is None
+    assert row.last_error_code == "STALE_PROCESSING_SECRET_RESUBMISSION_REQUIRED"
+    assert row.result == {
+        "requires_secret_resubmission": True,
+        "required_secret": "xchat_pin",
+    }
+    assert "xchat_pin" not in decrypt_secret_bundle(row.staging_secret)
 
 
 async def test_same_idempotency_key_returns_same_job(migrated_db, tmp_path, monkeypatch):

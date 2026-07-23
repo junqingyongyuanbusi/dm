@@ -17,6 +17,7 @@ from social_reply.application.account_management.service import (
     connect_x_account,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
@@ -49,6 +50,10 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
         return "PLATFORM_UNAVAILABLE", "Platform API is temporarily unavailable", True
     if isinstance(exc, LookupError):
         return "DEPENDENCY_NOT_FOUND", str(exc)[:500], False
+    if isinstance(exc, XChatActivationError):
+        # The XChat PIN is removed after the first attempt. Never schedule an
+        # automatic retry that would silently reconnect without unlocking keys.
+        return exc.code, exc.operator_message, False
     if isinstance(exc, ValueError) and str(exc).startswith(
         "x_direct_message_permission_missing:"
     ):
@@ -140,6 +145,13 @@ async def submit_provisioning_job(
             "NEEDS_ACTION",
         }
     ):
+        if requires_secret_resubmission(existing_job):
+            required_secret = str(
+                (existing_job.result or {}).get("required_secret") or ""
+            )
+            supplied_secret = secrets.get(required_secret) if required_secret else None
+            if not isinstance(supplied_secret, str) or not supplied_secret.strip():
+                raise ValueError("provisioning_secret_resubmission_required")
         async with get_session_factory()() as session:
             await session.execute(
                 update(models.ProvisioningJob)
@@ -149,6 +161,7 @@ async def submit_provisioning_job(
                     status="PENDING",
                     current_step="QUEUED",
                     next_attempt_at=None,
+                    result={},
                     last_error_code=None,
                     last_error_message=None,
                 )
@@ -282,13 +295,19 @@ async def process_provisioning_job(job_id: str) -> str:
     except Exception as exc:  # noqa: BLE001 - platform boundary is normalized below
         error_code, message, retryable = _error(exc)
         staging_secret = job.staging_secret
+        failure_result = dict(job.result or {})
         if job.platform == "x":
             submitted_secrets = decrypt_secret_bundle(job.staging_secret)
             if submitted_secrets.get("xchat_pin"):
-                # A PIN is a one-time unlock input. Never retain it after the first
-                # attempt, including NEEDS_ACTION failures; the operator must resubmit.
+                # A PIN is a one-time unlock input. Never retain it or retry without it.
                 submitted_secrets.pop("xchat_pin", None)
                 staging_secret = encrypt_secret_bundle(submitted_secrets)
+                retryable = False
+                failure_result = {
+                    **failure_result,
+                    "requires_secret_resubmission": True,
+                    "required_secret": "xchat_pin",
+                }
         next_attempt_at = None
         if retryable and job.attempt_count >= _MAX_ATTEMPTS:
             retryable = False
@@ -314,6 +333,7 @@ async def process_provisioning_job(job_id: str) -> str:
                     last_error_code=error_code,
                     last_error_message=message,
                     staging_secret=staging_secret,
+                    result=failure_result,
                 )
             )
             await session.commit()
@@ -359,47 +379,73 @@ async def process_provisioning_job(job_id: str) -> str:
     return "COMPLETED"
 
 
+def requires_secret_resubmission(job: models.ProvisioningJob) -> bool:
+    return bool((job.result or {}).get("requires_secret_resubmission"))
+
+
 async def retry_provisioning_job(job_id: uuid.UUID) -> None:
     async with get_session_factory()() as session:
-        result = await session.execute(
-            update(models.ProvisioningJob)
-            .where(
-                models.ProvisioningJob.id == job_id,
-                models.ProvisioningJob.status.in_(["FAILED", "NEEDS_ACTION"]),
+        job = (
+            await session.execute(
+                select(models.ProvisioningJob)
+                .where(models.ProvisioningJob.id == job_id)
+                .with_for_update()
             )
-            .values(
-                status="PENDING",
-                current_step="QUEUED",
-                next_attempt_at=None,
-                last_error_code=None,
-                last_error_message=None,
-            )
-        )
-        await session.commit()
-        if result.rowcount == 0:
+        ).scalar_one_or_none()
+        if job is None or job.status not in {"FAILED", "NEEDS_ACTION"}:
             raise ValueError("provisioning_job_not_retryable")
+        if requires_secret_resubmission(job):
+            raise ValueError("provisioning_secret_resubmission_required")
+        job.status = "PENDING"
+        job.current_step = "QUEUED"
+        job.next_attempt_at = None
+        job.last_error_code = None
+        job.last_error_message = None
+        await session.commit()
 
 
 async def sweep_provisioning_jobs() -> list[uuid.UUID]:
     now = datetime.now(UTC)
     stale_before = now - _STALE_AFTER
     async with get_session_factory()() as session:
-        await session.execute(
-            update(models.ProvisioningJob)
-            .where(
-                models.ProvisioningJob.status == "PROCESSING",
-                models.ProvisioningJob.locked_at < stale_before,
-            )
-            .values(
-                status="FAILED",
-                current_step="FAILED",
-                next_attempt_at=now,
-                locked_at=None,
-                locked_by=None,
-                last_error_code="STALE_PROCESSING",
-                last_error_message="Stale provisioning job recovered by scheduler",
-            )
+        stale_jobs = list(
+            (
+                await session.execute(
+                    select(models.ProvisioningJob)
+                    .where(
+                        models.ProvisioningJob.status == "PROCESSING",
+                        models.ProvisioningJob.locked_at < stale_before,
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars()
         )
+        for job in stale_jobs:
+            submitted_secrets = (
+                decrypt_secret_bundle(job.staging_secret) if job.staging_secret else {}
+            )
+            if job.platform == "x" and submitted_secrets.get("xchat_pin"):
+                submitted_secrets.pop("xchat_pin", None)
+                job.staging_secret = encrypt_secret_bundle(submitted_secrets)
+                job.status = "NEEDS_ACTION"
+                job.next_attempt_at = None
+                job.result = {
+                    **dict(job.result or {}),
+                    "requires_secret_resubmission": True,
+                    "required_secret": "xchat_pin",
+                }
+                job.last_error_code = "STALE_PROCESSING_SECRET_RESUBMISSION_REQUIRED"
+                job.last_error_message = (
+                    "Stale XChat provisioning requires the PIN to be resubmitted"
+                )
+            else:
+                job.status = "FAILED"
+                job.next_attempt_at = now
+                job.last_error_code = "STALE_PROCESSING"
+                job.last_error_message = "Stale provisioning job recovered by scheduler"
+            job.current_step = "FAILED"
+            job.locked_at = None
+            job.locked_by = None
         rows = list(
             (
                 await session.execute(

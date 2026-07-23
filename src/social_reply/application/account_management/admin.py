@@ -20,6 +20,7 @@ from social_reply.application.account_management.auth import (
 )
 from social_reply.application.account_management.jobs import (
     public_job,
+    requires_secret_resubmission,
     retry_provisioning_job,
     submit_provisioning_job,
 )
@@ -513,7 +514,12 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
     csrf = _csrf(request)
     in_flight = job.status in {"PENDING", "PROCESSING"}
     retry = ""
-    if job.status in {"FAILED", "NEEDS_ACTION"}:
+    if job.status in {"FAILED", "NEEDS_ACTION"} and requires_secret_resubmission(job):
+        retry = (
+            '<p class="muted">该任务的一次性凭证已清除。'
+            '<a href="/admin/accounts">返回账号页重新提交 PIN 或凭证</a>。</p>'
+        )
+    elif job.status in {"FAILED", "NEEDS_ACTION"}:
         retry = f"""<form method="post" action="/admin/jobs/{job.id}/retry" style="max-width:200px"><input type="hidden" name="csrf_token" value="{csrf}"><button>重试任务</button></form>"""
     refresh_note = '<p class="muted">任务运行中，页面每 4 秒自动刷新。</p>' if in_flight else ""
     rows = "".join(
@@ -550,7 +556,10 @@ async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
         job = await session.get(models.ProvisioningJob, job_id)
     if job is None or job.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
-    await retry_provisioning_job(job_id)
+    try:
+        await retry_provisioning_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     from social_reply.application.account_management.actors import process_platform_provisioning
     from social_reply.application.account_management.jobs import process_provisioning_job
 
