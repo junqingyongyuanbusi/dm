@@ -32,6 +32,18 @@ def test_error_sanitizes_platform_http_errors():
     assert "secret" not in message
 
 
+def test_error_explains_missing_x_direct_message_permission():
+    code, message, retryable = jobs._error(
+        ValueError(
+            "x_direct_message_permission_missing: set X App permissions to "
+            "Read and write and Direct message"
+        )
+    )
+    assert code == "X_DM_PERMISSION_REQUIRED"
+    assert "Read and write and Direct message" in message
+    assert retryable is False
+
+
 def test_result_payload_does_not_expose_verify_token():
     result = AccountConnectionResult(
         account_id=__import__("uuid").uuid4(),

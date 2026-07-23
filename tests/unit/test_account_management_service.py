@@ -2,6 +2,7 @@ import json
 import uuid
 
 import httpx
+import pytest
 
 from social_reply.application.account_management import service
 from social_reply.application.platform_accounts import PlatformAccountRuntime
@@ -138,6 +139,10 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         async def get_me(self):
             return {"id": "x-1", "username": "bot"}
 
+        async def read_dm_events(self, *, max_results):
+            assert max_results == 10
+            return [], None
+
         async def aclose(self):
             pass
 
@@ -174,6 +179,49 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
     assert result.platform_app_id == app_id
     assert result.app_public_id == "x_oauth"
     assert result.webhook_url == "https://reply.example.com/webhooks/x/x_oauth"
+
+
+async def test_connect_x_rejects_app_without_direct_message_permission(
+    monkeypatch, tmp_path
+):
+    closed = False
+
+    class FakeXClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get_me(self):
+            return {"id": "x-1", "username": "bot"}
+
+        async def read_dm_events(self, *, max_results):
+            request = httpx.Request("GET", "https://api.x.com/2/dm_events")
+            response = httpx.Response(
+                403,
+                request=request,
+                json={
+                    "type": "https://api.x.com/2/problems/oauth1-permissions",
+                    "title": "Forbidden",
+                },
+            )
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+        async def aclose(self):
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(service, "XClient", FakeXClient)
+
+    with pytest.raises(ValueError, match="x_direct_message_permission_missing"):
+        await service.connect_x_account(
+            consumer_key="ck",
+            consumer_secret="cs",
+            access_token="at",
+            access_token_secret="ats",
+            environment="oauth",
+            public_base_url="https://reply.example.com",
+            secrets_root=tmp_path,
+        )
+    assert closed is True
 
 
 async def test_enable_xchat_updates_existing_account_without_persisting_pin(monkeypatch):
