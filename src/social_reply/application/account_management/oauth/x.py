@@ -50,7 +50,7 @@ router = APIRouter(prefix="/admin", tags=["admin-oauth"])
 _X_OAUTH_BASE = "https://api.x.com"
 _X_RETURN_TO = "/admin/accounts"
 _X_TRANSACTION_MAX_AGE = timedelta(minutes=10)
-_PROVISIONING_WAIT_SECONDS = 5.0
+_PROVISIONING_WAIT_SECONDS = 30.0
 _RESULT_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -527,30 +527,49 @@ async def x_oauth_callback(request: Request) -> Response:
             secrets=secrets_data,
             admin_session_id=principal.session_id,
         )
-        from social_reply.application.account_management.actors import (
-            process_platform_provisioning,
-        )
-
-        initial_result = await dispatch_actor(
-            process_platform_provisioning,
-            str(job_id),
-            inline=lambda: process_provisioning_job(str(job_id)),
-        )
-        result = await _resolve_provisioning_result(job_id, initial_result)
     except Exception:  # noqa: BLE001 - callback must return a redacted result
         logger.error(
-            "x oauth callback request_id=%s stage=provision provider=x http_status=303 "
+            "x oauth callback request_id=%s stage=submit provider=x http_status=303 "
             "code=%s token_hash=%s",
             _request_id(request),
-            "provisioning_internal_error",
+            "provisioning_submit_failed",
             _oauth_token_hash(oauth_token)[:12],
         )
         return await _result_redirect(
             request,
             status_value="error",
-            code="provisioning_internal_error",
+            code="provisioning_submit_failed",
             return_to=state.get("return_to"),
         )
+
+    from social_reply.application.account_management.actors import (
+        process_platform_provisioning,
+    )
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _PROVISIONING_WAIT_SECONDS
+    try:
+        initial_result = await dispatch_actor(
+            process_platform_provisioning,
+            str(job_id),
+            inline=lambda: process_provisioning_job(str(job_id)),
+            timeout_seconds=max(0.001, deadline - loop.time()),
+        )
+        result = await _resolve_provisioning_result(
+            job_id,
+            initial_result,
+            timeout_seconds=max(0.0, deadline - loop.time()),
+        )
+    except Exception:  # noqa: BLE001 - the durable job remains recoverable
+        logger.error(
+            "x oauth callback request_id=%s stage=observe provider=x http_status=303 "
+            "code=%s token_hash=%s job_id=%s",
+            _request_id(request),
+            "provisioning_in_progress",
+            _oauth_token_hash(oauth_token)[:12],
+            job_id,
+        )
+        result = "PROCESSING"
     if result == "PROCESSING":
         _log_callback(
             request,

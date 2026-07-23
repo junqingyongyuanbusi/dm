@@ -326,6 +326,62 @@ async def test_retryable_provisioning_failure_is_reported_as_processing(
     )
 
 
+async def test_post_submit_dispatch_failure_is_reported_as_processing(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+):
+    async def fail_dispatch(*_args, **_kwargs):
+        raise TimeoutError("broker timeout")
+
+    monkeypatch.setattr(oauth_connect, "dispatch_actor", fail_dispatch)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+        )
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == (
+        "/admin/accounts?provider=x&status=processing&code=provisioning_in_progress"
+    )
+
+
+async def test_submit_failure_is_reported_as_terminal_error(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+):
+    async def fail_submit(**_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(oauth_connect, "submit_provisioning_job", fail_submit)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+        )
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == (
+        "/admin/accounts?provider=x&status=error&code=provisioning_submit_failed"
+    )
+
+
 async def test_callback_unhandled_error_is_no_store(
     oauth_env,
     migrated_db,

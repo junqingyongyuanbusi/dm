@@ -595,14 +595,17 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
     data = public_job(job)
     csrf = _csrf(request)
-    in_flight = job.status in {"PENDING", "PROCESSING"}
+    auto_retry = job.status == "FAILED" and job.next_attempt_at is not None
+    in_flight = job.status in {"PENDING", "PROCESSING"} or auto_retry
+    if auto_retry:
+        data["status"] = "PROCESSING"
     retry = ""
     if job.status in {"FAILED", "NEEDS_ACTION"} and requires_secret_resubmission(job):
         retry = (
             '<p class="muted">该任务的一次性凭证已清除。'
             '<a href="/admin/accounts">返回账号页重新提交 PIN 或凭证</a>。</p>'
         )
-    elif job.status in {"FAILED", "NEEDS_ACTION"}:
+    elif job.status in {"FAILED", "NEEDS_ACTION"} and not auto_retry:
         retry = f"""<form method="post" action="/admin/jobs/{job.id}/retry" style="max-width:200px"><input type="hidden" name="csrf_token" value="{csrf}"><button>重试任务</button></form>"""
     refresh_note = '<p class="muted">任务运行中，页面每 4 秒自动刷新。</p>' if in_flight else ""
     rows = "".join(
