@@ -7,6 +7,7 @@ from typing import Any
 from social_reply.shared.config import get_settings
 
 _DISPATCH_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="actor-dispatch")
+_DISPATCH_CAPACITY = asyncio.Semaphore(8)
 
 
 async def dispatch_actor(
@@ -21,9 +22,25 @@ async def dispatch_actor(
             return await inline()
         return None
     loop = asyncio.get_running_loop()
-    pending = loop.run_in_executor(_DISPATCH_EXECUTOR, partial(actor.send, *args))
-    if timeout_seconds is None:
+    deadline = loop.time() + timeout_seconds if timeout_seconds is not None else None
+    if deadline is None:
+        await _DISPATCH_CAPACITY.acquire()
+    else:
+        await asyncio.wait_for(
+            _DISPATCH_CAPACITY.acquire(),
+            timeout=max(0.001, deadline - loop.time()),
+        )
+    try:
+        pending = loop.run_in_executor(_DISPATCH_EXECUTOR, partial(actor.send, *args))
+    except Exception:
+        _DISPATCH_CAPACITY.release()
+        raise
+    pending.add_done_callback(lambda _future: _DISPATCH_CAPACITY.release())
+    if deadline is None:
         await pending
     else:
-        await asyncio.wait_for(pending, timeout=timeout_seconds)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError
+        await asyncio.wait_for(asyncio.shield(pending), timeout=remaining)
     return None

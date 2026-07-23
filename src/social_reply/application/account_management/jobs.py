@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 _MAX_BACKOFF_SECONDS = 300
 _MAX_ATTEMPTS = 8
 _STALE_AFTER = timedelta(minutes=5)
+_RETRY_DISPLAY_GRACE = timedelta(minutes=2)
 
 
 def _idempotency_key(tenant_id: str, platform: str, request: dict[str, Any]) -> str:
@@ -54,9 +55,7 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
         # The XChat PIN is removed after the first attempt. Never schedule an
         # automatic retry that would silently reconnect without unlocking keys.
         return exc.code, exc.operator_message, False
-    if isinstance(exc, ValueError) and str(exc).startswith(
-        "x_direct_message_permission_missing:"
-    ):
+    if isinstance(exc, ValueError) and str(exc).startswith("x_direct_message_permission_missing:"):
         return (
             "X_DM_PERMISSION_REQUIRED",
             "请在 X Developer Portal 将 App permissions 设为 "
@@ -91,9 +90,7 @@ async def submit_provisioning_job(
     safe_request = _safe_request(platform, request)
     async with get_session_factory()() as session:
         if admin_session_id is not None:
-            principal = await principal_from_session_row(
-                session, admin_session_id, for_update=True
-            )
+            principal = await principal_from_session_row(session, admin_session_id, for_update=True)
             if principal is None or tenant_id not in principal.allowed_tenants:
                 raise PermissionError("admin_session_invalid")
             actor = principal.actor
@@ -146,9 +143,7 @@ async def submit_provisioning_job(
         }
     ):
         if requires_secret_resubmission(existing_job):
-            required_secret = str(
-                (existing_job.result or {}).get("required_secret") or ""
-            )
+            required_secret = str((existing_job.result or {}).get("required_secret") or "")
             supplied_secret = secrets.get(required_secret) if required_secret else None
             if not isinstance(supplied_secret, str) or not supplied_secret.strip():
                 raise ValueError("provisioning_secret_resubmission_required")
@@ -381,6 +376,19 @@ async def process_provisioning_job(job_id: str) -> str:
 
 def requires_secret_resubmission(job: models.ProvisioningJob) -> bool:
     return bool((job.result or {}).get("requires_secret_resubmission"))
+
+
+def provisioning_job_is_in_flight(
+    job: models.ProvisioningJob,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if job.status in {"PENDING", "PROCESSING"}:
+        return True
+    if job.status != "FAILED" or job.next_attempt_at is None:
+        return False
+    current = now or datetime.now(UTC)
+    return job.next_attempt_at >= current - _RETRY_DISPLAY_GRACE
 
 
 async def retry_provisioning_job(job_id: uuid.UUID) -> None:

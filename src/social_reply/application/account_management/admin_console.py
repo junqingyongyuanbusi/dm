@@ -27,6 +27,7 @@ from social_reply.application.account_management.admin import (
     html,
 )
 from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.jobs import provisioning_job_is_in_flight
 from social_reply.application.account_management.oauth.common import notice
 from social_reply.application.account_management.provisioning import tenant_public_id
 from social_reply.application.account_management.service import enable_xchat_for_account
@@ -1123,7 +1124,7 @@ async def accounts_page(request: Request) -> Response:
         "".join(
             f"<tr><td><a href='/admin/jobs/{row.id}'><code>{str(row.id)[:8]}</code></a></td>"
             f"<td>{html.escape(row.platform)}</td>"
-            f"<td>{_pill('PROCESSING' if row.status == 'FAILED' and row.next_attempt_at else row.status)}</td>"
+            f"<td>{_pill('PROCESSING' if row.status == 'FAILED' and provisioning_job_is_in_flight(row) else row.status)}</td>"
             f"<td class='muted'>{html.escape(row.current_step)}</td>"
             f"<td class='muted'>{html.escape(row.last_error_code or '—')}</td></tr>"
             for row in jobs

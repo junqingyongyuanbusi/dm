@@ -20,6 +20,7 @@ from social_reply.application.account_management.auth import (
     verify_password,
 )
 from social_reply.application.account_management.jobs import (
+    provisioning_job_is_in_flight,
     public_job,
     requires_secret_resubmission,
     retry_provisioning_job,
@@ -596,8 +597,8 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
     data = public_job(job)
     csrf = _csrf(request)
-    auto_retry = job.status == "FAILED" and job.next_attempt_at is not None
-    in_flight = job.status in {"PENDING", "PROCESSING"} or auto_retry
+    in_flight = provisioning_job_is_in_flight(job)
+    auto_retry = job.status == "FAILED" and in_flight
     if auto_retry:
         data["status"] = "PROCESSING"
     retry = ""
