@@ -64,12 +64,14 @@ async def _request_token(
         client_secret=consumer_secret,
         redirect_uri=callback_url,
     )
-    body = urlencode({"x_auth_access_type": "write"})
+    # App-level OAuth 1.0a permissions define the consent scope. Sending the
+    # legacy x_auth_access_type=write parameter downgrades an RW+DM App to plain
+    # read/write, so request only the standard oauth_callback carried by auth.
     signed_url, headers, signed_body = auth.prepare(
         "POST",
         f"{_X_OAUTH_BASE}/oauth/request_token",
-        {"Content-Type": "application/x-www-form-urlencoded"},
-        body,
+        {},
+        None,
     )
     async with _http_client() as client:
         response = await client.post(

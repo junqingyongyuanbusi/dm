@@ -167,9 +167,12 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
         "/oauth/request_token",
         "/oauth/access_token",
     ]
-    assert oauth_env["calls"][0].content == b"x_auth_access_type=write"
-    assert "x_auth_access_type" not in oauth_env["calls"][0].url.params
-    assert oauth_env["calls"][0].headers["authorization"].startswith("OAuth ")
+    request_token_call = oauth_env["calls"][0]
+    assert request_token_call.content == b""
+    assert "x_auth_access_type" not in request_token_call.url.params
+    assert "x_auth_access_type" not in request_token_call.headers["authorization"]
+    assert "oauth_callback=" in request_token_call.headers["authorization"]
+    assert request_token_call.headers["authorization"].startswith("OAuth ")
 
 
 async def test_state_is_one_time_and_supports_parallel_account_flows(oauth_env):

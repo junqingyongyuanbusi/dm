@@ -77,6 +77,7 @@ async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
     assert 'name="platform"' in html and "关联 Facebook Page" in html
     # 回调及共享 webhook URL 直接渲染在页面,便于登记到平台后台
     assert "/admin/oauth/x/callback" in html
+    assert "授权确认页必须明确列出 Direct Messages 权限" in html
     assert "/admin/oauth/meta/callback" in html
     assert "/admin/oauth/instagram/callback" in html
     assert "/webhooks/meta/meta_oauth_default" in html
