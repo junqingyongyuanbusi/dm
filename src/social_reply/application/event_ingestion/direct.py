@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.application.reply_decision.jobs import snapshot_to_dict
@@ -37,6 +37,63 @@ async def ingest_canonical_event(
                 .where(models.RawEvent.id == raw_event_id)
                 .values(processing_status="PROCESSING")
             )
+
+        managed_echo = None
+        if event.platform == "x":
+            event_uuid = None
+            try:
+                event_uuid = uuid.UUID(event.external_event_id)
+            except ValueError:
+                pass
+            echo_conditions = [
+                models.OutboxMessage.platform_message_id == event.external_event_id
+            ]
+            if event_uuid is not None:
+                echo_conditions.append(models.OutboxMessage.id == event_uuid)
+            managed_echo = (
+                await session.execute(
+                    select(
+                        models.OutboxMessage.id,
+                        models.OutboxMessage.platform_account_id,
+                    )
+                    .join(
+                        models.PlatformAccount,
+                        models.PlatformAccount.id == models.OutboxMessage.platform_account_id,
+                    )
+                    .where(
+                        models.OutboxMessage.tenant_id == account.tenant_id,
+                        models.OutboxMessage.platform_account_id != account.id,
+                        models.PlatformAccount.platform == "x",
+                        or_(*echo_conditions),
+                    )
+                    .limit(1)
+                )
+            ).one_or_none()
+        if managed_echo is not None:
+            if raw_event_id is not None:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == raw_event_id)
+                    .values(processing_status="IGNORED_MANAGED_OUTBOX_ECHO")
+                )
+            session.add(
+                models.AuditLog(
+                    tenant_id=account.tenant_id,
+                    category="ingestion",
+                    actor="system",
+                    action="managed_x_outbox_echo_ignored",
+                    subject_type="raw_event" if raw_event_id is not None else "platform_event",
+                    subject_id=str(raw_event_id or event.external_event_id),
+                    detail={
+                        "target_account_id": str(account.id),
+                        "source_account_id": str(managed_echo.platform_account_id),
+                        "source_outbox_id": str(managed_echo.id),
+                        "external_event_id": event.external_event_id,
+                    },
+                )
+            )
+            await session.commit()
+            return None
 
         normalized_id = (
             await session.execute(
