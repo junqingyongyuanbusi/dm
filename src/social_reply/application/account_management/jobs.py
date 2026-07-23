@@ -49,6 +49,15 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
         return "PLATFORM_UNAVAILABLE", "Platform API is temporarily unavailable", True
     if isinstance(exc, LookupError):
         return "DEPENDENCY_NOT_FOUND", str(exc)[:500], False
+    if isinstance(exc, ValueError) and str(exc).startswith(
+        "x_direct_message_permission_missing:"
+    ):
+        return (
+            "X_DM_PERMISSION_REQUIRED",
+            "请在 X Developer Portal 将 App permissions 设为 "
+            "Read and write and Direct message，保存后重新授权账号。",
+            False,
+        )
     if isinstance(exc, (ValueError, KeyError)):
         return "INVALID_REQUEST", str(exc)[:500], False
     logger.exception("provisioning job failed")

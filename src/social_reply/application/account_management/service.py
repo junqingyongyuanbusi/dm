@@ -331,6 +331,22 @@ async def connect_x_account(
     client = XClient(**credentials, api_base_url=api_base_url, transport=transport)
     try:
         me = await client.get_me()
+        try:
+            await client.read_dm_events(max_results=10)
+        except httpx.HTTPStatusError as exc:
+            error_type = ""
+            try:
+                error_type = str(exc.response.json().get("type") or "")
+            except ValueError:
+                pass
+            if exc.response.status_code == 403 and error_type.endswith(
+                "/oauth1-permissions"
+            ):
+                raise ValueError(
+                    "x_direct_message_permission_missing: set X App permissions to "
+                    "Read and write and Direct message, then re-authorize the account"
+                ) from exc
+            raise
     finally:
         await client.aclose()
     external_account_id = str(me["id"])
