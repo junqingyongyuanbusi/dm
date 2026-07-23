@@ -1,6 +1,9 @@
 """X OAuth 1.0a account connection tests using deployment-level App keys."""
 
+import hashlib
+import logging
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -68,7 +71,7 @@ class FakeRedis:
 class FakePipeline:
     def __init__(self, redis: FakeRedis) -> None:
         self.redis = redis
-        self.key = ""
+        self.commands: list[tuple[str, str]] = []
 
     async def __aenter__(self):
         return self
@@ -77,14 +80,19 @@ class FakePipeline:
         pass
 
     def get(self, key):
-        self.key = str(key)
+        self.commands.append(("get", str(key)))
 
     def delete(self, key):
-        self.key = str(key)
+        self.commands.append(("delete", str(key)))
 
     async def execute(self):
-        value = self.redis.values.pop(self.key, None)
-        return value, int(value is not None)
+        results = []
+        for command, key in self.commands:
+            if command == "get":
+                results.append(self.redis.values.get(key))
+            else:
+                results.append(int(self.redis.values.pop(key, None) is not None))
+        return results
 
 
 async def _login(client: httpx.AsyncClient) -> str:
@@ -117,11 +125,13 @@ def oauth_env(monkeypatch):
         submitted.update(kwargs)
         return job_id
 
-    async def fake_dispatch(actor, *args, inline=None):
-        submitted["dispatched"] = True
+    async def fake_process(processed_job_id):
+        submitted["processed_job_id"] = processed_job_id
+        submitted.setdefault("process_calls", []).append(processed_job_id)
+        return "COMPLETED"
 
     monkeypatch.setattr(oauth_connect, "submit_provisioning_job", fake_submit)
-    monkeypatch.setattr(oauth_connect, "dispatch_actor", fake_dispatch)
+    monkeypatch.setattr(oauth_connect, "process_provisioning_job", fake_process)
     return {"calls": calls, "submitted": submitted, "job_id": job_id, "redis": redis}
 
 
@@ -146,7 +156,10 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
             f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
         )
     assert callback.status_code == 303
-    assert callback.headers["location"] == f"/admin/jobs/{oauth_env['job_id']}"
+    assert callback.headers["location"] == "/admin/accounts?provider=x&status=connected"
+    assert callback.headers["cache-control"] == "no-store"
+    assert callback.headers["pragma"] == "no-cache"
+    assert callback.headers["referrer-policy"] == "no-referrer"
 
     submitted = oauth_env["submitted"]
     assert submitted["platform"] == "x"
@@ -160,7 +173,7 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
     }
     assert submitted["request"]["name"] == "@newbot"
     assert submitted["request"]["environment"] == "oauth"
-    assert submitted["dispatched"] is True
+    assert submitted["processed_job_id"] == str(oauth_env["job_id"])
     assert oauth_env["redis"].values == {}
 
     assert [request.url.path for request in oauth_env["calls"]] == [
@@ -173,6 +186,234 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
     assert "x_auth_access_type" not in request_token_call.headers["authorization"]
     assert "oauth_callback=" in request_token_call.headers["authorization"]
     assert request_token_call.headers["authorization"].startswith("OAuth ")
+
+
+@pytest.mark.parametrize(
+    "user_agent",
+    [
+        "Mozilla/5.0 Chrome/126.0.0.0 Safari/537.36",
+        "Mozilla/5.0 Version/17.5 Safari/605.1.15",
+    ],
+)
+async def test_callback_without_cookie_completes_then_login_returns_to_accounts(
+    oauth_env,
+    migrated_db,
+    user_agent,
+):
+    app = create_app()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as initiating_client:
+        csrf = await _login(initiating_client)
+        start = await initiating_client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+        )
+        assert start.status_code == 303
+
+    result_path = "/admin/accounts?provider=x&status=connected"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+        headers={"User-Agent": user_agent, "X-Forwarded-Proto": "https"},
+    ) as callback_client:
+        callback = await callback_client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"] == (
+            "/admin/login?next=%2Fadmin%2Faccounts%3Fprovider%3Dx%26status%3Dconnected"
+        )
+        assert oauth_env["submitted"]["process_calls"] == [str(oauth_env["job_id"])]
+
+        replay = await callback_client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+        assert replay.status_code == 303
+        assert "oauth_state_missing" in replay.headers["location"]
+        assert oauth_env["submitted"]["process_calls"] == [str(oauth_env["job_id"])]
+
+        login_page = await callback_client.get(callback.headers["location"])
+        assert login_page.status_code == 200
+        assert (
+            'name="next" value="/admin/accounts?provider=x&amp;status=connected"' in login_page.text
+        )
+        csrf = callback_client.cookies["reply_admin_csrf"]
+        login = await callback_client.post(
+            "/admin/login",
+            data={
+                "csrf_token": csrf,
+                "next": result_path,
+                "username": "admin",
+                "password": "test-admin-password",
+            },
+        )
+        assert login.status_code == 303
+        assert login.headers["location"] == result_path
+
+
+async def test_callback_waits_when_worker_claims_job_first(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+):
+    async def skipped_process(_job_id):
+        return "SKIPPED_NOT_CLAIMABLE"
+
+    async def completed_job(_job_id):
+        return type("Job", (), {"status": "COMPLETED"})()
+
+    monkeypatch.setattr(oauth_connect, "process_provisioning_job", skipped_process)
+    monkeypatch.setattr(oauth_connect, "_load_provisioning_job", completed_job)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+        )
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/admin/accounts?provider=x&status=connected"
+
+
+async def test_claim_race_timeout_is_processing_not_failure(monkeypatch):
+    async def processing_job(_job_id):
+        return type("Job", (), {"status": "PROCESSING"})()
+
+    monkeypatch.setattr(oauth_connect, "_load_provisioning_job", processing_job)
+    result = await oauth_connect._resolve_provisioning_result(
+        uuid.uuid4(),
+        "SKIPPED_NOT_CLAIMABLE",
+        timeout_seconds=0.01,
+    )
+    assert result == "PROCESSING"
+
+
+async def test_retryable_provisioning_failure_is_reported_as_processing(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+):
+    async def retryable_failure(_job_id):
+        return "FAILED"
+
+    monkeypatch.setattr(oauth_connect, "process_provisioning_job", retryable_failure)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+        )
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == (
+        "/admin/accounts?provider=x&status=processing&code=provisioning_in_progress"
+    )
+
+
+async def test_callback_unhandled_error_is_no_store(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+):
+    async def fail_state(_namespace, _key):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(oauth_connect, "take_oauth_state", fail_state)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        response = await client.get(
+            "/admin/oauth/x/callback?oauth_token=opaque&oauth_verifier=opaque"
+        )
+    assert response.status_code == 500
+    assert response.text == "OAuth callback failed"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["referrer-policy"] == "no-referrer"
+
+
+async def test_expired_transaction_does_not_restart_oauth(oauth_env, migrated_db):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+        )
+        state = await oauth_common.take_oauth_state("x", _REQ_TOKEN)
+        assert state is not None
+        state["created_at"] = (datetime.now(UTC) - timedelta(minutes=11)).isoformat()
+        await oauth_common.store_oauth_state("x", _REQ_TOKEN, state)
+
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+    assert callback.status_code == 303
+    assert "oauth_transaction_invalid" in callback.headers["location"]
+    assert [request.url.path for request in oauth_env["calls"]] == ["/oauth/request_token"]
+    assert "process_calls" not in oauth_env["submitted"]
+
+
+@pytest.mark.parametrize("exchange_status", [401, 403])
+async def test_token_exchange_rejection_does_not_restart_oauth(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+    caplog,
+    exchange_status,
+):
+    caplog.set_level(logging.INFO, logger=oauth_connect.__name__)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        await client.post(
+            "/admin/oauth/x/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+        )
+
+        async def reject_exchange(**kwargs):
+            request = httpx.Request("POST", "https://api.x.com/oauth/access_token")
+            response = httpx.Response(exchange_status, request=request, text="rejected")
+            raise httpx.HTTPStatusError("rejected", request=request, response=response)
+
+        monkeypatch.setattr(oauth_connect, "_access_token", reject_exchange)
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+    assert callback.status_code == 303
+    assert callback.headers["location"] == (
+        "/admin/accounts?provider=x&status=error&code=x_token_exchange_rejected"
+    )
+    assert [request.url.path for request in oauth_env["calls"]] == ["/oauth/request_token"]
+    assert "process_calls" not in oauth_env["submitted"]
+    assert _REQ_TOKEN not in caplog.text
+    assert _REQ_SECRET not in caplog.text
+    assert "verifier-7" not in caplog.text
+    assert hashlib.sha256(_REQ_TOKEN.encode()).hexdigest()[:12] in caplog.text
 
 
 async def test_state_is_one_time_and_supports_parallel_account_flows(oauth_env):
@@ -222,12 +463,25 @@ async def test_callback_rejects_replay_and_handles_denial(oauth_env, migrated_db
         follow_redirects=False,
     ) as client:
         denied = await client.get("/admin/oauth/x/callback?denied=unknown")
-        assert denied.status_code == 200
+        assert denied.status_code == 303
+        assert "status%3Derror" in denied.headers["location"]
+        assert "oauth_state_missing" in denied.headers["location"]
 
-        no_state = await client.get(
-            "/admin/oauth/x/callback?oauth_token=missing&oauth_verifier=v"
+        no_state = await client.get("/admin/oauth/x/callback?oauth_token=missing&oauth_verifier=v")
+        assert no_state.status_code == 303
+        assert "oauth_state_missing" in no_state.headers["location"]
+        assert no_state.headers["cache-control"] == "no-store"
+
+        missing_parameters = await client.get("/admin/oauth/x/callback")
+        assert missing_parameters.status_code == 400
+        assert missing_parameters.headers["cache-control"] == "no-store"
+
+        slash_variant = await client.get(
+            "/admin/oauth/x/callback/?oauth_token=opaque&oauth_verifier=opaque"
         )
-        assert no_state.status_code == 400
+        assert slash_variant.status_code == 400
+        assert "location" not in slash_variant.headers
+        assert slash_variant.headers["cache-control"] == "no-store"
 
 
 async def test_callback_rejects_revoked_admin_session(oauth_env, migrated_db):
@@ -242,13 +496,20 @@ async def test_callback_rejects_revoked_admin_session(oauth_env, migrated_db):
             data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "b"},
         )
         assert start.status_code == 303
-        logout = await client.get("/admin/logout")
+        logout_page = await client.get("/admin/logout")
+        assert logout_page.status_code == 200
+        assert (await client.get("/admin/accounts")).status_code == 200
+        missing_csrf = await client.post("/admin/logout")
+        assert missing_csrf.status_code == 403
+        assert (await client.get("/admin/accounts")).status_code == 200
+        logout = await client.post("/admin/logout", data={"csrf_token": csrf})
         assert logout.status_code == 303
         callback = await client.get(
             f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=v"
         )
-    assert callback.status_code == 403
-    assert oauth_env["submitted"] == {}
+    assert callback.status_code == 303
+    assert "admin_session_invalid" in callback.headers["location"]
+    assert "processed_job_id" not in oauth_env["submitted"]
     assert [request.url.path for request in oauth_env["calls"]] == ["/oauth/request_token"]
 
 

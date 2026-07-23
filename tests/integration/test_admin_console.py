@@ -86,9 +86,22 @@ async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
     assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
 
 
-async def test_xchat_activation_error_renders_operator_notice(
-    session, migrated_db, monkeypatch
-):
+async def test_accounts_page_renders_x_oauth_result_banner(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        connected = await client.get("/admin/accounts?provider=x&status=connected")
+        processing = await client.get(
+            "/admin/accounts?provider=x&status=processing&code=provisioning_in_progress"
+        )
+        failed = await client.get(
+            "/admin/accounts?provider=x&status=error&code=x_token_exchange_rejected"
+        )
+    assert "X 账号授权并连接成功" in connected.text
+    assert "正在后台完成" in processing.text
+    assert "x_token_exchange_rejected" in failed.text
+
+
+async def test_xchat_activation_error_renders_operator_notice(session, migrated_db, monkeypatch):
     import uuid
 
     from social_reply.application.account_management import admin_console
@@ -143,9 +156,7 @@ async def test_xchat_activation_error_renders_operator_notice(
     assert "1234" not in response.text
 
 
-async def test_pin_provisioning_job_requires_secret_resubmission(
-    session, migrated_db
-):
+async def test_pin_provisioning_job_requires_secret_resubmission(session, migrated_db):
     import uuid
 
     job_id = uuid.uuid4()
@@ -282,7 +293,6 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
     assert any(d.question == "你们几点营业" for d in docs)
     chunk = (await session.execute(select(models.KnowledgeChunk))).scalars().first()
     assert chunk.embed_text == "你们几点营业"  # 非对称嵌入：只嵌问题
-
 
 
 async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatch):

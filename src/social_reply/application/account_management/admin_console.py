@@ -49,7 +49,7 @@ def _fmt(dt: datetime | None) -> str:
 def _ensure_csrf(response: Response, request: Request, csrf: str) -> Response:
     if not request.cookies.get(_CSRF_COOKIE):
         response.set_cookie(
-            _CSRF_COOKIE, csrf, httponly=False, samesite="strict", secure=_secure_cookie(request)
+            _CSRF_COOKIE, csrf, httponly=False, samesite="lax", secure=_secure_cookie(request)
         )
     return response
 
@@ -199,9 +199,7 @@ async def overview(request: Request) -> Response:
 <section class="card"><h2>决策分布</h2><p class="hint">近 7 日各动作占比。</p>{bars}</section>
 <section class="card"><h2>最近决策</h2><p class="hint">最新 8 条 AI 决策。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复预览</th><th></th></tr></thead><tbody>{recent_rows}</tbody></table></div></section>
 </div>"""
-    return HTMLResponse(
-        _page("总览", body, active="overview", show_users=principal.is_superadmin)
-    )
+    return HTMLResponse(_page("总览", body, active="overview", show_users=principal.is_superadmin))
 
 
 # ---------- 对话收件箱 ----------
@@ -1023,6 +1021,27 @@ async def accounts_page(request: Request) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
+    oauth_banner = ""
+    if request.query_params.get("provider") == "x":
+        oauth_status = request.query_params.get("status")
+        if oauth_status == "connected":
+            oauth_banner = '<div class="banner ok">X 账号授权并连接成功。</div>'
+        elif oauth_status == "processing":
+            oauth_banner = '<div class="banner info">X 账号连接正在后台完成，请稍后刷新。</div>'
+        elif oauth_status == "error":
+            raw_code = request.query_params.get("code") or "oauth_failed"
+            safe_code = (
+                "".join(
+                    character
+                    for character in raw_code[:64]
+                    if character.isascii() and (character.isalnum() or character in {"_", "-"})
+                )
+                or "oauth_failed"
+            )
+            oauth_banner = (
+                '<div class="banner err">X 授权未完成。错误代码：'
+                f"<code>{html.escape(safe_code)}</code></div>"
+            )
     csrf = _csrf(request)
     settings = get_settings()
     tenants = principal.allowed_tenants
@@ -1128,9 +1147,7 @@ async def accounts_page(request: Request) -> Response:
         f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
         f"{tenant_public_id('meta_oauth', webhook_tenant)}"
     )
-    instagram_callback = (
-        f"{settings.public_base_url.rstrip('/')}/admin/oauth/instagram/callback"
-    )
+    instagram_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/instagram/callback"
     instagram_webhook = (
         f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
         f"{tenant_public_id('instagram_oauth', webhook_tenant)}"
@@ -1157,10 +1174,10 @@ async def accounts_page(request: Request) -> Response:
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:
         body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>
-{killswitch_card}{account_card}{jobs_card}{connect_forms}"""
+{oauth_banner}{killswitch_card}{account_card}{jobs_card}{connect_forms}"""
     else:
         body = f"""<h1>账号授权</h1><p class="lede">授权并管理当前 Tenant 的平台账号。</p>
-{connect_forms}{account_card}{jobs_card}"""
+{oauth_banner}{connect_forms}{account_card}{jobs_card}"""
     response = HTMLResponse(
         _page("账号", body, active="accounts", show_users=principal.is_superadmin)
     )
@@ -1176,7 +1193,11 @@ async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Respo
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         account = await session.get(models.PlatformAccount, account_id)
-    if account is None or account.tenant_id not in principal.allowed_tenants or account.platform != "x":
+    if (
+        account is None
+        or account.tenant_id not in principal.allowed_tenants
+        or account.platform != "x"
+    ):
         raise HTTPException(status_code=404, detail="x_account_not_found")
     pin = (form.get("xchat_pin") or "").strip()
     if len(pin) != 4 or not pin.isdigit():

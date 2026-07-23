@@ -67,11 +67,12 @@ curl -s https://relay.nexory.top/healthz   # {"status":"ok"}(经 Cloudflare 全�
 
 `.env` 中的 `X_API_KEY` / `X_API_SECRET` 必须来自 X Developer Portal 的
 **Consumer Keys**，不能填写 OAuth 2.0 Client ID / Client Secret。User authentication
-settings 使用 **OAuth 1.0a**，App permissions 设为 **Read and Write**，App type 使用
-**Web App**，Callback URI 必须与 `PUBLIC_BASE_URL` 完全一致：
+settings 使用 **OAuth 1.0a**，App permissions 设为
+**Read and write and Direct message**，App type 使用 **Web App**。Callback URI 必须与
+`PUBLIC_BASE_URL` 完全一致，使用 HTTPS、无结尾斜杠、无 query：
 
 ```text
-https://relaytest.nexory.top/admin/oauth/x/callback
+${PUBLIC_BASE_URL}/admin/oauth/x/callback
 ```
 
 修改 `.env` 后需重建应用容器，而不是只重启进程：
@@ -81,6 +82,21 @@ docker compose pull
 # 强制让 api/worker/scheduler 读取新镜像和新环境变量
 docker compose up -d --force-recreate api worker scheduler
 ```
+
+#### X OAuth Redis Key 两阶段发布
+
+从旧版 `oauth:x:<raw-token>` 迁移到
+`x:oauth1:transaction:<sha256(oauth_token)>` 时，必须避免新 writer 与旧 reader
+在滚动窗口中交叉：
+
+1. Phase 1：临时设置 `X_OAUTH_LEGACY_STATE_WRITE=true`，部署新镜像。此时新代码仍写旧
+   key，但可以读取并一次性删除新旧两类 key；等待所有旧 API 副本退出。
+2. Phase 2：设置 `X_OAUTH_LEGACY_STATE_WRITE=false`，再次滚动 API。此时所有在途副本都已
+   具备双读能力，新请求只写 SHA-256 key。
+3. 确认至少经过一个 10 分钟 OAuth state TTL 后，再删除该临时变量或保持 `false`。
+
+Phase 2 后若需要回滚，只能回滚到具备双读能力的版本；若必须回滚到更老版本，应先恢复
+`true` 并等待 10 分钟排空 hash-key transaction，避免回调随机丢失。
 
 ## 日常运维
 

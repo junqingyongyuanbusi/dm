@@ -42,6 +42,40 @@ Revision `f3a6c1d8e250` adds a database-generated `messages.history_seq`, the `m
 
 History sent to an external LLM is bounded by `CONVERSATION_HISTORY_LIMIT` and `CONVERSATION_HISTORY_MAX_CHARS`; set the limit to `0` to disable multi-turn history. Customer text is retained unchanged in PostgreSQL but email and long-number patterns are redacted in the external LLM request.
 
+## Railway X OAuth state-key rollout
+
+The X OAuth transaction key changes from `oauth:x:<raw-token>` to
+`x:oauth1:transaction:<sha256(oauth_token)>`. The new application can read and atomically consume
+both formats, but the previous production image can read only the legacy key. Railway must use a
+two-phase API rollout:
+
+1. Before deploying the new image, set the API-only compatibility writer without triggering an
+   immediate deploy:
+
+   ```bash
+   railway variable set X_OAUTH_LEGACY_STATE_WRITE=true --service api --skip-deploys
+   ```
+
+2. Deploy the new image to API, Worker, and Scheduler. Wait for the new API deployment to report
+   `SUCCESS`, then use `railway deployment list --service api --limit 2` to confirm the previous API
+   deployment is `REMOVED` or `REMOVING`. During this phase every API writer uses the legacy key,
+   while every new reader accepts both formats.
+3. Switch the API writer to the hashed key and redeploy only API:
+
+   ```bash
+   railway variable set X_OAUTH_LEGACY_STATE_WRITE=false --service api --skip-deploys
+   railway redeploy --service api --yes
+   ```
+
+4. Confirm the phase-2 API deployment is `SUCCESS`, `/healthz` is healthy, callback access logs do
+   not contain query parameters, and new Redis transactions use only the hashed prefix. Keep this
+   dual-reader release in production for at least one 10-minute OAuth transaction TTL before
+   removing the compatibility variable.
+
+Do not roll phase 2 directly back to an image that reads only legacy keys. First set the writer back
+to `true` on the dual-reader image, deploy it, wait at least 10 minutes for hash-key transactions to
+expire or complete, and only then deploy the older image.
+
 ## Rollback
 
 Revision `c9e83a4d1f20` intentionally has no in-place downgrade because tenant-scoped knowledge

@@ -13,6 +13,7 @@ _ENV_KEYS = [
     "PLATFORM_SECRET_KEYS",
     "X_API_KEY",
     "X_API_SECRET",
+    "X_OAUTH_LEGACY_STATE_WRITE",
     "FACEBOOK_APP_ID",
     "FACEBOOK_APP_SECRET",
     "META_VERIFY_TOKEN",
@@ -101,6 +102,11 @@ def test_x_app_credentials_must_be_configured_as_a_pair() -> None:
 
     settings = _make(testing=True, x_api_key="key", x_api_secret="secret")
     assert settings.x_app_credentials == ("key", "secret")
+
+
+def test_x_oauth_legacy_state_write_is_typed_setting() -> None:
+    assert _make(testing=True).x_oauth_legacy_state_write is False
+    assert _make(testing=True, x_oauth_legacy_state_write=True).x_oauth_legacy_state_write is True
 
 
 def test_meta_app_credentials_must_be_configured_as_pairs() -> None:

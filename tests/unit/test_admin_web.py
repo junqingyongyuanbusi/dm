@@ -52,9 +52,83 @@ async def test_admin_login_sets_http_only_session_cookie(monkeypatch):
     cookie = response.headers["set-cookie"]
     assert "reply_admin_session=" in cookie
     assert "HttpOnly" in cookie
-    assert "SameSite=strict" in cookie
+    assert "SameSite=lax" in cookie
     assert "opaque-session-token" in cookie
     assert "admin" not in cookie.split("reply_admin_session=", 1)[1].split(";", 1)[0]
+
+
+async def test_admin_login_accepts_only_whitelisted_next(monkeypatch):
+    from social_reply.application.account_management import admin
+    from social_reply.application.account_management.auth import Principal
+
+    async def fake_authenticate(_username, _password):
+        return (
+            Principal(
+                session_id=__import__("uuid").uuid4(),
+                username="admin",
+                actor="user:admin",
+                allowed_tenants=frozenset({"default"}),
+            ),
+            "opaque-session-token",
+        )
+
+    monkeypatch.setattr(admin, "authenticate", fake_authenticate)
+    async with await _client() as client:
+        page = await client.get(
+            "/admin/login?next=%2Fadmin%2Faccounts%3Fprovider%3Dx%26status%3Dconnected"
+        )
+        csrf = client.cookies["reply_admin_csrf"]
+        assert "SameSite=lax" in page.headers["set-cookie"]
+        safe = await client.post(
+            "/admin/login",
+            data={
+                "csrf_token": csrf,
+                "username": "admin",
+                "password": "password",
+                "next": "/admin/accounts?provider=x&status=connected",
+            },
+        )
+        assert safe.headers["location"] == "/admin/accounts?provider=x&status=connected"
+
+    async with await _client() as client:
+        await client.get("/admin/login")
+        csrf = client.cookies["reply_admin_csrf"]
+        unsafe = await client.post(
+            "/admin/login",
+            data={
+                "csrf_token": csrf,
+                "username": "admin",
+                "password": "password",
+                "next": "https://evil.example/steal",
+            },
+        )
+        assert unsafe.headers["location"] == "/admin"
+
+
+async def test_admin_login_failure_preserves_whitelisted_next(monkeypatch):
+    from social_reply.application.account_management import admin
+
+    async def reject_authentication(_username, _password):
+        return None
+
+    monkeypatch.setattr(admin, "authenticate", reject_authentication)
+    async with await _client() as client:
+        await client.get("/admin/login")
+        csrf = client.cookies["reply_admin_csrf"]
+        response = await client.post(
+            "/admin/login",
+            data={
+                "csrf_token": csrf,
+                "username": "admin",
+                "password": "wrong",
+                "next": "/admin/accounts?provider=x&status=processing",
+            },
+        )
+    assert response.status_code == 401
+    assert (
+        'href="/admin/login?next=%2Fadmin%2Faccounts%3Fprovider%3Dx%26status%3Dprocessing"'
+        in response.text
+    )
 
 
 async def test_admin_meta_submission_parses_form_once(monkeypatch):

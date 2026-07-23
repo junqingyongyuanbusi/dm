@@ -7,8 +7,12 @@ Repeating the flow connects another X account; reconnecting the same account
 updates the existing database row by external account ID.
 """
 
+import asyncio
+import hashlib
 import logging
 import re
+import secrets
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qsl, urlencode
 
 import httpx
@@ -22,7 +26,11 @@ from social_reply.application.account_management.admin import (
     _require_csrf,
     _web_principal,
 )
-from social_reply.application.account_management.jobs import submit_provisioning_job
+from social_reply.application.account_management.auth import current_principal
+from social_reply.application.account_management.jobs import (
+    process_provisioning_job,
+    submit_provisioning_job,
+)
 from social_reply.application.account_management.oauth.common import (
     admin_callback_url,
     notice,
@@ -32,12 +40,18 @@ from social_reply.application.account_management.oauth.common import (
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.x_app import x_app_credentials
+from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
 
 _X_OAUTH_BASE = "https://api.x.com"
+_X_RETURN_TO = "/admin/accounts"
+_X_TRANSACTION_MAX_AGE = timedelta(minutes=10)
+_PROVISIONING_WAIT_SECONDS = 5.0
+_RESULT_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _oauth1_auth(**kwargs) -> ClientAuth:
@@ -54,6 +68,147 @@ def _x_error_detail(exc: Exception) -> str:
     body = exc.response.text.strip()
     match = re.search(r"<error\b[^>]*>(.*?)</error>", body, flags=re.DOTALL)
     return (match.group(1) if match else body)[:300]
+
+
+def _oauth_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _safe_return_to(value: object) -> str:
+    candidate = str(value or "")
+    return candidate if candidate in {_X_RETURN_TO} else _X_RETURN_TO
+
+
+def _safe_result_code(value: object, fallback: str) -> str:
+    candidate = str(value or "")
+    return candidate if _RESULT_CODE_RE.fullmatch(candidate) else fallback
+
+
+def _no_store(response: Response) -> Response:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+def _request_id(request: Request) -> str:
+    return (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-railway-request-id")
+        or request.headers.get("cf-ray")
+        or "-"
+    )
+
+
+def _log_callback(
+    request: Request,
+    *,
+    stage: str,
+    oauth_token: str = "",
+    http_status: int,
+    code: str,
+) -> None:
+    logger.info(
+        "x oauth callback request_id=%s stage=%s provider=x http_status=%s code=%s token_hash=%s",
+        _request_id(request),
+        stage,
+        http_status,
+        code,
+        _oauth_token_hash(oauth_token)[:12] if oauth_token else "-",
+    )
+
+
+async def _result_redirect(
+    request: Request,
+    *,
+    status_value: str,
+    code: str | None = None,
+    return_to: object = _X_RETURN_TO,
+) -> Response:
+    params = {"provider": "x", "status": status_value}
+    if code:
+        params["code"] = _safe_result_code(code, "oauth_failed")
+    result_path = f"{_safe_return_to(return_to)}?{urlencode(params)}"
+    try:
+        principal = await current_principal(request)
+    except Exception:  # noqa: BLE001 - result still safely returns through login
+        principal = None
+    target = (
+        result_path
+        if principal is not None and not principal.must_change_password
+        else f"/admin/login?{urlencode({'next': result_path})}"
+    )
+    return _no_store(RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER))
+
+
+def _valid_transaction(state: dict, oauth_token: str) -> bool:
+    if state.get("status") not in {None, "pending"}:
+        return False
+    if state.get("organization_id") not in {None, state.get("tenant_id")}:
+        return False
+    expected_hash = state.get("oauth_token_hash")
+    if expected_hash and not secrets.compare_digest(
+        str(expected_hash), _oauth_token_hash(oauth_token)
+    ):
+        return False
+    created_at = state.get("created_at")
+    if not created_at:
+        return True
+    try:
+        created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    age = datetime.now(UTC) - created
+    return timedelta(seconds=-60) <= age <= _X_TRANSACTION_MAX_AGE
+
+
+async def _load_provisioning_job(job_id):
+    async with get_session_factory()() as session:
+        return await session.get(models.ProvisioningJob, job_id)
+
+
+async def _resolve_provisioning_result(
+    job_id,
+    initial_result: str | None,
+    *,
+    timeout_seconds: float = _PROVISIONING_WAIT_SECONDS,
+) -> str:
+    if initial_result in {"COMPLETED", "NEEDS_ACTION"}:
+        return initial_result
+    if initial_result == "FAILED":
+        return "PROCESSING"
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return "PROCESSING"
+        try:
+            job = await asyncio.wait_for(_load_provisioning_job(job_id), timeout=remaining)
+        except TimeoutError:
+            return "PROCESSING"
+        if job is None:
+            return "MISSING"
+        if job.status in {"COMPLETED", "NEEDS_ACTION"}:
+            return job.status
+        if job.status == "FAILED":
+            return "PROCESSING"
+        sleep_for = min(0.1, deadline - loop.time())
+        if sleep_for <= 0:
+            return "PROCESSING"
+        await asyncio.sleep(sleep_for)
+
+
+async def _provisioning_error_code(job_id) -> str:
+    try:
+        job = await _load_provisioning_job(job_id)
+    except Exception:  # noqa: BLE001 - callback error codes stay redacted
+        return "provisioning_result_unavailable"
+    if job is None:
+        return "provisioning_result_missing"
+    return _safe_result_code(job.last_error_code, "provisioning_failed")
 
 
 async def _request_token(
@@ -164,9 +319,16 @@ async def x_oauth_start(request: Request) -> Response:
             token["oauth_token"],
             {
                 "request_token_secret": token["oauth_token_secret"],
+                "oauth_token_hash": _oauth_token_hash(token["oauth_token"]),
+                "admin_id": str(principal.user_id or principal.session_id),
+                "admin_session_id": str(principal.session_id),
+                "session_id": str(principal.session_id),
+                "organization_id": tenant_id,
                 "tenant_id": tenant_id,
                 "brand_id": (form.get("brand_id") or "default").strip() or "default",
-                "session_id": str(principal.session_id),
+                "return_to": _X_RETURN_TO,
+                "created_at": datetime.now(UTC).isoformat(),
+                "status": "pending",
                 "xchat_pin": form.get("xchat_pin", ""),
             },
         )
@@ -184,31 +346,133 @@ async def x_oauth_start(request: Request) -> Response:
 async def x_oauth_callback(request: Request) -> Response:
     denied = request.query_params.get("denied", "")
     if denied:
-        await take_oauth_state("x", denied)
-        return notice("授权已取消", "你在 X 上取消了授权，未做任何变更。")
+        try:
+            state = await take_oauth_state("x", denied)
+        except (OSError, RedisError):
+            state = None
+            code = "oauth_state_unavailable"
+        else:
+            code = "access_denied" if state is not None else "oauth_state_missing"
+        _log_callback(
+            request,
+            stage="denied",
+            oauth_token=denied,
+            http_status=303,
+            code=code,
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code=code,
+            return_to=(state or {}).get("return_to"),
+        )
 
     oauth_token = request.query_params.get("oauth_token", "")
     verifier = request.query_params.get("oauth_verifier", "")
     if not oauth_token or not verifier:
-        return notice("授权参数不完整", "请回到账号页重新发起授权。", status_code=400)
-    state = await take_oauth_state("x", oauth_token)
-    if state is None:
-        return notice(
-            "授权会话无效",
-            "发起记录缺失、已使用或已过期，请回到账号页重新发起。",
-            status_code=400,
+        _log_callback(
+            request,
+            stage="validate_callback",
+            http_status=400,
+            code="oauth_callback_parameters_missing",
         )
-    principal = await principal_from_oauth_context(state)
+        return _no_store(
+            notice(
+                "授权参数不完整",
+                "回调缺少必要参数，请从后台账号页重新发起授权。",
+                status_code=400,
+            )
+        )
+
+    try:
+        state = await take_oauth_state("x", oauth_token)
+    except (OSError, RedisError):
+        _log_callback(
+            request,
+            stage="load_transaction",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="oauth_state_unavailable",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="oauth_state_unavailable",
+        )
+    if state is None:
+        _log_callback(
+            request,
+            stage="load_transaction",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="oauth_state_missing",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="oauth_state_missing",
+        )
+    if not _valid_transaction(state, oauth_token):
+        _log_callback(
+            request,
+            stage="validate_transaction",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="oauth_transaction_invalid",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="oauth_transaction_invalid",
+            return_to=state.get("return_to"),
+        )
+
+    try:
+        principal = await principal_from_oauth_context(state)
+    except Exception:  # noqa: BLE001 - return a redacted callback result
+        _log_callback(
+            request,
+            stage="validate_admin",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="admin_session_unavailable",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="admin_session_unavailable",
+            return_to=state.get("return_to"),
+        )
     if principal is None:
-        return notice(
-            "授权会话已失效",
-            "管理员会话已退出、过期或失去 Tenant 权限，请重新登录并发起授权。",
-            status_code=403,
+        _log_callback(
+            request,
+            stage="validate_admin",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="admin_session_invalid",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="admin_session_invalid",
+            return_to=state.get("return_to"),
         )
 
     credentials = x_app_credentials()
     if credentials is None:
-        return notice("无法完成授权", "X_API_KEY/X_API_SECRET 当前不可用。", status_code=422)
+        _log_callback(
+            request,
+            stage="load_app_credentials",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="x_oauth_app_not_configured",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="x_oauth_app_not_configured",
+            return_to=state.get("return_to"),
+        )
     consumer_key, consumer_secret = credentials
     try:
         token = await _access_token(
@@ -219,24 +483,26 @@ async def x_oauth_callback(request: Request) -> Response:
             verifier=verifier,
         )
     except (httpx.HTTPError, KeyError, ValueError) as exc:
-        status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-        logger.warning(
-            "x oauth access token failed type=%s status=%s",
-            exc.__class__.__name__,
-            status_code,
+        exchange_status = (
+            exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 502
         )
-        return notice(
-            "换取凭证失败",
-            f"X OAuth access token 失败（{exc.__class__.__name__}），请重新授权。",
-            status_code=502,
+        code = (
+            "x_token_exchange_rejected"
+            if exchange_status in {401, 403}
+            else "x_token_exchange_failed"
         )
-
-    principal = await principal_from_oauth_context(state)
-    if principal is None:
-        return notice(
-            "授权会话已失效",
-            "管理员会话在授权期间已退出、过期或失去 Tenant 权限，请重新发起。",
-            status_code=403,
+        _log_callback(
+            request,
+            stage="exchange_access_token",
+            oauth_token=oauth_token,
+            http_status=303,
+            code=code,
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code=code,
+            return_to=state.get("return_to"),
         )
 
     screen_name = token.get("screen_name", "")
@@ -251,21 +517,79 @@ async def x_oauth_callback(request: Request) -> Response:
     if state.get("xchat_pin"):
         submission["xchat_pin"] = state["xchat_pin"]
     request_data, secrets_data = split_submission("x", submission)
-    job_id = await submit_provisioning_job(
-        tenant_id=state["tenant_id"],
-        brand_id=state.get("brand_id", "default"),
-        platform="x",
-        actor=principal.actor,
-        request=request_data,
-        secrets=secrets_data,
-        admin_session_id=principal.session_id,
-    )
-    from social_reply.application.account_management.actors import process_platform_provisioning
-    from social_reply.application.account_management.jobs import process_provisioning_job
+    try:
+        job_id = await submit_provisioning_job(
+            tenant_id=state["tenant_id"],
+            brand_id=state.get("brand_id", "default"),
+            platform="x",
+            actor=principal.actor,
+            request=request_data,
+            secrets=secrets_data,
+            admin_session_id=principal.session_id,
+        )
+        from social_reply.application.account_management.actors import (
+            process_platform_provisioning,
+        )
 
-    await dispatch_actor(
-        process_platform_provisioning,
-        str(job_id),
-        inline=lambda: process_provisioning_job(str(job_id)),
+        initial_result = await dispatch_actor(
+            process_platform_provisioning,
+            str(job_id),
+            inline=lambda: process_provisioning_job(str(job_id)),
+        )
+        result = await _resolve_provisioning_result(job_id, initial_result)
+    except Exception:  # noqa: BLE001 - callback must return a redacted result
+        logger.error(
+            "x oauth callback request_id=%s stage=provision provider=x http_status=303 "
+            "code=%s token_hash=%s",
+            _request_id(request),
+            "provisioning_internal_error",
+            _oauth_token_hash(oauth_token)[:12],
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="provisioning_internal_error",
+            return_to=state.get("return_to"),
+        )
+    if result == "PROCESSING":
+        _log_callback(
+            request,
+            stage="provision",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="provisioning_in_progress",
+        )
+        return await _result_redirect(
+            request,
+            status_value="processing",
+            code="provisioning_in_progress",
+            return_to=state.get("return_to"),
+        )
+    if result != "COMPLETED":
+        code = await _provisioning_error_code(job_id)
+        _log_callback(
+            request,
+            stage="provision",
+            oauth_token=oauth_token,
+            http_status=303,
+            code=code,
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code=code,
+            return_to=state.get("return_to"),
+        )
+
+    _log_callback(
+        request,
+        stage="completed",
+        oauth_token=oauth_token,
+        http_status=303,
+        code="connected",
     )
-    return RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return await _result_redirect(
+        request,
+        status_value="connected",
+        return_to=state.get("return_to"),
+    )
