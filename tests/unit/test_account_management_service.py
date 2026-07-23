@@ -289,7 +289,7 @@ async def test_enable_xchat_updates_existing_account_without_persisting_pin(monk
     fake_session = FakeSession()
     monkeypatch.setattr(service, "get_platform_account_runtime", fake_runtime)
     monkeypatch.setattr(service, "XChatClient", FakeXChatClient)
-    monkeypatch.setattr(service, "unlock_xchat_private_keys", fake_unlock)
+    monkeypatch.setattr(service, "unlock_account_xchat_keys", fake_unlock)
     monkeypatch.setattr(service, "get_session_factory", lambda: lambda: fake_session)
     encrypted = {}
     monkeypatch.setattr(

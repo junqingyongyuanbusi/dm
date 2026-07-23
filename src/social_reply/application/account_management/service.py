@@ -10,6 +10,9 @@ from social_reply.application.account_management.meta_subscription import subscr
 from social_reply.application.account_management.provisioning import provision_direct_account
 from social_reply.application.account_management.x_app import ensure_x_platform_app
 from social_reply.application.account_management.x_credentials import x_credentials
+from social_reply.application.account_management.xchat_activation import (
+    unlock_account_xchat_keys,
+)
 from social_reply.application.platform_accounts import (
     get_platform_account_runtime,
     get_platform_account_runtime_by_external_id,
@@ -18,7 +21,6 @@ from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.x.client import XClient
 from social_reply.connectors.xchat.client import XChatClient
-from social_reply.connectors.xchat.setup import unlock_xchat_private_keys
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
@@ -276,7 +278,7 @@ async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
         api_base_url=(account.config or {}).get("api_base_url", "https://api.x.com"),
     )
     try:
-        private_keys, key_version = await unlock_xchat_private_keys(
+        private_keys, key_version = await unlock_account_xchat_keys(
             client=client,
             user_id=account.external_account_id,
             pin=_require_secret(pin, "xchat_pin"),
@@ -366,7 +368,7 @@ async def connect_x_account(
     if xchat_pin and xchat_pin.strip():
         xchat = XChatClient(**credentials, api_base_url=api_base_url, transport=transport)
         try:
-            private_keys, key_version = await unlock_xchat_private_keys(
+            private_keys, key_version = await unlock_account_xchat_keys(
                 client=xchat,
                 user_id=external_account_id,
                 pin=xchat_pin.strip(),

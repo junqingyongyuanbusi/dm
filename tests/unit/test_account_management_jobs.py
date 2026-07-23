@@ -4,6 +4,7 @@ import httpx
 
 from social_reply.application.account_management import jobs
 from social_reply.application.account_management.service import AccountConnectionResult
+from social_reply.application.account_management.xchat_activation import XChatActivationError
 
 
 def test_safe_request_never_contains_credentials():
@@ -30,6 +31,22 @@ def test_error_sanitizes_platform_http_errors():
     assert message == "Platform API returned HTTP 503"
     assert retryable is True
     assert "secret" not in message
+
+
+def test_error_requires_manual_pin_resubmission_for_xchat_failures():
+    code, message, retryable = jobs._error(
+        XChatActivationError(
+            "XCHAT_RATE_LIMITED",
+            "X API 当前限流",
+            status_code=429,
+            retryable=True,
+        )
+    )
+    assert (code, message, retryable) == (
+        "XCHAT_RATE_LIMITED",
+        "X API 当前限流",
+        False,
+    )
 
 
 def test_error_explains_missing_x_direct_message_permission():

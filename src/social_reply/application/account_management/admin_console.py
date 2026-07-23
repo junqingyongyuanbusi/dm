@@ -4,6 +4,7 @@
 """
 
 import hashlib
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -26,8 +27,10 @@ from social_reply.application.account_management.admin import (
     html,
 )
 from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.oauth.common import notice
 from social_reply.application.account_management.provisioning import tenant_public_id
 from social_reply.application.account_management.service import enable_xchat_for_account
+from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.application.reply_decision.persist import _idempotency_key
 from social_reply.domain.automation.state_machine import AutomationStateEnum, can_transition
 from social_reply.infrastructure.database import models
@@ -35,6 +38,7 @@ from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-console"])
 
 
@@ -1179,8 +1183,26 @@ async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Respo
         raise HTTPException(status_code=422, detail="invalid_xchat_pin")
     try:
         await enable_xchat_for_account(account_id=account_id, pin=pin)
-    except Exception as exc:  # noqa: BLE001 - show a stable operator error, never echo PIN
-        raise HTTPException(status_code=422, detail="xchat_unlock_failed") from exc
+    except XChatActivationError as exc:
+        logger.warning("xchat activation failed account=%s code=%s", account_id, exc.code)
+        return notice(
+            "启用 XChat 失败",
+            f"{exc.operator_message}（错误代码：{exc.code}）",
+            status_code=exc.status_code,
+        )
+    except Exception as exc:  # noqa: BLE001 - platform boundary; never echo the PIN
+        logger.exception(
+            "unexpected xchat activation failure account=%s type=%s",
+            account_id,
+            type(exc).__name__,
+        )
+        return notice(
+            "启用 XChat 失败",
+            "系统未能完成 XChat 密钥恢复，请稍后重试。"
+            "如果问题持续存在，请检查 Railway API 日志。"
+            "（错误代码：XCHAT_ACTIVATION_FAILED）",
+            status_code=500,
+        )
     return RedirectResponse("/admin/accounts", status_code=status.HTTP_303_SEE_OTHER)
 
 
