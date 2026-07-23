@@ -106,7 +106,7 @@ async def users_page(request: Request, notice: str = "") -> Response:
             _CSRF_COOKIE,
             csrf,
             httponly=False,
-            samesite="strict",
+            samesite="lax",
             secure=_secure_cookie(request),
         )
     return response
@@ -159,6 +159,4 @@ async def create_user(request: Request) -> Response:
             raise HTTPException(
                 status_code=409, detail="username_or_tenant_already_exists"
             ) from exc
-    return RedirectResponse(
-        "/admin/users?notice=created", status_code=status.HTTP_303_SEE_OTHER
-    )
+    return RedirectResponse("/admin/users?notice=created", status_code=status.HTTP_303_SEE_OTHER)

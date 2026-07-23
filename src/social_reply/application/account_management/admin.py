@@ -1,8 +1,9 @@
 import html
+import re
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -34,6 +35,38 @@ router = APIRouter(prefix="/admin", tags=["admin-web"])
 _SESSION_COOKIE = "reply_admin_session"
 _CSRF_COOKIE = "reply_admin_csrf"
 _SESSION_TTL_SECONDS = 8 * 60 * 60
+_SAFE_NEXT_PATHS = {"/admin/accounts"}
+_SAFE_NEXT_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _safe_admin_next(value: object) -> str | None:
+    candidate = str(value or "")
+    if not candidate:
+        return None
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc or parsed.fragment or parsed.path not in _SAFE_NEXT_PATHS:
+        return None
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if set(query) - {"provider", "status", "code"}:
+        return None
+    normalized: dict[str, str] = {}
+    if "provider" in query:
+        if query["provider"] != ["x"]:
+            return None
+        normalized["provider"] = "x"
+    if "status" in query:
+        if len(query["status"]) != 1 or query["status"][0] not in {
+            "connected",
+            "error",
+            "processing",
+        }:
+            return None
+        normalized["status"] = query["status"][0]
+    if "code" in query:
+        if len(query["code"]) != 1 or not _SAFE_NEXT_CODE_RE.fullmatch(query["code"][0]):
+            return None
+        normalized["code"] = query["code"][0]
+    return parsed.path + (f"?{urlencode(normalized)}" if normalized else "")
 
 
 async def _web_principal(
@@ -43,9 +76,7 @@ async def _web_principal(
     if principal is None:
         return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     if principal.must_change_password and not allow_password_change:
-        return RedirectResponse(
-            "/admin/change-password", status_code=status.HTTP_303_SEE_OTHER
-        )
+        return RedirectResponse("/admin/change-password", status_code=status.HTTP_303_SEE_OTHER)
     return principal
 
 
@@ -194,6 +225,7 @@ details.collapse>.inner{{padding:0 24px 24px}}
 .banner{{padding:12px 16px;border-radius:var(--r-md);font-size:14px;margin-bottom:18px}}
 .banner.err{{background:var(--err-bg);color:var(--err-fg)}}
 .banner.ok{{background:var(--ok-bg);color:var(--ok-fg)}}
+.banner.info{{background:var(--info-bg);color:var(--info-fg)}}
 a{{color:var(--link)}}
 :focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}
 .muted{{color:var(--muted);font-size:13.5px}}
@@ -215,12 +247,18 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request) -> HTMLResponse:
     csrf = _csrf(request)
+    next_target = _safe_admin_next(request.query_params.get("next"))
+    next_field = (
+        f'<input type="hidden" name="next" value="{html.escape(next_target, quote=True)}">'
+        if next_target
+        else ""
+    )
     response = HTMLResponse(
         _page(
             "管理员登录",
             f"""<div class="login-wrap"><section class="card login-card"><h1>管理员登录</h1>
 <p class="hint">生产环境建议由身份感知代理或 OIDC/MFA 保护该入口。</p>
-<form method="post" action="/admin/login"><input type="hidden" name="csrf_token" value="{csrf}">
+<form method="post" action="/admin/login"><input type="hidden" name="csrf_token" value="{csrf}">{next_field}
 <label for="f-username">用户名</label><input id="f-username" name="username" autocomplete="username" required>
 <label for="f-password">密码</label><input id="f-password" name="password" type="password" autocomplete="current-password" required>
 <button type="submit" class="btn-block">登录</button></form></section></div>""",
@@ -232,7 +270,7 @@ async def login_page(request: Request) -> HTMLResponse:
             _CSRF_COOKIE,
             csrf,
             httponly=False,
-            samesite="strict",
+            samesite="lax",
             secure=_secure_cookie(request),
         )
     return response
@@ -242,14 +280,19 @@ async def login_page(request: Request) -> HTMLResponse:
 async def login(request: Request) -> Response:
     form = await _form(request)
     _require_csrf(request, form)
+    next_target = _safe_admin_next(form.get("next"))
     username = (form.get("username") or "").strip()
     password = form.get("password") or ""
+    retry_target = "/admin/login"
+    if next_target:
+        retry_target = f"{retry_target}?{urlencode({'next': next_target})}"
+    retry_link = html.escape(retry_target, quote=True)
     if len(username) > 128 or len(password) > 128:
         return HTMLResponse(
             _page(
                 "登录失败",
-                """<div class="login-wrap"><section class="card login-card"><h1>登录失败</h1>
-<p class="hint">用户名或密码错误。</p><p><a href="/admin/login">返回重试</a></p></section></div>""",
+                f"""<div class="login-wrap"><section class="card login-card"><h1>登录失败</h1>
+<p class="hint">用户名或密码错误。</p><p><a href="{retry_link}">返回重试</a></p></section></div>""",
                 show_logout=False,
             ),
             401,
@@ -259,28 +302,62 @@ async def login(request: Request) -> Response:
         return HTMLResponse(
             _page(
                 "登录失败",
-                """<div class="login-wrap"><section class="card login-card"><h1>登录失败</h1>
-<p class="hint">用户名或密码错误。</p><p><a href="/admin/login">返回重试</a></p></section></div>""",
+                f"""<div class="login-wrap"><section class="card login-card"><h1>登录失败</h1>
+<p class="hint">用户名或密码错误。</p><p><a href="{retry_link}">返回重试</a></p></section></div>""",
                 show_logout=False,
             ),
             401,
         )
     principal, raw_token = result
-    target = "/admin/change-password" if principal.must_change_password else "/admin"
+    if principal.must_change_password:
+        target = "/admin/change-password"
+        if next_target:
+            target = f"{target}?{urlencode({'next': next_target})}"
+    else:
+        target = next_target or "/admin"
     response = RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         _SESSION_COOKIE,
         raw_token,
         httponly=True,
-        samesite="strict",
+        samesite="lax",
         secure=_secure_cookie(request),
         max_age=_SESSION_TTL_SECONDS,
     )
     return response
 
 
-@router.get("/logout")
+@router.get("/logout", response_class=HTMLResponse)
+async def logout_page(request: Request) -> Response:
+    principal = await _web_principal(request, allow_password_change=True)
+    if isinstance(principal, Response):
+        return principal
+    csrf = _csrf(request)
+    response = HTMLResponse(
+        _page(
+            "确认退出",
+            f"""<div class="login-wrap"><section class="card login-card"><h1>确认退出</h1>
+<p class="hint">退出将撤销当前后台会话。</p>
+<form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{csrf}">
+<button type="submit" class="btn-block">退出</button></form></section></div>""",
+            show_logout=False,
+        )
+    )
+    if not request.cookies.get(_CSRF_COOKIE):
+        response.set_cookie(
+            _CSRF_COOKIE,
+            csrf,
+            httponly=False,
+            samesite="lax",
+            secure=_secure_cookie(request),
+        )
+    return response
+
+
+@router.post("/logout")
 async def logout(request: Request) -> Response:
+    form = await _form(request)
+    _require_csrf(request, form)
     await revoke_session(request.cookies.get(_SESSION_COOKIE, ""))
     response = RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie(_SESSION_COOKIE)
@@ -292,15 +369,21 @@ async def change_password_page(request: Request) -> Response:
     principal = await _web_principal(request, allow_password_change=True)
     if isinstance(principal, Response):
         return principal
+    next_target = _safe_admin_next(request.query_params.get("next"))
     if principal.is_superadmin or not principal.must_change_password:
-        return RedirectResponse("/admin", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(next_target or "/admin", status_code=status.HTTP_303_SEE_OTHER)
     csrf = _csrf(request)
+    next_field = (
+        f'<input type="hidden" name="next" value="{html.escape(next_target, quote=True)}">'
+        if next_target
+        else ""
+    )
     response = HTMLResponse(
         _page(
             "首次修改密码",
             f"""<div class="login-wrap"><section class="card login-card"><h1>首次修改密码</h1>
 <p class="hint">为保护账号，首次登录必须设置个人密码（12–128 个字符）。</p>
-<form method="post" action="/admin/change-password"><input type="hidden" name="csrf_token" value="{csrf}">
+<form method="post" action="/admin/change-password"><input type="hidden" name="csrf_token" value="{csrf}">{next_field}
 <label for="f-current-password">初始密码</label><input id="f-current-password" name="current_password" type="password" autocomplete="current-password" required>
 <label for="f-new-password">新密码</label><input id="f-new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required>
 <label for="f-confirm-password">确认新密码</label><input id="f-confirm-password" name="confirm_password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required>
@@ -313,7 +396,7 @@ async def change_password_page(request: Request) -> Response:
             _CSRF_COOKIE,
             csrf,
             httponly=False,
-            samesite="strict",
+            samesite="lax",
             secure=_secure_cookie(request),
         )
     return response
@@ -328,6 +411,7 @@ async def change_password(request: Request) -> Response:
         raise HTTPException(status_code=403, detail="password_change_not_available")
     form = await _form(request)
     _require_csrf(request, form)
+    next_target = _safe_admin_next(form.get("next"))
     new_password = form.get("new_password") or ""
     if new_password != (form.get("confirm_password") or ""):
         raise HTTPException(status_code=422, detail="password_confirmation_mismatch")
@@ -377,12 +461,12 @@ async def change_password(request: Request) -> Response:
             )
         )
         await session.commit()
-    response = RedirectResponse("/admin", status_code=status.HTTP_303_SEE_OTHER)
+    response = RedirectResponse(next_target or "/admin", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         _SESSION_COOKIE,
         raw_token,
         httponly=True,
-        samesite="strict",
+        samesite="lax",
         secure=_secure_cookie(request),
         max_age=_SESSION_TTL_SECONDS,
     )
@@ -406,7 +490,7 @@ def _input(
     return (
         f'<label for="{field_id}">{html.escape(label)}</label>'
         f'<input id="{field_id}" type="{input_type}" name="{name}"{value_attr} '
-        f'{required_attr} {readonly_attr}>'
+        f"{required_attr} {readonly_attr}>"
     )
 
 

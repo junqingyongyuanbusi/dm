@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # deployment, while each authorized account stores only its user token pair.
     x_api_key: SecretStr = SecretStr("")
     x_api_secret: SecretStr = SecretStr("")
+    x_oauth_legacy_state_write: bool = False
     facebook_app_id: str = ""
     facebook_app_secret: SecretStr = SecretStr("")
     meta_verify_token: SecretStr = SecretStr("")

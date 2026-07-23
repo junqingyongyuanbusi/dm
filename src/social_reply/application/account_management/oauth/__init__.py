@@ -3,7 +3,7 @@
 - x.py:X OAuth 1.0a 三步流
 - meta.py:Facebook Page / Instagram 专业账号(Facebook Login,OAuth 2.0)
 - instagram.py:Instagram Login 独立专业账号 OAuth
-- common.py:加密 state cookie、提示页等共享设施
+- common.py:加密 Redis state transaction、提示页等共享设施
 
 Telegram 无 OAuth(BotFather token 模型),继续走手工表单 + provisioning。
 """
