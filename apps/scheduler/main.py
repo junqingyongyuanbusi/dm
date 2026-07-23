@@ -5,7 +5,6 @@ import time
 from collections.abc import Awaitable, Callable
 
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
-from social_reply.application.event_ingestion.reconcile import reconcile_chatwoot_messages
 from social_reply.application.event_ingestion.x_dm_poll import poll_x_direct_messages
 from social_reply.application.event_ingestion.x_webhook_health import ensure_x_webhooks_valid
 from social_reply.application.event_ingestion.xchat_poll import poll_xchat_messages
@@ -18,17 +17,32 @@ from social_reply.infrastructure.queue.actor_loop import run_on_actor_loop
 from social_reply.shared.config import get_settings
 
 _INTERVAL_SECONDS = 3
-_SWEEPS: tuple[tuple[str, Callable[[], Awaitable[list]]], ...] = (
-    ("reconcile_chatwoot_messages", reconcile_chatwoot_messages),
-    ("sweep_provisioning_jobs", sweep_provisioning_jobs),
-    ("sweep_decision_jobs", sweep_decision_jobs),
-    ("sweep_outbox", sweep_outbox),
-    # Legacy DM 与 XChat 是两套互不兼容的消息栈，必须分别补拉。
-    ("poll_x_direct_messages", poll_x_direct_messages),
-    ("poll_xchat_messages", poll_xchat_messages),
-    ("ensure_xchat_subscriptions", ensure_xchat_subscriptions),
-    ("ensure_x_webhooks_valid", ensure_x_webhooks_valid),
-)
+
+
+def _build_sweeps(chatwoot_enabled: bool) -> tuple[tuple[str, Callable[[], Awaitable[list]]], ...]:
+    sweeps: list[tuple[str, Callable[[], Awaitable[list]]]] = []
+    if chatwoot_enabled:
+        from social_reply.application.event_ingestion.reconcile import (
+            reconcile_chatwoot_messages,
+        )
+
+        sweeps.append(("reconcile_chatwoot_messages", reconcile_chatwoot_messages))
+    sweeps.extend(
+        (
+            ("sweep_provisioning_jobs", sweep_provisioning_jobs),
+            ("sweep_decision_jobs", sweep_decision_jobs),
+            ("sweep_outbox", sweep_outbox),
+            # Legacy DM 与 XChat 是两套互不兼容的消息栈，必须分别补拉。
+            ("poll_x_direct_messages", poll_x_direct_messages),
+            ("poll_xchat_messages", poll_xchat_messages),
+            ("ensure_xchat_subscriptions", ensure_xchat_subscriptions),
+            ("ensure_x_webhooks_valid", ensure_x_webhooks_valid),
+        )
+    )
+    return tuple(sweeps)
+
+
+_SWEEPS = _build_sweeps(get_settings().chatwoot_enabled)
 
 logger = logging.getLogger(__name__)
 

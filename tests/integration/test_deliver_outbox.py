@@ -3,7 +3,10 @@ import uuid
 import pytest
 from sqlalchemy import insert, select
 
+from social_reply.application.message_delivery import outbox as outbox_module
+from social_reply.application.message_delivery import sweep as sweep_module
 from social_reply.application.message_delivery.outbox import deliver_outbox
+from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision import runner
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.domain.automation.state_machine import ensure_state, flip_to_human_active
@@ -67,6 +70,56 @@ async def _seed(
     )
     await session.commit()
     return conv_id, ob_id
+
+
+async def test_disabled_chatwoot_outbox_fails_closed(session, monkeypatch):
+    _conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+    fake = get_chatwoot_client()
+    before = len(fake.sent)
+    monkeypatch.setattr(
+        outbox_module,
+        "get_settings",
+        lambda: type("Settings", (), {"chatwoot_enabled": False})(),
+    )
+
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    assert len(fake.sent) == before
+    ob = (
+        await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))
+    ).scalar_one()
+    assert ob.status == "NEEDS_REVIEW"
+    assert ob.attempt_count == 1
+    assert ob.last_error_code == "CHATWOOT_DISABLED"
+    attempt = (
+        await session.execute(
+            select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == ob_id)
+        )
+    ).scalar_one()
+    assert attempt.outcome == "NEEDS_REVIEW"
+    assert attempt.error_code == "CHATWOOT_DISABLED"
+
+    def enabled():
+        return type("Settings", (), {"chatwoot_enabled": True})()
+
+    monkeypatch.setattr(outbox_module, "get_settings", enabled)
+    monkeypatch.setattr(sweep_module, "get_settings", enabled)
+    assert ob_id in await sweep_outbox()
+    session.expire_all()
+    assert (await session.get(models.OutboxMessage, ob_id)).status == "PENDING"
+    assert await deliver_outbox(str(ob_id)) == "SENT"
+    attempts = list(
+        (
+            await session.execute(
+                select(models.DeliveryAttempt)
+                .where(models.DeliveryAttempt.outbox_id == ob_id)
+                .order_by(models.DeliveryAttempt.attempt_no)
+            )
+        ).scalars()
+    )
+    assert [(item.attempt_no, item.outcome) for item in attempts] == [
+        (1, "NEEDS_REVIEW"),
+        (2, "SENT"),
+    ]
 
 
 async def test_bot_active_text_delivers_and_marks_sent(session):

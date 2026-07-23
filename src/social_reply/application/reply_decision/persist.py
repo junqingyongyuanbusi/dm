@@ -10,6 +10,31 @@ from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import AutomationStateEnum
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.infrastructure.database import models
+from social_reply.shared.config import get_settings
+
+
+class ChatwootDecisionDeferred(RuntimeError):
+    pass
+
+
+class DecisionDeliveryConfigurationError(RuntimeError):
+    pass
+
+
+def ensure_decision_delivery_available(
+    *,
+    account_config: dict,
+    chatwoot_inbox_id: int | None,
+    chatwoot_enabled: bool,
+) -> bool:
+    direct_delivery = account_config.get("delivery_mode") == "direct"
+    if direct_delivery:
+        return True
+    if chatwoot_inbox_id is None:
+        raise DecisionDeliveryConfigurationError("chatwoot_inbox_id_missing")
+    if not chatwoot_enabled:
+        raise ChatwootDecisionDeferred("chatwoot_disabled")
+    return False
 
 
 def _idempotency_key(
@@ -40,9 +65,15 @@ async def persist_decision(
                 models.PlatformAccount.tenant_id,
                 models.PlatformAccount.platform,
                 models.PlatformAccount.config,
+                models.PlatformAccount.chatwoot_inbox_id,
             ).where(models.PlatformAccount.id == account_id)
         )
     ).one()
+    direct_delivery = ensure_decision_delivery_available(
+        account_config=dict(account.config or {}),
+        chatwoot_inbox_id=account.chatwoot_inbox_id,
+        chatwoot_enabled=get_settings().chatwoot_enabled,
+    )
 
     if message_id is not None:
         existing = (
@@ -73,7 +104,7 @@ async def persist_decision(
     elif decision.action is ReplyAction.DRAFT:
         # Direct platforms have no private-note channel. Retain the ReplyDecision as a
         # draft for the admin inbox; never send it to the customer before approval.
-        if (account.config or {}).get("delivery_mode") != "direct":
+        if not direct_delivery:
             message_type = "private_note"
     elif decision.action is ReplyAction.HANDOFF:
         # 转人工：置 HANDOFF_PENDING（仅当当前非终态）
@@ -93,9 +124,11 @@ async def persist_decision(
         )
 
     if message_type is not None:
+        if direct_delivery and message_id is None:
+            raise DecisionDeliveryConfigurationError("direct_delivery_message_id_missing")
         reply_target = {}
         destination_type = "chatwoot_conversation"
-        if (account.config or {}).get("delivery_mode") == "direct" and message_id is not None:
+        if direct_delivery:
             reply_target = dict(
                 (
                     await session.execute(

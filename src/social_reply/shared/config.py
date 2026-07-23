@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://dev:dev@localhost:5432/social_reply"
     redis_url: str = "redis://localhost:6379/0"
+    chatwoot_enabled: bool = False
     chatwoot_webhook_secret: str = "change-me"
     chatwoot_signature_tolerance_seconds: int = 300
     tenant_id: str = "default"
@@ -71,16 +72,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_default_secret_in_prod(self) -> "Settings":
-        # 生产环境（非测试）拒绝空/默认 webhook 密钥
-        if not self.testing and self.chatwoot_webhook_secret in ("", "change-me"):
-            raise ValueError(
-                "CHATWOOT_WEBHOOK_SECRET 未配置（不能为空或 change-me）；测试环境请设 TESTING=true"
-            )
-        # 生产环境拒绝空/默认 Chatwoot API token
-        if not self.testing and self.chatwoot_api_token in ("", "dev-local-token"):
-            raise ValueError(
-                "CHATWOOT_API_TOKEN 未配置（不能为空或 dev-local-token）；测试环境请设 TESTING=true"
-            )
+        if self.chatwoot_enabled and not self.testing:
+            if self.chatwoot_webhook_secret in ("", "change-me"):
+                raise ValueError(
+                    "CHATWOOT_WEBHOOK_SECRET 未配置（CHATWOOT_ENABLED=true 时不能为空或 change-me）"
+                )
+            if self.chatwoot_api_token in ("", "dev-local-token"):
+                raise ValueError(
+                    "CHATWOOT_API_TOKEN 未配置"
+                    "（CHATWOOT_ENABLED=true 时不能为空或 dev-local-token）"
+                )
         if not self.testing and not self.control_api_key.get_secret_value():
             raise ValueError("CONTROL_API_KEY 未配置；账号管理 API 在生产环境必须鉴权")
         if not self.testing and len(self.admin_session_secret.get_secret_value()) < 32:

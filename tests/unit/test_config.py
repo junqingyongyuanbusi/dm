@@ -5,6 +5,7 @@ from social_reply.shared.config import Settings
 
 # 绕过 .env 与环境变量干扰的相关变量名
 _ENV_KEYS = [
+    "CHATWOOT_ENABLED",
     "CHATWOOT_WEBHOOK_SECRET",
     "CHATWOOT_API_TOKEN",
     "CONTROL_API_KEY",
@@ -42,6 +43,7 @@ def _make(**kwargs: object) -> Settings:
 
 def test_testing_true_默认值可用() -> None:
     settings = _make(testing=True)
+    assert settings.chatwoot_enabled is False
     assert settings.chatwoot_api_token == "dev-local-token"
     assert settings.openai_api_key == ""
     assert settings.openai_base_url == "https://api.openai.com/v1"
@@ -51,12 +53,34 @@ def test_testing_true_默认值可用() -> None:
 
 def test_非测试环境_默认_chatwoot_api_token_拒绝() -> None:
     with pytest.raises(ValueError, match="CHATWOOT_API_TOKEN"):
-        _make(testing=False, chatwoot_webhook_secret="real-secret")
+        _make(
+            testing=False,
+            chatwoot_enabled=True,
+            chatwoot_webhook_secret="real-secret",
+        )
 
 
 def test_非测试环境_空_chatwoot_api_token_拒绝() -> None:
     with pytest.raises(ValueError, match="CHATWOOT_API_TOKEN"):
-        _make(testing=False, chatwoot_webhook_secret="real-secret", chatwoot_api_token="")
+        _make(
+            testing=False,
+            chatwoot_enabled=True,
+            chatwoot_webhook_secret="real-secret",
+            chatwoot_api_token="",
+        )
+
+
+def test_非测试环境_禁用_chatwoot_无需其凭证() -> None:
+    settings = _make(
+        testing=False,
+        chatwoot_enabled=False,
+        chatwoot_webhook_secret="",
+        chatwoot_api_token="",
+        control_api_key="control-token",
+        llm_provider="openai",
+        openai_api_key="sk-test",
+    )
+    assert settings.chatwoot_enabled is False
 
 
 def test_非测试环境_openai_provider_空_key_拒绝() -> None:
@@ -73,6 +97,7 @@ def test_非测试环境_openai_provider_空_key_拒绝() -> None:
 def test_非测试环境_凭证齐全通过() -> None:
     settings = _make(
         testing=False,
+        chatwoot_enabled=True,
         chatwoot_webhook_secret="real-secret",
         chatwoot_api_token="real-token",
         control_api_key="control-token",

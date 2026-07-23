@@ -1,4 +1,4 @@
-# Reply Core · VPS 部署手册(Ubuntu + Docker + Cloudflare Tunnel)
+# Social Reply · VPS 部署手册(Ubuntu + Docker + Cloudflare Tunnel)
 
 拓扑:`cloudflared`(出站穿透)→ `api` → `worker`/`scheduler` + `postgres(pgvector)` + `redis`。
 全栈跑在 compose 内网,**零入站端口**——VPS 防火墙只需开 SSH。
@@ -62,6 +62,12 @@ curl -s https://relay.nexory.top/healthz   # {"status":"ok"}(经 Cloudflare 全�
 
 使用 `.env` 中的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 作为 bootstrap 超级管理员登录 `https://relay.nexory.top/admin`。在“用户”页创建一个绑定到单一 Tenant 的普通用户，确认其首次登录被强制修改密码，且改密后只能看到该 Tenant 数据；再发一条 Telegram 消息验证端到端自动回复。
 稳定运行几天后再停掉 Railway 服务(保留作回滚退路)。
+
+### Chatwoot 开关
+
+直连部署保持 `CHATWOOT_ENABLED=false`，此时无需配置 Chatwoot token/secret，API 不注册 `/webhooks/chatwoot`，Scheduler 也不执行 Chatwoot reconcile。Worker 仍注册兼容 Actor，用于排空切换前已进入队列的事件；这些事件的回复决策会等待重新启用 Chatwoot，不会被静默完成。
+
+若迁移环境仍使用 Chatwoot Bridge，必须为 `api`、`worker`、`scheduler` 同时设置 `CHATWOOT_ENABLED=true`，并填写 `CHATWOOT_BASE_URL`、`CHATWOOT_API_TOKEN`、`CHATWOOT_WEBHOOK_SECRET`。滚动发布期间不要让三个角色长期使用不同开关值。
 
 ### X OAuth 配置
 

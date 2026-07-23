@@ -4,6 +4,11 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select, update
 
+from social_reply.application.reply_decision.persist import (
+    ChatwootDecisionDeferred,
+    DecisionDeliveryConfigurationError,
+    ensure_decision_delivery_available,
+)
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.application.reply_decision.runner import (
     DecisionContextScopeError,
@@ -11,6 +16,7 @@ from social_reply.application.reply_decision.runner import (
 )
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,20 @@ async def process_decision_job(job_id: str) -> bool:
         return False
 
     try:
+        async with get_session_factory()() as session:
+            account = (
+                await session.execute(
+                    select(
+                        models.PlatformAccount.config,
+                        models.PlatformAccount.chatwoot_inbox_id,
+                    ).where(models.PlatformAccount.id == claimed.account_id)
+                )
+            ).one()
+        ensure_decision_delivery_available(
+            account_config=dict(account.config or {}),
+            chatwoot_inbox_id=account.chatwoot_inbox_id,
+            chatwoot_enabled=get_settings().chatwoot_enabled,
+        )
         await run_and_persist_decision(
             snapshot_from_dict(claimed.snapshot),
             claimed.conversation_id,
@@ -114,6 +134,60 @@ async def process_decision_job(job_id: str) -> bool:
                 )
             await session.commit()
         logger.error("decision context scope mismatch job_id=%s error=%s", jid, exc)
+        return False
+    except DecisionDeliveryConfigurationError as exc:
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(models.DecisionJob)
+                .where(
+                    models.DecisionJob.id == jid,
+                    models.DecisionJob.status == "PROCESSING",
+                )
+                .values(
+                    status="NEEDS_REVIEW",
+                    next_attempt_at=None,
+                    locked_at=None,
+                    last_error=str(exc)[:2000],
+                )
+            )
+            if claimed.raw_event_id is not None:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == claimed.raw_event_id)
+                    .values(
+                        processing_status="DECISION_NEEDS_REVIEW",
+                        processed_at=datetime.now(UTC),
+                    )
+                )
+            await session.commit()
+        logger.error("decision delivery configuration invalid job_id=%s error=%s", jid, exc)
+        return False
+    except ChatwootDecisionDeferred as exc:
+        async with get_session_factory()() as session:
+            await session.execute(
+                update(models.DecisionJob)
+                .where(
+                    models.DecisionJob.id == jid,
+                    models.DecisionJob.status == "PROCESSING",
+                )
+                .values(
+                    status="DEFERRED_CHATWOOT",
+                    next_attempt_at=None,
+                    locked_at=None,
+                    last_error=str(exc)[:2000],
+                )
+            )
+            if claimed.raw_event_id is not None:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == claimed.raw_event_id)
+                    .values(
+                        processing_status="DECISION_DEFERRED",
+                        processed_at=None,
+                    )
+                )
+            await session.commit()
+        logger.info("decision deferred while Chatwoot is disabled job_id=%s", jid)
         return False
     except Exception as exc:
         retry_at = datetime.now(UTC) + timedelta(
@@ -180,6 +254,17 @@ async def sweep_decision_jobs() -> list[uuid.UUID]:
     """恢复崩溃的 PROCESSING，并返回所有待执行任务供 scheduler 重新入队。"""
     now = datetime.now(UTC)
     async with get_session_factory()() as session:
+        if get_settings().chatwoot_enabled:
+            await session.execute(
+                update(models.DecisionJob)
+                .where(models.DecisionJob.status == "DEFERRED_CHATWOOT")
+                .values(
+                    status="PENDING",
+                    next_attempt_at=now,
+                    locked_at=None,
+                    last_error=None,
+                )
+            )
         await session.execute(
             update(models.DecisionJob)
             .where(

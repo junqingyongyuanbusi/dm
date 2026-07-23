@@ -17,6 +17,7 @@ from social_reply.connectors.registry import get_platform_sender
 from social_reply.domain.platform_accounts import is_active_account_status
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ async def _record_outcome(
 ) -> str:
     values: dict = {
         "status": status,
+        "attempt_count": attempt_no,
         "last_error_code": error_code,
         "last_error_message": error_message,
         "next_attempt_at": next_attempt_at,
@@ -250,6 +252,10 @@ async def deliver_outbox(outbox_id: str) -> str:
         if is_direct and not is_public:
             return await _stop_before_send(
                 session, oid, "CANCELLED", "DIRECT_DRAFT_BLOCKED", attempt_no
+            )
+        if not is_direct and not get_settings().chatwoot_enabled:
+            return await _stop_before_send(
+                session, oid, "NEEDS_REVIEW", "CHATWOOT_DISABLED", attempt_no
             )
         state = (
             await session.execute(

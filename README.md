@@ -1,6 +1,6 @@
-# Reply Core（社媒自动回复核心）
+# Social Reply（多租户社媒消息中台）
 
-架构见 `PLAN.md`。当前进度：Phase 1 / Plan 1 —— Chatwoot 事件入站链路。
+这是一个直连 X、Telegram、Meta 和 WhatsApp 的模块化单体，使用 PostgreSQL 保存会话、消息、决策与 Transactional Outbox，并支持 AI 自动回复和本地人工接管。Chatwoot 是可选 Bridge，不是系统启动依赖。
 
 ## 本地运行
 
@@ -8,37 +8,38 @@
 docker compose -f deploy/docker-compose.yml up -d
 uv sync
 cp .env.example .env
+# 直连模式默认关闭 Chatwoot，无需配置 Chatwoot secret/token。
+# CHATWOOT_ENABLED=false
 uv run alembic upgrade head
-
-# 准备一个测试账号（chatwoot_inbox_id=101）
-docker compose -f deploy/docker-compose.yml exec postgres psql -U dev -d social_reply -c \
-  "INSERT INTO platform_accounts (id, tenant_id, brand_id, platform, name, chatwoot_inbox_id, automation_default, status, created_at)
-   VALUES (gen_random_uuid(), 'default', 'b1', 'telegram', 'tg-main', 101, 'BOT_DRAFT_ONLY', 'CONNECTED', now());"
 
 # 终端 1：API
 uv run uvicorn apps.api.main:app --port 8000
 # 终端 2：worker
 uv run dramatiq apps.worker.main
-# 终端 3：冒烟
-uv run python scripts/send_test_webhook.py
+# 终端 3：scheduler
+uv run python -m apps.scheduler.main
 ```
 
-验收：`raw_events.processing_status='PROCESSED'`，`conversations`/`messages`/`automation_states`（BOT_DRAFT_ONLY）各一行。
+通过 `http://localhost:8000/admin` 连接平台账号。新账号默认 `BOT_DRAFT_ONLY`，平台事件经统一决策与 Outbox 链路处理。
 
-## Plan 2b：真实 Chatwoot 发送（需自托管 Chatwoot 凭证）
+## 可选 Chatwoot Bridge
 
-1. 在 Chatwoot 建一个 API/AgentBot inbox，取 `api_access_token` 与 account id。
-2. `.env` 设：`CHATWOOT_BASE_URL` / `CHATWOOT_API_TOKEN` / `TESTING=false` / `CHATWOOT_WEBHOOK_SECRET=<真实密钥>`。
-3. 确保 `platform_accounts.chatwoot_inbox_id` 与 `conversation_mappings` 已建立（首条入站消息会自动建 mapping）。
-4. 起三个常驻进程：
+需要保留 Chatwoot webhook、私有备注和 Messages API 投递时：
 
-   ```bash
-   uv run uvicorn apps.api.main:app --port 8000   # API（webhook 入口）
-   uv run dramatiq apps.worker.main               # worker（入站处理 + outbox 投递）
-   uv run python -m apps.scheduler.main           # scheduler（outbox 补扫，30s 一轮）
+1. 在 Chatwoot 建立 API/AgentBot inbox，获取 `api_access_token` 与 account id。
+2. 为 API、Worker 和 Scheduler 同时设置：
+
+   ```env
+   CHATWOOT_ENABLED=true
+   CHATWOOT_BASE_URL=https://chatwoot.example.com
+   CHATWOOT_API_TOKEN=<api_access_token>
+   CHATWOOT_WEBHOOK_SECRET=<强随机 webhook secret>
    ```
 
-5. Chatwoot webhook 指向 `http(s)://<host>:8000/webhooks/chatwoot`。用户发消息 → 决策 → BOT_ACTIVE 下自动回复经 Chatwoot Messages API 发出。
+3. 确保 `platform_accounts.chatwoot_inbox_id` 与 `conversation_mappings` 已建立。
+4. 将 Chatwoot webhook 指向 `https://<PUBLIC_BASE_URL>/webhooks/chatwoot`。
+
+关闭开关后，Chatwoot 路由和补拉任务不会注册；历史 Chatwoot Outbox 会进入 `NEEDS_REVIEW/CHATWOOT_DISABLED`，不会使用占位凭证发送，并在重新启用后自动回到投递队列。
 
 ## 平台账号管理控制面（推荐）
 

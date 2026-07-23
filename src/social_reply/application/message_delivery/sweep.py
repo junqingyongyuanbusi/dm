@@ -5,6 +5,7 @@ from sqlalchemy import insert, or_, select, update
 
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.shared.config import get_settings
 
 # SENDING 滞留阈值：超过视为 worker 崩溃/丢失，转人工（不自动重发，防歧义重复）
 _STALE_SENDING = timedelta(minutes=10)
@@ -15,6 +16,23 @@ async def sweep_outbox() -> list[uuid.UUID]:
     PENDING / 退避到期 FAILED 重新入队。返回本轮入队的 outbox id。"""
     now = datetime.now(UTC)
     async with get_session_factory()() as session:
+        if get_settings().chatwoot_enabled:
+            await session.execute(
+                update(models.OutboxMessage)
+                .where(
+                    models.OutboxMessage.status == "NEEDS_REVIEW",
+                    models.OutboxMessage.destination_type == "chatwoot_conversation",
+                    models.OutboxMessage.last_error_code == "CHATWOOT_DISABLED",
+                )
+                .values(
+                    status="PENDING",
+                    next_attempt_at=None,
+                    locked_at=None,
+                    locked_by=None,
+                    last_error_code=None,
+                    last_error_message=None,
+                )
+            )
         stale_rows = (
             await session.execute(
                 update(models.OutboxMessage)

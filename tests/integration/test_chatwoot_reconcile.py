@@ -49,6 +49,21 @@ async def _seed_mapping(session):
     await session.commit()
 
 
+async def test_reconcile_disabled_does_not_query_chatwoot(monkeypatch):
+    monkeypatch.setattr(
+        reconcile,
+        "get_settings",
+        lambda: type("Settings", (), {"chatwoot_enabled": False})(),
+    )
+
+    class UnexpectedClient:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("Chatwoot client must not be initialized")
+
+    monkeypatch.setattr(reconcile.httpx, "AsyncClient", UnexpectedClient)
+    assert await reconcile.reconcile_chatwoot_messages() == []
+
+
 async def test_reconcile_creates_raw_for_missing_incoming(session, monkeypatch):
     await _seed_mapping(session)
 

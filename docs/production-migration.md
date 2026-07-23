@@ -14,6 +14,19 @@ The API startup runs `scripts/prepare_database.py`:
 Worker and scheduler roles refuse to start until the database is at head and all encrypted
 envelopes can be decrypted.
 
+## Optional Chatwoot bridge
+
+`CHATWOOT_ENABLED` now defaults to `false`. Direct-only environments no longer need
+`CHATWOOT_WEBHOOK_SECRET` or `CHATWOOT_API_TOKEN`. Existing Chatwoot deployments must explicitly
+set `CHATWOOT_ENABLED=true` before deploying this release and keep the same value on API, Worker,
+and Scheduler.
+
+With the bridge disabled, the API route and reconcile task are absent. The Worker keeps the
+compatibility Actor long enough to drain already queued RawEvents; their delivery decisions remain
+`DEFERRED_CHATWOOT` and resume after the bridge is enabled again. Legacy pending Chatwoot
+deliveries move to `NEEDS_REVIEW/CHATWOOT_DISABLED` while disabled and are safely returned to the
+Outbox queue after re-enable. Database fields and conversation mappings remain intact.
+
 ### Previously released `a3f9c2e14b78` databases
 
 An earlier implementation dropped `credential_ref`, `webhook_secret_ref`, and
