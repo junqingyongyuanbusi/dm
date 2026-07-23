@@ -1122,7 +1122,8 @@ async def accounts_page(request: Request) -> Response:
     job_rows = (
         "".join(
             f"<tr><td><a href='/admin/jobs/{row.id}'><code>{str(row.id)[:8]}</code></a></td>"
-            f"<td>{html.escape(row.platform)}</td><td>{_pill(row.status)}</td>"
+            f"<td>{html.escape(row.platform)}</td>"
+            f"<td>{_pill('PROCESSING' if row.status == 'FAILED' and row.next_attempt_at else row.status)}</td>"
             f"<td class='muted'>{html.escape(row.current_step)}</td>"
             f"<td class='muted'>{html.escape(row.last_error_code or '—')}</td></tr>"
             for row in jobs

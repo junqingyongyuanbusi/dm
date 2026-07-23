@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pytest
 from sqlalchemy import insert, select
@@ -202,6 +204,48 @@ async def test_pin_provisioning_job_requires_secret_resubmission(session, migrat
     assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
     assert retry.status_code == 409
     assert retry.json()["detail"] == "provisioning_secret_resubmission_required"
+
+
+async def test_retryable_provisioning_job_renders_as_processing(session, migrated_db):
+    import uuid
+
+    job_id = uuid.uuid4()
+    await session.execute(
+        insert(models.ProvisioningJob).values(
+            id=job_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            actor="user:admin",
+            idempotency_key="scheduled-retry",
+            request={"environment": "oauth"},
+            staging_secret=encrypt_secret_bundle(
+                {
+                    "consumer_key": "ck",
+                    "consumer_secret": "cs",
+                    "access_token": "at",
+                    "access_token_secret": "ats",
+                }
+            ),
+            status="FAILED",
+            current_step="FAILED",
+            next_attempt_at=datetime.now(UTC) + timedelta(minutes=1),
+            last_error_code="PLATFORM_TEMPORARY_ERROR",
+            last_error_message="temporary",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get(f"/admin/jobs/{job_id}")
+        accounts = await client.get("/admin/accounts")
+
+    assert page.status_code == 200
+    assert "PROCESSING" in page.text
+    assert "每 4 秒自动刷新" in page.text
+    assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
+    assert "PROCESSING" in accounts.text
 
 
 async def test_conversation_state_flip_takeover(session, migrated_db):
