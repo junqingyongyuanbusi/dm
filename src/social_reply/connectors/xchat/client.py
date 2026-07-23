@@ -79,16 +79,19 @@ class XChatClient:
             "conversation_id,conversation_token,created_at,encoded_event,id,"
             "is_trusted,message_event_signature,previous_id,sender_id"
         )
+        path_id = conversation_id.replace(":", "-")
+        # Conversation listings use colon-delimited canonical IDs, while the Chat
+        # history path requires the same participant IDs separated by a hyphen.
         # The live X API currently exposes the dedicated /events route. xdk 0.9.0
         # was generated from an older spec where the same operation used the base
         # conversation path, so keep a compatibility fallback for either contract.
         response = await self._user.get(
-            f"{self._api_base_url}/2/chat/conversations/{conversation_id}/events",
+            f"{self._api_base_url}/2/chat/conversations/{path_id}/events",
             params=params,
         )
         if response.status_code == 404:
             response = await self._user.get(
-                f"{self._api_base_url}/2/chat/conversations/{conversation_id}",
+                f"{self._api_base_url}/2/chat/conversations/{path_id}",
                 params=params,
             )
         response.raise_for_status()

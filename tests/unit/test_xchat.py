@@ -177,6 +177,42 @@ async def test_xchat_client_sends_json_body_for_subscription():
 
 
 @pytest.mark.asyncio
+async def test_xchat_history_converts_canonical_conversation_separator():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": "event-1"}],
+                "meta": {"conversation_key_events": ["key-event"]},
+            },
+        )
+
+    client = XChatClient(
+        consumer_key="ck",
+        consumer_secret="cs",
+        access_token="at",
+        access_token_secret="ats",
+        api_base_url="https://api.x.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        events, key_events, next_token = await client.read_conversation_events(
+            "bot-1:user-1"
+        )
+    finally:
+        await client.aclose()
+
+    assert len(seen) == 1
+    assert seen[0].url.path == "/2/chat/conversations/bot-1-user-1/events"
+    assert events == [{"id": "event-1"}]
+    assert key_events == ["key-event"]
+    assert next_token is None
+
+
+@pytest.mark.asyncio
 async def test_xchat_sender_restores_signing_key_version(monkeypatch):
     calls: list[tuple[str, str]] = []
 
