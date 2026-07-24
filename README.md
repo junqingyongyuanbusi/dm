@@ -89,28 +89,37 @@ POST /api/v1/platform-accounts/telegram
 
 API 立即返回 `job_id`；Worker 验证 `getMe`、幂等创建或更新账号、生成账号级 webhook secret，并调用 Telegram `setWebhook`。通过 `GET /api/v1/platform-accounts/jobs/<job_id>` 查看结果。
 
-### 连接 Facebook / Instagram
+### 连接 Facebook Messenger / Instagram 私信
 
-新部署默认关闭未来 Meta 消息平台。接入前必须在 API、Worker、Scheduler 同时显式设置
-`FACEBOOK_MESSENGER_ENABLED=true` 或 `INSTAGRAM_MESSAGING_ENABLED=true`。
+新部署默认关闭 Meta 消息平台。接入前必须在 API、Worker、Scheduler 同时显式设置
+`FACEBOOK_MESSENGER_ENABLED=true` 或 `INSTAGRAM_MESSAGING_ENABLED=true`。当前发布范围是
+专业账号文本私信，默认 `BOT_DRAFT_ONLY`；评论、附件、模板和营销消息不进入自动回复。
+
+Messenger 推荐从 `/admin/accounts` 使用 Facebook Login OAuth。Control API 等价请求：
 
 ```http
 POST /api/v1/platform-accounts/meta
 
 {
-  "platform": "instagram",
-  "external_account_id": "<IG_ACCOUNT_ID>",
-  "access_token": "<LONG_LIVED_ACCESS_TOKEN>",
+  "platform": "facebook",
+  "external_account_id": "<PAGE_ID>",
+  "access_token": "<PAGE_ACCESS_TOKEN>",
   "app_secret": "<META_APP_SECRET>",
   "app_id": "<META_APP_ID>",
+  "verify_token": "<WEBHOOK_VERIFY_TOKEN>",
   "brand_id": "default",
   "enable_dm": true,
-  "enable_comments": true,
+  "enable_comments": false,
   "automation_default": "BOT_DRAFT_ONLY"
 }
 ```
 
-同一个 Meta App 下继续增加账号时，可传首次响应的 `app_public_id` 复用 webhook 路由。响应会返回 `webhook_url`；`verify_token` 只存入 Secret Store，不进入 ProvisioningJob、API 或管理页。首次接入请在表单中自行指定并同时配置到 Meta Dashboard。Meta Dashboard 中的字段订阅、Business Verification、Advanced Access/App Review 仍需人工完成。普通自动回复受 24 小时窗口约束，评论私密回复还有次数与期限限制。
+同一个 Meta App 下增加账号时，可传首次响应的 `app_public_id` 复用 webhook 路由。系统验证
+账号 token、使用 `appsecret_proof` 调用 Graph API并自动安装 `messages` subscription。本地账号
+先进入 `PROVISIONING` 以接住可能并发到达的私信 occurrence，但所有发送在 `READY` 前暂停；订阅
+失败会将账号设为 `DISABLED`。Scheduler 会核对 token 和 subscription，账号页显示 `READY`、`ERROR`
+或 `REAUTH_REQUIRED`。Business Verification、Advanced Access/App Review、App Live 状态、隐私
+政策和数据删除流程仍需在 Meta 后台完成。普通私信发送受 24 小时消息窗口约束。
 
 ### 连接 X
 

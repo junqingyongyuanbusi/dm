@@ -5,6 +5,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
+from social_reply.application.account_management.meta_health import reconcile_meta_account_health
 from social_reply.application.event_ingestion.raw_recovery import sweep_initial_raw_events
 from social_reply.application.event_ingestion.x_dm_poll import poll_x_direct_messages
 from social_reply.application.event_ingestion.x_webhook_health import ensure_x_webhooks_valid
@@ -46,7 +47,9 @@ def _build_sweeps(settings: Settings) -> tuple[tuple[str, Callable[[], Awaitable
         sweeps.append(("sweep_xchat_recovery", sweep_xchat_recovery))
     if settings.x_activity_enabled:
         sweeps.append(("ensure_x_webhooks_valid", ensure_x_webhooks_valid))
-    # Capability reconciliation must run before paused X Outbox rows are released.
+    if settings.facebook_messenger_enabled or settings.instagram_messaging_enabled:
+        sweeps.append(("reconcile_meta_account_health", reconcile_meta_account_health))
+    # Capability reconciliation must run before paused Outbox rows are released.
     sweeps.append(("sweep_outbox", sweep_outbox))
     return tuple(sweeps)
 

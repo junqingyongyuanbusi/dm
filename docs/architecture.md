@@ -25,7 +25,7 @@ same PostgreSQL schema, encryption keys, feature flags, and connector code.
 | --- | --- | --- |
 | API | Admin UI, users and sessions, OAuth callbacks, Provisioning API, webhook verification, webhook `RawEvent` persistence, actor dispatch | LLM decisions, durable retries, routine platform sending |
 | Worker | Provisioning actors, direct and Chatwoot ingestion actors, XChat decryption, `DecisionJob` execution, Outbox delivery | Schema migration, periodic recovery scheduling |
-| Scheduler | Provisioning/decision/Outbox recovery, Chatwoot reconciliation when enabled, X polling, webhook health and XChat subscription reconciliation | HTTP traffic, decision business logic |
+| Scheduler | Provisioning/decision/Outbox recovery, Chatwoot reconciliation when enabled, X polling/health, Meta token/subscription reconciliation | HTTP traffic, decision business logic |
 
 The image entrypoint uses `SERVICE_ROLE=api|worker|scheduler`. API runs database preparation and
 migrations. Worker and Scheduler refuse to start until the database is at Alembic head and encrypted
@@ -67,6 +67,8 @@ Redis is not the source of truth for accounts, ingestion, decisions, deliveries,
 ```text
 Telegram / Meta / WhatsApp / X webhook
   -> API signature and account validation
+  -> Meta: minimal verified-request evidence + account-scoped occurrence RawEvent
+  -> other platforms: account-scoped RawEvent
   -> RawEvent committed in PostgreSQL
   -> CanonicalEvent serialized to Dramatiq
   -> Worker ingest_canonical_event
@@ -124,10 +126,20 @@ resumable backfill.
 ## Meta platform boundaries
 
 Facebook Messenger, Instagram Messaging, and WhatsApp use independent Settings gates even though
-they share the signed Meta webhook route. A disabled event family stores only a tenant/app-scoped
-audit summary and SHA-256 body digest, then acknowledges without dispatch. Existing provisioning
-jobs and direct Outbox rows pause without consuming a disabled-period attempt and recover after the
-matching flag is re-enabled.
+they share the signed Meta webhook route. Messenger and Instagram are text-DM-only launch paths:
+OAuth/provisioning request DM permissions, install the `messages` subscription, keep comments out of
+capability-gated ingress, and default new conversations to `BOT_DRAFT_ONLY`. A verified enabled
+request writes one minimal app-scoped request record plus one owned RawEvent per recognized account
+entry. A disabled event family stores only a tenant/app-scoped audit summary and SHA-256 body digest,
+then acknowledges without dispatch.
+
+Meta Page/account calls include HMAC-SHA256 `appsecret_proof`. Provisioning creates an active route
+with health `PROVISIONING` so concurrent inbound occurrences remain durable, while send-time checks
+pause all Meta delivery until `READY`; subscription failure disables the account. Scheduler health
+reconciliation probes account identity,
+reads and repairs the desired subscription, and writes sanitized `READY`, `ERROR`, or
+`REAUTH_REQUIRED` state to account config. Existing provisioning jobs and direct Outbox rows pause
+without consuming a disabled-period attempt and recover after the matching flag is re-enabled.
 
 These gates are process-local configuration. Old images do not recognize them, so disabling a
 platform requires the coordinated API/Worker/Scheduler restart documented in
@@ -165,7 +177,7 @@ durable job boundary rather than directly mutating account rows.
 - Telegram/Meta/WhatsApp/X adapters only emit supported text-message CanonicalEvents. Unsupported
   media, receipts and reactions remain RawEvent evidence and do not enter reply decisions.
 - Ambiguous post-send transport failures do not blindly retry.
-- Account sender caches are keyed by `(platform, account_id, config_version)`.
+- Account sender caches are keyed by account config version and, for Meta senders, PlatformApp config version so App Secret rotation replaces the client.
 - Scheduler recovery is idempotent and each sweep is exception-isolated.
 
 ## Deployment invariants

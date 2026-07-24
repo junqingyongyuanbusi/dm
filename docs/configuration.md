@@ -61,13 +61,13 @@ a disabled polling stack performs no provider reconciliation until it is re-enab
 ## Meta and Instagram applications
 
 Code defaults keep existing deployments enabled during upgrades. Both environment templates
-explicitly set the three platform flags to `false`, so new deployments do not expose unfinished
-platform integrations. API, Worker and Scheduler must use the same values.
+explicitly set the three platform flags to `false`, so new deployments opt in account by account.
+API, Worker and Scheduler must use the same values.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FACEBOOK_MESSENGER_ENABLED` | `true` | Facebook Page messaging/comment ingress, provisioning and sending |
-| `INSTAGRAM_MESSAGING_ENABLED` | `true` | Instagram messaging/comment ingress, provisioning and sending |
+| `FACEBOOK_MESSENGER_ENABLED` | `true` | Facebook Page text-DM ingress, provisioning, health reconciliation and sending |
+| `INSTAGRAM_MESSAGING_ENABLED` | `true` | Instagram professional-account text-DM ingress, provisioning, health reconciliation and sending |
 | `WHATSAPP_ENABLED` | `true` | WhatsApp Cloud API ingress, provisioning and sending |
 | `FACEBOOK_APP_ID` | empty | Facebook Login App ID |
 | `FACEBOOK_APP_SECRET` | empty | Must be paired with Facebook App ID |
@@ -75,6 +75,7 @@ platform integrations. API, Worker and Scheduler must use the same values.
 | `INSTAGRAM_APP_ID` | empty | Standalone Instagram Login App ID |
 | `INSTAGRAM_APP_SECRET` | empty | Must be paired with Instagram App ID |
 | `INSTAGRAM_VERIFY_TOKEN` | empty | Falls back to `META_VERIFY_TOKEN` when empty |
+| `META_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler token and `messages` subscription reconciliation; range 60-86400 |
 
 Changing one of these flags is a coordinated three-role operation, not an ordinary mixed-version
 rolling update. Old images do not understand the flags and can still accept or send traffic. Use
@@ -88,7 +89,11 @@ this sequence:
    work will return to their durable queues automatically.
 
 A disabled signed webhook stores only a tenant/app-scoped audit summary and SHA-256 body digest. It
-does not copy message text, names or phone numbers into the gate audit row.
+does not copy message text, names or phone numbers into the gate audit row. Enabled Messenger and
+Instagram requests store one minimal verified-request record plus account-scoped occurrence
+RawEvents, so replay and tenant ownership do not depend on an account-unscoped multi-entry payload.
+Page/account Graph calls include `appsecret_proof`; the Scheduler repairs missing `messages`
+subscriptions and records sanitized provider health in `PlatformAccount.config`.
 
 ## Decision, LLM and knowledge
 

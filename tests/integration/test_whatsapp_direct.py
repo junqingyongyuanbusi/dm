@@ -162,7 +162,7 @@ async def test_whatsapp_webhook_uses_shared_reply_core_and_sender(
         async def aclose(self):
             return None
 
-    registry._senders[("whatsapp", account_id, 1)] = FakeSender()
+    registry._senders[("whatsapp", account_id, 1, 0)] = FakeSender()
     monkeypatch.setenv("LLM_PROVIDER", "stub")
     get_settings.cache_clear()
     payload = {

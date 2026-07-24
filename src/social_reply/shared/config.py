@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     instagram_app_id: str = ""
     instagram_app_secret: SecretStr = SecretStr("")
     instagram_verify_token: SecretStr = SecretStr("")
+    meta_health_check_interval_seconds: int = Field(default=600, ge=60, le=86400)
     account_secrets_root: Path = Path(".secrets/accounts")
     platform_secret_keys: SecretStr = SecretStr("")
     openai_api_key: str = ""

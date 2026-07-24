@@ -59,7 +59,7 @@ class MetaAccountRequest(_BaseAccountRequest):
     instagram_login_mode: Literal["facebook_login", "instagram_login"] = "facebook_login"
     page_id: str | None = Field(default=None, min_length=1, max_length=255)
     enable_dm: bool = True
-    enable_comments: bool = True
+    enable_comments: bool = False
 
     @model_validator(mode="after")
     def _validate_meta_request(self) -> "MetaAccountRequest":
@@ -67,6 +67,20 @@ class MetaAccountRequest(_BaseAccountRequest):
             raise ValueError("app_id 或 app_public_id 至少填写一个")
         if not self.enable_dm and not self.enable_comments:
             raise ValueError("enable_dm 与 enable_comments 至少启用一个")
+        if self.platform == "facebook" and self.instagram_login_mode != "facebook_login":
+            raise ValueError("Facebook 账号必须使用 facebook_login")
+        if (
+            self.platform == "instagram"
+            and self.instagram_login_mode == "facebook_login"
+            and not self.page_id
+        ):
+            raise ValueError("Facebook Login Instagram 必须填写 page_id")
+        if (
+            self.platform == "instagram"
+            and self.instagram_login_mode == "instagram_login"
+            and self.page_id
+        ):
+            raise ValueError("Instagram Login 不允许填写 page_id")
         return self
 
 

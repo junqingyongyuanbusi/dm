@@ -43,7 +43,7 @@ Failed jobs retain only the encrypted staging envelope for controlled retry, use
 `PlatformApp` owns application-level webhook credentials and one webhook route. It may contain many `PlatformAccount` rows.
 
 - Telegram: one direct `PlatformAccount`, account-level webhook.
-- Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows.
+- Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows. App secrets sign webhook bodies and generate `appsecret_proof`; account tokens remain account-scoped.
 - WhatsApp: a Meta `PlatformApp` plus one account per `phone_number_id`.
 - X: deployment-level OAuth Consumer App credentials, a tenant-shared `PlatformApp` webhook route, and one `PlatformAccount` per authorized user. Events route by `for_user_id`; legacy account-level webhook secrets remain readable during migration.
 
@@ -82,7 +82,7 @@ The built-in administration surface provides:
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
-- account enable/disable and health checks;
+- account enable/disable and health checks, including Messenger/Instagram token and `messages` subscription state;
 - no account-creation CLI requirement.
 
 OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.
@@ -91,4 +91,4 @@ Production deployments should put `/admin` behind an identity-aware proxy or rep
 
 ## OAuth evolution
 
-Meta and X OAuth are adapters into the same `ProvisioningJob` boundary. OAuth transaction state is encrypted and short-lived in Redis. Exchanged platform credentials are encrypted with `PLATFORM_SECRET_KEYS` and staged in the durable job row, then stored as encrypted PostgreSQL bundles on the resulting `PlatformApp` / `PlatformAccount`; completed jobs clear the staging bundle. `ACCOUNT_SECRETS_ROOT` is retained only for legacy `file://` migration. Platform App Review, Business Verification, WhatsApp template approval, and X product-tier permissions remain external prerequisites and are surfaced as capabilities/manual steps rather than bypassed.
+Meta and X OAuth are adapters into the same `ProvisioningJob` boundary. Messenger/Instagram accounts route inbound evidence with `meta_health_status=PROVISIONING`, but send-time validation pauses customer delivery until the requested remote `messages` subscription reaches `READY`; a subscription failure disables the account. Periodic Scheduler checks repair subscription drift and expose reauthorization failures. OAuth transaction state is encrypted and short-lived in Redis. Exchanged platform credentials are encrypted with `PLATFORM_SECRET_KEYS` and staged in the durable job row, then stored as encrypted PostgreSQL bundles on the resulting `PlatformApp` / `PlatformAccount`; completed jobs clear the staging bundle. `ACCOUNT_SECRETS_ROOT` is retained only for legacy `file://` migration. Platform App Review, Business Verification, WhatsApp template approval, and X product-tier permissions remain external prerequisites and are surfaced as capabilities/manual steps rather than bypassed.

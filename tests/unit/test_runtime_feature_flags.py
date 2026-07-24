@@ -20,6 +20,8 @@ def _settings(
     legacy: bool = True,
     activity: bool = True,
     xchat: bool = True,
+    facebook: bool = True,
+    instagram: bool = True,
 ) -> Settings:
     return Settings(
         _env_file=None,
@@ -28,6 +30,8 @@ def _settings(
         x_legacy_dm_enabled=legacy,
         x_activity_enabled=activity,
         xchat_enabled=xchat,
+        facebook_messenger_enabled=facebook,
+        instagram_messaging_enabled=instagram,
         platform_secret_keys="Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
     )
 
@@ -216,6 +220,9 @@ def test_scheduler_sweeps_follow_feature_flags():
     no_legacy = [name for name, _sweep in scheduler._build_sweeps(_settings(legacy=False))]
     no_activity = [name for name, _sweep in scheduler._build_sweeps(_settings(activity=False))]
     no_xchat = [name for name, _sweep in scheduler._build_sweeps(_settings(xchat=False))]
+    no_meta = [
+        name for name, _sweep in scheduler._build_sweeps(_settings(facebook=False, instagram=False))
+    ]
 
     assert chatwoot[0] == "reconcile_chatwoot_messages"
     assert chatwoot[1:] == base
@@ -229,5 +236,7 @@ def test_scheduler_sweeps_follow_feature_flags():
     assert "ensure_xchat_subscriptions" not in no_activity
     assert "poll_x_direct_messages" in no_activity
     assert "poll_xchat_messages" in no_activity
+    assert "reconcile_meta_account_health" in base
+    assert "reconcile_meta_account_health" not in no_meta
     assert base.index("poll_x_direct_messages") < base.index("sweep_outbox")
     assert base.index("poll_xchat_messages") < base.index("sweep_outbox")

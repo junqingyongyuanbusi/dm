@@ -190,6 +190,7 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
         assert query["enable_fb_login"] == ["0"]
         assert query["client_id"] == ["ig-app-id"]
         assert "instagram_business_manage_messages" in query["scope"][0]
+        assert "instagram_business_manage_comments" not in query["scope"][0]
 
         callback = await client.get(
             f"/admin/oauth/instagram/callback?code=code-42&state={query['state'][0]}"

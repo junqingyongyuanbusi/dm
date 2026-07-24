@@ -98,6 +98,47 @@ async def test_connect_meta_rechecks_feature_flags_before_platform_calls(
         )
 
 
+@pytest.mark.parametrize(
+    ("platform", "mode", "page_id", "error"),
+    [
+        ("facebook", "instagram_login", None, "facebook_requires_facebook_login"),
+        (
+            "instagram",
+            "facebook_login",
+            None,
+            "instagram_facebook_login_requires_page_id",
+        ),
+        ("instagram", "instagram_login", "page-1", "instagram_login_forbids_page_id"),
+    ],
+)
+async def test_connect_meta_rejects_invalid_login_path_before_graph_calls(
+    monkeypatch,
+    tmp_path,
+    platform,
+    mode,
+    page_id,
+    error,
+):
+    class UnexpectedClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("invalid path must not construct a Graph client")
+
+    monkeypatch.setattr(service, "MetaGraphClient", UnexpectedClient)
+    with pytest.raises(ValueError, match=error):
+        await service.connect_meta_account(
+            platform=platform,
+            external_account_id="account-1",
+            access_token="token",
+            app_secret="secret",
+            public_base_url="https://reply.example.com",
+            verify_token="verify",
+            app_id="app-1",
+            instagram_login_mode=mode,
+            page_id=page_id,
+            secrets_root=tmp_path,
+        )
+
+
 async def test_connect_whatsapp_rechecks_feature_flag_before_platform_calls(monkeypatch, tmp_path):
     settings = whatsapp_service.get_settings().model_copy(update={"whatsapp_enabled": False})
     monkeypatch.setattr(whatsapp_service, "get_settings", lambda: settings)
@@ -131,14 +172,19 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
 
     async def fake_provision_account(**kwargs):
         assert kwargs["platform_app_id"] == uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        assert kwargs["status"] == "active"
+        assert kwargs["config"]["meta_health_status"] == "PROVISIONING"
+        assert kwargs["capability"]["comments"] is False
         return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), "ig_public"
 
     async def fake_subscribe(**kwargs):
         assert kwargs["external_account_id"] == "page-1"
-        return ("messages", "comments")
+        assert kwargs["app_secret"] == "app-secret"
+        return ("messages",)
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer access-token"
+        assert request.url.params["appsecret_proof"]
         return httpx.Response(200, json={"id": "ig-1", "name": "IG Account"})
 
     monkeypatch.setattr(service, "provision_meta_app", fake_provision_meta_app)

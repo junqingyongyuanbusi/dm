@@ -4,7 +4,10 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import insert, or_, select, update
 
-from social_reply.domain.platform_accounts import CapabilityKey
+from social_reply.domain.platform_accounts import (
+    LEGACY_ACTIVE_ACCOUNT_STATUSES,
+    CapabilityKey,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -79,6 +82,35 @@ async def sweep_outbox() -> list[uuid.UUID]:
                     last_error_message=None,
                 )
             )
+        ready_meta_accounts = select(models.PlatformAccount.id).where(
+            models.PlatformAccount.platform.in_(("facebook", "instagram")),
+            models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+            models.PlatformAccount.config["meta_health_status"].astext == "READY",
+        )
+        await session.execute(
+            update(models.OutboxMessage)
+            .where(
+                models.OutboxMessage.status == "NEEDS_REVIEW",
+                models.OutboxMessage.last_error_code == "META_ACCOUNT_NOT_READY",
+                models.OutboxMessage.destination_type.in_(
+                    (
+                        "meta_messenger_dm",
+                        "meta_instagram_dm",
+                        "meta_public_comment",
+                        "meta_private_reply",
+                    )
+                ),
+                models.OutboxMessage.platform_account_id.in_(ready_meta_accounts),
+            )
+            .values(
+                status="PENDING",
+                next_attempt_at=None,
+                locked_at=None,
+                locked_by=None,
+                last_error_code=None,
+                last_error_message=None,
+            )
+        )
         stale_rows = (
             await session.execute(
                 update(models.OutboxMessage)

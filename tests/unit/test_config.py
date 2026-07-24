@@ -64,6 +64,7 @@ def test_testing_true_默认值可用() -> None:
     assert settings.facebook_messenger_enabled is True
     assert settings.instagram_messaging_enabled is True
     assert settings.whatsapp_enabled is True
+    assert settings.meta_health_check_interval_seconds == 600
 
 
 def test_非测试环境_默认_chatwoot_api_token_拒绝() -> None:
@@ -193,6 +194,7 @@ def test_environment_templates_disable_future_platforms() -> None:
         assert "FACEBOOK_MESSENGER_ENABLED=false" in content
         assert "INSTAGRAM_MESSAGING_ENABLED=false" in content
         assert "WHATSAPP_ENABLED=false" in content
+        assert "META_HEALTH_CHECK_INTERVAL_SECONDS=600" in content
 
 
 def test_meta_app_credentials_must_be_configured_as_pairs() -> None:

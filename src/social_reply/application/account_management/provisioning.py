@@ -179,6 +179,7 @@ async def provision_direct_account(
     automation_default: str,
     platform_app_id: uuid.UUID | None = None,
     preserve_existing_webhook_secret: bool = False,
+    status: str | None = None,
 ) -> tuple[uuid.UUID, str]:
     """幂等创建/更新直连账号；每个账号拥有独立凭证目录。"""
     platform = account_platform(platform).value
@@ -228,9 +229,13 @@ async def provision_direct_account(
         "chatwoot_inbox_id": None,
         "automation_default": automation_default,
         "status": (
-            canonical_account_status(existing.status)
-            if existing is not None
-            else ACTIVE_ACCOUNT_STATUS
+            canonical_account_status(status)
+            if status is not None
+            else (
+                canonical_account_status(existing.status)
+                if existing is not None
+                else ACTIVE_ACCOUNT_STATUS
+            )
         ),
     }
     async with get_session_factory()() as session:

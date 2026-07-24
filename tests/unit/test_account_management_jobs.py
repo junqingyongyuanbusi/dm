@@ -8,6 +8,14 @@ from social_reply.application.account_management.service import AccountConnectio
 from social_reply.application.account_management.xchat_activation import XChatActivationError
 
 
+def test_meta_boolean_form_values_are_parsed_strictly():
+    request = {"enable_dm": "true", "enable_comments": "false"}
+    assert jobs._request_bool(request, "enable_dm", default=False) is True
+    assert jobs._request_bool(request, "enable_comments", default=True) is False
+    with pytest.raises(ValueError, match="invalid_boolean:enable_dm"):
+        jobs._request_bool({"enable_dm": "maybe"}, "enable_dm", default=True)
+
+
 def test_safe_request_never_contains_credentials():
     safe = jobs._safe_request(
         "instagram",

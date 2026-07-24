@@ -626,6 +626,7 @@ async def _seed_direct_platform(
     capability: dict,
     target: dict,
     external_account_id: str | None = None,
+    config: dict | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     account_id, contact_id, conv_id, message_id, ob_id = (
         uuid.uuid4(),
@@ -634,6 +635,11 @@ async def _seed_direct_platform(
         uuid.uuid4(),
         uuid.uuid4(),
     )
+    account_config = config
+    if account_config is None:
+        account_config = (
+            {"meta_health_status": "READY"} if platform in {"facebook", "instagram"} else {}
+        )
     await session.execute(
         insert(models.PlatformAccount).values(
             id=account_id,
@@ -643,6 +649,7 @@ async def _seed_direct_platform(
             name="direct",
             external_account_id=external_account_id,
             status="active",
+            config=account_config,
             capability=capability,
         )
     )
@@ -704,6 +711,82 @@ async def _seed_direct_platform(
     )
     await session.commit()
     return account_id, ob_id
+
+
+async def test_meta_delivery_without_health_evidence_fails_closed(session, monkeypatch):
+    _account_id, outbox_id = await _seed_direct_platform(
+        session,
+        platform="facebook",
+        destination_type="meta_messenger_dm",
+        capability={"dm": True, "comments": False, "max_text_length": 2000},
+        target={"kind": "dm", "recipient_id": "user-1"},
+        external_account_id="page-1",
+        config={},
+    )
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("unverified legacy Meta account must not resolve a sender")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(outbox_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    paused = await session.get(models.OutboxMessage, outbox_id)
+    assert paused.attempt_count == 0
+    assert paused.last_error_code == "META_ACCOUNT_NOT_READY"
+
+
+async def test_meta_delivery_pauses_until_subscription_health_is_ready(session, monkeypatch):
+    account_id, outbox_id = await _seed_direct_platform(
+        session,
+        platform="facebook",
+        destination_type="meta_messenger_dm",
+        capability={"dm": True, "comments": False, "max_text_length": 2000},
+        target={"kind": "dm", "recipient_id": "user-1"},
+        external_account_id="page-1",
+        config={"meta_health_status": "PROVISIONING"},
+    )
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("provider sender must not resolve before subscription is ready")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(outbox_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    paused = await session.get(models.OutboxMessage, outbox_id)
+    assert paused.status == "NEEDS_REVIEW"
+    assert paused.attempt_count == 0
+    assert paused.last_error_code == "META_ACCOUNT_NOT_READY"
+    assert (
+        await session.scalar(
+            select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == outbox_id)
+        )
+        is None
+    )
+
+    await session.execute(
+        update(models.PlatformAccount)
+        .where(models.PlatformAccount.id == account_id)
+        .values(config={"meta_health_status": "READY"})
+    )
+    await session.commit()
+    assert outbox_id in await sweep_outbox()
+
+    sent = []
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            sent.append((target, text))
+            return "mid-ready"
+
+        async def aclose(self):
+            return None
+
+    async def ready_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", ready_sender)
+    assert await deliver_outbox(str(outbox_id)) == "SENT"
+    assert sent == [({"kind": "dm", "recipient_id": "user-1"}, "hi")]
 
 
 async def _seed_direct_x(

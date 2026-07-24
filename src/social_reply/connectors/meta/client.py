@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+
 import httpx
 
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
@@ -10,6 +13,14 @@ _META_RETRYABLE_CODES = {613, 4, 17, 341}  # 各类速率/临时限制
 _META_PERMANENT_CODES = {10, 100, 190, 200, 803, 551, 2018065}
 
 
+def appsecret_proof(access_token: str, app_secret: str) -> str:
+    return hmac.new(
+        app_secret.encode(),
+        access_token.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 class MetaGraphClient:
     """Facebook Messenger / Instagram Messaging / Meta 评论统一发送客户端。"""
 
@@ -18,6 +29,7 @@ class MetaGraphClient:
         *,
         platform: str,
         access_token: str,
+        app_secret: str,
         external_account_id: str,
         graph_base_url: str = "https://graph.facebook.com",
         api_version: str = "v23.0",
@@ -29,6 +41,8 @@ class MetaGraphClient:
             raise ValueError(f"unsupported_meta_platform:{platform}")
         if instagram_login_mode not in {"facebook_login", "instagram_login"}:
             raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
+        if not app_secret.strip():
+            raise ValueError("missing_meta_app_secret")
         self.platform = platform
         self._external_account_id = external_account_id
         self._instagram_login_mode = instagram_login_mode
@@ -39,6 +53,7 @@ class MetaGraphClient:
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             transport=transport,
             headers={"Authorization": f"Bearer {access_token}"},
+            params={"appsecret_proof": appsecret_proof(access_token, app_secret)},
         )
 
     def _messaging_sender_id(self) -> str:
@@ -87,17 +102,34 @@ class MetaGraphClient:
         if response.status_code >= 500 or response.is_success:
             return
         try:
-            error = response.json().get("error") or {}
+            payload = response.json()
         except ValueError:
-            return
+            payload = {}
+        error = payload.get("error") if isinstance(payload, dict) else {}
+        if not isinstance(error, dict):
+            error = {}
         code = error.get("code")
         subcode = error.get("error_subcode")
         detail = str(error.get("message", ""))[:200]
-        if response.status_code == 429 or code in _META_RETRYABLE_CODES:
-            raise RetryableSendError("META_RATE_LIMITED", detail)
-        if code in _META_PERMANENT_CODES:
-            label = "META_WINDOW_EXPIRED" if code == 10 else f"META_SEND_REJECTED_{code}"
-            raise PermanentSendError(f"{label}:{subcode}" if subcode else label, detail)
+        if (
+            response.status_code == 429
+            or error.get("is_transient") is True
+            or code in _META_RETRYABLE_CODES
+        ):
+            label = f"META_RETRYABLE_{code}" if code is not None else "META_RATE_LIMITED"
+            raise RetryableSendError(label, detail)
+        if 400 <= response.status_code < 500:
+            label = (
+                "META_WINDOW_EXPIRED"
+                if code == 10
+                else f"META_SEND_REJECTED_{code or response.status_code}"
+            )
+            if code in _META_PERMANENT_CODES or code is not None:
+                raise PermanentSendError(
+                    f"{label}:{subcode}" if subcode else label,
+                    detail,
+                )
+            raise PermanentSendError(label, detail or "Meta Graph API rejected the request")
 
     async def get_account(self) -> dict:
         if self.platform == "instagram" and self._instagram_login_mode == "instagram_login":

@@ -176,6 +176,8 @@ async def test_full_facebook_flow_submits_provisioning(session, meta_env):
     ) as client:
         csrf = await _login(client)
         start = await _run_start(client, csrf, "facebook")
+        assert "pages_messaging" in start.headers["location"]
+        assert "pages_manage_engagement" not in start.headers["location"]
         state_token = start.headers["location"].split("state=")[1].split("&")[0]
         callback = await client.get(
             f"/admin/oauth/meta/callback?code=auth-code-9&state={state_token}"
@@ -189,6 +191,9 @@ async def test_full_facebook_flow_submits_provisioning(session, meta_env):
     assert submitted["request"]["external_account_id"] == "page-9"
     assert submitted["request"]["app_id"] == "app-123"
     assert submitted["request"]["app_public_id"] == "meta_app"
+    assert submitted["request"]["enable_dm"] is True
+    assert submitted["request"]["enable_comments"] is False
+    assert submitted["request"]["automation_default"] == "BOT_DRAFT_ONLY"
     assert submitted["secrets"]["access_token"] == "PAGE-TOKEN-9"
     assert submitted["secrets"]["app_secret"] == "meta-app-secret"
     assert submitted["secrets"]["verify_token"] == "vt-1"
@@ -222,6 +227,7 @@ async def test_instagram_filters_pages_without_ig_and_shows_picker(session, meta
         csrf = await _login(client)
         start = await _run_start(client, csrf, "instagram")
         assert "instagram_manage_messages" in start.headers["location"]
+        assert "instagram_manage_comments" not in start.headers["location"]
         state_token = start.headers["location"].split("state=")[1].split("&")[0]
         picker = await client.get(f"/admin/oauth/meta/callback?code=code-ig&state={state_token}")
     # 无 IG 的 Page 被过滤,只剩两个 IG 候选,渲染选择页
@@ -312,6 +318,8 @@ async def test_instagram_select_finalizes_with_ig_id(session, meta_env):
     assert submitted["request"]["external_account_id"] == "ig-c"
     assert submitted["request"]["page_id"] == "page-c"
     assert submitted["request"]["name"] == "@shopc"
+    assert submitted["request"]["enable_dm"] is True
+    assert submitted["request"]["enable_comments"] is False
     assert submitted["secrets"]["access_token"] == "T-C"
 
 

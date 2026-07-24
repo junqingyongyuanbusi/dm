@@ -42,6 +42,19 @@ def _disabled_platform(exc: Exception) -> str | None:
     return None
 
 
+def _request_bool(request: dict[str, Any], key: str, *, default: bool) -> bool:
+    value = request.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"invalid_boolean:{key}")
+
+
 def _idempotency_key(tenant_id: str, platform: str, request: dict[str, Any]) -> str:
     explicit = request.get("idempotency_key")
     if explicit:
@@ -283,8 +296,8 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
             api_version=request.get("api_version", "v23.0"),
             instagram_login_mode=request.get("instagram_login_mode", "facebook_login"),
             page_id=request.get("page_id"),
-            enable_dm=bool(request.get("enable_dm", True)),
-            enable_comments=bool(request.get("enable_comments", True)),
+            enable_dm=_request_bool(request, "enable_dm", default=True),
+            enable_comments=_request_bool(request, "enable_comments", default=False),
             **common,
         )
     if job.platform == "whatsapp":

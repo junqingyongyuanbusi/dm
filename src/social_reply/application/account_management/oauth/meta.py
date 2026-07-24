@@ -48,13 +48,9 @@ _API_VERSION = "v23.0"
 _DIALOG_URL = f"https://www.facebook.com/{_API_VERSION}/dialog/oauth"
 _GRAPH_BASE = f"https://graph.facebook.com/{_API_VERSION}"
 _SCOPES = {
-    "facebook": (
-        "pages_show_list,pages_messaging,pages_manage_metadata,"
-        "pages_read_engagement,pages_manage_engagement"
-    ),
+    "facebook": "pages_show_list,pages_messaging,pages_manage_metadata",
     "instagram": (
-        "pages_show_list,pages_manage_metadata,pages_read_engagement,"
-        "instagram_basic,instagram_manage_messages,instagram_manage_comments"
+        "pages_show_list,pages_manage_metadata,instagram_basic,instagram_manage_messages"
     ),
 }
 
@@ -386,6 +382,9 @@ async def _finalize(
         "api_version": _API_VERSION,
         "instagram_login_mode": "facebook_login",
         "page_id": candidate["id"],
+        "enable_dm": True,
+        "enable_comments": False,
+        "automation_default": "BOT_DRAFT_ONLY",
         "access_token": candidate["access_token"],
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,

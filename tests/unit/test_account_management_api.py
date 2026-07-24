@@ -54,6 +54,38 @@ async def test_telegram_account_api_submits_durable_job(monkeypatch):
     assert "token" not in captured["request"]
 
 
+async def test_messenger_account_api_defaults_to_dm_only_draft_mode(monkeypatch):
+    captured = {}
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+    async def fake_enqueue(_job_id):
+        return None
+
+    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "platform": "facebook",
+                "external_account_id": "page-1",
+                "access_token": "page-token",
+                "app_secret": "app-secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+            },
+        )
+    assert response.status_code == 202
+    assert captured["platform"] == "facebook"
+    assert captured["request"]["enable_dm"] is True
+    assert captured["request"]["enable_comments"] is False
+    assert captured["request"]["automation_default"] == "BOT_DRAFT_ONLY"
+
+
 async def test_meta_account_api_rejects_missing_app_identity():
     async with await _client() as client:
         response = await client.post(
@@ -146,6 +178,7 @@ async def test_x_account_api_rejects_pin_when_xchat_disabled(monkeypatch):
                 "app_secret": "secret",
                 "app_id": "app-1",
                 "verify_token": "verify",
+                "page_id": "page-1",
             },
             "instagram_integration_disabled",
         ),

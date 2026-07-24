@@ -57,7 +57,7 @@ async def test_two_telegram_accounts_route_and_send_with_isolated_credentials(se
 
             return handler
 
-        registry._senders[("telegram", account_id, 1)] = TelegramClient(
+        registry._senders[("telegram", account_id, 1, 0)] = TelegramClient(
             token=f"token-{name}",
             transport=httpx.MockTransport(make_handler(name)),
         )
@@ -101,6 +101,6 @@ async def test_two_telegram_accounts_route_and_send_with_isolated_credentials(se
     assert sent["bot-b"][0]["chat_id"] == 77
 
     for _name, account_id in accounts:
-        sender = registry._senders.pop(("telegram", account_id, 1))
+        sender = registry._senders.pop(("telegram", account_id, 1, 0))
         await sender.aclose()
     get_settings.cache_clear()

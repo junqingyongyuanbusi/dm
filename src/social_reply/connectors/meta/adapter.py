@@ -12,10 +12,14 @@ class MetaWebhookAdapter:
         platform: str | None = None,
         account_id: str | None = None,
         external_account_id: str | None = None,
+        allow_dm: bool = True,
+        allow_comments: bool = True,
     ) -> None:
         self._platform = platform
         self._account_id = account_id
         self._external_account_id = external_account_id
+        self._allow_dm = allow_dm
+        self._allow_comments = allow_comments
 
     def normalize(self, payload: dict) -> list[CanonicalEvent]:
         events: list[CanonicalEvent] = []
@@ -29,7 +33,7 @@ class MetaWebhookAdapter:
             account_key = self._account_id or entry_account_id
             if not account_key:
                 continue
-            for messaging in entry.get("messaging", []):
+            for messaging in entry.get("messaging", []) if self._allow_dm else ():
                 message = messaging.get("message") or {}
                 sender_id = str((messaging.get("sender") or {}).get("id", ""))
                 recipient_id = str((messaging.get("recipient") or {}).get("id", ""))
@@ -62,7 +66,7 @@ class MetaWebhookAdapter:
                         raw_payload=messaging,
                     )
                 )
-            for change in entry.get("changes", []):
+            for change in entry.get("changes", []) if self._allow_comments else ():
                 value = change.get("value") or {}
                 if change.get("field") not in {"comments", "feed"}:
                     continue

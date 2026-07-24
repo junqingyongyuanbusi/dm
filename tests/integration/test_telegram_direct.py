@@ -41,7 +41,7 @@ async def test_telegram_webhook_direct_to_sent_outbox(session, monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True, "result": {"message_id": 9001}})
 
-    registry._senders[("telegram", account_id, 1)] = TelegramClient(
+    registry._senders[("telegram", account_id, 1, 0)] = TelegramClient(
         token="token",
         api_base_url="https://api.telegram.test",
         transport=httpx.MockTransport(handler),
@@ -84,6 +84,6 @@ async def test_telegram_webhook_direct_to_sent_outbox(session, monkeypatch):
     assert outbox.status == "SENT"
     assert outbox.platform_message_id == "9001"
 
-    sender = registry._senders.pop(("telegram", account_id, 1))
+    sender = registry._senders.pop(("telegram", account_id, 1, 0))
     await sender.aclose()
     get_settings.cache_clear()

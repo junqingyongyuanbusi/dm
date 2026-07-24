@@ -8,7 +8,10 @@ from pathlib import Path
 import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
-from social_reply.application.account_management.meta_subscription import subscribe_meta_account
+from social_reply.application.account_management.meta_subscription import (
+    meta_subscription_fields,
+    subscribe_meta_account,
+)
 from social_reply.application.account_management.provisioning import provision_direct_account
 from social_reply.application.account_management.x_app import ensure_x_platform_app
 from social_reply.application.account_management.x_credentials import x_credentials
@@ -28,6 +31,10 @@ from social_reply.connectors.xchat.state import (
     XChatState,
     classify_xchat_state,
     xchat_state_config,
+)
+from social_reply.domain.platform_accounts import (
+    ACTIVE_ACCOUNT_STATUS,
+    DISABLED_ACCOUNT_STATUS,
 )
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -79,6 +86,22 @@ def _webhook_url(public_base_url: str, path: str) -> str:
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _meta_provider_error_code(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            payload = exc.response.json()
+        except ValueError:
+            payload = {}
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        return f"META_HTTP_{exc.response.status_code}_{code or 'UNKNOWN'}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "META_TIMEOUT"
+    if isinstance(exc, httpx.TransportError):
+        return "META_TRANSPORT_ERROR"
+    return f"META_{exc.__class__.__name__.upper()}"
 
 
 async def _xchat_public_keys(client: XChatClient, user_id: str) -> list[dict]:
@@ -176,7 +199,7 @@ async def connect_meta_account(
     instagram_login_mode: str = "facebook_login",
     page_id: str | None = None,
     enable_dm: bool = True,
-    enable_comments: bool = True,
+    enable_comments: bool = False,
     automation_default: str = "BOT_DRAFT_ONLY",
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AccountConnectionResult:
@@ -187,6 +210,12 @@ async def connect_meta_account(
         raise ValueError(f"{platform}_integration_disabled")
     if instagram_login_mode not in {"facebook_login", "instagram_login"}:
         raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
+    if platform == "facebook" and instagram_login_mode != "facebook_login":
+        raise ValueError("facebook_requires_facebook_login")
+    if platform == "instagram" and instagram_login_mode == "facebook_login" and not page_id:
+        raise ValueError("instagram_facebook_login_requires_page_id")
+    if platform == "instagram" and instagram_login_mode == "instagram_login" and page_id:
+        raise ValueError("instagram_login_forbids_page_id")
     graph_base_url = graph_base_url or (
         "https://graph.instagram.com"
         if platform == "instagram" and instagram_login_mode == "instagram_login"
@@ -201,6 +230,7 @@ async def connect_meta_account(
     client = MetaGraphClient(
         platform=platform,
         access_token=access_token,
+        app_secret=app_secret,
         external_account_id=external_account_id,
         graph_base_url=graph_base_url,
         api_version=api_version,
@@ -231,8 +261,23 @@ async def connect_meta_account(
             else "meta"
         ),
     )
-    # Meta App 与账号分两次幂等 upsert：账号落库失败时 App 仍可安全复用，
-    # 但不向调用方返回成功；下次请求会使用相同 app_id/public_id 收敛。
+    desired_fields = meta_subscription_fields(
+        platform=platform,
+        enable_dm=enable_dm,
+        enable_comments=enable_comments,
+    )
+    account_config = {
+        "graph_base_url": graph_base_url,
+        "api_version": api_version,
+        "instagram_login_mode": instagram_login_mode,
+        **({"page_id": page_id} if page_id else {}),
+        "meta_desired_subscribed_fields": list(desired_fields),
+        "meta_subscribed_fields": [],
+        "meta_health_status": "PROVISIONING",
+        "meta_health_checked_at": _utc_now_iso(),
+        "meta_health_error_code": None,
+    }
+    # Route inbound occurrences immediately; delivery remains blocked while provisioning.
     account_id, resolved_public_id = await provision_direct_account(
         platform=platform,
         external_account_id=external_account_id,
@@ -244,12 +289,7 @@ async def connect_meta_account(
         secrets_root=secrets_root,
         credential_bundle={"access_token": access_token},
         webhook_secret_bundle=None,
-        config={
-            "graph_base_url": graph_base_url,
-            "api_version": api_version,
-            "instagram_login_mode": instagram_login_mode,
-            **({"page_id": page_id} if page_id else {}),
-        },
+        config=account_config,
         capability={
             "dm": enable_dm,
             "comments": enable_comments,
@@ -257,22 +297,63 @@ async def connect_meta_account(
         },
         automation_default=automation_default,
         platform_app_id=platform_app_id,
+        status=ACTIVE_ACCOUNT_STATUS,
     )
-    subscribed_fields = await subscribe_meta_account(
-        platform=platform,
-        access_token=access_token,
-        external_account_id=(
-            page_id
-            if platform == "instagram" and instagram_login_mode == "facebook_login" and page_id
-            else external_account_id
-        ),
-        instagram_login_mode=instagram_login_mode,
-        graph_base_url=graph_base_url,
-        api_version=api_version,
-        enable_dm=enable_dm,
-        enable_comments=enable_comments,
-        transport=transport,
+    subscription_account_id = (
+        page_id
+        if platform == "instagram" and instagram_login_mode == "facebook_login"
+        else external_account_id
     )
+    try:
+        subscribed_fields = await subscribe_meta_account(
+            platform=platform,
+            access_token=access_token,
+            app_secret=app_secret,
+            external_account_id=subscription_account_id,
+            instagram_login_mode=instagram_login_mode,
+            graph_base_url=graph_base_url,
+            api_version=api_version,
+            enable_dm=enable_dm,
+            enable_comments=enable_comments,
+            transport=transport,
+        )
+    except Exception as exc:
+        async with get_session_factory()() as session:
+            await session.execute(
+                models.PlatformAccount.__table__.update()
+                .where(models.PlatformAccount.id == account_id)
+                .values(
+                    status=DISABLED_ACCOUNT_STATUS,
+                    config=models.PlatformAccount.config.op("||")(
+                        {
+                            "meta_health_status": "ERROR",
+                            "meta_health_checked_at": _utc_now_iso(),
+                            "meta_health_error_code": _meta_provider_error_code(exc),
+                        }
+                    ),
+                    config_version=models.PlatformAccount.config_version + 1,
+                )
+            )
+            await session.commit()
+        raise
+    async with get_session_factory()() as session:
+        await session.execute(
+            models.PlatformAccount.__table__.update()
+            .where(models.PlatformAccount.id == account_id)
+            .values(
+                status=ACTIVE_ACCOUNT_STATUS,
+                config=models.PlatformAccount.config.op("||")(
+                    {
+                        "meta_subscribed_fields": list(subscribed_fields),
+                        "meta_health_status": "READY",
+                        "meta_health_checked_at": _utc_now_iso(),
+                        "meta_health_error_code": None,
+                    }
+                ),
+                config_version=models.PlatformAccount.config_version + 1,
+            )
+        )
+        await session.commit()
     return AccountConnectionResult(
         account_id=account_id,
         platform=platform,

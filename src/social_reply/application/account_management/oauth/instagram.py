@@ -33,9 +33,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
 
 _API_VERSION = "v23.0"
-_SCOPES = (
-    "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments"
-)
+_SCOPES = "instagram_business_basic,instagram_business_manage_messages"
 
 
 def _instagram_client(**kwargs) -> httpx.AsyncClient:
