@@ -86,7 +86,7 @@ A successful text send is written back as an outbound `Message`, linked to its s
 The delivery fast path reduces latency; it does not replace durability. `sweep_outbox` recovers rows
 that were committed but not sent because a process crashed.
 
-Webhook ingestion persists `RawEvent` before dispatch, but a crash or dispatch loss between that commit and creation of `DecisionJob` can leave a PENDING RawEvent with no automatic recovery. Legacy X DM and XChat polling also feed the canonical ingestion path without a complete append-only polling journal. RawEvent recovery, durable polling checkpoints and resumable backfill are a later reliability phase.
+Webhook ingestion and X polling persist `RawEvent` evidence before normalization. Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. A crash or dispatch loss between a RawEvent commit and creation of `DecisionJob` can still leave a PENDING row with no automatic recovery. RawEvent recovery, durable polling checkpoints and resumable backfill are the next reliability phase.
 
 ## Chatwoot bridge
 

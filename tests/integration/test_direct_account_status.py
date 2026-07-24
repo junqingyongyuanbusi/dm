@@ -58,6 +58,68 @@ async def test_disabled_account_is_rechecked_before_direct_ingestion(session):
     assert normalized_count is None
 
 
+@pytest.mark.parametrize(
+    ("mismatch", "error"),
+    [
+        ("account", "raw_event_platform_account_mismatch"),
+        ("tenant", "raw_event_tenant_mismatch"),
+    ],
+)
+async def test_raw_event_ownership_is_validated_before_ingestion(session, mismatch, error):
+    account_id = uuid.uuid4()
+    other_account_id = uuid.uuid4()
+    raw_event_id = uuid.uuid4()
+    for current_id, tenant_id in (
+        (account_id, "tenant-a"),
+        (other_account_id, "tenant-b"),
+    ):
+        await session.execute(
+            insert(models.PlatformAccount).values(
+                id=current_id,
+                tenant_id=tenant_id,
+                brand_id="b1",
+                platform="telegram",
+                name=str(current_id),
+                status="active",
+                capability={"dm": True, "max_text_length": 4096},
+            )
+        )
+    await session.execute(
+        insert(models.RawEvent).values(
+            id=raw_event_id,
+            tenant_id="tenant-b" if mismatch == "tenant" else "tenant-a",
+            platform_account_id=(other_account_id if mismatch == "account" else account_id),
+            source="telegram_poll",
+            ingress_kind="poll",
+            event_namespace="telegram.dm",
+            external_event_id=f"event-{mismatch}",
+            payload={},
+            context={},
+            processing_status="PENDING",
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(PermissionError, match=error):
+        await ingest_canonical_event(
+            CanonicalEvent(
+                platform="telegram",
+                platform_account_key=str(account_id),
+                external_event_id=f"event-{mismatch}",
+                external_user_id="user-1",
+                conversation_key=f"telegram:account:user-{mismatch}",
+                text="hello",
+            ),
+            raw_event_id=raw_event_id,
+        )
+
+    session.expire_all()
+    raw_event = await session.get(models.RawEvent, raw_event_id)
+    normalized = await session.scalar(select(models.NormalizedEvent.id).limit(1))
+    assert raw_event.processing_status == "PENDING"
+    assert normalized is None
+
+
 async def test_account_disable_is_rechecked_at_ingestion_commit(session, monkeypatch):
     account_id = uuid.uuid4()
     raw_event_id = uuid.uuid4()

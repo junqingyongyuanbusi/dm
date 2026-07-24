@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from social_reply.shared.config import get_settings
@@ -183,8 +184,16 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).one()
-        await engine.dispose()
-        assert revision == "92a6e3f1c4d8"
+            trigger_count = (
+                await connection.execute(
+                    text(
+                        "SELECT count(*) FROM pg_trigger "
+                        "WHERE tgname='trg_raw_event_evidence_append_only'"
+                    )
+                )
+            ).scalar_one()
+        assert revision == "d6b8f0a2c431"
+        assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {
             "dm": False,
@@ -197,6 +206,31 @@ async def test_message_history_migration_backfills_and_round_trips():
         ]
         assert rows[-1].sender_type == "bot"
         assert str(rows[-1].source_outbox_id) == "00000000-0000-0000-0000-000000000006"
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO raw_events (id, source, payload, headers, context, "
+                    "processing_status) VALUES ("
+                    "'00000000-0000-0000-0000-000000000007', 'test', "
+                    "'{\"value\": 1}'::jsonb, '{}'::jsonb, '{}'::jsonb, 'PENDING')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE raw_events SET processing_status='PROCESSED' "
+                    "WHERE id='00000000-0000-0000-0000-000000000007'"
+                )
+            )
+        with pytest.raises(DBAPIError, match="raw_event_evidence_is_append_only"):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE raw_events SET payload='{\"value\": 2}'::jsonb "
+                        "WHERE id='00000000-0000-0000-0000-000000000007'"
+                    )
+                )
+        await engine.dispose()
 
         await _alembic(database_url, "downgrade", "e7b2c4d9a610")
         await _alembic(database_url, "upgrade", "head")

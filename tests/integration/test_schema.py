@@ -74,6 +74,51 @@ async def test_admin_auth_tables_have_constraints_and_indexes(migrated_db):
     assert "ix_admin_sessions_expires_at" in session_indexes
 
 
+async def test_poll_raw_event_journal_columns_and_indexes_exist(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        columns = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='raw_events'"
+                )
+            )
+        }
+        normalized_columns = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='normalized_events'"
+                )
+            )
+        }
+        indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='raw_events'")
+            )
+        }
+    assert {
+        "tenant_id",
+        "platform_account_id",
+        "ingress_kind",
+        "event_namespace",
+        "external_event_id",
+        "external_conversation_id",
+        "context",
+        "schema_version",
+        "occurred_at",
+    } <= columns
+    assert {"external_conversation_id", "event_metadata"} <= normalized_columns
+    assert {
+        "ix_raw_events_status_received",
+        "ix_raw_events_account_received",
+    } <= indexes
+
+
 async def test_platform_account_contract_constraints_exist(migrated_db):
     engine = get_engine()
     async with engine.connect() as conn:

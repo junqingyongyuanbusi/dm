@@ -202,10 +202,25 @@ class Message(Base):
 
 class RawEvent(Base):
     __tablename__ = "raw_events"
+    __table_args__ = (
+        Index("ix_raw_events_status_received", "processing_status", "received_at"),
+        Index("ix_raw_events_account_received", "platform_account_id", "received_at"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
-    source: Mapped[str] = mapped_column(Text)  # chatwoot / meta / telegram ...
+    tenant_id: Mapped[str | None] = mapped_column(Text)
+    platform_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("platform_accounts.id")
+    )
+    source: Mapped[str] = mapped_column(Text)  # chatwoot / meta / telegram / poll stream
+    ingress_kind: Mapped[str] = mapped_column(Text, default="webhook")
+    event_namespace: Mapped[str | None] = mapped_column(Text)
+    external_event_id: Mapped[str | None] = mapped_column(Text)
+    external_conversation_id: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict] = mapped_column(JSONB)
     headers: Mapped[dict] = mapped_column(JSONB, default=dict)
+    context: Mapped[dict] = mapped_column(JSONB, default=dict)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_status: Mapped[str] = mapped_column(Text, default="PENDING")
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -228,6 +243,8 @@ class NormalizedEvent(Base):
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("conversations.id"))
     message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
     raw_event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("raw_events.id"))
+    external_conversation_id: Mapped[str | None] = mapped_column(Text)
+    event_metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

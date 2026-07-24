@@ -3,12 +3,20 @@
 import logging
 import os
 import time
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import httpx
 from sqlalchemy import update
 
 from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.event_ingestion.direct import ingest_canonical_event
+from social_reply.application.event_ingestion.poll_raw import (
+    PollOccurrence,
+    append_poll_occurrences,
+    mark_poll_occurrences,
+)
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 from social_reply.connectors.x.adapter import XWebhookAdapter
 from social_reply.connectors.x.client import XClient
@@ -27,6 +35,12 @@ _MAX_PAGES_PER_POLL = 3
 # 游标回看窗口:X 全局端点有官方未修复的事件晚到问题,晚到事件 id 小于已推进游标
 # 会被永久跳过。回看 5 分钟,重复入站由 NormalizedEvent 唯一约束幂等吸收。
 _CURSOR_LOOKBACK_MS = 5 * 60 * 1000
+
+
+@dataclass(frozen=True)
+class _PolledEvent:
+    payload: dict
+    raw_event_id: uuid.UUID
 
 
 async def poll_x_direct_messages() -> list[str]:
@@ -81,8 +95,15 @@ async def _poll_account(account, *, reconcile_capability: bool = False) -> list[
         access_token_secret=credentials["access_token_secret"],
         api_base_url=account.config.get("api_base_url", "https://api.x.com"),
     )
+    poll_run_id = uuid.uuid4()
     try:
-        events = await _read_until_cursor(client, cursor, bootstrap=not bootstrapped)
+        events = await _read_until_cursor(
+            client,
+            account=account,
+            cursor=cursor,
+            poll_run_id=poll_run_id,
+            bootstrap=not bootstrapped,
+        )
     finally:
         await client.aclose()
     if reconcile_capability:
@@ -92,33 +113,29 @@ async def _poll_account(account, *, reconcile_capability: bool = False) -> list[
         await _save_cursor(account.id, newest_id, bootstrapped=True)
         return []
     if not events:
-        # 空转也要留痕:证明本轮确实调了 API 且无新于游标的 legacy 事件。
-        # XChat 使用独立的 Chat API；由 xchat_poll 负责补拉，不能据此判断 X 侧无消息。
         logger.info("x_dm_poll idle account=%s cursor=%s", account.id, cursor)
         return []
 
     newest_id = _max_event_id(events)
     adapter = XWebhookAdapter(account_id=str(account.id), external_account_id=self_id)
     ingested: list[str] = []
-    for event in sorted(events, key=lambda item: _as_int(item.get("id")) or 0):
+    for occurrence in sorted(events, key=lambda item: _as_int(item.payload.get("id")) or 0):
+        event = occurrence.payload
         event_id = str(event.get("id") or "")
-        canonical = adapter.normalize(
-            {
-                "for_user_id": self_id,
-                "direct_message_events": [
-                    {
-                        "id": event_id,
-                        "type": "message_create",
-                        "message_create": {
-                            "sender_id": event.get("sender_id"),
-                            "message_data": {"text": event.get("text")},
-                        },
-                    }
-                ],
-            }
-        )
+        canonical = adapter.normalize({"direct_message_events": [event]})
+        if not canonical:
+            sender_id = str(event.get("sender_id") or "")
+            status = "IGNORED_SELF" if sender_id == self_id else "IGNORED_UNSUPPORTED"
+            await mark_poll_occurrences([occurrence.raw_event_id], status)
+            continue
         for item in canonical:
-            if await ingest_canonical_event(item) is not None:
+            if (
+                await ingest_canonical_event(
+                    item,
+                    raw_event_id=occurrence.raw_event_id,
+                )
+                is not None
+            ):
                 ingested.append(event_id)
 
     # Advance only after every fetched event has completed ingestion. Any exception leaves the
@@ -132,22 +149,70 @@ async def _poll_account(account, *, reconcile_capability: bool = False) -> list[
 
 
 async def _read_until_cursor(
-    client: XClient, cursor: str | None, *, bootstrap: bool = False
-) -> list[dict]:
+    client: XClient,
+    *,
+    account,
+    cursor: str | None,
+    poll_run_id: uuid.UUID,
+    bootstrap: bool = False,
+) -> list[_PolledEvent]:
     cursor_num = _as_int(cursor)
     # 比较基准 = 游标减去回看窗口(雪花 id 高 42 位是毫秒时间戳,时间差需左移 22 位)
     floor_num = cursor_num - (_CURSOR_LOOKBACK_MS << 22) if cursor_num is not None else None
     pagination_token: str | None = None
     seen_tokens: set[str] = set()
-    collected: list[dict] = []
-    for _page in range(_MAX_PAGES_PER_POLL):
+    collected: list[_PolledEvent] = []
+    for page_index in range(_MAX_PAGES_PER_POLL):
+        request_token = pagination_token
         events, pagination_token = await client.read_dm_events(
-            max_results=100, pagination_token=pagination_token
+            max_results=100, pagination_token=request_token
         )
-        for event in events:
+        occurrences: list[PollOccurrence] = []
+        relevant: list[bool] = []
+        for item_index, event in enumerate(events):
             event_num = _as_int(event.get("id"))
-            if floor_num is None or event_num is None or event_num > floor_num:
-                collected.append(event)
+            is_relevant = floor_num is None or event_num is None or event_num > floor_num
+            relevant.append(is_relevant)
+            occurrences.append(
+                PollOccurrence(
+                    payload=dict(event),
+                    external_event_id=str(event.get("id") or "") or None,
+                    external_conversation_id=str(
+                        event.get("dm_conversation_id") or event.get("sender_id") or ""
+                    )
+                    or None,
+                    occurred_at=_parse_time(event.get("created_at")),
+                    processing_status=(
+                        "IGNORED_BOOTSTRAP"
+                        if bootstrap
+                        else "PENDING"
+                        if is_relevant
+                        else "IGNORED_BEFORE_LOOKBACK"
+                    ),
+                    context={
+                        "poll_run_id": str(poll_run_id),
+                        "page_index": page_index,
+                        "item_index": item_index,
+                        "pagination_token": request_token,
+                        "next_token": pagination_token,
+                        "cursor_before": cursor,
+                        "lookback_floor": str(floor_num) if floor_num is not None else None,
+                        "fetch_mode": "bootstrap" if bootstrap else "lookback",
+                    },
+                )
+            )
+        raw_ids = await append_poll_occurrences(
+            tenant_id=account.tenant_id,
+            platform_account_id=account.id,
+            source="x_dm_poll",
+            event_namespace="x.legacy_dm",
+            occurrences=occurrences,
+        )
+        collected.extend(
+            _PolledEvent(payload=event, raw_event_id=raw_event_id)
+            for event, raw_event_id, is_relevant in zip(events, raw_ids, relevant, strict=True)
+            if is_relevant
+        )
         if bootstrap or not pagination_token:
             return collected
         if pagination_token in seen_tokens:
@@ -166,8 +231,18 @@ async def _read_until_cursor(
     return collected
 
 
-def _max_event_id(events: list[dict]) -> str | None:
-    values = [_as_int(event.get("id")) for event in events]
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _max_event_id(events: list[_PolledEvent]) -> str | None:
+    values = [_as_int(event.payload.get("id")) for event in events]
     numeric = [value for value in values if value is not None]
     return str(max(numeric)) if numeric else None
 

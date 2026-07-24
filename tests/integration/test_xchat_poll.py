@@ -141,11 +141,28 @@ async def test_xchat_poll_ingests_decrypted_text(session, monkeypatch):
     conversation = await session.get(models.Conversation, normalized.conversation_id)
     assert message.text == "follow-up"
     assert conversation.conversation_key.startswith("x_chat:")
+    assert normalized.external_conversation_id == _CONVERSATION
+    assert normalized.event_metadata["event_namespace"] == "x.xchat"
+    assert normalized.event_metadata["envelope_id"] == "200"
+    message_raw = await session.get(models.RawEvent, normalized.raw_event_id)
+    assert message_raw.source == "xchat_poll"
+    assert message_raw.ingress_kind == "poll"
+    assert message_raw.event_namespace == "x.xchat.message"
+    assert message_raw.external_event_id == "200"
+    assert message_raw.external_conversation_id == _CONVERSATION
+    assert message_raw.payload["encoded_event"] == "cipher"
+    assert message_raw.context["conversation"]["peer_id"] == _PEER
+    assert message_raw.processing_status == "PROCESSED"
+    key_raw = (
+        await session.execute(
+            select(models.RawEvent).where(models.RawEvent.event_namespace == "x.xchat.key_change")
+        )
+    ).scalar_one()
+    assert key_raw.payload == {"key_change": "key-change"}
+    assert key_raw.processing_status == "PROCESSED_KEY_MATERIAL"
 
 
-async def test_first_xchat_backfill_only_replies_to_newest_recent_inbound(
-    session, monkeypatch
-):
+async def test_first_xchat_backfill_only_replies_to_newest_recent_inbound(session, monkeypatch):
     await _seed_account(session, bootstrapped=False)
 
     async def fake_conversations(self, *, max_results=100, pagination_token=None):
@@ -209,6 +226,64 @@ async def test_first_xchat_backfill_only_replies_to_newest_recent_inbound(
     xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == ["message-300"]
+    raw_events = (
+        (
+            await session.execute(
+                select(models.RawEvent).where(models.RawEvent.event_namespace == "x.xchat.message")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(raw_events) == 3
+    assert sorted(row.processing_status for row in raw_events) == [
+        "IGNORED_BOOTSTRAP",
+        "IGNORED_BOOTSTRAP",
+        "PROCESSED",
+    ]
+
+
+async def test_xchat_decrypt_failure_keeps_raw_occurrence_and_cursor(session, monkeypatch):
+    account_id = await _seed_account(session, bootstrapped=True)
+
+    async def fake_conversations(self, *, max_results=100, pagination_token=None):
+        return ([{"id": _CONVERSATION, "participant_ids": [_PEER], "type": "direct"}], None)
+
+    async def fake_events(self, conversation_id, *, pagination_token=None):
+        return (
+            [
+                {
+                    "id": "200",
+                    "sender_id": _PEER,
+                    "conversation_id": _CONVERSATION,
+                    "created_at": "2026-07-20T01:51:31Z",
+                    "encoded_event": "cipher",
+                }
+            ],
+            [],
+            None,
+        )
+
+    async def fake_public_keys(self, user_id):
+        return []
+
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
+    monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
+    monkeypatch.setattr(xchat_poll, "decrypt_history", lambda **_kwargs: ([], {}, {0: "key"}))
+    xchat_poll._last_poll_at = None
+
+    assert await xchat_poll.poll_xchat_messages() == []
+    session.expire_all()
+    raw_event = (
+        await session.execute(
+            select(models.RawEvent).where(models.RawEvent.external_event_id == "200")
+        )
+    ).scalar_one()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert raw_event.processing_status == "XCHAT_DECRYPT_FAILED"
+    assert raw_event.payload["encoded_event"] == "cipher"
+    assert account.config["xchat_cursors"][_CONVERSATION] == "100"
 
 
 async def test_first_xchat_backfill_skips_when_latest_event_is_ours(session, monkeypatch):

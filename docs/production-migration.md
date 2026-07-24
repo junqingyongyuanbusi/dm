@@ -44,6 +44,12 @@ Workers continue registering all durable actors so already accepted work can dra
 checkpoint/backfill lands, verified accounts retain low-frequency reconciliation to avoid enlarging
 provider-history gaps. `x_post_reply` is independent of the Legacy DM flag.
 
+## Polling RawEvent journal
+
+Revision `d6b8f0a2c431` adds tenant/account/stream/conversation/occurrence metadata to `raw_events` and preserves Legacy X DM plus XChat polling occurrences before normalization or decryption side effects. It also persists external conversation and event metadata on `normalized_events`.
+
+A database trigger makes RawEvent evidence fields append-only while still allowing operational status transitions. Code or manual SQL that attempts to rewrite payload, source, ownership, occurrence context or timestamps will fail with `raw_event_evidence_is_append_only`. The migration does not yet introduce durable polling checkpoints or a PENDING RawEvent recovery sweep; those are separate reliability changes.
+
 ## Platform account contract
 
 Revision `92a6e3f1c4d8` converts legacy `platform_accounts.status='CONNECTED'` rows to the canonical

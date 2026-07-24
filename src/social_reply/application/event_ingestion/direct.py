@@ -31,6 +31,23 @@ async def ingest_canonical_event(
         ).scalar_one_or_none()
         if account is None:
             raise LookupError(f"unknown_{event.platform}_account")
+        if raw_event_id is not None:
+            raw_event = (
+                await session.execute(
+                    select(models.RawEvent)
+                    .where(models.RawEvent.id == raw_event_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if raw_event is None:
+                raise LookupError(f"raw_event_not_found:{raw_event_id}")
+            if (
+                raw_event.platform_account_id is not None
+                and raw_event.platform_account_id != account.id
+            ):
+                raise PermissionError("raw_event_platform_account_mismatch")
+            if raw_event.tenant_id is not None and raw_event.tenant_id != account.tenant_id:
+                raise PermissionError("raw_event_tenant_mismatch")
         if not is_active_account_status(account.status):
             if raw_event_id is not None:
                 await session.execute(
@@ -113,6 +130,11 @@ async def ingest_canonical_event(
                     external_event_id=event.external_event_id,
                     event_type=f"{event.channel_type}.message.created",
                     raw_event_id=raw_event_id,
+                    external_conversation_id=event.external_conversation_id,
+                    event_metadata={
+                        "event_namespace": event.event_namespace or event.platform,
+                        **event.event_metadata,
+                    },
                     occurred_at=event.occurred_at,
                 )
                 .on_conflict_do_nothing(
@@ -240,6 +262,15 @@ async def ingest_canonical_event(
                     select(models.DecisionJob.id).where(models.DecisionJob.message_id == message_id)
                 )
             ).scalar_one()
+        if raw_event_id is not None:
+            await session.execute(
+                update(models.RawEvent)
+                .where(
+                    models.RawEvent.id == raw_event_id,
+                    models.RawEvent.processing_status == "PROCESSING",
+                )
+                .values(processing_status="DECISION_PENDING")
+            )
         latest_status = await session.scalar(
             select(models.PlatformAccount.status)
             .where(models.PlatformAccount.id == account.id)

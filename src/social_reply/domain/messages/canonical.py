@@ -22,7 +22,9 @@ class CanonicalEvent:
     text: str | None
     occurred_at: datetime | None = None
     channel_type: ChannelType = ChannelType.DM
+    event_namespace: str | None = None
     external_conversation_id: str | None = None
+    event_metadata: dict[str, Any] = field(default_factory=dict)
     reply_target: dict[str, Any] = field(default_factory=dict)
     raw_payload: dict[str, Any] = field(default_factory=dict)
 
@@ -45,7 +47,9 @@ def canonical_event_from_dict(value: dict[str, Any]) -> CanonicalEvent:
         text=value.get("text"),
         occurred_at=datetime.fromisoformat(occurred_at) if occurred_at else None,
         channel_type=ChannelType(value.get("channel_type", ChannelType.DM)),
+        event_namespace=value.get("event_namespace"),
         external_conversation_id=value.get("external_conversation_id"),
+        event_metadata=dict(value.get("event_metadata") or {}),
         reply_target=dict(value.get("reply_target") or {}),
         raw_payload=dict(value.get("raw_payload") or {}),
     )

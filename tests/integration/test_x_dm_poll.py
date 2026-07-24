@@ -103,6 +103,8 @@ async def test_poll_ingests_user_dm_skips_self_and_advances_cursor(session, monk
             "sender_id": _USER,
             "text": "What is pip?",
             "created_at": "2026-07-17T12:47:00Z",
+            "event_type": "MessageCreate",
+            "dm_conversation_id": "dm-conversation-1",
         },
     ]
 
@@ -126,6 +128,23 @@ async def test_poll_ingests_user_dm_skips_self_and_advances_cursor(session, monk
         .all()
     )
     assert normalized == []
+    raw_events = (
+        (await session.execute(select(models.RawEvent).order_by(models.RawEvent.external_event_id)))
+        .scalars()
+        .all()
+    )
+    assert [row.external_event_id for row in raw_events] == ["100", "200"]
+    assert {row.processing_status for row in raw_events} == {"IGNORED_BOOTSTRAP"}
+    user_raw = raw_events[0]
+    assert user_raw.source == "x_dm_poll"
+    assert user_raw.ingress_kind == "poll"
+    assert user_raw.event_namespace == "x.legacy_dm"
+    assert user_raw.external_conversation_id == "dm-conversation-1"
+    assert user_raw.occurred_at.isoformat() == "2026-07-17T12:47:00+00:00"
+    assert user_raw.payload["event_type"] == "MessageCreate"
+    assert user_raw.context["poll_run_id"]
+    assert user_raw.context["page_index"] == 0
+    assert user_raw.context["item_index"] == 1
 
     # 游标推进到最新 id（200）
     acc = await session.get(models.PlatformAccount, account_id)
@@ -213,6 +232,17 @@ async def test_poll_ingests_all_fresh_messages_no_drop(session, monkeypatch):
         .all()
     )
     assert sorted(n.external_event_id for n in normalized) == ["100", "200", "300"]
+    raw_events = (
+        (await session.execute(select(models.RawEvent).order_by(models.RawEvent.external_event_id)))
+        .scalars()
+        .all()
+    )
+    assert [row.external_event_id for row in raw_events] == ["100", "200", "300"]
+    assert all(row.processing_status == "PROCESSED" for row in raw_events)
+    raw_by_id = {row.external_event_id: row for row in raw_events}
+    assert all(event.raw_event_id == raw_by_id[event.external_event_id].id for event in normalized)
+    assert all(event.external_conversation_id == _USER for event in normalized)
+    assert all(event.event_metadata["event_namespace"] == "x.legacy_dm" for event in normalized)
     # 游标推进到最大 id
     acc = (
         await session.execute(
@@ -407,3 +437,17 @@ async def test_poll_is_idempotent_on_repeat(session, monkeypatch):
         .all()
     )
     assert len(normalized) == 1
+    raw_events = (
+        (
+            await session.execute(
+                select(models.RawEvent).where(models.RawEvent.external_event_id == "100")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(raw_events) == 2
+    assert {row.processing_status for row in raw_events} == {
+        "PROCESSED",
+        "SKIPPED_DUPLICATE",
+    }
