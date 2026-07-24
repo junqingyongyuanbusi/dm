@@ -78,6 +78,7 @@ The built-in administration surface provides:
 - mandatory first-login password change for newly created tenant users;
 - tenant-user self-service account authorization for the user's assigned tenant, including OAuth starts and tenant-scoped provisioning jobs;
 - superadmin-only tenant-wide automation kill switch; tenant users retain account-level controls for their own accounts;
+- PostgreSQL-backed runtime health summary on `/admin`, covering ingestion recovery, decision jobs, Outbox, provisioning, active X sync gaps, and disabled accounts with oldest backlog age;
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;

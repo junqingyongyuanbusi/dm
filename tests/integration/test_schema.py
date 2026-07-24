@@ -126,6 +126,7 @@ async def test_poll_raw_event_journal_columns_and_indexes_exist(migrated_db):
         "ix_raw_events_status_received",
         "ix_raw_events_account_received",
         "ix_raw_events_processing_due",
+        "ix_raw_events_tenant_status_received",
     } <= indexes
 
 
@@ -158,6 +159,26 @@ async def test_platform_sync_tables_have_constraints_and_indexes(migrated_db):
         "ix_sync_gaps_retry",
         "uq_sync_gaps_active_checkpoint",
     } <= gap_indexes
+
+
+async def test_admin_health_indexes_exist(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            text(
+                "SELECT tablename, indexname FROM pg_indexes "
+                "WHERE indexname IN ("
+                "'ix_raw_events_tenant_status_received',"
+                "'ix_outbox_tenant_status_created',"
+                "'ix_platform_accounts_tenant_status'"
+                ")"
+            )
+        )
+    assert set(rows) == {
+        ("raw_events", "ix_raw_events_tenant_status_received"),
+        ("outbox_messages", "ix_outbox_tenant_status_created"),
+        ("platform_accounts", "ix_platform_accounts_tenant_status"),
+    }
 
 
 async def test_platform_account_contract_constraints_exist(migrated_db):

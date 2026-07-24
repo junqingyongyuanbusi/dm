@@ -6,12 +6,13 @@
 import hashlib
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import desc, func, select, update
+from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.application.account_management.admin import (
@@ -77,6 +78,215 @@ def _tenant_input(principal: Principal) -> str:
 
 
 # ---------- 总览 ----------
+
+
+_RAW_ACTION_STATUSES = (
+    "INITIAL_DISPATCH_DEAD",
+    "DECISION_NEEDS_REVIEW",
+    "XCHAT_PIN_REQUIRED",
+    "XCHAT_KEY_RECOVERY_REQUIRED",
+    "XCHAT_DECRYPT_FAILED",
+    "XCHAT_RETRY_EXHAUSTED",
+    "XCHAT_REAUTHORIZATION_REQUIRED",
+    "XCHAT_ACCESS_FORBIDDEN",
+    "XCHAT_DECRYPT_MISSING_OUTPUT",
+    "XCHAT_PUBLIC_KEY_LOOKUP_FAILED",
+)
+_RAW_WARNING_STATUSES = (
+    "INITIAL_DISPATCH_RETRY",
+    "INITIAL_DISPATCHING",
+    "DECISION_PENDING",
+    "DECISION_DEFERRED",
+    "XCHAT_DECRYPTION_PENDING",
+    "XCHAT_PROCESSING",
+    "XCHAT_RETRYABLE_ERROR",
+)
+
+
+def _raw_action_condition():
+    return or_(
+        models.RawEvent.processing_status.in_(_RAW_ACTION_STATUSES),
+        models.RawEvent.processing_status.like("XCHAT_PUBLIC_KEY_HTTP_%"),
+    )
+
+
+def _raw_warning_condition():
+    return or_(
+        and_(
+            models.RawEvent.processing_status == "PENDING",
+            models.RawEvent.context.op("?")("initial_dispatch"),
+        ),
+        models.RawEvent.processing_status.in_(_RAW_WARNING_STATUSES),
+    )
+
+
+@dataclass(frozen=True)
+class _HealthMetric:
+    key: str
+    label: str
+    action_count: int
+    warning_count: int
+    oldest_at: datetime | None
+    href: str
+
+    @property
+    def level(self) -> str:
+        if self.action_count:
+            return "ACTION"
+        if self.warning_count:
+            return "WARNING"
+        return "HEALTHY"
+
+
+def _health_age(now: datetime, oldest_at: datetime | None) -> str:
+    if oldest_at is None:
+        return "—"
+    if oldest_at.tzinfo is None:
+        oldest_at = oldest_at.replace(tzinfo=UTC)
+    seconds = max(int((now - oldest_at).total_seconds()), 0)
+    if seconds < 60:
+        return "刚刚"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} 小时"
+    return f"{hours // 24} 天"
+
+
+async def _load_health_metrics(
+    session, tenants: frozenset[str], now: datetime
+) -> list[_HealthMetric]:
+    raw_action = _raw_action_condition()
+    raw_warning = _raw_warning_condition()
+    raw_row = (
+        await session.execute(
+            select(
+                func.count().filter(raw_action),
+                func.count().filter(raw_warning),
+                func.min(models.RawEvent.received_at).filter(or_(raw_action, raw_warning)),
+            ).where(models.RawEvent.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    decision_action = models.DecisionJob.status == "NEEDS_REVIEW"
+    decision_warning = models.DecisionJob.status.in_(
+        ("PENDING", "PROCESSING", "FAILED", "DEFERRED_CHATWOOT")
+    )
+    decision_row = (
+        await session.execute(
+            select(
+                func.count().filter(decision_action),
+                func.count().filter(decision_warning),
+                func.min(models.DecisionJob.created_at).filter(
+                    or_(decision_action, decision_warning)
+                ),
+            )
+            .select_from(models.DecisionJob)
+            .join(
+                models.PlatformAccount,
+                models.PlatformAccount.id == models.DecisionJob.account_id,
+            )
+            .where(models.PlatformAccount.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    outbox_action = models.OutboxMessage.status == "NEEDS_REVIEW"
+    outbox_warning = models.OutboxMessage.status.in_(("PENDING", "SENDING", "FAILED"))
+    outbox_row = (
+        await session.execute(
+            select(
+                func.count().filter(outbox_action),
+                func.count().filter(outbox_warning),
+                func.min(models.OutboxMessage.created_at).filter(
+                    or_(outbox_action, outbox_warning)
+                ),
+            ).where(models.OutboxMessage.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    retry_grace = now - timedelta(minutes=2)
+    provisioning_action = or_(
+        models.ProvisioningJob.status == "NEEDS_ACTION",
+        and_(
+            models.ProvisioningJob.status == "FAILED",
+            or_(
+                models.ProvisioningJob.next_attempt_at.is_(None),
+                models.ProvisioningJob.next_attempt_at < retry_grace,
+            ),
+        ),
+    )
+    provisioning_warning = or_(
+        models.ProvisioningJob.status.in_(("PENDING", "PROCESSING", "PAUSED_PLATFORM_DISABLED")),
+        and_(
+            models.ProvisioningJob.status == "FAILED",
+            models.ProvisioningJob.next_attempt_at >= retry_grace,
+        ),
+    )
+    provisioning_row = (
+        await session.execute(
+            select(
+                func.count().filter(provisioning_action),
+                func.count().filter(provisioning_warning),
+                func.min(models.ProvisioningJob.created_at).filter(
+                    or_(provisioning_action, provisioning_warning)
+                ),
+            ).where(models.ProvisioningJob.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    active_gap = models.SyncGap.status.in_(("OPEN", "RETRYING"))
+    sync_action = and_(active_gap, models.SyncGap.gap_type == "DECRYPT_ERROR")
+    sync_warning = and_(active_gap, models.SyncGap.gap_type != "DECRYPT_ERROR")
+    sync_row = (
+        await session.execute(
+            select(
+                func.count().filter(sync_action),
+                func.count().filter(sync_warning),
+                func.min(models.SyncGap.created_at).filter(active_gap),
+            )
+            .select_from(models.SyncGap)
+            .join(
+                models.PlatformCheckpoint,
+                models.PlatformCheckpoint.id == models.SyncGap.checkpoint_id,
+            )
+            .join(
+                models.PlatformAccount,
+                models.PlatformAccount.id == models.PlatformCheckpoint.platform_account_id,
+            )
+            .where(
+                models.PlatformCheckpoint.tenant_id.in_(tenants),
+                models.PlatformAccount.tenant_id.in_(tenants),
+            )
+        )
+    ).one()
+
+    account_action = models.PlatformAccount.status == "DISABLED"
+    account_row = (
+        await session.execute(
+            select(
+                func.count().filter(account_action),
+                func.min(models.PlatformAccount.created_at).filter(account_action),
+            ).where(models.PlatformAccount.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    return [
+        _HealthMetric("ingestion", "入站恢复", *raw_row, "/admin/delivery"),
+        _HealthMetric("decisions", "决策任务", *decision_row, "/admin/decisions"),
+        _HealthMetric("delivery", "消息投递", *outbox_row, "/admin/delivery"),
+        _HealthMetric("provisioning", "账号接入", *provisioning_row, "/admin/accounts"),
+        _HealthMetric("sync", "X 同步", *sync_row, "/admin/accounts"),
+        _HealthMetric(
+            "accounts",
+            "账号状态",
+            int(account_row[0]),
+            0,
+            account_row[1],
+            "/admin/accounts",
+        ),
+    ]
 
 
 @router.get("", response_class=HTMLResponse)
@@ -157,6 +367,7 @@ async def overview(request: Request) -> Response:
             .scalars()
             .all()
         )
+        health_metrics = await _load_health_metrics(session, tenants, now)
 
     auto = action_counts.get("auto_reply", 0)
     handled = auto + action_counts.get("draft", 0) + action_counts.get("handoff", 0)
@@ -188,6 +399,16 @@ async def overview(request: Request) -> Response:
         f'<span class="bar-count">{action_counts.get(a, 0)}</span></div>'
         for a in ("auto_reply", "draft", "handoff", "ignore")
     )
+    health_rows = "".join(
+        f'<tr data-health="{metric.key}"><td><strong>{metric.label}</strong></td>'
+        f"<td>{_pill(metric.level)}</td>"
+        f"<td>{metric.action_count} 需处理 · {metric.warning_count} 恢复中</td>"
+        f"<td class='muted'>{_health_age(now, metric.oldest_at)}</td>"
+        f"<td><a href='{metric.href}'>查看</a></td></tr>"
+        for metric in health_metrics
+    )
+    health = f"""<section class="card"><h2>运行健康</h2><p class="hint">当前积压与需人工处理项。</p>
+<div class="tablewrap"><table><thead><tr><th>环节</th><th>状态</th><th>积压</th><th>最老等待</th><th></th></tr></thead><tbody>{health_rows}</tbody></table></div></section>"""
     recent_rows = (
         "".join(
             f"<tr><td class='muted'>{_fmt(d.created_at)}</td><td>{_pill(d.action)}</td>"
@@ -198,7 +419,7 @@ async def overview(request: Request) -> Response:
         )
         or "<tr><td colspan='5' class='muted'>暂无决策记录</td></tr>"
     )
-    body = f"""<h1>总览</h1><p class="lede">自动回复运行状况与近 7 日决策分布。</p>{stats}
+    body = f"""<h1>总览</h1><p class="lede">自动回复运行状况与近 7 日决策分布。</p>{stats}{health}
 <div class="grid" style="grid-template-columns:1fr 1.4fr">
 <section class="card"><h2>决策分布</h2><p class="hint">近 7 日各动作占比。</p>{bars}</section>
 <section class="card"><h2>最近决策</h2><p class="hint">最新 8 条 AI 决策。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复预览</th><th></th></tr></thead><tbody>{recent_rows}</tbody></table></div></section>
@@ -904,7 +1125,7 @@ async def delivery_page(request: Request) -> Response:
                 select(
                     models.RawEvent.source,
                     models.RawEvent.processing_status,
-                    func.count(models.RawEvent.id),
+                    func.count(func.distinct(models.RawEvent.id)),
                     func.max(models.RawEvent.received_at),
                 )
                 .outerjoin(
@@ -912,14 +1133,17 @@ async def delivery_page(request: Request) -> Response:
                     models.NormalizedEvent.raw_event_id == models.RawEvent.id,
                 )
                 .where(
-                    models.RawEvent.received_at >= day_ago,
-                    (
-                        models.NormalizedEvent.tenant_id.in_(tenants)
-                        | (
-                            models.NormalizedEvent.id.is_(None)
-                            if principal.is_superadmin
-                            else False
-                        )
+                    or_(
+                        models.RawEvent.tenant_id.in_(tenants),
+                        and_(
+                            models.RawEvent.tenant_id.is_(None),
+                            models.NormalizedEvent.tenant_id.in_(tenants),
+                        ),
+                    ),
+                    or_(
+                        models.RawEvent.received_at >= day_ago,
+                        _raw_action_condition(),
+                        _raw_warning_condition(),
                     ),
                 )
                 .group_by(models.RawEvent.source, models.RawEvent.processing_status)

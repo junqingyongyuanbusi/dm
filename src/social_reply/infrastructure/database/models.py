@@ -115,6 +115,7 @@ class PlatformAccount(Base):
             "jsonb_typeof(capability) = 'object'",
             name="ck_platform_accounts_capability_object",
         ),
+        Index("ix_platform_accounts_tenant_status", "tenant_id", "status"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
@@ -211,6 +212,12 @@ class RawEvent(Base):
         Index("ix_raw_events_status_received", "processing_status", "received_at"),
         Index("ix_raw_events_account_received", "platform_account_id", "received_at"),
         Index(
+            "ix_raw_events_tenant_status_received",
+            "tenant_id",
+            "processing_status",
+            "received_at",
+        ),
+        Index(
             "ix_raw_events_processing_due",
             "processing_status",
             "processing_next_attempt_at",
@@ -237,9 +244,7 @@ class RawEvent(Base):
     processing_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     processing_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_error_code: Mapped[str | None] = mapped_column(Text)
-    processing_last_dispatched_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    processing_last_dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -415,6 +420,12 @@ class OutboxMessage(Base):
     __table_args__ = (
         # Takeover cancellation and recovery sweeps both filter by conversation and status.
         Index("ix_outbox_conversation_status", "conversation_id", "status"),
+        Index(
+            "ix_outbox_tenant_status_created",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")

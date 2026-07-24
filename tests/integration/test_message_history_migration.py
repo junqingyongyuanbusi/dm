@@ -216,7 +216,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).all()
-        assert revision == "b2d8f5a3c714"
+        assert revision == "c5a8e2f4d901"
         assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {
