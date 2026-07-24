@@ -1,5 +1,7 @@
 import os
 
+from sqlalchemy.engine import make_url
+
 # 测试套件必须与开发者本地 .env 隔离（密闭性）：
 # pydantic-settings 中真实环境变量优先于 .env 文件，这里用 setdefault 钉住
 # 所有影响决策/验签行为的配置为"测试默认值"——.env 里的真实凭证/开关不再泄漏进测试，
@@ -39,3 +41,9 @@ _TEST_DEFAULTS = {
 }
 for _k, _v in _TEST_DEFAULTS.items():
     os.environ.setdefault(_k, _v)
+
+_database_name = make_url(os.environ["DATABASE_URL"]).database or ""
+if not _database_name.endswith("_test"):
+    raise RuntimeError(
+        f"pytest refuses to use non-test database: {_database_name or '<missing>'}"
+    )

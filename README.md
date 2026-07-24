@@ -151,13 +151,21 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 → Telegram / Facebook / Instagram / X API
 ```
 
-## 测试
+## 测试与 CI
 
 ```bash
+uv sync --frozen --all-groups
+uv run ruff check .
 uv run pytest -m "not integration"   # 纯单元
-docker compose -f deploy/docker-compose.yml up -d
-uv run pytest                        # 全量
+
+docker compose -f deploy/docker-compose.yml up -d postgres redis
+docker compose -f deploy/docker-compose.yml exec -T postgres sh -c \
+  'psql -U dev -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '\''social_reply_test'\''" | grep -q 1 || createdb -U dev social_reply_test'
+DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
+REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 全量
 ```
+
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head。
 
 ## 回复模板导入（知识库）
 
