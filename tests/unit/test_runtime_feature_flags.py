@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from apps.scheduler import main as scheduler
 from social_reply.application.event_ingestion import (
+    x_dm_poll,
     x_webhook_health,
     xchat_poll,
     xchat_subscription,
@@ -109,6 +110,68 @@ async def test_disabled_activity_sweeps_do_not_load_accounts(monkeypatch):
     assert await x_webhook_health.ensure_x_webhooks_valid() == []
 
 
+async def test_reconciliation_sweeps_run_immediately_after_process_start(monkeypatch):
+    called: list[str] = []
+
+    def account_loader(name):
+        async def load(_platform):
+            called.append(name)
+            return []
+
+        return load
+
+    monkeypatch.setattr(x_dm_poll.time, "monotonic", lambda: 1.0)
+    monkeypatch.setattr(x_dm_poll, "get_settings", lambda: _settings())
+    monkeypatch.setattr(xchat_subscription, "get_settings", lambda: _settings())
+    monkeypatch.setattr(x_webhook_health, "get_settings", lambda: _settings())
+    monkeypatch.setattr(
+        x_dm_poll, "list_active_accounts_by_platform", account_loader("legacy")
+    )
+    monkeypatch.setattr(
+        xchat_poll, "list_active_accounts_by_platform", account_loader("xchat")
+    )
+    monkeypatch.setattr(
+        xchat_subscription,
+        "list_active_accounts_by_platform",
+        account_loader("subscriptions"),
+    )
+    monkeypatch.setattr(
+        x_webhook_health,
+        "list_active_accounts_by_platform",
+        account_loader("health"),
+    )
+    x_dm_poll._last_poll_at = None
+    xchat_poll._last_poll_at = None
+    xchat_subscription._last_check_at = None
+    x_webhook_health._last_check_at = None
+
+    await x_dm_poll.poll_x_direct_messages()
+    await xchat_poll.poll_xchat_messages()
+    await xchat_subscription.ensure_xchat_subscriptions()
+    await x_webhook_health.ensure_x_webhooks_valid()
+
+    assert called == ["legacy", "xchat", "subscriptions", "health"]
+
+
+async def test_zero_monotonic_timestamp_is_still_throttled(monkeypatch):
+    calls = 0
+
+    async def list_accounts(_platform):
+        nonlocal calls
+        calls += 1
+        return []
+
+    monkeypatch.setattr(x_dm_poll.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(x_dm_poll, "get_settings", lambda: _settings())
+    monkeypatch.setattr(x_dm_poll, "list_active_accounts_by_platform", list_accounts)
+    x_dm_poll._last_poll_at = None
+
+    await x_dm_poll.poll_x_direct_messages()
+    await x_dm_poll.poll_x_direct_messages()
+
+    assert calls == 1
+
+
 async def test_xchat_poll_requires_strict_capability(monkeypatch):
     accounts = [
         SimpleNamespace(capability={}),
@@ -125,7 +188,7 @@ async def test_xchat_poll_requires_strict_capability(monkeypatch):
     monkeypatch.setattr(xchat_poll, "list_active_accounts_by_platform", list_accounts)
     monkeypatch.setattr(xchat_poll, "x_credentials", unexpected_credentials)
     monkeypatch.setattr(xchat_poll.time, "monotonic", lambda: 1000.0)
-    xchat_poll._last_poll_at = 0.0
+    xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []
 

@@ -13,7 +13,7 @@ from social_reply.shared.config import get_settings
 logger = logging.getLogger(__name__)
 
 _CHECK_INTERVAL_SECONDS = int(os.getenv("XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS", "600"))
-_last_check_at: float = 0.0
+_last_check_at: float | None = None
 
 
 async def ensure_xchat_subscriptions() -> list[str]:
@@ -22,7 +22,7 @@ async def ensure_xchat_subscriptions() -> list[str]:
     if not settings.x_activity_enabled or not settings.xchat_enabled:
         return []
     now = time.monotonic()
-    if now - _last_check_at < _CHECK_INTERVAL_SECONDS:
+    if _last_check_at is not None and now - _last_check_at < _CHECK_INTERVAL_SECONDS:
         return []
     _last_check_at = now
 

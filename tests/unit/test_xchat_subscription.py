@@ -38,7 +38,7 @@ async def test_subscription_reconciliation_skips_account_without_keys(monkeypatc
 
     monkeypatch.setattr(xchat_subscription, "list_active_accounts_by_platform", fake_accounts)
     monkeypatch.setattr(xchat_subscription, "XChatClient", UnexpectedClient)
-    xchat_subscription._last_check_at = 0.0
+    xchat_subscription._last_check_at = None
     assert await xchat_subscription.ensure_xchat_subscriptions() == []
 
 
@@ -93,5 +93,5 @@ async def test_subscription_reconciliation_creates_missing(monkeypatch):
 
     monkeypatch.setattr(xchat_subscription, "list_active_accounts_by_platform", fake_accounts)
     monkeypatch.setattr(xchat_subscription, "XChatClient", FakeClient)
-    xchat_subscription._last_check_at = 0.0
+    xchat_subscription._last_check_at = None
     assert await xchat_subscription.ensure_xchat_subscriptions() == ["subscription-1"]

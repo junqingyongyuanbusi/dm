@@ -20,7 +20,7 @@ from social_reply.shared.config import get_settings
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = int(os.getenv("X_DM_POLL_INTERVAL_SECONDS", "90"))
-_last_poll_at: float = 0.0
+_last_poll_at: float | None = None
 # /2/dm_events 限流为 15 req/15min(实测+官方 PPU 文档)。90s 间隔常态每轮 1 页
 # ≈10 req/15min;页帽限制积压轮的额外翻页,防单轮打爆预算引发 429 连环。
 _MAX_PAGES_PER_POLL = 3
@@ -33,7 +33,7 @@ async def poll_x_direct_messages() -> list[str]:
     global _last_poll_at
     settings = get_settings()
     now = time.monotonic()
-    if now - _last_poll_at < _POLL_INTERVAL_SECONDS:
+    if _last_poll_at is not None and now - _last_poll_at < _POLL_INTERVAL_SECONDS:
         return []
     _last_poll_at = now
 

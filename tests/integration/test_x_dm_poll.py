@@ -45,7 +45,7 @@ async def _seed_x_account(session, *, dm_capable: bool = True) -> uuid.UUID:
 
 
 async def test_legacy_reenable_reconciles_unknown_dm_capability(session, monkeypatch):
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     account_id = await _seed_x_account(session, dm_capable=False)
 
     class FakeClient:
@@ -68,7 +68,7 @@ async def test_legacy_reenable_reconciles_unknown_dm_capability(session, monkeyp
 
 
 async def test_legacy_disabled_skips_account_without_verified_capability(session, monkeypatch):
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     await _seed_x_account(session, dm_capable=False)
     monkeypatch.setattr(
         x_dm_poll,
@@ -87,7 +87,7 @@ async def test_legacy_disabled_skips_account_without_verified_capability(session
 async def test_poll_ingests_user_dm_skips_self_and_advances_cursor(session, monkeypatch):
     monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "false")
     get_settings.cache_clear()
-    x_dm_poll._last_poll_at = 0.0  # 重置节流，避免跨用例串扰
+    x_dm_poll._last_poll_at = None  # 重置节流，避免跨用例串扰
     account_id = await _seed_x_account(session)
 
     # X 返回按时间倒序：自己发的回复 + 用户真实 DM
@@ -143,14 +143,14 @@ async def test_empty_bootstrap_does_not_drop_first_live_message(session, monkeyp
         return pages.pop(0)
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == []
     session.expire_all()
     account = await session.get(models.PlatformAccount, account_id)
     assert account.config.get("x_dm_bootstrapped") is True
     assert account.config.get("x_dm_cursor") is None
 
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == ["100"]
 
 
@@ -169,7 +169,7 @@ async def test_poll_throttled_within_interval(session, monkeypatch):
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
     monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 60)
 
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     await x_dm_poll.poll_x_direct_messages()  # 首次真实拉取
     await x_dm_poll.poll_x_direct_messages()  # 间隔内，应跳过
     await x_dm_poll.poll_x_direct_messages()  # 间隔内，应跳过
@@ -197,7 +197,7 @@ async def test_poll_ingests_all_fresh_messages_no_drop(session, monkeypatch):
         return events, None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     ingested = await x_dm_poll.poll_x_direct_messages()
 
     # 三条按时间正序全部入站
@@ -234,7 +234,7 @@ async def test_existing_cursor_implies_bootstrapped_during_rollout(session, monk
         return ([{"id": "200", "sender_id": _USER, "text": "new"}], None)
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == ["200"]
 
 
@@ -263,7 +263,7 @@ async def test_poll_reads_all_pages_until_existing_cursor(session, monkeypatch):
         )
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == [
         "2078000200000000000",
         "2078000300000000000",
@@ -291,7 +291,7 @@ async def test_late_arriving_event_within_lookback_is_recovered(session, monkeyp
         return [{"id": late_event, "sender_id": _USER, "text": "late arrival"}], None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == [late_event]
 
     session.expire_all()
@@ -326,7 +326,7 @@ async def test_page_budget_caps_requests_per_poll(session, monkeypatch):
         )
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     ingested = await x_dm_poll.poll_x_direct_messages()
 
     assert calls == [None, "t1", "t2"]  # 页帽 3:恰好三次请求后截断
@@ -358,7 +358,7 @@ async def test_poll_cursor_numeric_comparison(session, monkeypatch):
         return events, None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     ingested = await x_dm_poll.poll_x_direct_messages()
 
     assert ingested == ["2078120216798941669"]
@@ -389,9 +389,9 @@ async def test_poll_is_idempotent_on_repeat(session, monkeypatch):
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
 
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     first = await x_dm_poll.poll_x_direct_messages()
-    x_dm_poll._last_poll_at = 0.0  # 绕过节流，验证的是游标/去重幂等而非节流
+    x_dm_poll._last_poll_at = None  # 绕过节流，验证的是游标/去重幂等而非节流
     second = await x_dm_poll.poll_x_direct_messages()
 
     assert first == ["100"]

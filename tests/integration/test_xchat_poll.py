@@ -70,7 +70,7 @@ async def test_xchat_first_empty_poll_bootstraps(session, monkeypatch):
 
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
-    xchat_poll._last_poll_at = 0.0
+    xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []
     session.expire_all()
@@ -127,7 +127,7 @@ async def test_xchat_poll_ingests_decrypted_text(session, monkeypatch):
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
     monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
     monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
-    xchat_poll._last_poll_at = 0.0
+    xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == ["message-200"]
     normalized = (
@@ -206,7 +206,7 @@ async def test_first_xchat_backfill_only_replies_to_newest_recent_inbound(
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
     monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
     monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
-    xchat_poll._last_poll_at = 0.0
+    xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == ["message-300"]
 
@@ -265,6 +265,6 @@ async def test_first_xchat_backfill_skips_when_latest_event_is_ours(session, mon
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
     monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
     monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
-    xchat_poll._last_poll_at = 0.0
+    xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []

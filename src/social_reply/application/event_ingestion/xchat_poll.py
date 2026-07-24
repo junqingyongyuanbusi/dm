@@ -34,13 +34,13 @@ _MAX_CONVERSATION_PAGES = 3
 _MAX_CONVERSATIONS_PER_POLL = int(os.getenv("XCHAT_MAX_CONVERSATIONS_PER_POLL", "10"))
 _MAX_EVENT_PAGES = 3
 _BACKFILL_REPLY_WINDOW = timedelta(hours=24)
-_last_poll_at: float = 0.0
+_last_poll_at: float | None = None
 
 
 async def poll_xchat_messages() -> list[str]:
     global _last_poll_at
     now = time.monotonic()
-    if now - _last_poll_at < _POLL_INTERVAL_SECONDS:
+    if _last_poll_at is not None and now - _last_poll_at < _POLL_INTERVAL_SECONDS:
         return []
     _last_poll_at = now
 
