@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 
@@ -29,17 +30,23 @@ def _ingress_plan(
     *,
     legacy_enabled: bool,
     xchat_enabled: bool,
+    activity_status: str | None = None,
 ) -> tuple[list[CanonicalEvent], str, bool]:
-    is_xchat = event_type.startswith("chat.")
-    if is_xchat and not xchat_enabled:
-        return [], "IGNORED_XCHAT_DISABLED", False
+    if event_type == "chat.received":
+        if not xchat_enabled:
+            return [], "IGNORED_XCHAT_DISABLED", False
+        return [], "XCHAT_DECRYPTION_PENDING", True
+    if event_type.startswith("chat."):
+        return [], "IGNORED_X_ACTIVITY_EVENT", False
+    if event_type == "dm.received":
+        if not legacy_enabled:
+            return [], "IGNORED_X_LEGACY_DISABLED", False
+        return events, activity_status or ("PENDING" if events else "IGNORED_AT_INGRESS"), False
     has_legacy_dm = bool(payload.get("direct_message_events") or payload.get("dm_events"))
     if has_legacy_dm and not legacy_enabled:
         events = [event for event in events if event.reply_target.get("kind") != "dm"]
         if not events:
             return [], "IGNORED_X_LEGACY_DISABLED", False
-    if is_xchat:
-        return events, "XCHAT_DECRYPTION_PENDING", True
     return events, "PENDING" if events else "IGNORED_AT_INGRESS", False
 
 
@@ -94,30 +101,54 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
     if account is None:
         raise HTTPException(status_code=404, detail="x_event_account_not_found")
     settings = get_settings()
-    event_type = str((payload.get("data") or {}).get("event_type") or "")
-    is_xchat = event_type.startswith("chat.")
+    data = payload.get("data") or {}
+    event_type = str(data.get("event_type") or "")
+    is_xchat = event_type == "chat.received"
     adapter = XWebhookAdapter(
         account_id=str(account.id),
         external_account_id=account.external_account_id,
     )
+    activity_status = None
+    if event_type == "dm.received":
+        normalized, activity_status = adapter.normalize_activity_dm(payload)
+    else:
+        normalized = adapter.normalize(payload)
     events, processing_status, dispatch_xchat = _ingress_plan(
         payload,
         event_type,
-        adapter.normalize(payload),
+        normalized,
         legacy_enabled=settings.x_legacy_dm_enabled,
         xchat_enabled=settings.xchat_enabled,
+        activity_status=activity_status,
+    )
+    event_payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    event_namespace = (
+        f"x.activity.{event_type.replace('.', '_')}" if event_type else "x.account_activity"
+    )
+    external_conversation_id = (
+        str(event_payload.get("conversation_id") or event_payload.get("dm_conversation_id") or "")
+        or None
     )
     async with get_session_factory()() as session:
         raw_event_id = (
             await session.execute(
                 insert(models.RawEvent)
                 .values(
+                    tenant_id=account.tenant_id,
+                    platform_account_id=account.id,
                     source="x",
+                    ingress_kind="webhook",
+                    event_namespace=event_namespace,
+                    external_event_id=str(data.get("event_uuid") or "") or None,
+                    external_conversation_id=external_conversation_id,
                     payload=payload,
                     headers={
                         "signature_verified": True,
                         "event_type": event_type or None,
                     },
+                    context={"raw_body_sha256": hashlib.sha256(body).hexdigest()},
+                    schema_version=1,
+                    occurred_at=events[0].occurred_at if events else None,
                     processing_status=processing_status,
                 )
                 .returning(models.RawEvent.id)
@@ -152,6 +183,7 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
         )
     elif dispatch_xchat:
         from social_reply.application.event_ingestion.xchat_actors import process_xchat_event
+        from social_reply.application.event_ingestion.xchat_recovery import note_xchat_dispatch
         from social_reply.application.event_ingestion.xchat_webhook import (
             process_xchat_raw_event,
         )
@@ -162,6 +194,7 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
             str(account.id),
             inline=lambda: process_xchat_raw_event(raw_event_id, account.id),
         )
+        await note_xchat_dispatch(raw_event_id)
         logger.info(
             "XCHAT_EVENT_RECEIVED raw_event_id=%s account=%s event_type=%s event_uuid=%s",
             raw_event_id,

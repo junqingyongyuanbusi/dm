@@ -178,3 +178,96 @@ async def test_account_disable_is_rechecked_at_ingestion_commit(session, monkeyp
     normalized_count = await session.scalar(select(models.NormalizedEvent.id).limit(1))
     assert raw_status == "IGNORED_ACCOUNT_INACTIVE"
     assert normalized_count is None
+
+
+async def test_stale_xchat_claim_cannot_mark_new_claim_inactive(session, monkeypatch):
+    account_id = uuid.uuid4()
+    raw_event_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            name="active-x",
+            external_account_id="bot-1",
+            status="active",
+            capability={"dm": True, "x_chat": True, "mentions": True},
+        )
+    )
+    await session.execute(
+        insert(models.RawEvent).values(
+            id=raw_event_id,
+            tenant_id="default",
+            platform_account_id=account_id,
+            source="x",
+            payload={"data": {"event_type": "chat.received"}},
+            context={"xchat_claim_token": "old-claim"},
+            processing_status="XCHAT_PROCESSING",
+        )
+    )
+    await session.commit()
+
+    original_ensure_state = direct_module.ensure_state
+    original_mark_inactive = direct_module._mark_raw_event_account_inactive
+
+    async def disable_after_state(current_session, conversation_id, default_state):
+        result = await original_ensure_state(current_session, conversation_id, default_state)
+        async with get_session_factory()() as other_session:
+            await other_session.execute(
+                update(models.PlatformAccount)
+                .where(models.PlatformAccount.id == account_id)
+                .values(status="DISABLED")
+            )
+            await other_session.commit()
+        return result
+
+    async def establish_new_claim_before_inactive_mark(
+        current_session,
+        current_raw_event_id,
+        *,
+        claim_token,
+    ):
+        async with get_session_factory()() as other_session:
+            await other_session.execute(
+                update(models.RawEvent)
+                .where(models.RawEvent.id == current_raw_event_id)
+                .values(
+                    context={"xchat_claim_token": "new-claim"},
+                    processing_status="XCHAT_PROCESSING",
+                )
+            )
+            await other_session.commit()
+        await original_mark_inactive(
+            current_session,
+            current_raw_event_id,
+            claim_token=claim_token,
+        )
+
+    monkeypatch.setattr(direct_module, "ensure_state", disable_after_state)
+    monkeypatch.setattr(
+        direct_module,
+        "_mark_raw_event_account_inactive",
+        establish_new_claim_before_inactive_mark,
+    )
+    result = await ingest_canonical_event(
+        CanonicalEvent(
+            platform="x",
+            platform_account_key=str(account_id),
+            external_event_id="event-x-race",
+            external_user_id="user-1",
+            conversation_key=f"x_chat:{account_id}:bot-1:user-1",
+            text="hello",
+            reply_target={"kind": "x_chat", "conversation_id": "bot-1:user-1"},
+        ),
+        raw_event_id=raw_event_id,
+        raw_event_claim_token="old-claim",
+    )
+
+    assert result is None
+    session.expire_all()
+    raw = await session.get(models.RawEvent, raw_event_id)
+    normalized_count = await session.scalar(select(models.NormalizedEvent.id).limit(1))
+    assert raw.processing_status == "XCHAT_PROCESSING"
+    assert raw.context["xchat_claim_token"] == "new-claim"
+    assert normalized_count is None

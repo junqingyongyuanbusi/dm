@@ -124,12 +124,8 @@ async def test_reconciliation_sweeps_run_immediately_after_process_start(monkeyp
     monkeypatch.setattr(x_dm_poll, "get_settings", lambda: _settings())
     monkeypatch.setattr(xchat_subscription, "get_settings", lambda: _settings())
     monkeypatch.setattr(x_webhook_health, "get_settings", lambda: _settings())
-    monkeypatch.setattr(
-        x_dm_poll, "list_active_accounts_by_platform", account_loader("legacy")
-    )
-    monkeypatch.setattr(
-        xchat_poll, "list_active_accounts_by_platform", account_loader("xchat")
-    )
+    monkeypatch.setattr(x_dm_poll, "list_active_accounts_by_platform", account_loader("legacy"))
+    monkeypatch.setattr(xchat_poll, "list_active_accounts_by_platform", account_loader("xchat"))
     monkeypatch.setattr(
         xchat_subscription,
         "list_active_accounts_by_platform",
@@ -204,7 +200,8 @@ def test_scheduler_sweeps_follow_feature_flags():
     assert chatwoot[1:] == base
     assert "poll_x_direct_messages" in no_legacy
     assert "poll_xchat_messages" in no_xchat
-    assert "ensure_xchat_subscriptions" not in no_xchat
+    assert "ensure_xchat_subscriptions" in no_xchat
+    assert "sweep_xchat_recovery" not in no_xchat
     assert "ensure_x_webhooks_valid" not in no_activity
     assert "ensure_xchat_subscriptions" not in no_activity
     assert "poll_x_direct_messages" in no_activity

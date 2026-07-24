@@ -114,6 +114,8 @@ async def test_xchat_setup_separates_juicebox_configuration_errors(monkeypatch):
                 {
                     "juicebox_config": {"token_map": {}},
                     "public_key_version": "1",
+                    "public_key": "identity",
+                    "signing_public_key": "signing",
                 }
             ]
 

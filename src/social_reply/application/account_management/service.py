@@ -1,6 +1,8 @@
+import logging
 import secrets
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -21,10 +23,19 @@ from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.x.client import XClient
 from social_reply.connectors.xchat.client import XChatClient
+from social_reply.connectors.xchat.state import (
+    XChatKeyState,
+    XChatState,
+    classify_xchat_state,
+    xchat_state_config,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 from social_reply.shared.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _AUTOMATION_DEFAULTS = {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
 _META_PLATFORMS = {"facebook", "instagram"}
@@ -64,6 +75,19 @@ def _webhook_url(public_base_url: str, path: str) -> str:
     if not base_url:
         raise ValueError("missing_public_base_url")
     return f"{base_url}{path}"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+async def _xchat_public_keys(client: XChatClient, user_id: str) -> list[dict]:
+    try:
+        return await client.get_user_public_keys(user_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return []
+        raise
 
 
 async def connect_telegram_account(
@@ -279,27 +303,46 @@ async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
         api_base_url=(account.config or {}).get("api_base_url", "https://api.x.com"),
     )
     try:
+        records = await _xchat_public_keys(client, account.external_account_id)
         private_keys, key_version = await unlock_account_xchat_keys(
             client=client,
             user_id=account.external_account_id,
             pin=_require_secret(pin, "xchat_pin"),
+            records=records,
         )
     finally:
         await client.aclose()
     credentials["xchat_private_keys_b64"] = private_keys
     credentials["xchat_signing_key_version"] = key_version
+    state_config = xchat_state_config(
+        XChatState(
+            key_state=XChatKeyState.READY,
+            registered=True,
+            public_key_version=key_version,
+        ),
+        probed_at=_utc_now_iso(),
+    )
     async with get_session_factory()() as session:
         await session.execute(
             models.PlatformAccount.__table__.update()
             .where(models.PlatformAccount.id == account_id)
             .values(
                 credential_bundle=encrypt_secret_bundle(credentials),
-                config=models.PlatformAccount.config.op("||")({"xchat_enabled": True}),
+                config=models.PlatformAccount.config.op("||")(
+                    {"xchat_enabled": True, **state_config}
+                ),
                 capability=models.PlatformAccount.capability.op("||")({"x_chat": True}),
                 config_version=models.PlatformAccount.config_version + 1,
             )
         )
         await session.commit()
+
+    from social_reply.application.event_ingestion.xchat_actors import recover_xchat_account
+
+    try:
+        await dispatch_actor(recover_xchat_account, str(account_id))
+    except Exception:  # noqa: BLE001 - keys are already committed; scheduler remains the fallback
+        logger.exception("failed to dispatch XChat recovery account=%s", account_id)
 
 
 async def connect_x_account(
@@ -369,25 +412,73 @@ async def connect_x_account(
     existing_xchat_credentials = (
         existing_runtime.credential_bundle if existing_runtime is not None else {}
     )
-    xchat_enabled = bool(existing_xchat_credentials.get("xchat_private_keys_b64"))
-    if xchat_pin and xchat_pin.strip():
-        xchat = XChatClient(**credentials, api_base_url=api_base_url, transport=transport)
+    private_keys = existing_xchat_credentials.get("xchat_private_keys_b64")
+    stored_key_version = existing_xchat_credentials.get("xchat_signing_key_version")
+    if private_keys:
+        credentials["xchat_private_keys_b64"] = private_keys
+    if stored_key_version:
+        credentials["xchat_signing_key_version"] = stored_key_version
+
+    if settings.xchat_enabled:
+        xchat = XChatClient(
+            consumer_key=credentials["consumer_key"],
+            consumer_secret=credentials["consumer_secret"],
+            access_token=credentials["access_token"],
+            access_token_secret=credentials["access_token_secret"],
+            api_base_url=api_base_url,
+            transport=transport,
+        )
         try:
-            private_keys, key_version = await unlock_account_xchat_keys(
-                client=xchat,
-                user_id=external_account_id,
-                pin=xchat_pin.strip(),
-            )
+            public_key_records = await _xchat_public_keys(xchat, external_account_id)
+            if xchat_pin and xchat_pin.strip():
+                private_keys, stored_key_version = await unlock_account_xchat_keys(
+                    client=xchat,
+                    user_id=external_account_id,
+                    pin=xchat_pin.strip(),
+                    records=public_key_records,
+                )
+                credentials["xchat_private_keys_b64"] = private_keys
+                credentials["xchat_signing_key_version"] = stored_key_version
         finally:
             await xchat.aclose()
-        credentials["xchat_private_keys_b64"] = private_keys
-        credentials["xchat_signing_key_version"] = key_version
-        xchat_enabled = True
-    elif xchat_enabled:
-        credentials["xchat_private_keys_b64"] = existing_xchat_credentials["xchat_private_keys_b64"]
-        credentials["xchat_signing_key_version"] = existing_xchat_credentials[
-            "xchat_signing_key_version"
-        ]
+        if xchat_pin and xchat_pin.strip():
+            xchat_state = XChatState(
+                key_state=XChatKeyState.READY,
+                registered=True,
+                public_key_version=str(stored_key_version),
+            )
+        else:
+            xchat_state = classify_xchat_state(
+                public_key_records,
+                private_keys_b64=private_keys,
+            )
+        if xchat_state.key_state is XChatKeyState.READY:
+            credentials["xchat_signing_key_version"] = str(xchat_state.public_key_version)
+    else:
+        existing_config = existing_runtime.config if existing_runtime is not None else {}
+        existing_state_value = existing_config.get("xchat_key_state")
+        try:
+            existing_state = XChatKeyState(str(existing_state_value))
+        except ValueError:
+            existing_state = (
+                XChatKeyState.READY
+                if private_keys and stored_key_version
+                else XChatKeyState.NOT_REGISTERED
+            )
+        xchat_state = XChatState(
+            key_state=existing_state,
+            registered=bool(existing_config.get("xchat_registered", private_keys)),
+            public_key_version=existing_config.get("xchat_public_key_version", stored_key_version),
+        )
+    xchat_ready = xchat_state.key_state is XChatKeyState.READY
+    if settings.xchat_enabled:
+        xchat_config = xchat_state_config(xchat_state, probed_at=_utc_now_iso())
+    else:
+        xchat_config = {
+            "xchat_registered": xchat_state.registered,
+            "xchat_key_state": xchat_state.key_state.value,
+            "xchat_public_key_version": xchat_state.public_key_version,
+        }
     platform_app_id, app_public_id = await ensure_x_platform_app(
         tenant_id=tenant_id,
         consumer_key=credentials["consumer_key"],
@@ -408,11 +499,12 @@ async def connect_x_account(
             **(existing_runtime.config if existing_runtime is not None else {}),
             "api_base_url": api_base_url,
             "environment": environment,
-            "xchat_enabled": xchat_enabled,
+            "xchat_enabled": xchat_ready,
+            **xchat_config,
         },
         capability={
             "dm": dm_capable,
-            "x_chat": xchat_enabled,
+            "x_chat": xchat_ready,
             "mentions": True,
             "max_text_length": 280,
         },
@@ -438,9 +530,13 @@ async def connect_x_account(
             (
                 "XChat 全局开关已关闭，密钥材料会保留但不会补拉或发送。"
                 if not settings.xchat_enabled
-                else "XChat 已解锁：scheduler 将通过 Chat API 补拉加密消息。"
-                if xchat_enabled
-                else "尚未提供 XChat PIN：已迁移到 XChat 的私信仍无法解密；请重新接入并填写 PIN。"
+                else "XChat 已解锁：实时 webhook 与 Chat API 补拉均已启用。"
+                if xchat_ready
+                else "账号已注册 XChat，但需要提交 4 位 PIN 恢复现有密钥。"
+                if xchat_state.key_state is XChatKeyState.RECOVERY_REQUIRED
+                else "账号尚未注册 XChat；未加密 DM 仍继续通过 legacy 通道处理。"
+                if xchat_state.key_state is XChatKeyState.NOT_REGISTERED
+                else "XChat 公私钥不匹配或配置不完整；已关闭加密消息发送。"
             ),
         ),
     )

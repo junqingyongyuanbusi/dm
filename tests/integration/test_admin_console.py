@@ -130,6 +130,54 @@ async def test_accounts_page_renders_x_oauth_result_banner(migrated_db):
     assert "x_token_exchange_rejected" in failed.text
 
 
+async def test_accounts_page_shows_independent_x_transport_states(session, migrated_db):
+    import uuid
+
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            name="@xbot",
+            external_account_id="x-1",
+            public_id="x-public-state",
+            credential_bundle=encrypt_secret_bundle(
+                {
+                    "consumer_key": "ck",
+                    "consumer_secret": "cs",
+                    "access_token": "at",
+                    "access_token_secret": "ats",
+                }
+            ),
+            config={
+                "xchat_registered": True,
+                "xchat_key_state": "RECOVERY_REQUIRED",
+                "x_activity_subscriptions": {
+                    "dm.received": {"status": "ACTIVE"},
+                    "chat.received": {"status": "ACTIVE"},
+                },
+            },
+            capability={"dm": True, "x_chat": False, "mentions": True},
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    assert "Legacy DM" in response.text
+    assert "DM Activity" in response.text
+    assert "XChat Key" in response.text
+    assert "RECOVERY_REQUIRED" in response.text
+    assert f'action="/admin/accounts/{account_id}/xchat"' in response.text
+    assert "恢复 XChat 密钥" in response.text
+
+
 async def test_xchat_activation_error_renders_operator_notice(session, migrated_db, monkeypatch):
     import uuid
 

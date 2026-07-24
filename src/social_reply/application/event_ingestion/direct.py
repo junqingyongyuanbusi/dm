@@ -2,6 +2,7 @@ import uuid
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.reply_decision.jobs import snapshot_to_dict
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
@@ -13,10 +14,32 @@ from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
 
 
+async def _mark_raw_event_account_inactive(
+    session: AsyncSession,
+    raw_event_id: uuid.UUID,
+    *,
+    claim_token: str | None,
+) -> None:
+    raw_event = (
+        await session.execute(
+            select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if raw_event is None:
+        return
+    if (
+        claim_token is not None
+        and (raw_event.context or {}).get("xchat_claim_token") != claim_token
+    ):
+        return
+    raw_event.processing_status = "IGNORED_ACCOUNT_INACTIVE"
+
+
 async def ingest_canonical_event(
     event: CanonicalEvent,
     *,
     raw_event_id: uuid.UUID | None = None,
+    raw_event_claim_token: str | None = None,
 ) -> uuid.UUID | None:
     """平台直连事件的通用 Inbox：同事务保存消息、状态快照和 DecisionJob。"""
     account_uuid = uuid.UUID(event.platform_account_key)
@@ -48,6 +71,12 @@ async def ingest_canonical_event(
                 raise PermissionError("raw_event_platform_account_mismatch")
             if raw_event.tenant_id is not None and raw_event.tenant_id != account.tenant_id:
                 raise PermissionError("raw_event_tenant_mismatch")
+            if (
+                raw_event_claim_token is not None
+                and (raw_event.context or {}).get("xchat_claim_token") != raw_event_claim_token
+            ):
+                await session.rollback()
+                return None
         if not is_active_account_status(account.status):
             if raw_event_id is not None:
                 await session.execute(
@@ -279,10 +308,10 @@ async def ingest_canonical_event(
         if latest_status is None or not is_active_account_status(latest_status):
             await session.rollback()
             if raw_event_id is not None:
-                await session.execute(
-                    update(models.RawEvent)
-                    .where(models.RawEvent.id == raw_event_id)
-                    .values(processing_status="IGNORED_ACCOUNT_INACTIVE")
+                await _mark_raw_event_account_inactive(
+                    session,
+                    raw_event_id,
+                    claim_token=raw_event_claim_token,
                 )
                 await session.commit()
             return None

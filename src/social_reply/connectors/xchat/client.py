@@ -120,15 +120,18 @@ class XChatClient:
         response.raise_for_status()
         return list(response.json().get("data") or [])
 
-    async def create_received_subscription(
+    async def create_activity_subscription(
         self,
         *,
+        event_type: str,
         user_id: str,
         webhook_id: str | None = None,
-        tag: str = "reply-core xchat",
+        tag: str,
     ) -> dict:
+        if event_type not in {"chat.received", "dm.received"}:
+            raise ValueError(f"unsupported_x_activity_event_type:{event_type}")
         body: dict[str, object] = {
-            "event_type": "chat.received",
+            "event_type": event_type,
             "filter": {"user_id": user_id},
             "tag": tag,
         }
@@ -141,6 +144,20 @@ class XChatClient:
         )
         response.raise_for_status()
         return response.json()
+
+    async def create_received_subscription(
+        self,
+        *,
+        user_id: str,
+        webhook_id: str | None = None,
+        tag: str = "reply-core xchat",
+    ) -> dict:
+        return await self.create_activity_subscription(
+            event_type="chat.received",
+            user_id=user_id,
+            webhook_id=webhook_id,
+            tag=tag,
+        )
 
     async def list_webhooks(self) -> list[dict]:
         bearer = await self._app_bearer_token()
@@ -193,9 +210,7 @@ class XChatClient:
     async def _app_bearer_token(self) -> str:
         if self._app_bearer:
             return self._app_bearer
-        basic = base64.b64encode(
-            f"{self._consumer_key}:{self._consumer_secret}".encode()
-        ).decode()
+        basic = base64.b64encode(f"{self._consumer_key}:{self._consumer_secret}".encode()).decode()
         response = await self._app.post(
             "/oauth2/token",
             headers={"Authorization": f"Basic {basic}"},

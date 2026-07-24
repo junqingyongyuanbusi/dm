@@ -3,9 +3,24 @@ import uuid
 
 import httpx
 import pytest
+from chat_xdk import Chat
 
 from social_reply.application.account_management import service
 from social_reply.application.platform_accounts import PlatformAccountRuntime
+from social_reply.connectors.xchat.crypto import export_private_key_b64
+
+
+def _xchat_material(version: str = "7") -> tuple[str, dict]:
+    chat = Chat()
+    generated = chat.generate_keypairs()
+    registration = generated.public_key
+    return export_private_key_b64(chat), {
+        "public_key_version": version,
+        "public_key": registration.public_key,
+        "signing_public_key": registration.signing_public_key,
+        "identity_public_key_signature": registration.identity_public_key_signature,
+        "juicebox_config": {"tokens": {}},
+    }
 
 
 async def test_connect_telegram_validates_and_configures_webhook(monkeypatch, tmp_path):
@@ -100,6 +115,7 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         update={"x_legacy_dm_enabled": False, "xchat_enabled": True}
     )
     monkeypatch.setattr(service, "get_settings", lambda: settings)
+    private_keys, public_key_record = _xchat_material()
     existing = PlatformAccountRuntime(
         id=uuid.uuid4(),
         tenant_id="default",
@@ -130,7 +146,7 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
                 "consumer_secret": "old-cs",
                 "access_token": "old-at",
                 "access_token_secret": "old-ats",
-                "xchat_private_keys_b64": "private",
+                "xchat_private_keys_b64": private_keys,
                 "xchat_signing_key_version": "7",
             }
         ),
@@ -150,13 +166,24 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         async def aclose(self):
             pass
 
+    class FakeXChatClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get_user_public_keys(self, user_id):
+            return [public_key_record]
+
+        async def aclose(self):
+            pass
+
     async def fake_existing(**kwargs):
         return existing
 
     async def fake_provision(**kwargs):
-        assert kwargs["credential_bundle"]["xchat_private_keys_b64"] == "private"
+        assert kwargs["credential_bundle"]["xchat_private_keys_b64"] == private_keys
         assert kwargs["credential_bundle"]["xchat_signing_key_version"] == "7"
         assert kwargs["config"]["xchat_cursors"] == {"x-1-peer": "123"}
+        assert kwargs["config"]["xchat_key_state"] == "READY"
         assert kwargs["capability"]["dm"] is True
         assert kwargs["capability"]["x_chat"] is True
         return uuid.uuid4(), "primary"
@@ -167,6 +194,7 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         return app_id, "x_oauth"
 
     monkeypatch.setattr(service, "XClient", FakeXClient)
+    monkeypatch.setattr(service, "XChatClient", FakeXChatClient)
     monkeypatch.setattr(service, "get_platform_account_runtime_by_external_id", fake_existing)
     monkeypatch.setattr(service, "ensure_x_platform_app", fake_x_app)
     monkeypatch.setattr(service, "provision_direct_account", fake_provision)
@@ -184,6 +212,78 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
     assert result.platform_app_id == app_id
     assert result.app_public_id == "x_oauth"
     assert result.webhook_url == "https://reply.example.com/webhooks/x/x_oauth"
+
+
+async def test_connect_x_detects_registered_xchat_that_needs_pin(monkeypatch, tmp_path):
+    settings = service.get_settings().model_copy(
+        update={"x_legacy_dm_enabled": True, "xchat_enabled": True}
+    )
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
+
+    class FakeXClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get_me(self):
+            return {"id": "x-1", "username": "bot"}
+
+        async def read_dm_events(self, *, max_results):
+            return [], None
+
+        async def aclose(self):
+            pass
+
+    class FakeXChatClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def get_user_public_keys(self, user_id):
+            return [
+                {
+                    "public_key_version": "7",
+                    "public_key": "identity",
+                    "signing_public_key": "signing",
+                    "juicebox_config": {"tokens": {}},
+                }
+            ]
+
+        async def aclose(self):
+            pass
+
+    async def missing_existing(**kwargs):
+        raise LookupError("missing")
+
+    async def fake_x_app(**kwargs):
+        return uuid.uuid4(), "x_oauth"
+
+    async def fake_provision(**kwargs):
+        assert kwargs["config"]["xchat_registered"] is True
+        assert kwargs["config"]["xchat_key_state"] == "RECOVERY_REQUIRED"
+        assert kwargs["capability"]["dm"] is True
+        assert kwargs["capability"]["x_chat"] is False
+        return uuid.uuid4(), "x_public"
+
+    monkeypatch.setattr(service, "XClient", FakeXClient)
+    monkeypatch.setattr(service, "XChatClient", FakeXChatClient)
+    monkeypatch.setattr(
+        service,
+        "get_platform_account_runtime_by_external_id",
+        missing_existing,
+    )
+    monkeypatch.setattr(service, "ensure_x_platform_app", fake_x_app)
+    monkeypatch.setattr(service, "provision_direct_account", fake_provision)
+
+    result = await service.connect_x_account(
+        consumer_key="ck",
+        consumer_secret="cs",
+        access_token="at",
+        access_token_secret="ats",
+        environment="oauth",
+        public_base_url="https://reply.example.com",
+        secrets_root=tmp_path,
+    )
+
+    assert "需要提交 4 位 PIN" in result.manual_steps[1]
 
 
 async def test_connect_x_rejects_app_without_direct_message_permission(monkeypatch, tmp_path):
@@ -371,6 +471,9 @@ async def test_enable_xchat_updates_existing_account_without_persisting_pin(monk
         def __init__(self, **kwargs):
             pass
 
+        async def get_user_public_keys(self, user_id):
+            return [{"public_key_version": "7"}]
+
         async def aclose(self):
             pass
 
@@ -403,6 +506,12 @@ async def test_enable_xchat_updates_existing_account_without_persisting_pin(monk
     monkeypatch.setattr(service, "XChatClient", FakeXChatClient)
     monkeypatch.setattr(service, "unlock_account_xchat_keys", fake_unlock)
     monkeypatch.setattr(service, "get_session_factory", lambda: lambda: fake_session)
+    dispatched = []
+
+    async def fake_dispatch(actor, *args, **kwargs):
+        dispatched.append((actor.actor_name, args))
+
+    monkeypatch.setattr(service, "dispatch_actor", fake_dispatch)
     encrypted = {}
     monkeypatch.setattr(
         service,
@@ -415,3 +524,4 @@ async def test_enable_xchat_updates_existing_account_without_persisting_pin(monk
     assert encrypted["xchat_signing_key_version"] == "7"
     assert "1234" not in encrypted.values()
     assert str(fake_session.statement).count("||") == 2
+    assert dispatched == [("recover_xchat_account", (str(existing.id),))]

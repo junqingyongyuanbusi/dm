@@ -1110,19 +1110,38 @@ async def accounts_page(request: Request) -> Response:
         auto_target = "BOT_DRAFT_ONLY" if a.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
         auto_label = "切为草稿" if a.automation_default == "BOT_ACTIVE" else "切为自动"
         xchat_form = ""
-        if (
-            settings.xchat_enabled
-            and a.platform == "x"
-            and not (a.capability or {}).get("x_chat", False)
-        ):
-            xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="csrf_token" value="{csrf}"><input type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><button class="btn-sm btn-ghost">启用 XChat</button></form>"""
+        channel_status = "—"
+        if a.platform == "x":
+            account_config = dict(a.config or {})
+            capability = dict(a.capability or {})
+            xchat_state = str(
+                account_config.get("xchat_key_state")
+                or ("READY" if capability.get("x_chat") else "UNKNOWN")
+            )
+            xchat_registered = account_config.get("xchat_registered") is True
+            subscriptions = dict(account_config.get("x_activity_subscriptions") or {})
+            legacy_subscription = str(
+                (subscriptions.get("dm.received") or {}).get("status") or "UNKNOWN"
+            )
+            xchat_subscription = str(
+                (subscriptions.get("chat.received") or {}).get("status") or "UNKNOWN"
+            )
+            channel_status = (
+                f"<div>Legacy DM {_pill('READY' if capability.get('dm') else 'DISABLED')}</div>"
+                f"<div>DM Activity {_pill(legacy_subscription)}</div>"
+                f"<div>XChat Key {_pill(xchat_state)}</div>"
+                f"<div>XChat Activity {_pill(xchat_subscription)}</div>"
+            )
+            if settings.xchat_enabled and xchat_registered and not capability.get("x_chat", False):
+                xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="csrf_token" value="{csrf}"><input type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><button class="btn-sm btn-ghost">恢复 XChat 密钥</button></form>"""
         account_rows += (
             f"<tr><td>{html.escape(a.platform)}</td><td>{html.escape(a.name)}</td>"
-            f"<td>{_pill(a.status)}</td><td>{_pill(a.automation_default)}</td><td>{ks_pill}</td>"
+            f"<td>{_pill(a.status)}</td><td>{channel_status}</td>"
+            f"<td>{_pill(a.automation_default)}</td><td>{ks_pill}</td>"
             f"""<td><form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>
 <form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="account"><input type="hidden" name="account_id" value="{a.id}"><input type="hidden" name="tenant_id" value="{html.escape(a.tenant_id)}"><button class="btn-sm {ks_cls}">{ks_btn}</button></form>{xchat_form}</td></tr>"""
         )
-    account_rows = account_rows or "<tr><td colspan='6' class='muted'>尚未连接账号</td></tr>"
+    account_rows = account_rows or "<tr><td colspan='7' class='muted'>尚未连接账号</td></tr>"
 
     job_rows = (
         "".join(
@@ -1208,7 +1227,7 @@ async def accounts_page(request: Request) -> Response:
 <form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
 <form class="card"{x_card_style} method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}<input type="hidden" name="environment" value="oauth">{xchat_manual_input}<button class="btn-block">连接 X</button></form>
 </div></div></details>"""
-    account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
+    account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:
         body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>

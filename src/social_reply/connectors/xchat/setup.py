@@ -4,6 +4,10 @@ from chat_xdk import Chat
 
 from social_reply.connectors.xchat.client import XChatClient
 from social_reply.connectors.xchat.crypto import export_private_key_b64
+from social_reply.connectors.xchat.state import (
+    matching_public_key_version,
+    newest_public_key_record,
+)
 
 
 class XChatKeyConfigurationError(ValueError):
@@ -41,11 +45,14 @@ async def unlock_xchat_private_keys(
     client: XChatClient,
     user_id: str,
     pin: str,
+    records: list[dict] | None = None,
 ) -> tuple[str, str]:
-    records = await client.get_user_public_keys(user_id)
+    records = records if records is not None else await client.get_user_public_keys(user_id)
     if not records:
         raise ValueError("xchat_public_keys_not_found")
-    record = records[0]
+    record = newest_public_key_record(records)
+    if record is None:
+        raise ValueError("xchat_public_key_record_incomplete")
     juicebox = record.get("juicebox_config")
     version = record.get("public_key_version") or record.get("version")
     if not isinstance(juicebox, dict) or not version:
@@ -65,4 +72,8 @@ async def unlock_xchat_private_keys(
     finally:
         secret[:] = b"\x00" * len(secret)
     chat.set_key_version(str(version))
-    return export_private_key_b64(chat), str(version)
+    private_keys_b64 = export_private_key_b64(chat)
+    matched_version = matching_public_key_version(private_keys_b64, records)
+    if matched_version is None:
+        raise XChatKeyConfigurationError("xchat_public_key_mismatch")
+    return private_keys_b64, matched_version

@@ -173,6 +173,46 @@ def test_x_v2_direct_message_events_format():
     assert events[0].conversation_key == "x_dm:bot-1:2041798240056598528"
 
 
+def test_x_activity_dm_received_uses_dm_event_id_for_poll_deduplication():
+    events, status = XWebhookAdapter(
+        account_id="account-1",
+        external_account_id="bot-1",
+    ).normalize_activity_dm(
+        {
+            "data": {
+                "event_type": "dm.received",
+                "event_uuid": "activity-uuid-1",
+                "filter": {"user_id": "bot-1"},
+                "payload": {
+                    "id": "dm-1",
+                    "event_type": "MessageCreate",
+                    "sender_id": "user-1",
+                    "dm_conversation_id": "conversation-1",
+                    "text": "hello",
+                    "created_at": "2026-07-20T01:51:31Z",
+                },
+            }
+        }
+    )
+
+    assert status == "PENDING"
+    assert events[0].external_event_id == "dm-1"
+    assert events[0].event_namespace == "x.activity.dm_received"
+    assert events[0].event_metadata["activity_event_uuid"] == "activity-uuid-1"
+    assert events[0].reply_target == {"kind": "dm", "participant_id": "user-1"}
+
+
+def test_x_activity_dm_received_fails_closed_on_unknown_schema():
+    events, status = XWebhookAdapter(
+        account_id="account-1",
+        external_account_id="bot-1",
+    ).normalize_activity_dm(
+        {"data": {"event_type": "dm.received", "payload": {"unexpected": True}}}
+    )
+    assert events == []
+    assert status == "X_ACTIVITY_DM_SCHEMA_UNSUPPORTED"
+
+
 def test_x_v2_dm_from_self_is_ignored():
     """自己发出的 DM（sender == 账号自身）不应触发回复，避免自我回环。"""
     events = XWebhookAdapter(

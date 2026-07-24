@@ -36,6 +36,32 @@ def test_ingress_plan_filters_disabled_legacy_dm_but_keeps_mentions():
     assert dispatch_xchat is False
 
 
+def test_ingress_plan_routes_activity_dm_without_xchat_decryption():
+    payload = {
+        "data": {
+            "event_type": "dm.received",
+            "payload": {"id": "dm-1", "sender_id": "user-1", "text": "hello"},
+        }
+    }
+    events, activity_status = router.XWebhookAdapter(
+        account_id="account-1",
+        external_account_id="bot-1",
+    ).normalize_activity_dm(payload)
+
+    planned, status, dispatch_xchat = router._ingress_plan(
+        payload,
+        "dm.received",
+        events,
+        legacy_enabled=True,
+        xchat_enabled=True,
+        activity_status=activity_status,
+    )
+
+    assert [event.external_event_id for event in planned] == ["dm-1"]
+    assert status == "PENDING"
+    assert dispatch_xchat is False
+
+
 def test_ingress_plan_drops_disabled_xchat_before_dispatch():
     events, status, dispatch_xchat = router._ingress_plan(
         {"data": {"event_type": "chat.received"}},
