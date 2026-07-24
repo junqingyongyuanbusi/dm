@@ -20,6 +20,9 @@ EXPECTED_TABLES = {
     "messages",
     "raw_events",
     "normalized_events",
+    "platform_checkpoints",
+    "sync_runs",
+    "sync_gaps",
     "automation_states",
     "outbox_messages",
     "audit_logs",
@@ -117,6 +120,37 @@ async def test_poll_raw_event_journal_columns_and_indexes_exist(migrated_db):
         "ix_raw_events_status_received",
         "ix_raw_events_account_received",
     } <= indexes
+
+
+async def test_platform_sync_tables_have_constraints_and_indexes(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        checkpoint_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='platform_checkpoints'"
+                )
+            )
+        }
+        gap_indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='sync_gaps'")
+            )
+        }
+    assert {
+        "ck_platform_checkpoints_stream",
+        "ck_platform_checkpoints_scope",
+        "ck_platform_checkpoints_revision",
+        "ck_platform_checkpoints_claim",
+        "uq_platform_checkpoints_account_stream_scope",
+    } <= checkpoint_constraints
+    assert {
+        "ix_sync_gaps_retry",
+        "uq_sync_gaps_active_checkpoint",
+    } <= gap_indexes
 
 
 async def test_platform_account_contract_constraints_exist(migrated_db):

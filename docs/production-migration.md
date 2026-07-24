@@ -40,15 +40,21 @@ same values.
 
 A disabled stack keeps credentials, cursors, subscriptions, and XChat key material intact. Matching
 Outbox rows move to a recoverable `NEEDS_REVIEW` state and return to `PENDING` after re-enable.
-Workers continue registering all durable actors so already accepted work can drain. Until durable
-checkpoint/backfill lands, verified accounts retain low-frequency reconciliation to avoid enlarging
-provider-history gaps. `x_post_reply` is independent of the Legacy DM flag.
+Workers continue registering all durable actors so already accepted work can drain. Verified
+accounts retain low-frequency reconciliation; PostgreSQL checkpoint leases serialize poll ownership
+and open gaps trigger resumable backfill. `x_post_reply` is independent of the Legacy DM flag.
 
 ## Polling RawEvent journal
 
 Revision `d6b8f0a2c431` adds tenant/account/stream/conversation/occurrence metadata to `raw_events` and preserves Legacy X DM plus XChat polling occurrences before normalization or decryption side effects. It also persists external conversation and event metadata on `normalized_events`.
 
-A database trigger makes RawEvent evidence fields append-only while still allowing operational status transitions. Code or manual SQL that attempts to rewrite payload, source, ownership, occurrence context or timestamps will fail with `raw_event_evidence_is_append_only`. The migration does not yet introduce durable polling checkpoints or a PENDING RawEvent recovery sweep; those are separate reliability changes.
+A database trigger makes RawEvent evidence fields append-only while still allowing operational status transitions. Code or manual SQL that attempts to rewrite payload, source, ownership, occurrence context or timestamps will fail with `raw_event_evidence_is_append_only`.
+
+## Durable polling checkpoints
+
+Revision `a1c7e4f2b903` creates `platform_checkpoints`, `sync_runs`, and `sync_gaps`. It migrates Legacy X DM and per-conversation XChat cursors from `platform_accounts.config`, retains the old config keys for rollback, and makes the new checkpoint rows authoritative for writes. Database leases plus fencing revisions serialize Scheduler ownership. Page caps, pagination failures, and XChat decryption failures leave the checkpoint unchanged and open a resumable gap.
+
+Pause old Scheduler processes before starting the new Scheduler and keep the mixed-version window short: old code writes config cursors while new code writes checkpoint rows. The migration still does not add a generic PENDING RawEvent recovery sweep; that remains a separate reliability change.
 
 ## Platform account contract
 

@@ -104,6 +104,19 @@ async def test_message_history_migration_backfills_and_round_trips():
             )
             """,
             """
+            INSERT INTO platform_accounts (
+                id, tenant_id, brand_id, platform, name, config,
+                capability, config_version, automation_default, status
+            ) VALUES (
+                '00000000-0000-0000-0000-000000000008',
+                'tenant-x', 'b1', 'x', 'x-probe',
+                '{"x_dm_cursor": "900", "x_dm_bootstrapped": true,
+                  "xchat_cursors": {"self-peer": "700", "self:peer": "900"},
+                  "xchat_bootstrapped": {"self-peer": false}}'::jsonb,
+                '{}'::jsonb, 1, 'BOT_ACTIVE', 'CONNECTED'
+            )
+            """,
+            """
             INSERT INTO contacts (
                 id, tenant_id, platform, platform_account_id, external_user_id
             ) VALUES (
@@ -192,13 +205,29 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).scalar_one()
-        assert revision == "d6b8f0a2c431"
+            checkpoints = (
+                await connection.execute(
+                    text(
+                        "SELECT stream, scope_key, cursor, bootstrapped "
+                        "FROM platform_checkpoints "
+                        "WHERE platform_account_id="
+                        "'00000000-0000-0000-0000-000000000008' "
+                        "ORDER BY stream, scope_key"
+                    )
+                )
+            ).all()
+        assert revision == "a1c7e4f2b903"
         assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {
             "dm": False,
             "max_text_length": 4096,
         }
+        assert [tuple(row) for row in checkpoints] == [
+            ("XCHAT_CONVERSATION", "self:peer", "900", True),
+            ("XCHAT_DISCOVERY", "", None, False),
+            ("X_LEGACY_DM", "", "900", True),
+        ]
         assert [(row.history_seq, row.text) for row in rows] == [
             (1, "first"),
             (2, "second"),

@@ -41,7 +41,7 @@ PostgreSQL owns:
 - webhook `RawEvent` rows and normalized event deduplication;
 - contacts, conversations, messages and automation state;
 - `ProvisioningJob`, `DecisionJob`, `ReplyDecision` and `OutboxMessage` state;
-- delivery attempts, audit logs, knowledge documents/chunks and polling cursors.
+- delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps.
 
 Once a `ProvisioningJob`, `DecisionJob`, or `OutboxMessage` exists, process crashes and Redis queue loss are recoverable from PostgreSQL. A committed webhook `RawEvent` that has not yet produced its durable job is a known gap described below.
 
@@ -86,7 +86,7 @@ A successful text send is written back as an outbound `Message`, linked to its s
 The delivery fast path reduces latency; it does not replace durability. `sweep_outbox` recovers rows
 that were committed but not sent because a process crashed.
 
-Webhook ingestion and X polling persist `RawEvent` evidence before normalization. Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. A crash or dispatch loss between a RawEvent commit and creation of `DecisionJob` can still leave a PENDING row with no automatic recovery. RawEvent recovery, durable polling checkpoints and resumable backfill are the next reliability phase.
+Webhook ingestion and X polling persist `RawEvent` evidence before normalization. Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes. A crash or dispatch loss between a RawEvent commit and creation of `DecisionJob` can still leave a PENDING row with no automatic recovery; the RawEvent recovery sweep remains the next reliability boundary.
 
 ## Chatwoot bridge
 
@@ -114,9 +114,8 @@ these families independently.
 | `XCHAT_ENABLED` | PIN activation, subscriptions, XChat webhook processing and `x_chat_message` sending |
 
 `x_post_reply` is independent of the Legacy DM flag. Disabling a send stack preserves tokens,
-cursors, private keys and recoverable Outbox rows. Until durable checkpoints/backfill exist, verified
-accounts retain low-frequency polling so a long disabled period does not exceed provider history
-windows.
+cursors, private keys and recoverable Outbox rows. Verified accounts retain low-frequency polling;
+PostgreSQL leases prevent duplicate ownership and open gaps drive resumable backfill.
 
 ## Provisioning path
 

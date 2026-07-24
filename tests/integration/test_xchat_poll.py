@@ -16,6 +16,19 @@ _PEER = "1831625034739412993"
 _CONVERSATION = f"{_SELF}:{_PEER}"
 
 
+async def _conversation_checkpoint(session, account_id: uuid.UUID):
+    session.expire_all()
+    return (
+        await session.execute(
+            select(models.PlatformCheckpoint).where(
+                models.PlatformCheckpoint.platform_account_id == account_id,
+                models.PlatformCheckpoint.stream == "XCHAT_CONVERSATION",
+                models.PlatformCheckpoint.scope_key == _CONVERSATION,
+            )
+        )
+    ).scalar_one()
+
+
 async def _seed_account(session, *, bootstrapped: bool) -> uuid.UUID:
     chat = Chat()
     chat.generate_keypairs()
@@ -73,14 +86,13 @@ async def test_xchat_first_empty_poll_bootstraps(session, monkeypatch):
     xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []
-    session.expire_all()
-    account = await session.get(models.PlatformAccount, account_id)
-    assert account.config["xchat_cursors"].get(_CONVERSATION) is None
-    assert account.config["xchat_bootstrapped"][_CONVERSATION] is True
+    checkpoint = await _conversation_checkpoint(session, account_id)
+    assert checkpoint.cursor is None
+    assert checkpoint.bootstrapped is True
 
 
 async def test_xchat_poll_ingests_decrypted_text(session, monkeypatch):
-    await _seed_account(session, bootstrapped=True)
+    account_id = await _seed_account(session, bootstrapped=True)
 
     async def fake_conversations(self, *, max_results=100, pagination_token=None):
         return ([{"id": _CONVERSATION, "participant_ids": [_PEER], "type": "direct"}], None)
@@ -160,6 +172,9 @@ async def test_xchat_poll_ingests_decrypted_text(session, monkeypatch):
     ).scalar_one()
     assert key_raw.payload == {"key_change": "key-change"}
     assert key_raw.processing_status == "PROCESSED_KEY_MATERIAL"
+    checkpoint = await _conversation_checkpoint(session, account_id)
+    assert checkpoint.cursor == "200"
+    assert checkpoint.bootstrapped is True
 
 
 async def test_first_xchat_backfill_only_replies_to_newest_recent_inbound(session, monkeypatch):
@@ -267,23 +282,370 @@ async def test_xchat_decrypt_failure_keeps_raw_occurrence_and_cursor(session, mo
     async def fake_public_keys(self, user_id):
         return []
 
+    decrypt_fails = True
+
+    def fake_decrypt(**kwargs):
+        if decrypt_fails:
+            return [], {}, {0: "key"}
+        envelope = kwargs["message_events"][0]
+        return (
+            [
+                {
+                    "envelope": envelope,
+                    "event": {
+                        "type": "Message",
+                        "message_id": "message-200-recovered",
+                        "sender_id": _PEER,
+                        "content": {"content_type": "Text", "text": "recovered"},
+                        "verified": True,
+                    },
+                }
+            ],
+            {},
+            {},
+        )
+
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
     monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
-    monkeypatch.setattr(xchat_poll, "decrypt_history", lambda **_kwargs: ([], {}, {0: "key"}))
+    monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
+    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
     xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []
     session.expire_all()
+    checkpoint = await _conversation_checkpoint(session, account_id)
     raw_event = (
         await session.execute(
             select(models.RawEvent).where(models.RawEvent.external_event_id == "200")
         )
     ).scalar_one()
-    account = await session.get(models.PlatformAccount, account_id)
+    gap = (
+        await session.execute(
+            select(models.SyncGap).where(models.SyncGap.checkpoint_id == checkpoint.id)
+        )
+    ).scalar_one()
     assert raw_event.processing_status == "XCHAT_DECRYPT_FAILED"
     assert raw_event.payload["encoded_event"] == "cipher"
-    assert account.config["xchat_cursors"][_CONVERSATION] == "100"
+    assert checkpoint.cursor == "100"
+    assert gap.status == "OPEN"
+    assert gap.gap_type == "DECRYPT_ERROR"
+    gap_id = gap.id
+
+    decrypt_fails = False
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == ["message-200-recovered"]
+    checkpoint = await _conversation_checkpoint(session, account_id)
+    gap = await session.get(models.SyncGap, gap_id)
+    assert checkpoint.cursor == "200"
+    assert gap.status == "RESOLVED"
+    assert (
+        await session.scalar(
+            select(models.NormalizedEvent).where(
+                models.NormalizedEvent.external_event_id == "message-200-recovered"
+            )
+        )
+    ) is not None
+
+
+async def test_xchat_event_page_gap_resumes_without_advancing_early(session, monkeypatch):
+    account_id = await _seed_account(session, bootstrapped=True)
+    calls: list[str | None] = []
+
+    async def fake_conversations(self, *, max_results=100, pagination_token=None):
+        return ([{"id": _CONVERSATION, "participant_ids": [_PEER], "type": "direct"}], None)
+
+    async def fake_events(self, conversation_id, *, pagination_token=None):
+        calls.append(pagination_token)
+        if pagination_token == "t3":
+            return (
+                [
+                    {
+                        "id": "50",
+                        "sender_id": _PEER,
+                        "conversation_id": _CONVERSATION,
+                        "encoded_event": "old",
+                    }
+                ],
+                [],
+                None,
+            )
+        ids = {None: "400", "t1": "300", "t2": "200"}
+        next_tokens = {None: "t1", "t1": "t2", "t2": "t3"}
+        event_id = ids[pagination_token]
+        return (
+            [
+                {
+                    "id": event_id,
+                    "sender_id": _PEER,
+                    "conversation_id": _CONVERSATION,
+                    "encoded_event": event_id,
+                }
+            ],
+            [],
+            next_tokens[pagination_token],
+        )
+
+    async def fake_public_keys(self, user_id):
+        return []
+
+    def fake_decrypt(**kwargs):
+        return (
+            [
+                {
+                    "envelope": envelope,
+                    "event": {
+                        "type": "Message",
+                        "message_id": f"message-{envelope['id']}",
+                        "sender_id": _PEER,
+                        "content": {"content_type": "Text", "text": envelope["encoded_event"]},
+                        "verified": True,
+                    },
+                }
+                for envelope in kwargs["message_events"]
+            ],
+            {},
+            {},
+        )
+
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
+    monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
+    monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
+    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+    xchat_poll._last_poll_at = None
+
+    assert await xchat_poll.poll_xchat_messages() == [
+        "message-200",
+        "message-300",
+        "message-400",
+    ]
+    checkpoint = await _conversation_checkpoint(session, account_id)
+    gap = (
+        await session.execute(
+            select(models.SyncGap).where(models.SyncGap.checkpoint_id == checkpoint.id)
+        )
+    ).scalar_one()
+    assert checkpoint.cursor == "100"
+    assert gap.status == "OPEN"
+    assert gap.gap_type == "PAGE_CAP"
+    assert gap.resume_token == "t3"
+    gap_id = gap.id
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == []
+    assert calls == [None, "t1", "t2", "t3"]
+    checkpoint = await _conversation_checkpoint(session, account_id)
+    gap = await session.get(models.SyncGap, gap_id)
+    assert checkpoint.cursor == "400"
+    assert gap.status == "RESOLVED"
+
+
+async def test_xchat_discovery_page_gap_resumes_deeper_conversations(session, monkeypatch):
+    account_id = await _seed_account(session, bootstrapped=True)
+    calls: list[str | None] = []
+    request_sizes: list[int] = []
+
+    async def fake_conversations(self, *, max_results=100, pagination_token=None):
+        calls.append(pagination_token)
+        request_sizes.append(max_results)
+        current = {None: "one", "t1": "two", "t2": "three", "t3": "deep"}[pagination_token]
+        next_token = {None: "t1", "t1": "t2", "t2": "t3", "t3": None}[pagination_token]
+        return ([{"id": current, "participant_ids": [_PEER], "type": "direct"}], next_token)
+
+    async def fake_events(self, conversation_id, *, pagination_token=None):
+        return [], [], None
+
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
+    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(xchat_poll, "_MAX_CONVERSATIONS_PER_POLL", 3)
+    xchat_poll._last_poll_at = None
+
+    assert await xchat_poll.poll_xchat_messages() == []
+    discovery = (
+        await session.execute(
+            select(models.PlatformCheckpoint).where(
+                models.PlatformCheckpoint.platform_account_id == account_id,
+                models.PlatformCheckpoint.stream == "XCHAT_DISCOVERY",
+            )
+        )
+    ).scalar_one()
+    gap = (
+        await session.execute(
+            select(models.SyncGap).where(models.SyncGap.checkpoint_id == discovery.id)
+        )
+    ).scalar_one()
+    assert calls == [None, "t1", "t2"]
+    assert request_sizes == [3, 2, 1]
+    assert gap.status == "OPEN"
+    assert gap.resume_token == "t3"
+    gap_id = gap.id
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == []
+    assert calls[-1] == "t3"
+    deep = (
+        await session.execute(
+            select(models.PlatformCheckpoint).where(
+                models.PlatformCheckpoint.platform_account_id == account_id,
+                models.PlatformCheckpoint.stream == "XCHAT_CONVERSATION",
+                models.PlatformCheckpoint.scope_key == "deep",
+            )
+        )
+    ).scalar_one()
+    deep_id = deep.id
+    session.expire_all()
+    gap = await session.get(models.SyncGap, gap_id)
+    deep = await session.get(models.PlatformCheckpoint, deep_id)
+    assert deep.bootstrapped is True
+    assert gap.status == "RESOLVED"
+
+
+async def test_expired_xchat_discovery_token_restarts_from_first_page(session, monkeypatch):
+    account_id = await _seed_account(session, bootstrapped=True)
+    calls: list[str | None] = []
+
+    async def fake_conversations(self, *, max_results=100, pagination_token=None):
+        calls.append(pagination_token)
+        if pagination_token == "expired":
+            raise RuntimeError("token expired")
+        conversation_id = "first" if calls.count(None) == 1 else "deep"
+        next_token = "expired" if calls.count(None) == 1 else None
+        return ([{"id": conversation_id, "participant_ids": [_PEER], "type": "direct"}], next_token)
+
+    async def fake_events(self, conversation_id, *, pagination_token=None):
+        return [], [], None
+
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
+    monkeypatch.setattr(xchat_poll, "_MAX_CONVERSATION_PAGES", 1)
+    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == []
+    discovery = (
+        await session.execute(
+            select(models.PlatformCheckpoint).where(
+                models.PlatformCheckpoint.platform_account_id == account_id,
+                models.PlatformCheckpoint.stream == "XCHAT_DISCOVERY",
+            )
+        )
+    ).scalar_one()
+    gap = (
+        await session.execute(
+            select(models.SyncGap).where(models.SyncGap.checkpoint_id == discovery.id)
+        )
+    ).scalar_one()
+    gap_id = gap.id
+    assert gap.resume_token == "expired"
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == []
+    session.expire_all()
+    gap = await session.get(models.SyncGap, gap_id)
+    assert gap.status == "OPEN"
+    assert gap.resume_token is None
+    assert gap.detail["restart_from_checkpoint"] is True
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == []
+    session.expire_all()
+    gap = await session.get(models.SyncGap, gap_id)
+    deep = await session.scalar(
+        select(models.PlatformCheckpoint.id).where(
+            models.PlatformCheckpoint.platform_account_id == account_id,
+            models.PlatformCheckpoint.stream == "XCHAT_CONVERSATION",
+            models.PlatformCheckpoint.scope_key == "deep",
+        )
+    )
+    assert calls == [None, "expired", None]
+    assert gap.status == "RESOLVED"
+    assert deep is not None
+
+
+async def test_expired_xchat_event_token_restarts_from_conversation_cursor(session, monkeypatch):
+    account_id = await _seed_account(session, bootstrapped=True)
+    calls: list[str | None] = []
+
+    async def fake_conversations(self, *, max_results=100, pagination_token=None):
+        return ([{"id": _CONVERSATION, "participant_ids": [_PEER], "type": "direct"}], None)
+
+    async def fake_events(self, conversation_id, *, pagination_token=None):
+        calls.append(pagination_token)
+        if pagination_token == "expired":
+            raise RuntimeError("token expired")
+        return (
+            [
+                {
+                    "id": "200",
+                    "sender_id": _PEER,
+                    "conversation_id": _CONVERSATION,
+                    "encoded_event": "cipher",
+                }
+            ],
+            [],
+            "expired" if calls.count(None) == 1 else None,
+        )
+
+    async def fake_public_keys(self, user_id):
+        return []
+
+    def fake_decrypt(**kwargs):
+        return (
+            [
+                {
+                    "envelope": envelope,
+                    "event": {
+                        "type": "Message",
+                        "message_id": "message-200-expired-token",
+                        "sender_id": _PEER,
+                        "content": {"content_type": "Text", "text": "recover"},
+                        "verified": True,
+                    },
+                }
+                for envelope in kwargs["message_events"]
+            ],
+            {},
+            {},
+        )
+
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
+    monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
+    monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
+    monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
+    monkeypatch.setattr(xchat_poll, "_MAX_EVENT_PAGES", 1)
+    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == ["message-200-expired-token"]
+    checkpoint = await _conversation_checkpoint(session, account_id)
+    gap = (
+        await session.execute(
+            select(models.SyncGap).where(models.SyncGap.checkpoint_id == checkpoint.id)
+        )
+    ).scalar_one()
+    checkpoint_id = checkpoint.id
+    gap_id = gap.id
+    assert checkpoint.cursor == "100"
+    assert gap.resume_token == "expired"
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == []
+    session.expire_all()
+    checkpoint = await session.get(models.PlatformCheckpoint, checkpoint_id)
+    gap = await session.get(models.SyncGap, gap_id)
+    assert checkpoint.cursor == "100"
+    assert gap.status == "OPEN"
+    assert gap.resume_token is None
+
+    xchat_poll._last_poll_at = None
+    assert await xchat_poll.poll_xchat_messages() == []
+    checkpoint = await _conversation_checkpoint(session, account_id)
+    gap = await session.get(models.SyncGap, gap_id)
+    assert calls == [None, "expired", None]
+    assert checkpoint.cursor == "200"
+    assert gap.status == "RESOLVED"
 
 
 async def test_first_xchat_backfill_skips_when_latest_event_is_ours(session, monkeypatch):

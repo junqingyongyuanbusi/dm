@@ -40,9 +40,10 @@ async def save_conversation_key_events(
             return
         config = dict(row.config or {})
         cached = dict(config.get(_CONFIG_FIELD) or {})
-        if cached.get(conversation_id) == values:
+        merged = list(dict.fromkeys([*(cached.get(conversation_id) or []), *values]))
+        if cached.get(conversation_id) == merged:
             return
-        cached[conversation_id] = values
+        cached[conversation_id] = merged
         config[_CONFIG_FIELD] = cached
         await session.execute(
             update(models.PlatformAccount)
