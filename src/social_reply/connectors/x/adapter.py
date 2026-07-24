@@ -75,8 +75,15 @@ class XWebhookAdapter:
                 or event.get("text")
             )
             event_id = event.get("id")
+            event_type = event.get("event_type") or event.get("type")
             conversation_id = str(event.get("dm_conversation_id") or sender_id)
-            if not sender_id or not event_id or sender_id == self._external_account_id:
+            if (
+                not sender_id
+                or not event_id
+                or sender_id == self._external_account_id
+                or event_type not in (None, "MessageCreate", "message_create")
+                or not isinstance(text, str)
+            ):
                 continue
             events.append(
                 CanonicalEvent(
@@ -90,7 +97,7 @@ class XWebhookAdapter:
                     event_namespace="x.legacy_dm",
                     external_conversation_id=conversation_id,
                     event_metadata={
-                        "event_type": event.get("event_type") or event.get("type"),
+                        "event_type": event_type,
                         "dm_conversation_id": event.get("dm_conversation_id"),
                     },
                     reply_target={"kind": "dm", "participant_id": sender_id},
@@ -100,7 +107,13 @@ class XWebhookAdapter:
         for event in payload.get("tweet_create_events", []) + payload.get("post_create_events", []):
             author_id = str(event.get("user_id_str") or event.get("author_id") or "")
             event_id = event.get("id_str") or event.get("id")
-            if not author_id or not event_id or author_id == self._external_account_id:
+            text = event.get("text")
+            if (
+                not author_id
+                or not event_id
+                or author_id == self._external_account_id
+                or not isinstance(text, str)
+            ):
                 continue
             events.append(
                 CanonicalEvent(
@@ -109,7 +122,7 @@ class XWebhookAdapter:
                     external_event_id=str(event_id),
                     external_user_id=author_id,
                     conversation_key=f"x_reply:{self._account_id}:{event_id}",
-                    text=event.get("text"),
+                    text=text,
                     channel_type=ChannelType.MENTION,
                     event_namespace="x.activity",
                     reply_target={"kind": "reply", "in_reply_to_post_id": str(event_id)},

@@ -118,6 +118,66 @@ def test_whatsapp_normalization():
     }
 
 
+def test_text_only_adapters_ignore_unsupported_message_occurrences():
+    meta_events = MetaWebhookAdapter().normalize(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "page-1",
+                    "messaging": [
+                        {
+                            "sender": {"id": "user-1"},
+                            "message": {"mid": "m-attachment", "attachments": [{}]},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    whatsapp_events = WhatsAppWebhookAdapter(
+        account_id="account-1",
+        phone_number_id="phone-1",
+    ).normalize(
+        {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "metadata": {"phone_number_id": "phone-1"},
+                                "messages": [
+                                    {
+                                        "id": "wamid-image",
+                                        "from": "15551234567",
+                                        "type": "image",
+                                        "image": {"id": "image-1"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    x_events = XWebhookAdapter(account_id="account-1").normalize(
+        {
+            "dm_events": [
+                {
+                    "id": "receipt-1",
+                    "sender_id": "user-1",
+                    "event_type": "Read",
+                    "text": "not a message",
+                }
+            ]
+        }
+    )
+    assert meta_events == []
+    assert whatsapp_events == []
+    assert x_events == []
+
+
 def test_x_crc_signature_and_dm_normalization():
     token = crc_response(consumer_secret="secret", crc_token="challenge")
     assert token.startswith("sha256=")

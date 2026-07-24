@@ -10,6 +10,10 @@ class ChannelType(StrEnum):
     MENTION = "mention"
 
 
+class CanonicalEventKind(StrEnum):
+    MESSAGE = "message"
+
+
 @dataclass(frozen=True)
 class CanonicalEvent:
     """平台 Adapter 输出的统一入站消息。"""
@@ -20,6 +24,7 @@ class CanonicalEvent:
     external_user_id: str
     conversation_key: str
     text: str | None
+    event_kind: CanonicalEventKind = CanonicalEventKind.MESSAGE
     occurred_at: datetime | None = None
     channel_type: ChannelType = ChannelType.DM
     event_namespace: str | None = None
@@ -31,6 +36,7 @@ class CanonicalEvent:
 
 def canonical_event_to_dict(event: CanonicalEvent) -> dict[str, Any]:
     value = asdict(event)
+    value["event_kind"] = event.event_kind.value
     value["channel_type"] = event.channel_type.value
     value["occurred_at"] = event.occurred_at.isoformat() if event.occurred_at else None
     return value
@@ -45,6 +51,7 @@ def canonical_event_from_dict(value: dict[str, Any]) -> CanonicalEvent:
         external_user_id=value["external_user_id"],
         conversation_key=value["conversation_key"],
         text=value.get("text"),
+        event_kind=CanonicalEventKind(value.get("event_kind", CanonicalEventKind.MESSAGE)),
         occurred_at=datetime.fromisoformat(occurred_at) if occurred_at else None,
         channel_type=ChannelType(value.get("channel_type", ChannelType.DM)),
         event_namespace=value.get("event_namespace"),

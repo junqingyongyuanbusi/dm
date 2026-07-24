@@ -473,6 +473,22 @@ async def test_direct_claim_completion_reaggregates_jobs_under_raw_lock(session)
     assert raw.processing_claim_token is None
 
 
+async def test_direct_ingest_rejects_non_message_canonical_events(session):
+    event = CanonicalEvent(
+        platform="telegram",
+        platform_account_key=str(uuid.uuid4()),
+        external_event_id="receipt-1",
+        external_user_id="user-1",
+        conversation_key="telegram:account:chat-1",
+        text=None,
+        event_kind="delivery_receipt",  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match="canonical_event_not_reply_eligible"):
+        await direct_ingestion.ingest_canonical_event(event)
+    assert (await session.execute(select(models.Message))).first() is None
+    assert (await session.execute(select(models.DecisionJob))).first() is None
+
+
 async def test_chatwoot_claimed_dispatch_reaches_terminal_status(session):
     raw_event_id = await _seed_raw(
         session,

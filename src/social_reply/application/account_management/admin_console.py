@@ -32,6 +32,9 @@ from social_reply.application.account_management.oauth.common import notice
 from social_reply.application.account_management.provisioning import tenant_public_id
 from social_reply.application.account_management.service import enable_xchat_for_account
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.application.message_delivery.contracts import (
+    build_direct_reply_destination,
+)
 from social_reply.application.reply_decision.persist import _idempotency_key
 from social_reply.domain.automation.state_machine import AutomationStateEnum, can_transition
 from social_reply.infrastructure.database import models
@@ -522,42 +525,23 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
                 raise HTTPException(status_code=409, detail="decision_message_scope_mismatch")
             reply_target = dict(msg.reply_target or {})
             occurred_at = msg.occurred_at
-        kind = reply_target.get("kind", "dm")
         visibility = decision.reply_visibility or "public"
-        # 目的地映射与 persist_decision 保持一致（DRY 的最小可行复制，含会话时限）
-        if account.platform == "telegram":
-            destination_type = "telegram_dm"
-        elif account.platform == "x":
-            destination_type = (
-                "x_post_reply"
-                if kind == "reply"
-                else "x_chat_message"
-                if kind == "x_chat"
-                else "x_dm"
+        try:
+            destination = build_direct_reply_destination(
+                platform=account.platform,
+                reply_target=reply_target,
+                visibility=visibility,
+                occurred_at=occurred_at,
+                now=datetime.now(UTC),
             )
-        elif account.platform == "whatsapp":
-            destination_type = "whatsapp_session_message"
-        elif account.platform in {"facebook", "instagram"}:
-            if visibility == "private" and kind == "comment":
-                destination_type = "meta_private_reply"
-                reply_target = {**reply_target, "kind": "private_reply"}
-            elif kind == "comment":
-                destination_type = "meta_public_comment"
-            else:
-                destination_type = (
-                    "meta_messenger_dm" if account.platform == "facebook" else "meta_instagram_dm"
-                )
-        else:
-            raise HTTPException(status_code=409, detail="unsupported_platform_for_approve")
-        valid_until = None
-        if destination_type in {
-            "meta_messenger_dm",
-            "meta_instagram_dm",
-            "whatsapp_session_message",
-        }:
-            valid_until = (occurred_at or datetime.now(UTC)) + timedelta(hours=24)
-        elif destination_type == "meta_private_reply":
-            valid_until = datetime.now(UTC) + timedelta(days=7)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="unsupported_platform_for_approve",
+            ) from exc
+        destination_type = destination.destination_type
+        reply_target = destination.target
+        valid_until = destination.valid_until
         outbox_id = (
             await session.execute(
                 pg_insert(models.OutboxMessage)

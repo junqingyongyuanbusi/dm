@@ -44,6 +44,10 @@ def test_incoming_public_is_inbound_user():
     assert classify(parse_message_created(_payload())) is EventClass.INBOUND_USER
 
 
+def test_incoming_without_text_is_not_reply_eligible():
+    assert classify(parse_message_created(_payload(content=None))) is EventClass.IGNORE
+
+
 def test_agent_outgoing_public_flips_human():
     # PLAN.md §六：outgoing 且 sender.type=user 且非 private → 人工接管
     p = _payload(message_type="outgoing", sender={"id": 3, "type": "user"})

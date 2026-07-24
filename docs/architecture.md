@@ -71,6 +71,7 @@ Telegram / Meta / WhatsApp / X webhook
   -> CanonicalEvent serialized to Dramatiq
   -> Worker ingest_canonical_event
   -> NormalizedEvent dedupe
+  -> text-only CanonicalEvent(kind=message)
   -> Contact / Conversation / inbound Message / AutomationState
   -> DecisionJob(PENDING) in the same transaction
   -> Worker claims DecisionJob(PROCESSING)
@@ -158,6 +159,11 @@ durable job boundary rather than directly mutating account rows.
 - Public sending rechecks takeover state immediately before network I/O.
 - Direct sending rechecks tenant, account status, route/platform compatibility, capability, text
   limit and delivery window.
+- Direct text commands bind destination and target kind to the source ReplyDecision/Message target
+  and Conversation contact before sender resolution; malformed or wrong-recipient rows never call a
+  connector.
+- Telegram/Meta/WhatsApp/X adapters only emit supported text-message CanonicalEvents. Unsupported
+  media, receipts and reactions remain RawEvent evidence and do not enter reply decisions.
 - Ambiguous post-send transport failures do not blindly retry.
 - Account sender caches are keyed by `(platform, account_id, config_version)`.
 - Scheduler recovery is idempotent and each sweep is exception-isolated.

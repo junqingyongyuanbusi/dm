@@ -34,9 +34,11 @@ class MetaWebhookAdapter:
                 sender_id = str((messaging.get("sender") or {}).get("id", ""))
                 recipient_id = str((messaging.get("recipient") or {}).get("id", ""))
                 event_id = message.get("mid")
+                text = message.get("text")
                 if (
                     not sender_id
                     or not event_id
+                    or not isinstance(text, str)
                     or message.get("is_echo")
                     or sender_id == self._external_account_id
                     or (self._external_account_id and recipient_id != self._external_account_id)
@@ -49,7 +51,7 @@ class MetaWebhookAdapter:
                         external_event_id=str(event_id),
                         external_user_id=sender_id,
                         conversation_key=f"{platform}_dm:{account_key}:{sender_id}",
-                        text=message.get("text"),
+                        text=text,
                         occurred_at=(
                             datetime.fromtimestamp(messaging["timestamp"] / 1000, tz=UTC)
                             if messaging.get("timestamp")
@@ -72,10 +74,12 @@ class MetaWebhookAdapter:
                     or ""
                 )
                 verb = value.get("verb") or value.get("action")
+                text = value.get("message") or value.get("text")
                 if (
                     not comment_id
                     or not sender_id
                     or sender_id == self._external_account_id
+                    or not isinstance(text, str)
                     or value.get("is_hidden")
                     or verb in {"remove", "delete", "deleted"}
                 ):
@@ -98,7 +102,7 @@ class MetaWebhookAdapter:
                             f"{platform}_comment:{account_key}:{post_id}:"
                             f"{root_comment_id}:{sender_id}"
                         ),
-                        text=value.get("message") or value.get("text"),
+                        text=text,
                         channel_type=ChannelType.COMMENT,
                         reply_target={"kind": "comment", "comment_id": str(comment_id)},
                         raw_payload=change,

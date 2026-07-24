@@ -1,7 +1,7 @@
 import uuid
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from social_reply.application.message_delivery import outbox as outbox_module
 from social_reply.application.message_delivery import sweep as sweep_module
@@ -242,6 +242,34 @@ async def test_no_mapping_marks_needs_review(session):
     assert ob.status == "NEEDS_REVIEW" and ob.last_error_code == "NO_MAPPING"
 
 
+async def test_blank_chatwoot_text_fails_before_network(session, monkeypatch):
+    from social_reply.connectors.chatwoot import client as cw
+
+    _conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == ob_id)
+        .values(payload={"text": "   ", "visibility": "public"})
+    )
+    await session.commit()
+
+    async def unexpected_send(**_kwargs):
+        raise AssertionError("blank text must not reach Chatwoot")
+
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", unexpected_send)
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.attempt_count == 0
+    assert outbox.last_error_code == "DELIVERY_TEXT_INVALID"
+    assert (
+        await session.scalar(
+            select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == ob_id)
+        )
+        is None
+    )
+
+
 async def test_ambiguous_timeout_marks_needs_review_no_retry(session, monkeypatch):
     import httpx
 
@@ -417,8 +445,10 @@ async def _seed_direct_platform(
     destination_type: str,
     capability: dict,
     target: dict,
+    external_account_id: str | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID]:
-    account_id, contact_id, conv_id, ob_id = (
+    account_id, contact_id, conv_id, message_id, ob_id = (
+        uuid.uuid4(),
         uuid.uuid4(),
         uuid.uuid4(),
         uuid.uuid4(),
@@ -431,6 +461,7 @@ async def _seed_direct_platform(
             brand_id="b1",
             platform=platform,
             name="direct",
+            external_account_id=external_account_id,
             status="active",
             capability=capability,
         )
@@ -457,6 +488,16 @@ async def _seed_direct_platform(
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
     await session.execute(
+        insert(models.Message).values(
+            id=message_id,
+            conversation_id=conv_id,
+            direction="inbound",
+            sender_type="contact",
+            text="inbound",
+            reply_target=target,
+        )
+    )
+    await session.execute(
         insert(models.OutboxMessage).values(
             id=ob_id,
             tenant_id="default",
@@ -468,6 +509,17 @@ async def _seed_direct_platform(
             payload={"text": "hi", "target": target},
             idempotency_key=str(ob_id),
             status="PENDING",
+        )
+    )
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            tenant_id="default",
+            conversation_id=conv_id,
+            message_id=message_id,
+            action="auto_reply",
+            reply_text="hi",
+            source="rule",
+            outbox_id=ob_id,
         )
     )
     await session.commit()
@@ -482,7 +534,13 @@ async def _seed_direct_x(
     target=None,
 ):
     """直连 X outbox（BOT_ACTIVE），用于验证发送侧错误分类和功能开关。"""
-    account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    account_id, contact_id, conv_id, message_id = (
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+    reply_target = target or {"kind": "dm", "participant_id": "u1"}
     await session.execute(
         insert(models.PlatformAccount).values(
             id=account_id,
@@ -509,6 +567,16 @@ async def _seed_direct_x(
         )
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
+    await session.execute(
+        insert(models.Message).values(
+            id=message_id,
+            conversation_id=conv_id,
+            direction="inbound",
+            sender_type="contact",
+            text="inbound",
+            reply_target=reply_target,
+        )
+    )
     ob_id = uuid.uuid4()
     await session.execute(
         insert(models.OutboxMessage).values(
@@ -520,10 +588,20 @@ async def _seed_direct_x(
             message_type="text",
             payload={
                 "text": "hi",
-                "target": target or {"kind": "dm", "participant_id": "u1"},
+                "target": reply_target,
             },
             idempotency_key=str(ob_id),
             status="PENDING",
+        )
+    )
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            conversation_id=conv_id,
+            message_id=message_id,
+            action="auto_reply",
+            reply_text="hi",
+            source="rule",
+            outbox_id=ob_id,
         )
     )
     await session.commit()
@@ -551,6 +629,141 @@ async def test_direct_delivery_fails_closed_for_invalid_account_contract(
     session.expire_all()
     outbox = await session.get(models.OutboxMessage, ob_id)
     assert outbox.last_error_code == error_code
+
+
+@pytest.mark.parametrize(
+    ("platform", "destination_type", "capability", "target", "external_account_id"),
+    [
+        (
+            "facebook",
+            "meta_messenger_dm",
+            {"dm": True, "comments": True, "max_text_length": 2000},
+            {"kind": "comment", "comment_id": "comment-1"},
+            "page-1",
+        ),
+        (
+            "facebook",
+            "meta_public_comment",
+            {"dm": True, "comments": True, "max_text_length": 2000},
+            {"kind": "dm", "recipient_id": "user-1"},
+            "page-1",
+        ),
+        (
+            "x",
+            "x_dm",
+            {"dm": True, "x_chat": True, "mentions": True, "max_text_length": 280},
+            {"kind": "reply", "in_reply_to_post_id": "post-1"},
+            "x-1",
+        ),
+        (
+            "x",
+            "x_post_reply",
+            {"dm": True, "x_chat": True, "mentions": True, "max_text_length": 280},
+            {"kind": "dm", "participant_id": "user-1"},
+            "x-1",
+        ),
+        (
+            "whatsapp",
+            "whatsapp_session_message",
+            {
+                "dm": True,
+                "session_messages": True,
+                "templates": False,
+                "max_text_length": 4096,
+            },
+            {
+                "kind": "session_message",
+                "phone_number_id": "phone-2",
+                "to": "15551234567",
+            },
+            "phone-1",
+        ),
+    ],
+)
+async def test_mismatched_direct_target_fails_before_sender_resolution(
+    session,
+    monkeypatch,
+    platform,
+    destination_type,
+    capability,
+    target,
+    external_account_id,
+):
+    _account_id, ob_id = await _seed_direct_platform(
+        session,
+        platform=platform,
+        destination_type=destination_type,
+        capability=capability,
+        target=target,
+        external_account_id=external_account_id,
+    )
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("invalid command must not resolve a sender")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.attempt_count == 0
+    assert outbox.last_error_code == "DELIVERY_TARGET_INVALID"
+    assert (
+        await session.scalar(
+            select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == ob_id)
+        )
+        is None
+    )
+
+
+async def test_valid_shape_wrong_recipient_fails_before_sender_resolution(session, monkeypatch):
+    _account_id, ob_id = await _seed_direct_x(session)
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == ob_id)
+        .values(
+            payload={
+                "text": "hi",
+                "target": {"kind": "dm", "participant_id": "user-2"},
+            }
+        )
+    )
+    await session.commit()
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("wrong recipient must not resolve a sender")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.attempt_count == 0
+    assert outbox.last_error_code == "DELIVERY_TARGET_INVALID"
+
+
+async def test_missing_direct_text_fails_as_contract_error(session, monkeypatch):
+    _account_id, ob_id = await _seed_direct_platform(
+        session,
+        platform="telegram",
+        destination_type="telegram_dm",
+        capability={"dm": True, "max_text_length": 4096},
+        target={"chat_id": 42},
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == ob_id)
+        .values(payload={"target": {"chat_id": 42}})
+    )
+    await session.commit()
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("invalid command must not resolve a sender")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.attempt_count == 0
+    assert outbox.last_error_code == "DELIVERY_TEXT_INVALID"
 
 
 @pytest.mark.parametrize(

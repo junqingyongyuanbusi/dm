@@ -1,7 +1,7 @@
 import uuid
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from social_reply.application.reply_decision import persist as persist_module
 from social_reply.application.reply_decision.persist import (
@@ -99,6 +99,41 @@ async def test_auto_reply_writes_decision_and_outbox(session):
     assert ob.status == "PENDING" and ob.payload["text"] == "您好"
     assert ob.message_type == "text"
     assert ob.destination_type == "chatwoot_conversation"
+
+
+async def test_private_x_post_reply_is_rejected_before_outbox_creation(session):
+    account_id, conv_id, msg_id = await _seed(
+        session,
+        config={"delivery_mode": "direct"},
+        reply_target={"kind": "reply", "in_reply_to_post_id": "post-1"},
+    )
+    await session.execute(
+        update(models.PlatformAccount)
+        .where(models.PlatformAccount.id == account_id)
+        .values(platform="x")
+    )
+    await session.commit()
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="private detail",
+        reply_visibility=Visibility.PRIVATE,
+    )
+
+    with pytest.raises(
+        DecisionDeliveryConfigurationError,
+        match="x_post_reply_requires_public_visibility",
+    ):
+        await persist_decision(
+            session,
+            _snap(conv_id, account_id),
+            conv_id,
+            msg_id,
+            account_id,
+            decision,
+            "v0",
+        )
+    await session.rollback()
+    assert (await session.execute(select(models.OutboxMessage))).first() is None
 
 
 async def test_disabled_chatwoot_writes_decision_without_outbox(session, monkeypatch):

@@ -58,6 +58,21 @@ Paused provisioning jobs and Outbox rows resume automatically without consuming 
 attempt. Signed webhooks received while disabled retain only tenant/app ownership, the event family,
 and a SHA-256 body digest, not the original message payload.
 
+## Event and send contracts
+
+`CanonicalEvent` now persists an additive `event_kind=message` field. New readers default historical
+serialized events without the field to `message`; old readers ignore the additional key. Current
+Telegram, Meta, WhatsApp, X and Chatwoot normalization is text-message-only, so unsupported media,
+receipts and reactions remain in RawEvent evidence without creating DecisionJobs.
+
+Direct Outbox delivery now validates nonblank text and binds the destination target to the source
+`ReplyDecision.message_id`, `Message.reply_target`, Conversation contact and account identity before
+sender resolution. Existing valid rows require no migration. Historical rows with missing source
+links, malformed targets, wrong recipients, or private X post replies move to operator-visible
+`NEEDS_REVIEW` without consuming a network attempt; the application does not infer recipients from
+arbitrary strings. Telegram retains only its prior empty-target fallback from the persisted
+conversation destination.
+
 ## Polling RawEvent journal
 
 Revision `d6b8f0a2c431` adds tenant/account/stream/conversation/occurrence metadata to `raw_events` and preserves Legacy X DM plus XChat polling occurrences before normalization or decryption side effects. It also persists external conversation and event metadata on `normalized_events`.

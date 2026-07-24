@@ -23,7 +23,8 @@ class TelegramWebhookAdapter:
         chat_id = chat.get("id")
         message_id = message.get("message_id")
         user_id = sender.get("id")
-        if chat_id is None or message_id is None or user_id is None:
+        text = message.get("text") or message.get("caption")
+        if chat_id is None or message_id is None or user_id is None or not isinstance(text, str):
             return []
         occurred_at = None
         if message.get("date") is not None:
@@ -35,7 +36,7 @@ class TelegramWebhookAdapter:
                 external_event_id=str(update_id),
                 external_user_id=str(user_id),
                 conversation_key=f"telegram:{self._account_id}:{chat_id}",
-                text=message.get("text") or message.get("caption"),
+                text=text,
                 occurred_at=occurred_at,
                 external_conversation_id=str(chat_id),
                 reply_target={"chat_id": chat_id},
