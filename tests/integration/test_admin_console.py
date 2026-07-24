@@ -401,7 +401,8 @@ async def test_stalled_provisioning_retry_renders_as_failed(session, migrated_db
 
 async def test_conversation_state_flip_takeover(session, migrated_db):
     # 构造一个 BOT_ACTIVE 会话，验证人工接管把状态翻到 HUMAN_ACTIVE
-    account_id, contact_id, conv_id = (
+    account_id, contact_id, conv_id, outbox_id = (
+        __import__("uuid").uuid4(),
         __import__("uuid").uuid4(),
         __import__("uuid").uuid4(),
         __import__("uuid").uuid4(),
@@ -439,6 +440,19 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
         )
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=outbox_id,
+            conversation_id=conv_id,
+            platform_account_id=account_id,
+            destination_type="telegram_message",
+            destination_id="telegram:x:u1",
+            message_type="text",
+            payload={"text": "pending"},
+            idempotency_key=str(outbox_id),
+            status="PENDING",
+        )
+    )
     await session.commit()
 
     async with _app_client() as client:
@@ -460,6 +474,20 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
         )
     ).scalar_one()
     assert state == "HUMAN_ACTIVE"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    audit = (
+        await session.execute(
+            select(models.AuditLog).where(
+                models.AuditLog.category == "state_transition",
+                models.AuditLog.subject_id == str(conv_id),
+            )
+        )
+    ).scalar_one()
+    assert outbox.status == "CANCELLED"
+    assert outbox.last_error_code == "TAKEOVER"
+    assert audit.action == "HUMAN_ACTIVE"
+    assert audit.detail == {"reason": "admin_manual"}
 
 
 async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkeypatch):

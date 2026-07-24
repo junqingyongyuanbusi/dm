@@ -37,7 +37,11 @@ from social_reply.application.message_delivery.contracts import (
     build_direct_reply_destination,
 )
 from social_reply.application.reply_decision.persist import _idempotency_key
-from social_reply.domain.automation.state_machine import AutomationStateEnum, can_transition
+from social_reply.domain.automation.state_machine import (
+    AutomationStateEnum,
+    can_transition,
+    flip_to_human_active,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -606,18 +610,27 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
         if conv is None or conv.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         # CAS：仅当仍处于提交时看到的状态才翻转（防并发接管竞态）
-        await session.execute(
-            update(models.AutomationState)
-            .where(
-                models.AutomationState.conversation_id == conversation_id,
-                models.AutomationState.state == expect,
+        if target == AutomationStateEnum.HUMAN_ACTIVE:
+            await flip_to_human_active(
+                session,
+                conversation_id,
+                principal.actor,
+                "admin_manual",
+                expected_state=AutomationStateEnum(expect),
             )
-            .values(
-                state=target,
-                state_version=models.AutomationState.state_version + 1,
-                state_changed_reason="admin_manual",
+        else:
+            await session.execute(
+                update(models.AutomationState)
+                .where(
+                    models.AutomationState.conversation_id == conversation_id,
+                    models.AutomationState.state == expect,
+                )
+                .values(
+                    state=target,
+                    state_version=models.AutomationState.state_version + 1,
+                    state_changed_reason="admin_manual",
+                )
             )
-        )
         await session.commit()
     return RedirectResponse(
         f"/admin/conversations/{conversation_id}", status_code=status.HTTP_303_SEE_OTHER

@@ -56,17 +56,23 @@ _SWEEPS = _build_sweeps(get_settings())
 logger = logging.getLogger(__name__)
 
 
+def _run_sweep_cycle(
+    sweeps: tuple[tuple[str, Callable[[], Awaitable[list]]], ...] = _SWEEPS,
+) -> None:
+    for name, sweep in sweeps:
+        try:
+            recovered = run_on_actor_loop(sweep())
+            if recovered:
+                logger.info("%s: recovered %d items", name, len(recovered))
+        except Exception:  # noqa: BLE001 - recovery tasks must remain isolated
+            logger.exception("%s failed; retrying in %ds", name, _INTERVAL_SECONDS)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     get_settings()  # Fail startup if encryption or production safety settings are invalid.
     while True:
-        for name, sweep in _SWEEPS:
-            try:
-                recovered = run_on_actor_loop(sweep())
-                if recovered:
-                    logger.info("%s: recovered %d items", name, len(recovered))
-            except Exception:  # noqa: BLE001 - recovery tasks must remain isolated
-                logger.exception("%s failed; retrying in %ds", name, _INTERVAL_SECONDS)
+        _run_sweep_cycle()
         time.sleep(_INTERVAL_SECONDS)
 
 

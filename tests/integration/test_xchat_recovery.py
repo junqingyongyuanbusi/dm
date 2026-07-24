@@ -178,6 +178,41 @@ async def test_expired_xchat_worker_claim_is_recovered(session, migrated_db):
     assert raw.processing_error_code == "XCHAT_WORKER_LEASE_EXPIRED"
 
 
+async def test_expired_eighth_xchat_claim_exhausts_recovery(session, migrated_db):
+    from datetime import UTC, datetime, timedelta
+
+    account_id = uuid.uuid4()
+    raw_event_id = uuid.uuid4()
+    await _insert_x_account(session, account_id=account_id, external_id="bot-1")
+    await session.execute(
+        insert(models.RawEvent).values(
+            id=raw_event_id,
+            tenant_id="default",
+            platform_account_id=account_id,
+            source="x",
+            ingress_kind="webhook",
+            event_namespace="x.activity.chat_received",
+            payload={"data": {"event_type": "chat.received"}},
+            headers={},
+            context={},
+            processing_status="XCHAT_PROCESSING",
+            processing_claim_token=uuid.uuid4(),
+            processing_claim_expires_at=datetime.now(UTC) - timedelta(minutes=1),
+            processing_attempt_count=xchat_recovery._MAX_RETRY_ATTEMPTS,
+        )
+    )
+    await session.commit()
+
+    assert await xchat_recovery._recover_expired_claims() == [str(raw_event_id)]
+
+    session.expire_all()
+    raw = await session.get(models.RawEvent, raw_event_id)
+    assert raw.processing_status == "XCHAT_RETRY_EXHAUSTED"
+    assert raw.processing_error_code == "XCHAT_WORKER_LEASE_EXPIRED"
+    assert raw.processing_next_attempt_at is None
+    assert raw.processed_at is not None
+
+
 async def test_replay_dispatch_failure_keeps_event_recoverable(
     session,
     migrated_db,

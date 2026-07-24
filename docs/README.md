@@ -10,6 +10,8 @@
   provisioning trust boundaries.
 - [Production migration notes](production-migration.md): database, encrypted-secret and staged
   rollout requirements.
+- [Reliability fault drills](reliability-drills.md): repeatable queue-loss, crash, lease, takeover,
+  retry-exhaustion and recovery validation.
 - [VPS operations](../deploy/vps/README.md): deployment, backup, upgrade and rollback runbook.
 
 When documents disagree, executable code and Alembic migrations define behavior. Update the current

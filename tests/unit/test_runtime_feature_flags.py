@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 import sys
@@ -190,6 +191,23 @@ async def test_xchat_poll_requires_strict_capability(monkeypatch):
     xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []
+
+
+def test_scheduler_cycle_isolates_sweep_failures(monkeypatch):
+    calls: list[str] = []
+
+    async def broken():
+        calls.append("broken")
+        raise RuntimeError("boom")
+
+    async def healthy():
+        calls.append("healthy")
+        return ["recovered"]
+
+    monkeypatch.setattr(scheduler, "run_on_actor_loop", asyncio.run)
+    scheduler._run_sweep_cycle((("broken", broken), ("healthy", healthy)))
+
+    assert calls == ["broken", "healthy"]
 
 
 def test_scheduler_sweeps_follow_feature_flags():

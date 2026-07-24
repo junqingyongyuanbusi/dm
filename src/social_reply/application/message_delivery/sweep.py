@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -7,6 +8,8 @@ from social_reply.domain.platform_accounts import CapabilityKey
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 # SENDING 滞留阈值：超过视为 worker 崩溃/丢失，转人工（不自动重发，防歧义重复）
 _STALE_SENDING = timedelta(minutes=10)
@@ -119,6 +122,12 @@ async def sweep_outbox() -> list[uuid.UUID]:
     # 延迟导入：避免模块加载时初始化 broker
     from social_reply.application.message_delivery.actors import deliver_outbox_message
 
+    dispatched: list[uuid.UUID] = []
     for oid in enqueued:
-        deliver_outbox_message.send(str(oid))
-    return enqueued
+        try:
+            deliver_outbox_message.send(str(oid))
+        except Exception:  # noqa: BLE001 - the durable row remains eligible for recovery
+            logger.exception("outbox dispatch failed outbox_id=%s", oid)
+        else:
+            dispatched.append(oid)
+    return dispatched

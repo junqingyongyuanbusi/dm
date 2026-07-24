@@ -1,9 +1,11 @@
+import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 
 import httpx
-from sqlalchemy import insert, select, update
+from sqlalchemy import and_, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,12 +30,36 @@ from social_reply.domain.platform_accounts import (
     normalize_account_capability,
 )
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.advisory_locks import (
+    hold_conversation_delivery_lock,
+)
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 5
+_CANCELLED_SEND_DRAIN_SECONDS = 30
+
+
+async def _await_send[T](awaitable: Awaitable[T]) -> T:
+    task = asyncio.create_task(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        logger.warning("delivery actor cancelled with provider send in flight; draining")
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=_CANCELLED_SEND_DRAIN_SECONDS,
+            )
+        except TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+            raise
 
 
 def _safe_error(exc: Exception) -> str:
@@ -304,111 +330,116 @@ async def _validate_direct_send(
     return None, account, command
 
 
-async def deliver_outbox(outbox_id: str) -> str:
-    """Claim, validate, send without a DB transaction, then durably record the outcome."""
-    oid = uuid.UUID(outbox_id)
-    async with get_session_factory()() as session:
-        claimed = (
-            await session.execute(
-                update(models.OutboxMessage)
-                .where(
-                    models.OutboxMessage.id == oid,
-                    models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
-                )
-                .values(status="SENDING", locked_at=datetime.now(UTC), locked_by="deliver")
-                .returning(models.OutboxMessage.id)
-            )
-        ).first()
-        if claimed is None:
-            await session.commit()
-            return "SKIPPED_NOT_CLAIMABLE"
-        row = (
-            await session.execute(
-                select(models.OutboxMessage).where(models.OutboxMessage.id == oid)
-            )
-        ).scalar_one()
-        attempt_no = row.attempt_count + 1
-        if not isinstance(row.payload, dict):
-            return await _stop_before_send(
-                session,
-                oid,
-                "NEEDS_REVIEW",
-                "DELIVERY_PAYLOAD_INVALID",
-                attempt_no,
-                count_attempt=False,
-            )
-        payload = dict(row.payload)
-        if not isinstance(payload.get("text"), str) or not payload["text"].strip():
-            return await _stop_before_send(
-                session,
-                oid,
-                "NEEDS_REVIEW",
-                "DELIVERY_TEXT_INVALID",
-                attempt_no,
-                count_attempt=False,
-            )
-        is_direct = row.destination_type != "chatwoot_conversation"
-        is_public = row.message_type != "private_note"
-
-        if is_direct and not is_public:
-            return await _stop_before_send(
-                session, oid, "CANCELLED", "DIRECT_DRAFT_BLOCKED", attempt_no
-            )
-        settings = get_settings()
-        if not is_direct and not settings.chatwoot_enabled:
-            return await _stop_before_send(
-                session, oid, "NEEDS_REVIEW", "CHATWOOT_DISABLED", attempt_no
-            )
-        if row.destination_type == "x_dm" and not settings.x_legacy_dm_enabled:
-            return await _stop_before_send(
-                session,
-                oid,
-                "NEEDS_REVIEW",
-                "X_LEGACY_DM_DISABLED",
-                attempt_no,
-                count_attempt=False,
-            )
-        if row.destination_type == "x_chat_message" and not settings.xchat_enabled:
-            return await _stop_before_send(
-                session,
-                oid,
-                "NEEDS_REVIEW",
-                "XCHAT_DISABLED",
-                attempt_no,
-                count_attempt=False,
-            )
-        state = (
-            await session.execute(
-                select(models.AutomationState.state).where(
-                    models.AutomationState.conversation_id == row.conversation_id
-                )
-            )
-        ).scalar_one_or_none()
-        admin_approved_draft = payload.get("approval") == "admin" and state == "BOT_DRAFT_ONLY"
-        if is_public and state != "BOT_ACTIVE" and not admin_approved_draft:
-            return await _stop_before_send(
-                session, oid, "CANCELLED", "TAKEOVER_AT_SEND", attempt_no
-            )
-        direct_command: TextSendCommand | None = None
-        if is_direct:
-            stopped, _account, direct_command = await _validate_direct_send(
-                session,
-                row,
-                payload,
-                attempt_no,
-            )
-            if stopped is not None:
-                return stopped
-        target = None if is_direct else await _resolve_target(session, row.conversation_id)
+async def _deliver_outbox_locked(
+    session: AsyncSession,
+    oid: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> str:
+    claimed = (
         await session.execute(
             update(models.OutboxMessage)
-            .where(models.OutboxMessage.id == oid)
-            .values(attempt_count=attempt_no)
+            .where(
+                models.OutboxMessage.id == oid,
+                models.OutboxMessage.conversation_id == conversation_id,
+                or_(
+                    models.OutboxMessage.status == "PENDING",
+                    and_(
+                        models.OutboxMessage.status == "FAILED",
+                        models.OutboxMessage.next_attempt_at <= datetime.now(UTC),
+                    ),
+                ),
+            )
+            .values(status="SENDING", locked_at=datetime.now(UTC), locked_by="deliver")
+            .returning(models.OutboxMessage.id)
         )
+    ).first()
+    if claimed is None:
         await session.commit()
+        return "SKIPPED_NOT_CLAIMABLE"
+    row = (
+        await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == oid))
+    ).scalar_one()
+    attempt_no = row.attempt_count + 1
+    if not isinstance(row.payload, dict):
+        return await _stop_before_send(
+            session,
+            oid,
+            "NEEDS_REVIEW",
+            "DELIVERY_PAYLOAD_INVALID",
+            attempt_no,
+            count_attempt=False,
+        )
+    payload = dict(row.payload)
+    if not isinstance(payload.get("text"), str) or not payload["text"].strip():
+        return await _stop_before_send(
+            session,
+            oid,
+            "NEEDS_REVIEW",
+            "DELIVERY_TEXT_INVALID",
+            attempt_no,
+            count_attempt=False,
+        )
+    is_direct = row.destination_type != "chatwoot_conversation"
+    is_public = row.message_type != "private_note"
+
+    if is_direct and not is_public:
+        return await _stop_before_send(
+            session, oid, "CANCELLED", "DIRECT_DRAFT_BLOCKED", attempt_no
+        )
+    settings = get_settings()
+    if not is_direct and not settings.chatwoot_enabled:
+        return await _stop_before_send(
+            session, oid, "NEEDS_REVIEW", "CHATWOOT_DISABLED", attempt_no
+        )
+    if row.destination_type == "x_dm" and not settings.x_legacy_dm_enabled:
+        return await _stop_before_send(
+            session,
+            oid,
+            "NEEDS_REVIEW",
+            "X_LEGACY_DM_DISABLED",
+            attempt_no,
+            count_attempt=False,
+        )
+    if row.destination_type == "x_chat_message" and not settings.xchat_enabled:
+        return await _stop_before_send(
+            session,
+            oid,
+            "NEEDS_REVIEW",
+            "XCHAT_DISABLED",
+            attempt_no,
+            count_attempt=False,
+        )
+    state = (
+        await session.execute(
+            select(models.AutomationState.state).where(
+                models.AutomationState.conversation_id == row.conversation_id
+            )
+        )
+    ).scalar_one_or_none()
+    admin_approved_draft = payload.get("approval") == "admin" and state == "BOT_DRAFT_ONLY"
+    if is_public and state != "BOT_ACTIVE" and not admin_approved_draft:
+        return await _stop_before_send(session, oid, "CANCELLED", "TAKEOVER_AT_SEND", attempt_no)
+    direct_command: TextSendCommand | None = None
+    if is_direct:
+        stopped, _account, direct_command = await _validate_direct_send(
+            session,
+            row,
+            payload,
+            attempt_no,
+        )
+        if stopped is not None:
+            return stopped
+    target = None if is_direct else await _resolve_target(session, row.conversation_id)
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == oid)
+        .values(attempt_count=attempt_no)
+    )
+    await session.commit()
 
     if not is_direct and target is None:
-        return await _finalize(
+        return await _record_outcome(
+            session,
             oid,
             "NEEDS_REVIEW",
             attempt_no=attempt_no,
@@ -418,7 +449,8 @@ async def deliver_outbox(outbox_id: str) -> str:
 
     async def fail_retryable(exc: Exception) -> str:
         if attempt_no >= _MAX_ATTEMPTS:
-            return await _finalize(
+            return await _record_outcome(
+                session,
                 oid,
                 "NEEDS_REVIEW",
                 attempt_no=attempt_no,
@@ -426,7 +458,8 @@ async def deliver_outbox(outbox_id: str) -> str:
                 error_message=_safe_error(exc),
             )
         next_at = datetime.now(UTC) + timedelta(seconds=min(30 * 2**attempt_no, 3600))
-        return await _finalize(
+        return await _record_outcome(
+            session,
             oid,
             "FAILED",
             attempt_no=attempt_no,
@@ -436,7 +469,8 @@ async def deliver_outbox(outbox_id: str) -> str:
         )
 
     async def ambiguous(exc: Exception) -> str:
-        return await _finalize(
+        return await _record_outcome(
+            session,
             oid,
             "NEEDS_REVIEW",
             attempt_no=attempt_no,
@@ -447,7 +481,8 @@ async def deliver_outbox(outbox_id: str) -> str:
     async def fail_permanent(exc: PlatformSendError) -> str:
         # 平台确定性拒绝(对方不收 DM、超出消息窗口、token 失效):消息未送达且重试无意义,
         # 直接标 NEEDS_REVIEW 并把平台错误码透传给运营,不进退避重试队列。
-        return await _finalize(
+        return await _record_outcome(
+            session,
             oid,
             "NEEDS_REVIEW",
             attempt_no=attempt_no,
@@ -465,19 +500,23 @@ async def deliver_outbox(outbox_id: str) -> str:
     try:
         if is_direct:
             assert direct_command is not None and sender is not None
-            platform_message_id = await sender.send_text(
-                target=direct_command.target,
-                text=direct_command.text,
+            platform_message_id = await _await_send(
+                sender.send_text(
+                    target=direct_command.target,
+                    text=direct_command.text,
+                )
             )
             chatwoot_message_id = None
         else:
             assert target is not None
             account_id, chatwoot_conv_id = target
-            chatwoot_message_id = await get_chatwoot_client().create_message(
-                account_id=account_id,
-                conversation_id=chatwoot_conv_id,
-                content=payload["text"],
-                private=(row.message_type == "private_note"),
+            chatwoot_message_id = await _await_send(
+                get_chatwoot_client().create_message(
+                    account_id=account_id,
+                    conversation_id=chatwoot_conv_id,
+                    content=payload["text"],
+                    private=(row.message_type == "private_note"),
+                )
             )
             platform_message_id = None
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -495,10 +534,26 @@ async def deliver_outbox(outbox_id: str) -> str:
     except Exception as exc:  # noqa: BLE001 - unknown post-dispatch failures are ambiguous
         return await ambiguous(exc)
 
-    return await _finalize(
+    return await _record_outcome(
+        session,
         oid,
         "SENT",
         attempt_no=attempt_no,
         chatwoot_message_id=chatwoot_message_id,
         platform_message_id=platform_message_id,
     )
+
+
+async def deliver_outbox(outbox_id: str) -> str:
+    """Serialize takeover with one durable send attempt for the conversation."""
+    oid = uuid.UUID(outbox_id)
+    async with get_session_factory()() as lookup_session:
+        conversation_id = await lookup_session.scalar(
+            select(models.OutboxMessage.conversation_id).where(models.OutboxMessage.id == oid)
+        )
+    if conversation_id is None:
+        return "SKIPPED_NOT_CLAIMABLE"
+
+    async with hold_conversation_delivery_lock(conversation_id) as connection:
+        async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+            return await _deliver_outbox_locked(session, oid, conversation_id)

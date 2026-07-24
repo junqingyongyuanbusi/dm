@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -25,6 +26,7 @@ async def _seed_job(
     next_attempt_at=None,
     locked_at=None,
     chatwoot_inbox_id: int | None = None,
+    attempt_count: int = 0,
 ):
     account_id, contact_id, conversation_id, message_id, raw_event_id = (
         uuid.uuid4(),
@@ -101,6 +103,7 @@ async def _seed_job(
             account_id=account_id,
             snapshot=snapshot_to_dict(snapshot),
             status=status,
+            attempt_count=attempt_count,
             next_attempt_at=next_attempt_at,
             locked_at=locked_at,
         )
@@ -203,3 +206,95 @@ async def test_sweep_enqueues_pending_due_failed_and_recovers_stale(session):
     ).scalar_one()
     assert recovered.status == "FAILED"
     assert recovered.last_error == "stale PROCESSING recovered by sweep"
+
+
+async def test_decision_retry_exhaustion_transitions_to_needs_review(session, monkeypatch):
+    job_id = await _seed_job(session, attempt_count=decision_jobs._MAX_ATTEMPTS - 1)
+
+    async def fail_decision(*_args, **_kwargs):
+        raise RuntimeError("persistent decision failure")
+
+    monkeypatch.setattr(decision_jobs, "run_and_persist_decision", fail_decision)
+
+    assert await process_decision_job(str(job_id)) is False
+    session.expire_all()
+    job = await session.get(models.DecisionJob, job_id)
+    raw = await session.get(models.RawEvent, job.raw_event_id)
+    assert job.attempt_count == decision_jobs._MAX_ATTEMPTS
+    assert job.status == "NEEDS_REVIEW"
+    assert job.next_attempt_at is None
+    assert job.locked_at is None
+    assert job.last_error.startswith("RETRY_EXHAUSTED: RuntimeError")
+    assert raw.processing_status == "DECISION_NEEDS_REVIEW"
+
+
+async def test_stale_eighth_decision_worker_cannot_revert_terminal_raw_event(
+    session,
+    monkeypatch,
+):
+    job_id = await _seed_job(session, attempt_count=decision_jobs._MAX_ATTEMPTS - 1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_decision(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(decision_jobs, "run_and_persist_decision", blocked_decision)
+    worker = asyncio.create_task(process_decision_job(str(job_id)))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await session.execute(
+        models.DecisionJob.__table__.update()
+        .where(models.DecisionJob.id == job_id)
+        .values(locked_at=datetime.now(UTC) - timedelta(minutes=6))
+    )
+    await session.commit()
+
+    assert job_id not in await sweep_decision_jobs()
+    release.set()
+    assert await worker is False
+
+    session.expire_all()
+    job = await session.get(models.DecisionJob, job_id)
+    raw = await session.get(models.RawEvent, job.raw_event_id)
+    assert job.status == "NEEDS_REVIEW"
+    assert job.attempt_count == decision_jobs._MAX_ATTEMPTS
+    assert raw.processing_status == "DECISION_NEEDS_REVIEW"
+
+
+async def test_sweep_terminalizes_exhausted_stale_decision(session):
+    stale = await _seed_job(
+        session,
+        status="PROCESSING",
+        locked_at=datetime.now(UTC) - timedelta(minutes=6),
+        attempt_count=decision_jobs._MAX_ATTEMPTS,
+    )
+
+    assert stale not in await sweep_decision_jobs()
+    session.expire_all()
+    job = await session.get(models.DecisionJob, stale)
+    raw = await session.get(models.RawEvent, job.raw_event_id)
+    assert job.status == "NEEDS_REVIEW"
+    assert job.next_attempt_at is None
+    assert job.last_error == "RETRY_EXHAUSTED: recovered by sweep"
+    assert raw.processing_status == "DECISION_NEEDS_REVIEW"
+
+
+async def test_decision_sweep_isolates_broker_dispatch_failures(session, monkeypatch):
+    first = await _seed_job(session)
+    second = await _seed_job(session)
+    calls: list[uuid.UUID] = []
+
+    from social_reply.application.reply_decision.actors import process_reply_decision
+
+    def dispatch(job_id: str):
+        calls.append(uuid.UUID(job_id))
+        if len(calls) == 1:
+            raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(process_reply_decision, "send", dispatch)
+
+    dispatched = await sweep_decision_jobs()
+    assert set(calls) == {first, second}
+    assert len(dispatched) == 1
+    assert dispatched[0] == calls[1]

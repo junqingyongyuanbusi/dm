@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import pytest
@@ -11,6 +12,7 @@ from social_reply.application.reply_decision import runner
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.domain.automation.state_machine import ensure_state, flip_to_human_active
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.engine import get_session_factory
 
 pytestmark = pytest.mark.integration
 
@@ -206,13 +208,102 @@ async def test_defense2_cancels_text_when_not_bot_active(session):
     result = await deliver_outbox(str(ob_id))
     assert result == "SKIPPED_NOT_CLAIMABLE"
     fake = get_chatwoot_client()
-    assert all(
-        s["content"] != "您好，请提供订单号。" or True for s in fake.sent
-    )  # 未新增该会话发送  # noqa: E501
+    assert fake.sent == []
     ob = (
         await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == ob_id))
     ).scalar_one()
     assert ob.status == "CANCELLED"
+
+
+async def test_takeover_waits_for_inflight_send_then_commits(session, monkeypatch):
+    from social_reply.connectors.chatwoot import client as cw
+
+    conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_send(**_kwargs):
+        started.set()
+        await release.wait()
+        return 987
+
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", blocked_send)
+    delivery_task = asyncio.create_task(deliver_outbox(str(ob_id)))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    delivery_task.cancel()
+
+    async def takeover():
+        async with get_session_factory()() as takeover_session:
+            flipped = await flip_to_human_active(
+                takeover_session,
+                conv_id,
+                "3",
+                "agent_takeover",
+            )
+            await takeover_session.commit()
+            return flipped
+
+    takeover_task = asyncio.create_task(takeover())
+    await asyncio.sleep(0.05)
+    assert takeover_task.done() is False
+
+    release.set()
+    assert await delivery_task == "SENT"
+    assert await takeover_task is True
+
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    state = await session.get(models.AutomationState, conv_id)
+    assert outbox.status == "SENT"
+    assert state.state == "HUMAN_ACTIVE"
+    assert get_chatwoot_client().sent == []
+
+
+async def test_cancelled_send_timeout_finalizes_ambiguity_and_releases_lock(
+    session,
+    monkeypatch,
+):
+    from social_reply.connectors.chatwoot import client as cw
+
+    conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    async def blocked_send(**_kwargs):
+        started.set()
+        try:
+            await never.wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", blocked_send)
+    monkeypatch.setattr(outbox_module, "_CANCELLED_SEND_DRAIN_SECONDS", 0.01)
+
+    delivery_task = asyncio.create_task(deliver_outbox(str(ob_id)))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    delivery_task.cancel()
+    assert await delivery_task == "NEEDS_REVIEW"
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+    async with get_session_factory()() as takeover_session:
+        assert await asyncio.wait_for(
+            flip_to_human_active(
+                takeover_session,
+                conv_id,
+                "3",
+                "agent_takeover",
+            ),
+            timeout=1,
+        )
+        await takeover_session.commit()
+
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    state = await session.get(models.AutomationState, conv_id)
+    assert outbox.status == "NEEDS_REVIEW"
+    assert outbox.last_error_code == "AMBIGUOUS_SEND"
+    assert state.state == "HUMAN_ACTIVE"
 
 
 async def test_defense2_direct_cancel_when_state_flips_without_defense3(session):
@@ -362,6 +453,95 @@ async def test_connect_error_marks_failed_with_backoff(session, monkeypatch):
     if next_at.tzinfo is None:
         next_at = next_at.replace(tzinfo=UTC)
     assert next_at > now  # 指数退避：下次尝试在未来
+
+
+async def test_connect_timeout_is_retryable_before_request_is_sent(session, monkeypatch):
+    import httpx
+
+    from social_reply.connectors.chatwoot import client as cw
+
+    _conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+
+    async def _boom(**_kwargs):
+        raise httpx.ConnectTimeout("connect timeout")
+
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
+
+    assert await deliver_outbox(str(ob_id)) == "FAILED"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.status == "FAILED"
+    assert outbox.last_error_code == "SEND_ERROR"
+    assert outbox.next_attempt_at is not None
+
+
+async def test_fifth_retryable_send_failure_requires_review(session, monkeypatch):
+    import httpx
+
+    from social_reply.connectors.chatwoot import client as cw
+
+    _conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+    await session.execute(
+        update(models.OutboxMessage).where(models.OutboxMessage.id == ob_id).values(attempt_count=4)
+    )
+    await session.commit()
+
+    async def _boom(**_kwargs):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
+
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.attempt_count == 5
+    assert outbox.status == "NEEDS_REVIEW"
+    assert outbox.last_error_code == "SEND_ERROR"
+    assert outbox.next_attempt_at is None
+
+
+async def test_duplicate_outbox_actor_respects_failed_backoff(session, monkeypatch):
+    import httpx
+
+    from social_reply.connectors.chatwoot import client as cw
+
+    _conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
+
+    async def _boom(**_kwargs):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(cw.get_chatwoot_client(), "create_message", _boom)
+
+    assert await deliver_outbox(str(ob_id)) == "FAILED"
+    assert await deliver_outbox(str(ob_id)) == "SKIPPED_NOT_CLAIMABLE"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.status == "FAILED"
+    assert outbox.attempt_count == 1
+    assert outbox.next_attempt_at is not None
+    attempts = list(
+        (
+            await session.execute(
+                select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == ob_id)
+            )
+        ).scalars()
+    )
+    assert len(attempts) == 1
+
+
+async def test_failed_outbox_without_due_time_is_not_claimable(session):
+    _conv_id, ob_id = await _seed(
+        session,
+        state="BOT_ACTIVE",
+        message_type="text",
+        status="FAILED",
+    )
+
+    assert await deliver_outbox(str(ob_id)) == "SKIPPED_NOT_CLAIMABLE"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.status == "FAILED"
+    assert outbox.attempt_count == 0
 
 
 async def test_retryable_platform_error_schedules_retry(session, monkeypatch):
