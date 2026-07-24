@@ -92,7 +92,14 @@ async def test_reconcile_creates_raw_for_missing_incoming(session, monkeypatch):
         kwargs["transport"] = httpx.MockTransport(handler)
         return real_client(*args, **kwargs)
 
+    dispatched = []
+
+    async def capture_dispatch(raw_event_id):
+        dispatched.append(raw_event_id)
+        return True
+
     monkeypatch.setattr(reconcile.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(reconcile, "dispatch_initial_raw_event", capture_dispatch)
     created = await reconcile.reconcile_chatwoot_messages()
 
     assert len(created) == 1
@@ -101,6 +108,9 @@ async def test_reconcile_creates_raw_for_missing_incoming(session, monkeypatch):
     assert raw.payload["id"] == 55
     assert raw.payload["content"] == "latest"
     assert raw.processing_status == "PENDING"
+    assert raw.ingress_kind == "reconcile"
+    assert raw.context["initial_dispatch"] == {"version": 1, "kind": "chatwoot"}
+    assert dispatched == [raw.id]
 
 
 async def test_reconcile_skips_already_normalized_message(session, monkeypatch):

@@ -69,7 +69,14 @@ async def test_telegram_webhook_direct_to_sent_outbox(session, monkeypatch):
     assert response.status_code == 200
     raw_event = (await session.execute(select(models.RawEvent))).scalar_one()
     assert raw_event.source == "telegram"
+    assert raw_event.tenant_id == "default"
+    assert raw_event.platform_account_id == account_id
     assert raw_event.processing_status == "PROCESSED"
+    dispatch = raw_event.context["initial_dispatch"]
+    assert dispatch["version"] == 1
+    assert dispatch["kind"] == "direct"
+    assert dispatch["events"][0]["platform_account_key"] == str(account_id)
+    assert dispatch["events"][0]["raw_payload"] == {}
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     outbox = (await session.execute(select(models.OutboxMessage))).scalar_one()
     assert decision.action == "auto_reply"

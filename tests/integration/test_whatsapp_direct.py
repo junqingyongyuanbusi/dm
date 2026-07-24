@@ -61,7 +61,11 @@ async def test_disabled_meta_family_is_audited_without_dispatch(
     async def unexpected_dispatch(*_args, **_kwargs):
         raise AssertionError("disabled family must not dispatch")
 
-    monkeypatch.setattr(meta_router, "dispatch_actor", unexpected_dispatch)
+    monkeypatch.setattr(
+        meta_router,
+        "dispatch_initial_raw_event",
+        unexpected_dispatch,
+    )
     payload = {
         "object": object_type,
         "entry": [
@@ -195,6 +199,13 @@ async def test_whatsapp_webhook_uses_shared_reply_core_and_sender(
             headers={"X-Hub-Signature-256": signature, "Content-Type": "application/json"},
         )
     assert response.status_code == 200
+    raw_event = (await session.execute(select(models.RawEvent))).scalar_one()
+    assert raw_event.tenant_id == "tenant-a"
+    dispatch = raw_event.context["initial_dispatch"]
+    assert dispatch["version"] == 1
+    assert dispatch["kind"] == "direct"
+    assert dispatch["events"][0]["platform_account_key"] == str(account_id)
+    assert dispatch["events"][0]["raw_payload"] == {}
     outbox = (await session.execute(select(models.OutboxMessage))).scalar_one()
     assert outbox.destination_type == "whatsapp_session_message"
     assert outbox.status == "SENT"

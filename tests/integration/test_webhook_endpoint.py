@@ -39,6 +39,20 @@ async def client(migrated_db, monkeypatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def captured_dispatch(monkeypatch):
+    from social_reply.application.event_ingestion import router
+
+    dispatched = []
+
+    async def capture(raw_event_id):
+        dispatched.append(raw_event_id)
+        return True
+
+    monkeypatch.setattr(router, "dispatch_initial_raw_event", capture)
+    return dispatched
+
+
 PAYLOAD = {
     "event": "message_created",
     "id": 55,
@@ -63,24 +77,20 @@ async def test_bad_signature_rejected_and_nothing_stored(client, session):
     assert (await session.execute(select(models.RawEvent))).first() is None
 
 
-async def test_valid_webhook_stores_raw_and_enqueues(client, session):
-    import dramatiq
-
-    broker = dramatiq.get_broker()
+async def test_valid_webhook_stores_raw_and_enqueues(client, session, captured_dispatch):
     body = json.dumps(PAYLOAD).encode()
     resp = await client.post("/webhooks/chatwoot", content=body, headers=_signed_headers(body))
     assert resp.status_code == 200
     raw = (await session.execute(select(models.RawEvent))).scalar_one()
     assert raw.source == "chatwoot"
     assert raw.payload["id"] == 55
-    queue = broker.queues["default"]
-    assert queue.qsize() == 1
+    assert raw.context["initial_dispatch"] == {"version": 1, "kind": "chatwoot"}
+    assert captured_dispatch == [raw.id]
 
 
-async def test_conversation_event_recovers_embedded_latest_message(client, session):
-    import dramatiq
-
-    broker = dramatiq.get_broker()
+async def test_conversation_event_recovers_embedded_latest_message(
+    client, session, captured_dispatch
+):
     payload = {
         "event": "conversation_typing_off",
         "conversation": {
@@ -112,13 +122,12 @@ async def test_conversation_event_recovers_embedded_latest_message(client, sessi
     assert raw.payload["id"] == 56
     assert raw.payload["content"] == "True"
     assert raw.payload["message_type"] == 0
-    assert broker.queues["default"].qsize() == 1
+    assert captured_dispatch == [raw.id]
 
 
-async def test_top_level_conversation_event_recovers_embedded_message(client, session):
-    import dramatiq
-
-    broker = dramatiq.get_broker()
+async def test_top_level_conversation_event_recovers_embedded_message(
+    client, session, captured_dispatch
+):
     payload = {
         "event": "conversation_updated",
         "id": 77,
@@ -147,7 +156,7 @@ async def test_top_level_conversation_event_recovers_embedded_message(client, se
     assert raw.payload["event"] == "message_created"
     assert raw.payload["id"] == 57
     assert raw.payload["content"] == "Help"
-    assert broker.queues["default"].qsize() == 1
+    assert captured_dispatch == [raw.id]
 
 
 async def test_non_message_event_acknowledged_without_enqueue(client, session):

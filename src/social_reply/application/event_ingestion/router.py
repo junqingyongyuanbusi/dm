@@ -3,7 +3,10 @@ import time
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import insert
 
-from social_reply.application.event_ingestion.actors import process_chatwoot_event
+from social_reply.application.event_ingestion.raw_recovery import (
+    chatwoot_dispatch_context,
+    dispatch_initial_raw_event,
+)
 from social_reply.connectors.chatwoot.signature import verify_signature
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -75,12 +78,14 @@ async def chatwoot_webhook(request: Request) -> Response:
             insert(models.RawEvent)
             .values(
                 source="chatwoot",
+                ingress_kind="webhook",
                 payload=payload,
                 headers={
                     "X-Chatwoot-Timestamp": request.headers.get("X-Chatwoot-Timestamp"),
                     "X-Chatwoot-Delivery": request.headers.get("X-Chatwoot-Delivery"),
                     "User-Agent": request.headers.get("User-Agent"),
                 },
+                context=chatwoot_dispatch_context() if is_message else {},
                 processing_status="PENDING" if is_message else "IGNORED_AT_INGRESS",
             )
             .returning(models.RawEvent.id)
@@ -90,5 +95,5 @@ async def chatwoot_webhook(request: Request) -> Response:
 
     # 入口只做验签+存 raw+入队，重活交给 worker
     if is_message:
-        process_chatwoot_event.send(str(raw_event_id))
+        await dispatch_initial_raw_event(raw_event_id)
     return Response(status_code=200)

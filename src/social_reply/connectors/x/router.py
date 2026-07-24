@@ -5,7 +5,10 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy import insert
 
-from social_reply.application.event_ingestion.direct_actors import process_direct_event
+from social_reply.application.event_ingestion.raw_recovery import (
+    direct_dispatch_context,
+    dispatch_initial_raw_event,
+)
 from social_reply.application.platform_accounts import (
     find_platform_account_by_external_id,
     find_platform_account_by_public_id,
@@ -129,6 +132,8 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
         str(event_payload.get("conversation_id") or event_payload.get("dm_conversation_id") or "")
         or None
     )
+    serialized_events = [canonical_event_to_dict(event) for event in events]
+    dispatch_context = direct_dispatch_context(serialized_events) if serialized_events else {}
     async with get_session_factory()() as session:
         raw_event_id = (
             await session.execute(
@@ -146,7 +151,10 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
                         "signature_verified": True,
                         "event_type": event_type or None,
                     },
-                    context={"raw_body_sha256": hashlib.sha256(body).hexdigest()},
+                    context={
+                        "raw_body_sha256": hashlib.sha256(body).hexdigest(),
+                        **dispatch_context,
+                    },
                     schema_version=1,
                     occurred_at=events[0].occurred_at if events else None,
                     processing_status=processing_status,
@@ -171,16 +179,8 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
                 )
             )
         await session.commit()
-    serialized_events = [canonical_event_to_dict(event) for event in events]
     if serialized_events:
-        from social_reply.application.event_ingestion.direct_actors import _process_events
-
-        await dispatch_actor(
-            process_direct_event,
-            str(raw_event_id),
-            serialized_events,
-            inline=lambda: _process_events(raw_event_id, serialized_events),
-        )
+        await dispatch_initial_raw_event(raw_event_id)
     elif dispatch_xchat:
         from social_reply.application.event_ingestion.xchat_actors import process_xchat_event
         from social_reply.application.event_ingestion.xchat_recovery import note_xchat_dispatch

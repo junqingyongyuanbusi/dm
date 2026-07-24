@@ -68,7 +68,15 @@ A database trigger makes RawEvent evidence fields append-only while still allowi
 
 Revision `a1c7e4f2b903` creates `platform_checkpoints`, `sync_runs`, and `sync_gaps`. It migrates Legacy X DM and per-conversation XChat cursors from `platform_accounts.config`, retains the old config keys for rollback, and makes the new checkpoint rows authoritative for writes. Database leases plus fencing revisions serialize Scheduler ownership. Page caps, pagination failures, and XChat decryption failures leave the checkpoint unchanged and open a resumable gap.
 
-Pause old Scheduler processes before starting the new Scheduler and keep the mixed-version window short: old code writes config cursors while new code writes checkpoint rows. The migration still does not add a generic PENDING RawEvent recovery sweep; that remains a separate reliability change.
+Pause old Scheduler processes before starting the new Scheduler and keep the mixed-version window short: old code writes config cursors while new code writes checkpoint rows.
+
+## Initial RawEvent dispatch recovery
+
+The existing `b2d8f5a3c714` RawEvent processing columns now also back generic initial-dispatch recovery; this release adds no new table or migration. New Telegram, Meta, X direct, Chatwoot webhook, and Chatwoot reconciliation rows persist a versioned actor contract in immutable `RawEvent.context`.
+
+New recovery actors use the dedicated `initial_raw_v1` Dramatiq queue. Old workers do not declare or consume that queue, while new workers retain the old direct and Chatwoot actor signatures to drain messages produced by the previous image. This supports either API-first or Worker-first rolling replacement without interpreting a token as the old actor payload.
+
+Scheduler redispatches lost reservations and expired worker leases. Eight failed worker claims move a row to `INITIAL_DISPATCH_DEAD`; broker-send failures remain retryable without consuming a worker attempt. Historical `PENDING` rows without versioned dispatch metadata and all polling/XChat-owned rows are intentionally excluded because their actor arguments cannot be reconstructed safely.
 
 ## Platform account contract
 

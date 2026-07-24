@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 _STALE_PROCESSING = timedelta(minutes=5)
 _MAX_BACKOFF_SECONDS = 300
+_INITIAL_DISPATCH_ACTIVE_STATUSES = (
+    "PENDING",
+    "INITIAL_DISPATCH_RETRY",
+    "INITIAL_DISPATCHING",
+)
 
 
 def snapshot_to_dict(snapshot: DecisionSnapshot) -> dict[str, str | int | None]:
@@ -126,7 +131,10 @@ async def process_decision_job(job_id: str) -> bool:
             if claimed.raw_event_id is not None:
                 await session.execute(
                     update(models.RawEvent)
-                    .where(models.RawEvent.id == claimed.raw_event_id)
+                    .where(
+                        models.RawEvent.id == claimed.raw_event_id,
+                        models.RawEvent.processing_status.not_in(_INITIAL_DISPATCH_ACTIVE_STATUSES),
+                    )
                     .values(
                         processing_status="DECISION_NEEDS_REVIEW",
                         processed_at=datetime.now(UTC),
@@ -153,7 +161,10 @@ async def process_decision_job(job_id: str) -> bool:
             if claimed.raw_event_id is not None:
                 await session.execute(
                     update(models.RawEvent)
-                    .where(models.RawEvent.id == claimed.raw_event_id)
+                    .where(
+                        models.RawEvent.id == claimed.raw_event_id,
+                        models.RawEvent.processing_status.not_in(_INITIAL_DISPATCH_ACTIVE_STATUSES),
+                    )
                     .values(
                         processing_status="DECISION_NEEDS_REVIEW",
                         processed_at=datetime.now(UTC),
@@ -180,7 +191,10 @@ async def process_decision_job(job_id: str) -> bool:
             if claimed.raw_event_id is not None:
                 await session.execute(
                     update(models.RawEvent)
-                    .where(models.RawEvent.id == claimed.raw_event_id)
+                    .where(
+                        models.RawEvent.id == claimed.raw_event_id,
+                        models.RawEvent.processing_status.not_in(_INITIAL_DISPATCH_ACTIVE_STATUSES),
+                    )
                     .values(
                         processing_status="DECISION_DEFERRED",
                         processed_at=None,
@@ -240,7 +254,10 @@ async def process_decision_job(job_id: str) -> bool:
             if remaining is None:
                 await session.execute(
                     update(models.RawEvent)
-                    .where(models.RawEvent.id == claimed.raw_event_id)
+                    .where(
+                        models.RawEvent.id == claimed.raw_event_id,
+                        models.RawEvent.processing_status.not_in(_INITIAL_DISPATCH_ACTIVE_STATUSES),
+                    )
                     .values(
                         processing_status="PROCESSED",
                         processed_at=datetime.now(UTC),

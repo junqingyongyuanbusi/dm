@@ -5,6 +5,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
+from social_reply.application.event_ingestion.raw_recovery import sweep_initial_raw_events
 from social_reply.application.event_ingestion.x_dm_poll import poll_x_direct_messages
 from social_reply.application.event_ingestion.x_webhook_health import ensure_x_webhooks_valid
 from social_reply.application.event_ingestion.xchat_poll import poll_xchat_messages
@@ -31,6 +32,7 @@ def _build_sweeps(settings: Settings) -> tuple[tuple[str, Callable[[], Awaitable
     sweeps.extend(
         (
             ("sweep_provisioning_jobs", sweep_provisioning_jobs),
+            ("sweep_initial_raw_events", sweep_initial_raw_events),
             ("sweep_decision_jobs", sweep_decision_jobs),
         )
     )

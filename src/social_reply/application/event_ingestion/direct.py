@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,7 @@ async def ingest_canonical_event(
 ) -> uuid.UUID | None:
     """平台直连事件的通用 Inbox：同事务保存消息、状态快照和 DecisionJob。"""
     account_uuid = uuid.UUID(event.platform_account_key)
+    initial_dispatch_claim = False
     async with get_session_factory()() as session:
         account = (
             await session.execute(
@@ -68,13 +69,21 @@ async def ingest_canonical_event(
                 raise PermissionError("raw_event_platform_account_mismatch")
             if raw_event.tenant_id is not None and raw_event.tenant_id != account.tenant_id:
                 raise PermissionError("raw_event_tenant_mismatch")
-            if raw_event_claim_token is not None and str(
-                raw_event.processing_claim_token or ""
-            ) != raw_event_claim_token:
-                await session.rollback()
-                return None
+            if raw_event_claim_token is not None:
+                if str(raw_event.processing_claim_token or "") != raw_event_claim_token:
+                    await session.rollback()
+                    return None
+                initial_dispatch_claim = raw_event.processing_status == "INITIAL_DISPATCHING"
+                if initial_dispatch_claim:
+                    database_now = await session.scalar(select(func.clock_timestamp()))
+                    if (
+                        raw_event.processing_claim_expires_at is None
+                        or raw_event.processing_claim_expires_at <= database_now
+                    ):
+                        await session.rollback()
+                        return None
         if not is_active_account_status(account.status):
-            if raw_event_id is not None:
+            if raw_event_id is not None and not initial_dispatch_claim:
                 await session.execute(
                     update(models.RawEvent)
                     .where(models.RawEvent.id == raw_event_id)
@@ -83,7 +92,7 @@ async def ingest_canonical_event(
             await session.commit()
             return None
 
-        if raw_event_id is not None:
+        if raw_event_id is not None and not initial_dispatch_claim:
             await session.execute(
                 update(models.RawEvent)
                 .where(models.RawEvent.id == raw_event_id)
@@ -120,7 +129,7 @@ async def ingest_canonical_event(
                 )
             ).one_or_none()
         if managed_echo is not None:
-            if raw_event_id is not None:
+            if raw_event_id is not None and not initial_dispatch_claim:
                 await session.execute(
                     update(models.RawEvent)
                     .where(models.RawEvent.id == raw_event_id)
@@ -174,7 +183,7 @@ async def ingest_canonical_event(
             )
         ).scalar_one_or_none()
         if normalized_id is None:
-            if raw_event_id is not None:
+            if raw_event_id is not None and not initial_dispatch_claim:
                 await session.execute(
                     update(models.RawEvent)
                     .where(models.RawEvent.id == raw_event_id)
@@ -287,7 +296,7 @@ async def ingest_canonical_event(
                     select(models.DecisionJob.id).where(models.DecisionJob.message_id == message_id)
                 )
             ).scalar_one()
-        if raw_event_id is not None:
+        if raw_event_id is not None and not initial_dispatch_claim:
             await session.execute(
                 update(models.RawEvent)
                 .where(
@@ -303,7 +312,7 @@ async def ingest_canonical_event(
         )
         if latest_status is None or not is_active_account_status(latest_status):
             await session.rollback()
-            if raw_event_id is not None:
+            if raw_event_id is not None and not initial_dispatch_claim:
                 await _mark_raw_event_account_inactive(
                     session,
                     raw_event_id,

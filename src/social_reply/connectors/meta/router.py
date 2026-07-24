@@ -6,7 +6,10 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import insert
 
-from social_reply.application.event_ingestion.direct_actors import process_direct_event
+from social_reply.application.event_ingestion.raw_recovery import (
+    direct_dispatch_context,
+    dispatch_initial_raw_event,
+)
 from social_reply.application.platform_accounts import (
     find_platform_account_by_external_id,
     find_platform_app_by_public_id,
@@ -17,7 +20,6 @@ from social_reply.connectors.whatsapp.adapter import WhatsAppWebhookAdapter
 from social_reply.domain.messages.canonical import canonical_event_to_dict
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -151,28 +153,26 @@ async def meta_webhook(app_public_id: str, request: Request) -> Response:
             external_account_id=external_account_id,
         )
         queued_events.extend(adapter.normalize({"object": object_type, "entry": [entry]}))
+    serialized_events = [canonical_event_to_dict(event) for event in queued_events]
     async with get_session_factory()() as session:
         raw_event_id = (
             await session.execute(
                 insert(models.RawEvent)
                 .values(
+                    tenant_id=app.tenant_id,
                     source="meta",
+                    ingress_kind="webhook",
                     payload=payload,
                     headers={"signature_verified": True},
-                    processing_status="PENDING" if queued_events else "IGNORED_AT_INGRESS",
+                    context=(
+                        direct_dispatch_context(serialized_events) if serialized_events else {}
+                    ),
+                    processing_status=("PENDING" if serialized_events else "IGNORED_AT_INGRESS"),
                 )
                 .returning(models.RawEvent.id)
             )
         ).scalar_one()
         await session.commit()
-    serialized_events = [canonical_event_to_dict(event) for event in queued_events]
     if serialized_events:
-        from social_reply.application.event_ingestion.direct_actors import _process_events
-
-        await dispatch_actor(
-            process_direct_event,
-            str(raw_event_id),
-            serialized_events,
-            inline=lambda: _process_events(raw_event_id, serialized_events),
-        )
+        await dispatch_initial_raw_event(raw_event_id)
     return Response(status_code=200)

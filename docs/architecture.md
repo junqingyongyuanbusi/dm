@@ -43,7 +43,7 @@ PostgreSQL owns:
 - `ProvisioningJob`, `DecisionJob`, `ReplyDecision` and `OutboxMessage` state;
 - delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps.
 
-Once a `ProvisioningJob`, `DecisionJob`, or `OutboxMessage` exists, process crashes and Redis queue loss are recoverable from PostgreSQL. A committed webhook `RawEvent` that has not yet produced its durable job is a known gap described below.
+New webhook and Chatwoot reconciliation `RawEvent` rows persist a versioned initial-dispatch contract before commit. Process crashes and Redis queue loss are recoverable from that row before normalization, then from `DecisionJob` and `OutboxMessage` after their transactional boundaries.
 
 ### Redis is transient infrastructure
 
@@ -53,7 +53,7 @@ Redis owns only short-lived or reconstructable state:
 - automation kill switches;
 - OAuth transaction state and short-lived coordination/cache data.
 
-Redis is not the source of truth for accounts, decisions, deliveries, or durable jobs. Scheduler sweeps re-enqueue persisted `ProvisioningJob`, `DecisionJob`, and `OutboxMessage` work after queue loss; there is not yet a generic PENDING `RawEvent` recovery sweep.
+Redis is not the source of truth for accounts, ingestion, decisions, deliveries, or durable jobs. Scheduler sweeps re-enqueue versioned initial-dispatch `RawEvent` rows plus persisted `ProvisioningJob`, `DecisionJob`, and `OutboxMessage` work after queue loss.
 
 ### External systems
 
@@ -86,7 +86,9 @@ A successful text send is written back as an outbound `Message`, linked to its s
 The delivery fast path reduces latency; it does not replace durability. `sweep_outbox` recovers rows
 that were committed but not sent because a process crashed.
 
-Webhook ingestion and X polling persist `RawEvent` evidence before normalization. Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes. A crash or dispatch loss between a RawEvent commit and creation of `DecisionJob` can still leave a PENDING row with no automatic recovery; the RawEvent recovery sweep remains the next reliability boundary.
+Webhook ingestion and X polling persist `RawEvent` evidence before normalization. New Telegram, Meta, X direct, Chatwoot webhook, and Chatwoot reconciliation rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
+
+Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes.
 
 ## Chatwoot bridge
 
@@ -148,7 +150,9 @@ durable job boundary rather than directly mutating account rows.
 
 ## Reliability invariants
 
-- Webhook payloads are committed before actor dispatch; this is an audit boundary, not yet a complete RawEvent recovery guarantee.
+- Recoverable webhook actor arguments are committed as immutable RawEvent dispatch metadata before actor dispatch.
+- Initial dispatch uses a versioned dedicated queue, database reservations, worker claim tokens, leases and bounded dead-letter attempts.
+- Historical or polling RawEvents without that contract are never inferred by the generic sweep.
 - Inbound facts and their `DecisionJob` are committed together.
 - Decisions and Outbox intent are committed together.
 - Public sending rechecks takeover state immediately before network I/O.

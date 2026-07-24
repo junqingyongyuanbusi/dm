@@ -70,7 +70,8 @@ def test_direct_only_production_modules_import_without_chatwoot_credentials():
                 "assert 'social_reply.connectors.x.router' not in sys.modules; "
                 "assert 'social_reply.application.event_ingestion.xchat_actors' in sys.modules; "
                 "assert {name for name, _ in scheduler._SWEEPS} == "
-                "{'sweep_provisioning_jobs', 'sweep_decision_jobs', 'sweep_outbox'}"
+                "{'sweep_provisioning_jobs', 'sweep_initial_raw_events', "
+                "'sweep_decision_jobs', 'sweep_outbox'}"
             ),
         ],
         cwd=os.getcwd(),
@@ -200,6 +201,8 @@ def test_scheduler_sweeps_follow_feature_flags():
 
     assert chatwoot[0] == "reconcile_chatwoot_messages"
     assert chatwoot[1:] == base
+    assert base.index("sweep_provisioning_jobs") < base.index("sweep_initial_raw_events")
+    assert base.index("sweep_initial_raw_events") < base.index("sweep_decision_jobs")
     assert "poll_x_direct_messages" not in no_legacy
     assert "poll_xchat_messages" not in no_xchat
     assert "ensure_xchat_subscriptions" in no_xchat

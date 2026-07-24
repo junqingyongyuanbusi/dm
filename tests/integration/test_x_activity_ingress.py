@@ -107,6 +107,11 @@ async def test_dm_received_activity_webhook_persists_owner_and_ingests_message(
     assert raw.event_namespace == "x.activity.dm_received"
     assert raw.external_conversation_id == "conversation-1"
     assert raw.context["raw_body_sha256"] == hashlib.sha256(body).hexdigest()
+    dispatch = raw.context["initial_dispatch"]
+    assert dispatch["version"] == 1
+    assert dispatch["kind"] == "direct"
+    assert dispatch["events"][0]["platform_account_key"] == str(account_id)
+    assert dispatch["events"][0]["raw_payload"] == {}
     assert raw.processing_status in {
         "DECISION_PENDING",
         "DECISION_NEEDS_REVIEW",

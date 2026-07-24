@@ -141,8 +141,8 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 
 ```text
 平台 Webhook
-→ 验签并提交 RawEvent
-→ Redis / Dramatiq dispatch
+→ 验签并提交 RawEvent + versioned dispatch contract
+→ PostgreSQL reservation / lease → Redis / Dramatiq dispatch
 → CanonicalEvent + NormalizedEvent 去重
 → Message + DecisionJob（同一事务）
 → Rules / RAG / LLM / Final Guard
@@ -151,7 +151,7 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 → Telegram / Facebook / Instagram / WhatsApp / X / XChat
 ```
 
-PostgreSQL 是消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Worker 提交 Outbox 后走低延迟 Fast Path，Scheduler 仍从数据库补扫崩溃或队列丢失的工作。
+PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Scheduler 会恢复带版本化 dispatch contract 的新 RawEvent、DecisionJob 和 Outbox；历史缺少安全重建参数的 `PENDING` RawEvent 不会被猜测执行。Worker 提交 Outbox 后仍走低延迟 Fast Path。
 
 ## 文档
 
