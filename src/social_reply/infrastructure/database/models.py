@@ -204,8 +204,17 @@ class Message(Base):
 class RawEvent(Base):
     __tablename__ = "raw_events"
     __table_args__ = (
+        CheckConstraint(
+            "processing_attempt_count >= 0",
+            name="ck_raw_events_processing_attempt_count",
+        ),
         Index("ix_raw_events_status_received", "processing_status", "received_at"),
         Index("ix_raw_events_account_received", "platform_account_id", "received_at"),
+        Index(
+            "ix_raw_events_processing_due",
+            "processing_status",
+            "processing_next_attempt_at",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str | None] = mapped_column(Text)
@@ -223,6 +232,14 @@ class RawEvent(Base):
     schema_version: Mapped[int] = mapped_column(Integer, default=1)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_status: Mapped[str] = mapped_column(Text, default="PENDING")
+    processing_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    processing_claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    processing_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_error_code: Mapped[str | None] = mapped_column(Text)
+    processing_last_dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

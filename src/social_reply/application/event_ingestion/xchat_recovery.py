@@ -9,7 +9,6 @@ from sqlalchemy import select
 from social_reply.application.event_ingestion.xchat_subscription import (
     ensure_xchat_subscriptions,
 )
-from social_reply.application.event_ingestion.xchat_webhook import _attempt_count, _timestamp_due
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -26,6 +25,7 @@ _ACTIVATION_ONLY_STATUSES = ("XCHAT_DECRYPT_FAILED",)
 _REPLAY_BATCH_SIZE = 100
 _DISPATCH_RESERVATION = timedelta(minutes=5)
 _SWEEP_INTERVAL_SECONDS = int(os.getenv("XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS", "30"))
+_MAX_RETRY_ATTEMPTS = 8
 _last_sweep_at: float | None = None
 
 
@@ -49,10 +49,8 @@ async def note_xchat_dispatch(raw_event_id: uuid.UUID) -> None:
         ).scalar_one_or_none()
         if row is None:
             return
-        context = dict(row.context or {})
-        context["xchat_last_dispatched_at"] = now.isoformat()
-        context["xchat_next_attempt_at"] = (now + _DISPATCH_RESERVATION).isoformat()
-        row.context = context
+        row.processing_last_dispatched_at = now
+        row.processing_next_attempt_at = now + _DISPATCH_RESERVATION
         await session.commit()
 
 
@@ -124,15 +122,13 @@ async def _reserve_replay(
         )
         selected: list[uuid.UUID] = []
         for row in rows:
-            context = dict(row.context or {})
-            if not _timestamp_due(context.get("xchat_next_attempt_at"), now=now):
+            if row.processing_next_attempt_at and row.processing_next_attempt_at > now:
                 continue
             if row.processing_status in _ACTIVATION_ONLY_STATUSES:
                 row.processing_status = "XCHAT_RETRYABLE_ERROR"
-                context["xchat_last_error_code"] = "XCHAT_ACTIVATION_REPLAY"
-            context["xchat_last_dispatched_at"] = now.isoformat()
-            context["xchat_next_attempt_at"] = (now + _DISPATCH_RESERVATION).isoformat()
-            row.context = context
+                row.processing_error_code = "XCHAT_ACTIVATION_REPLAY"
+            row.processing_last_dispatched_at = now
+            row.processing_next_attempt_at = now + _DISPATCH_RESERVATION
             selected.append(row.id)
             if len(selected) >= limit:
                 break
@@ -144,15 +140,15 @@ async def _release_dispatch_reservation(raw_event_id: uuid.UUID) -> None:
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
+                select(models.RawEvent)
+                .where(models.RawEvent.id == raw_event_id)
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if row is None:
             return
-        context = dict(row.context or {})
-        context["xchat_last_error_code"] = "XCHAT_DISPATCH_FAILED"
-        context["xchat_next_attempt_at"] = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
-        row.context = context
+        row.processing_error_code = "XCHAT_DISPATCH_FAILED"
+        row.processing_next_attempt_at = datetime.now(UTC) + timedelta(seconds=30)
         await session.commit()
 
 
@@ -172,20 +168,19 @@ async def _recover_expired_claims(*, limit: int = _REPLAY_BATCH_SIZE) -> list[st
             ).scalars()
         )
         for row in rows:
-            context = dict(row.context or {})
-            if not _timestamp_due(context.get("xchat_claim_expires_at"), now=now):
+            if row.processing_claim_expires_at and row.processing_claim_expires_at > now:
                 continue
-            context.pop("xchat_claim_token", None)
-            context.pop("xchat_claim_expires_at", None)
-            context["xchat_last_error_code"] = "XCHAT_WORKER_LEASE_EXPIRED"
-            if _attempt_count(context) >= 8:
+            row.processing_claim_token = None
+            row.processing_claim_expires_at = None
+            row.processing_error_code = "XCHAT_WORKER_LEASE_EXPIRED"
+            if int(row.processing_attempt_count or 0) >= _MAX_RETRY_ATTEMPTS:
                 row.processing_status = "XCHAT_RETRY_EXHAUSTED"
-                context.pop("xchat_next_attempt_at", None)
+                row.processing_next_attempt_at = None
                 row.processed_at = now
             else:
                 row.processing_status = "XCHAT_RETRYABLE_ERROR"
-                context["xchat_next_attempt_at"] = now.isoformat()
-            row.context = context
+                row.processing_next_attempt_at = now
+                row.processed_at = None
             recovered.append(str(row.id))
         await session.commit()
     return recovered

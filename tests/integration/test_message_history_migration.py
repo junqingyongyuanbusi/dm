@@ -216,7 +216,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).all()
-        assert revision == "a1c7e4f2b903"
+        assert revision == "b2d8f5a3c714"
         assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {
@@ -247,7 +247,10 @@ async def test_message_history_migration_backfills_and_round_trips():
             )
             await connection.execute(
                 text(
-                    "UPDATE raw_events SET processing_status='PROCESSED' "
+                    "UPDATE raw_events SET processing_status='PROCESSED', "
+                    "processing_claim_token="
+                    "'00000000-0000-0000-0000-000000000008', "
+                    "processing_attempt_count=1, processing_error_code='TEST' "
                     "WHERE id='00000000-0000-0000-0000-000000000007'"
                 )
             )

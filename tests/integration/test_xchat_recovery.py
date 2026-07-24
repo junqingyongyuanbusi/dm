@@ -63,12 +63,11 @@ async def test_xchat_raw_event_claim_is_account_scoped_and_single_use(session, m
     )
     await session.commit()
 
-    assert await xchat_webhook._claim(raw_event_id, other_account_id, "default", "bot-2") is None
+    assert await xchat_webhook._claim(raw_event_id, other_account_id, "default") is None
     claim = await xchat_webhook._claim(
         raw_event_id,
         account_id,
         "default",
-        "bot-1",
     )
     assert claim is not None
     assert claim.payload == payload
@@ -77,7 +76,6 @@ async def test_xchat_raw_event_claim_is_account_scoped_and_single_use(session, m
             raw_event_id,
             account_id,
             "default",
-            "bot-1",
         )
         is None
     )
@@ -163,11 +161,11 @@ async def test_expired_xchat_worker_claim_is_recovered(session, migrated_db):
             event_namespace="x.activity.chat_received",
             payload={"data": {"event_type": "chat.received"}},
             headers={},
-            context={
-                "xchat_claim_expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
-                "xchat_attempt_count": 1,
-            },
+            context={},
             processing_status="XCHAT_PROCESSING",
+            processing_claim_token=uuid.uuid4(),
+            processing_claim_expires_at=datetime.now(UTC) - timedelta(minutes=1),
+            processing_attempt_count=1,
         )
     )
     await session.commit()
@@ -177,7 +175,7 @@ async def test_expired_xchat_worker_claim_is_recovered(session, migrated_db):
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
     assert raw.processing_status == "XCHAT_RETRYABLE_ERROR"
-    assert raw.context["xchat_last_error_code"] == "XCHAT_WORKER_LEASE_EXPIRED"
+    assert raw.processing_error_code == "XCHAT_WORKER_LEASE_EXPIRED"
 
 
 async def test_replay_dispatch_failure_keeps_event_recoverable(
@@ -213,8 +211,8 @@ async def test_replay_dispatch_failure_keeps_event_recoverable(
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
     assert raw.processing_status == "XCHAT_KEY_RECOVERY_REQUIRED"
-    assert raw.context["xchat_last_error_code"] == "XCHAT_DISPATCH_FAILED"
-    assert raw.context["xchat_next_attempt_at"]
+    assert raw.processing_error_code == "XCHAT_DISPATCH_FAILED"
+    assert raw.processing_next_attempt_at
 
 
 async def test_stale_xchat_worker_cannot_overwrite_new_claim_or_ingest(
@@ -234,8 +232,9 @@ async def test_stale_xchat_worker_cannot_overwrite_new_claim_or_ingest(
             event_namespace="x.activity.chat_received",
             payload={"data": {"event_type": "chat.received"}},
             headers={},
-            context={"xchat_claim_token": "new-claim"},
+            context={},
             processing_status="XCHAT_PROCESSING",
+            processing_claim_token=uuid.UUID("11111111-1111-1111-1111-111111111111"),
         )
     )
     await session.commit()
@@ -263,7 +262,7 @@ async def test_stale_xchat_worker_cannot_overwrite_new_claim_or_ingest(
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
     assert raw.processing_status == "XCHAT_PROCESSING"
-    assert raw.context["xchat_claim_token"] == "new-claim"
+    assert str(raw.processing_claim_token) == "11111111-1111-1111-1111-111111111111"
     assert await session.scalar(select(func.count()).select_from(models.NormalizedEvent)) == 0
 
 
@@ -295,7 +294,7 @@ async def test_unowned_xchat_event_requires_matching_tenant_source_and_target(
     )
     await session.commit()
 
-    assert await xchat_webhook._claim(raw_event_id, account_id, "default", "bot-1") is None
+    assert await xchat_webhook._claim(raw_event_id, account_id, "default") is None
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
     assert raw.platform_account_id is None
@@ -322,4 +321,4 @@ async def test_unowned_xchat_event_requires_matching_tenant_source_and_target(
         )
     )
     await session.commit()
-    assert await xchat_webhook._claim(null_tenant_id, account_id, "default", "bot-1") is None
+    assert await xchat_webhook._claim(null_tenant_id, account_id, "default") is None

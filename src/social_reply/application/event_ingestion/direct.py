@@ -27,10 +27,7 @@ async def _mark_raw_event_account_inactive(
     ).scalar_one_or_none()
     if raw_event is None:
         return
-    if (
-        claim_token is not None
-        and (raw_event.context or {}).get("xchat_claim_token") != claim_token
-    ):
+    if claim_token is not None and str(raw_event.processing_claim_token or "") != claim_token:
         return
     raw_event.processing_status = "IGNORED_ACCOUNT_INACTIVE"
 
@@ -71,10 +68,9 @@ async def ingest_canonical_event(
                 raise PermissionError("raw_event_platform_account_mismatch")
             if raw_event.tenant_id is not None and raw_event.tenant_id != account.tenant_id:
                 raise PermissionError("raw_event_tenant_mismatch")
-            if (
-                raw_event_claim_token is not None
-                and (raw_event.context or {}).get("xchat_claim_token") != raw_event_claim_token
-            ):
+            if raw_event_claim_token is not None and str(
+                raw_event.processing_claim_token or ""
+            ) != raw_event_claim_token:
                 await session.rollback()
                 return None
         if not is_active_account_status(account.status):

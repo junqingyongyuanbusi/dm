@@ -114,11 +114,18 @@ async def test_poll_raw_event_journal_columns_and_indexes_exist(migrated_db):
         "context",
         "schema_version",
         "occurred_at",
+        "processing_claim_token",
+        "processing_claim_expires_at",
+        "processing_attempt_count",
+        "processing_next_attempt_at",
+        "processing_error_code",
+        "processing_last_dispatched_at",
     } <= columns
     assert {"external_conversation_id", "event_metadata"} <= normalized_columns
     assert {
         "ix_raw_events_status_received",
         "ix_raw_events_account_received",
+        "ix_raw_events_processing_due",
     } <= indexes
 
 

@@ -202,8 +202,9 @@ async def test_stale_xchat_claim_cannot_mark_new_claim_inactive(session, monkeyp
             platform_account_id=account_id,
             source="x",
             payload={"data": {"event_type": "chat.received"}},
-            context={"xchat_claim_token": "old-claim"},
+            context={},
             processing_status="XCHAT_PROCESSING",
+            processing_claim_token=uuid.UUID("11111111-1111-1111-1111-111111111111"),
         )
     )
     await session.commit()
@@ -233,7 +234,9 @@ async def test_stale_xchat_claim_cannot_mark_new_claim_inactive(session, monkeyp
                 update(models.RawEvent)
                 .where(models.RawEvent.id == current_raw_event_id)
                 .values(
-                    context={"xchat_claim_token": "new-claim"},
+                    processing_claim_token=uuid.UUID(
+                        "22222222-2222-2222-2222-222222222222"
+                    ),
                     processing_status="XCHAT_PROCESSING",
                 )
             )
@@ -261,7 +264,7 @@ async def test_stale_xchat_claim_cannot_mark_new_claim_inactive(session, monkeyp
             reply_target={"kind": "x_chat", "conversation_id": "bot-1:user-1"},
         ),
         raw_event_id=raw_event_id,
-        raw_event_claim_token="old-claim",
+        raw_event_claim_token="11111111-1111-1111-1111-111111111111",
     )
 
     assert result is None
@@ -269,5 +272,5 @@ async def test_stale_xchat_claim_cannot_mark_new_claim_inactive(session, monkeyp
     raw = await session.get(models.RawEvent, raw_event_id)
     normalized_count = await session.scalar(select(models.NormalizedEvent.id).limit(1))
     assert raw.processing_status == "XCHAT_PROCESSING"
-    assert raw.context["xchat_claim_token"] == "new-claim"
+    assert str(raw.processing_claim_token) == "22222222-2222-2222-2222-222222222222"
     assert normalized_count is None

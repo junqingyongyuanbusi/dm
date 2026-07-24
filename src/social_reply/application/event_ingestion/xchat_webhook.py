@@ -39,12 +39,7 @@ class XChatClaim:
 
 async def process_xchat_raw_event(raw_event_id: uuid.UUID, account_id: uuid.UUID) -> None:
     account = await get_platform_account_runtime(account_id)
-    claim = await _claim(
-        raw_event_id,
-        account_id,
-        account.tenant_id,
-        str(account.external_account_id or ""),
-    )
+    claim = await _claim(raw_event_id, account_id, account.tenant_id)
     if claim is None:
         return
     data = claim.payload.get("data") or {}
@@ -178,87 +173,42 @@ async def _claim(
     raw_event_id: uuid.UUID,
     account_id: uuid.UUID,
     tenant_id: str,
-    external_account_id: str,
 ) -> XChatClaim | None:
     now = datetime.now(UTC)
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
+                select(models.RawEvent)
+                .where(models.RawEvent.id == raw_event_id)
+                .with_for_update()
             )
         ).scalar_one_or_none()
-        if row is None or not _claim_owner_matches(
-            row,
-            account_id=account_id,
-            tenant_id=tenant_id,
-            external_account_id=external_account_id,
+        if (
+            row is None
+            or row.source != "x"
+            or row.platform_account_id != account_id
+            or row.tenant_id != tenant_id
         ):
             await session.rollback()
             return None
-        context = dict(row.context or {})
         if row.processing_status == "XCHAT_PROCESSING":
-            if not _timestamp_due(context.get("xchat_claim_expires_at"), now=now):
+            if row.processing_claim_expires_at and row.processing_claim_expires_at > now:
                 await session.rollback()
                 return None
         elif row.processing_status not in _CLAIMABLE_STATUSES:
             await session.rollback()
             return None
-        claim_token = str(uuid.uuid4())
-        context.update(
-            {
-                "xchat_claim_token": claim_token,
-                "xchat_claimed_at": now.isoformat(),
-                "xchat_claim_expires_at": (now + _CLAIM_LEASE).isoformat(),
-                "xchat_attempt_count": _attempt_count(context) + 1,
-            }
-        )
-        row.tenant_id = tenant_id
-        row.platform_account_id = account_id
+        claim_token = uuid.uuid4()
         row.processing_status = "XCHAT_PROCESSING"
-        row.context = context
+        row.processing_claim_token = claim_token
+        row.processing_claim_expires_at = now + _CLAIM_LEASE
+        row.processing_attempt_count = int(row.processing_attempt_count or 0) + 1
+        row.processing_next_attempt_at = None
+        row.processing_error_code = None
+        row.processed_at = None
         payload = dict(row.payload or {})
         await session.commit()
-        return XChatClaim(payload=payload, token=claim_token)
-
-
-def _claim_owner_matches(
-    row: models.RawEvent,
-    *,
-    account_id: uuid.UUID,
-    tenant_id: str,
-    external_account_id: str,
-) -> bool:
-    if row.source != "x":
-        return False
-    if row.platform_account_id is not None:
-        return row.platform_account_id == account_id and row.tenant_id == tenant_id
-    if row.tenant_id != tenant_id:
-        return False
-    payload = dict(row.payload or {})
-    data = payload.get("data") or {}
-    target_user_id = str(
-        payload.get("for_user_id") or (data.get("filter") or {}).get("user_id") or ""
-    )
-    return data.get("event_type") == "chat.received" and target_user_id == external_account_id
-
-
-def _timestamp_due(value: object, *, now: datetime) -> bool:
-    if not isinstance(value, str):
-        return True
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed <= now
-
-
-def _attempt_count(context: dict) -> int:
-    try:
-        return max(0, int(context.get("xchat_attempt_count") or 0))
-    except (TypeError, ValueError):
-        return 0
+        return XChatClaim(payload=payload, token=str(claim_token))
 
 
 async def _mark_retryable(
@@ -270,28 +220,27 @@ async def _mark_retryable(
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
+                select(models.RawEvent)
+                .where(models.RawEvent.id == raw_event_id)
+                .with_for_update()
             )
         ).scalar_one_or_none()
-        if row is None:
-            return
-        context = dict(row.context or {})
-        if context.get("xchat_claim_token") != claim_token:
+        if row is None or str(row.processing_claim_token or "") != claim_token:
             await session.rollback()
             return
-        attempts = _attempt_count(context)
-        context.pop("xchat_claim_token", None)
-        context.pop("xchat_claim_expires_at", None)
-        context["xchat_last_error_code"] = error_code
+        attempts = int(row.processing_attempt_count or 0)
+        row.processing_claim_token = None
+        row.processing_claim_expires_at = None
+        row.processing_error_code = error_code
         if attempts >= _MAX_RETRY_ATTEMPTS:
             row.processing_status = "XCHAT_RETRY_EXHAUSTED"
-            context.pop("xchat_next_attempt_at", None)
+            row.processing_next_attempt_at = None
             row.processed_at = now
         else:
             delay_seconds = min(3600, 30 * (2 ** max(0, attempts - 1)))
             row.processing_status = "XCHAT_RETRYABLE_ERROR"
-            context["xchat_next_attempt_at"] = (now + timedelta(seconds=delay_seconds)).isoformat()
-        row.context = context
+            row.processing_next_attempt_at = now + timedelta(seconds=delay_seconds)
+            row.processed_at = None
         await session.commit()
 
 
@@ -305,22 +254,22 @@ async def _mark(
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
+                select(models.RawEvent)
+                .where(models.RawEvent.id == raw_event_id)
+                .with_for_update()
             )
         ).scalar_one_or_none()
-        if row is None:
-            return
-        context = dict(row.context or {})
-        if context.get("xchat_claim_token") != claim_token:
+        if row is None or str(row.processing_claim_token or "") != claim_token:
             await session.rollback()
             return
-        context.pop("xchat_claim_token", None)
-        context.pop("xchat_claim_expires_at", None)
-        context.pop("xchat_next_attempt_at", None)
-        if error_code:
-            context["xchat_last_error_code"] = error_code
+        row.processing_claim_token = None
+        row.processing_claim_expires_at = None
+        row.processing_next_attempt_at = None
+        row.processing_error_code = error_code
         row.processing_status = status
-        row.context = context
-        if status not in {"XCHAT_KEY_RECOVERY_REQUIRED", "XCHAT_PIN_REQUIRED"}:
-            row.processed_at = datetime.now(UTC)
+        row.processed_at = (
+            None
+            if status in {"XCHAT_KEY_RECOVERY_REQUIRED", "XCHAT_PIN_REQUIRED"}
+            else datetime.now(UTC)
+        )
         await session.commit()
