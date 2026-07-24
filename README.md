@@ -114,6 +114,19 @@ POST /api/v1/platform-accounts/meta
 }
 ```
 
+Instagram 提供两条不可混用的接入路径：
+
+- **Facebook Login**：从 `/admin/accounts` 的 Facebook Login 卡片选择关联 Page 的 Instagram
+  专业账号；保存 Page access token、IG professional account ID 和必填 `page_id`，订阅与发送使用
+  Facebook Graph 的 Page 路径。Control API 传 `instagram_login_mode=facebook_login`。
+- **Instagram Login**：从独立 Instagram Login 卡片授权；保存 Instagram long-lived token 和 IG
+  professional account ID，不允许 `page_id`，订阅与发送使用 Instagram Graph 的 IG 账号路径。
+  Control API 传 `instagram_login_mode=instagram_login`。
+
+两条路径都固定 `enable_dm=true`、`enable_comments=false` 和 `BOT_DRAFT_ONLY`。`meta` 与
+`instagram` App family 共用 `/webhooks/meta/{app_public_id}` 路由，因此数据库会拒绝跨 family
+重复的 `app_public_id`。
+
 同一个 Meta App 下增加账号时，可传首次响应的 `app_public_id` 复用 webhook 路由。系统验证
 账号 token、使用 `appsecret_proof` 调用 Graph API并自动安装 `messages` subscription。本地账号
 先进入 `PROVISIONING` 以接住可能并发到达的私信 occurrence，但所有发送在 `READY` 前暂停；订阅

@@ -145,10 +145,15 @@ async def _handle_meta_messaging_request(
             allow_comments=allow_comments,
         )
         events = adapter.normalize({"object": object_type, "entry": [entry]})
+        stored_entry = dict(entry)
+        if not allow_dm:
+            stored_entry.pop("messaging", None)
+        if not allow_comments:
+            stored_entry.pop("changes", None)
         occurrences.append(
             (
                 account,
-                entry,
+                stored_entry,
                 [canonical_event_to_dict(event) for event in events],
             )
         )

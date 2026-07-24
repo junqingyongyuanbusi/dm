@@ -58,6 +58,19 @@ Paused provisioning jobs and Outbox rows resume automatically without consuming 
 attempt. Signed webhooks received while disabled retain only tenant/app ownership, the event family,
 and a SHA-256 body digest, not the original message payload.
 
+Revision `d4e7f2a9b608` makes `/webhooks/meta/{app_public_id}` unambiguous across Facebook Login
+`platform_family=meta` and standalone Instagram Login `platform_family=instagram`. The migration
+aborts if a public ID is already present in both families. Check and rename/reprovision a collision
+before deployment:
+
+```sql
+SELECT public_id, array_agg(platform_family ORDER BY platform_family)
+FROM platform_apps
+WHERE platform_family IN ('meta', 'instagram')
+GROUP BY public_id
+HAVING count(*) > 1;
+```
+
 ## Event and send contracts
 
 `CanonicalEvent` now persists an additive `event_kind=message` field. New readers default historical

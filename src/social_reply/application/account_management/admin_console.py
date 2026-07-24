@@ -1330,6 +1330,9 @@ async def accounts_page(request: Request) -> Response:
         ks_cls = "btn-ghost" if stopped else "btn-danger"
         auto_target = "BOT_DRAFT_ONLY" if a.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
         auto_label = "切为草稿" if a.automation_default == "BOT_ACTIVE" else "切为自动"
+        automation_form = ""
+        if a.platform not in {"facebook", "instagram"} or a.automation_default == "BOT_ACTIVE":
+            automation_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>"""
         xchat_form = ""
         channel_status = "—"
         if a.platform == "x":
@@ -1369,7 +1372,7 @@ async def accounts_page(request: Request) -> Response:
             f"<tr><td>{html.escape(a.platform)}</td><td>{html.escape(a.name)}</td>"
             f"<td>{_pill(a.status)}</td><td>{channel_status}</td>"
             f"<td>{_pill(a.automation_default)}</td><td>{ks_pill}</td>"
-            f"""<td><form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>
+            f"""<td>{automation_form}
 <form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="account"><input type="hidden" name="account_id" value="{a.id}"><input type="hidden" name="tenant_id" value="{html.escape(a.tenant_id)}"><button class="btn-sm {ks_cls}">{ks_btn}</button></form>{xchat_form}</td></tr>"""
         )
     account_rows = account_rows or "<tr><td colspan='7' class='muted'>尚未连接账号</td></tr>"
@@ -1549,6 +1552,8 @@ async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Re
         account = await session.get(models.PlatformAccount, account_id)
         if account is None or account.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="account_not_found")
+        if account.platform in {"facebook", "instagram"} and target != "BOT_DRAFT_ONLY":
+            raise HTTPException(status_code=422, detail="meta_requires_bot_draft_only")
         account.automation_default = target
         await session.commit()
     return RedirectResponse("/admin/accounts", status_code=status.HTTP_303_SEE_OTHER)

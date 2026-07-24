@@ -65,8 +65,10 @@ class MetaAccountRequest(_BaseAccountRequest):
     def _validate_meta_request(self) -> "MetaAccountRequest":
         if not self.app_id and not self.app_public_id:
             raise ValueError("app_id 或 app_public_id 至少填写一个")
-        if not self.enable_dm and not self.enable_comments:
-            raise ValueError("enable_dm 与 enable_comments 至少启用一个")
+        if not self.enable_dm or self.enable_comments:
+            raise ValueError("当前 Meta 接入仅允许文本私信")
+        if self.automation_default != "BOT_DRAFT_ONLY":
+            raise ValueError("Meta 接入必须使用 BOT_DRAFT_ONLY")
         if self.platform == "facebook" and self.instagram_login_mode != "facebook_login":
             raise ValueError("Facebook 账号必须使用 facebook_login")
         if (

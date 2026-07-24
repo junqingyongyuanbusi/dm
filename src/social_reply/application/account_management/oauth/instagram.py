@@ -26,6 +26,7 @@ from social_reply.application.account_management.oauth.common import (
     take_oauth_state,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.connectors.meta.client import appsecret_proof
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
@@ -157,6 +158,7 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 params={
                     "fields": "user_id,username,name,profile_picture_url",
                     "access_token": long_token,
+                    "appsecret_proof": appsecret_proof(long_token, app.app_secret),
                 },
             )
             profile_response.raise_for_status()
@@ -196,6 +198,9 @@ async def instagram_oauth_callback(request: Request) -> Response:
         "app_public_id": app.public_id,
         "api_version": _API_VERSION,
         "instagram_login_mode": "instagram_login",
+        "enable_dm": True,
+        "enable_comments": False,
+        "automation_default": "BOT_DRAFT_ONLY",
         "access_token": long_token,
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,

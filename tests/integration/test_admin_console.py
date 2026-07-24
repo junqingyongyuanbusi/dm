@@ -1,3 +1,4 @@
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -77,6 +78,8 @@ async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
     assert "Facebook Login · 多账号 OAuth" in html
     assert "Instagram Login · 独立账号 OAuth" in html
     assert 'name="platform"' in html and "关联 Facebook Page" in html
+    assert 'name="page_id"' in html
+    assert 'name="enable_comments" value="false"' in html
     # 回调及共享 webhook URL 直接渲染在页面,便于登记到平台后台
     assert "/admin/oauth/x/callback" in html
     assert "授权确认页必须明确列出 Direct Messages 权限" in html
@@ -86,6 +89,63 @@ async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
     assert "/webhooks/meta/instagram_oauth_default" in html
     # Telegram 无 OAuth,给 BotFather 指引 + 手工表单
     assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
+
+
+async def test_meta_account_automation_only_converges_to_draft(session, migrated_db):
+    account_id = uuid.uuid4()
+    legacy_active_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="instagram",
+            name="@shop",
+            external_account_id="ig-1",
+            public_id=f"ig_{uuid.uuid4().hex}",
+            config={"meta_health_status": "READY"},
+            capability={"dm": True, "comments": False, "max_text_length": 1000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=legacy_active_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="facebook",
+            name="Legacy Page",
+            external_account_id="page-legacy",
+            public_id=f"fb_{uuid.uuid4().hex}",
+            config={"meta_health_status": "READY"},
+            capability={"dm": True, "comments": False, "max_text_length": 2000},
+            automation_default="BOT_ACTIVE",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/accounts")
+        assert f'action="/admin/accounts/{account_id}/automation"' not in page.text
+        assert f'action="/admin/accounts/{legacy_active_id}/automation"' in page.text
+        rejected = await client.post(
+            f"/admin/accounts/{account_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
+        )
+        converged = await client.post(
+            f"/admin/accounts/{legacy_active_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_DRAFT_ONLY"},
+        )
+    assert rejected.status_code == 422
+    assert converged.status_code == 303
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    legacy_active = await session.get(models.PlatformAccount, legacy_active_id)
+    assert account.automation_default == "BOT_DRAFT_ONLY"
+    assert legacy_active.automation_default == "BOT_DRAFT_ONLY"
 
 
 async def test_accounts_page_hides_future_platform_forms_when_disabled(migrated_db, monkeypatch):

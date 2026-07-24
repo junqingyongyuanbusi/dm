@@ -82,6 +82,12 @@ class PlatformApp(Base):
     __table_args__ = (
         UniqueConstraint("platform_family", "public_id"),
         UniqueConstraint("tenant_id", "platform_family", "external_app_id"),
+        Index(
+            "uq_platform_apps_meta_route_public_id",
+            "public_id",
+            unique=True,
+            postgresql_where=text("platform_family IN ('meta', 'instagram')"),
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")

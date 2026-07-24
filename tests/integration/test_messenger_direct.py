@@ -127,6 +127,8 @@ async def test_signed_messenger_dm_is_account_scoped_and_becomes_draft(session):
     assert occurrence.tenant_id == "tenant-a"
     assert occurrence.platform_account_id == account_id
     assert occurrence.event_namespace == "meta.facebook.entry"
+    assert "changes" not in occurrence.payload["entry"][0]
+    assert "comment must stay out of decisions" not in json.dumps(occurrence.payload)
     dispatch = occurrence.context["initial_dispatch"]
     assert len(dispatch["events"]) == 1
     event = dispatch["events"][0]

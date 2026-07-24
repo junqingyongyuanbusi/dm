@@ -139,6 +139,43 @@ async def test_connect_meta_rejects_invalid_login_path_before_graph_calls(
         )
 
 
+@pytest.mark.parametrize(
+    ("enable_dm", "enable_comments", "automation_default", "error"),
+    [
+        (False, False, "BOT_DRAFT_ONLY", "meta_private_messages_only"),
+        (True, True, "BOT_DRAFT_ONLY", "meta_private_messages_only"),
+        (True, False, "BOT_ACTIVE", "meta_requires_bot_draft_only"),
+    ],
+)
+async def test_connect_meta_rejects_out_of_scope_launch_policy_before_graph_calls(
+    monkeypatch,
+    tmp_path,
+    enable_dm,
+    enable_comments,
+    automation_default,
+    error,
+):
+    class UnexpectedClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("invalid launch policy must not construct a Graph client")
+
+    monkeypatch.setattr(service, "MetaGraphClient", UnexpectedClient)
+    with pytest.raises(ValueError, match=error):
+        await service.connect_meta_account(
+            platform="facebook",
+            external_account_id="page-1",
+            access_token="token",
+            app_secret="secret",
+            public_base_url="https://reply.example.com",
+            verify_token="verify",
+            app_id="app-1",
+            enable_dm=enable_dm,
+            enable_comments=enable_comments,
+            automation_default=automation_default,
+            secrets_root=tmp_path,
+        )
+
+
 async def test_connect_whatsapp_rechecks_feature_flag_before_platform_calls(monkeypatch, tmp_path):
     settings = whatsapp_service.get_settings().model_copy(update={"whatsapp_enabled": False})
     monkeypatch.setattr(whatsapp_service, "get_settings", lambda: settings)

@@ -72,6 +72,20 @@ async def provision_platform_app(
                     )
                 )
             ).scalar_one_or_none()
+        if public_id and platform_family in {"meta", "instagram"}:
+            shared_route_owner = (
+                await session.execute(
+                    select(models.PlatformApp).where(
+                        models.PlatformApp.platform_family.in_(("meta", "instagram")),
+                        models.PlatformApp.public_id == public_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if (
+                shared_route_owner is not None
+                and shared_route_owner.platform_family != platform_family
+            ):
+                raise ValueError("meta_webhook_public_id_collision")
         if external_app_id and public_id:
             public_id_owner = (
                 await session.execute(

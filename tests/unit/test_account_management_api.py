@@ -101,6 +101,76 @@ async def test_meta_account_api_rejects_missing_app_identity():
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "platform": "facebook",
+            "external_account_id": "page-1",
+            "access_token": "token",
+            "app_secret": "secret",
+            "app_id": "app-1",
+            "verify_token": "verify",
+            "instagram_login_mode": "instagram_login",
+        },
+        {
+            "platform": "instagram",
+            "external_account_id": "ig-1",
+            "access_token": "token",
+            "app_secret": "secret",
+            "app_id": "app-1",
+            "verify_token": "verify",
+            "instagram_login_mode": "facebook_login",
+        },
+        {
+            "platform": "instagram",
+            "external_account_id": "ig-1",
+            "access_token": "token",
+            "app_secret": "secret",
+            "app_id": "app-1",
+            "verify_token": "verify",
+            "instagram_login_mode": "instagram_login",
+            "page_id": "page-1",
+        },
+    ],
+)
+async def test_meta_account_api_rejects_mixed_login_paths(payload):
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json=payload,
+        )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"enable_dm": False},
+        {"enable_comments": True},
+        {"automation_default": "BOT_ACTIVE"},
+    ],
+)
+async def test_meta_account_api_rejects_out_of_scope_launch_policy(overrides):
+    payload = {
+        "platform": "facebook",
+        "external_account_id": "page-1",
+        "access_token": "token",
+        "app_secret": "secret",
+        "app_id": "app-1",
+        "verify_token": "verify",
+        **overrides,
+    }
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json=payload,
+        )
+    assert response.status_code == 422
+
+
 async def test_x_account_api_rejects_disabled_features(monkeypatch):
     settings = account_router.get_settings().model_copy(
         update={

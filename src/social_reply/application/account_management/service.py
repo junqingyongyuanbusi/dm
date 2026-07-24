@@ -221,8 +221,10 @@ async def connect_meta_account(
         if platform == "instagram" and instagram_login_mode == "instagram_login"
         else "https://graph.facebook.com"
     )
-    if not enable_dm and not enable_comments:
-        raise ValueError("meta_account_requires_dm_or_comments")
+    if not enable_dm or enable_comments:
+        raise ValueError("meta_private_messages_only")
+    if automation_default != "BOT_DRAFT_ONLY":
+        raise ValueError("meta_requires_bot_draft_only")
     _validate_automation_default(automation_default)
     external_account_id = _require_secret(external_account_id, "external_account_id")
     access_token = _require_secret(access_token, "meta_access_token")

@@ -77,6 +77,11 @@ API, Worker and Scheduler must use the same values.
 | `INSTAGRAM_VERIFY_TOKEN` | empty | Falls back to `META_VERIFY_TOKEN` when empty |
 | `META_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler token and `messages` subscription reconciliation; range 60-86400 |
 
+`FACEBOOK_APP_*` owns Messenger Pages and Facebook Login Instagram accounts. `INSTAGRAM_APP_*`
+owns standalone Instagram Login accounts. The first path requires a Page ID and Page token; the
+second forbids a Page ID and stores an Instagram long-lived token. Their generated webhook IDs use
+different prefixes, and PostgreSQL enforces uniqueness across both App families.
+
 Changing one of these flags is a coordinated three-role operation, not an ordinary mixed-version
 rolling update. Old images do not understand the flags and can still accept or send traffic. Use
 this sequence:

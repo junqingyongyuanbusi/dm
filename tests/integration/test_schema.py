@@ -251,7 +251,42 @@ async def test_platform_apps_and_account_fk_exist(migrated_db):
                 )
             )
         }
+        app_indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='platform_apps'")
+            )
+        }
     assert "platform_app_id" in account_cols
+    assert "uq_platform_apps_meta_route_public_id" in app_indexes
+
+
+async def test_meta_webhook_route_id_is_unique_across_app_families(session):
+    public_id = f"shared_{uuid.uuid4().hex}"
+    await session.execute(
+        insert(models.PlatformApp).values(
+            tenant_id="tenant-a",
+            platform_family="meta",
+            name="Facebook App",
+            public_id=public_id,
+            config={},
+            status="active",
+        )
+    )
+    await session.commit()
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.PlatformApp).values(
+                tenant_id="tenant-b",
+                platform_family="instagram",
+                name="Instagram App",
+                public_id=public_id,
+                config={},
+                status="active",
+            )
+        )
+        await session.commit()
+    await session.rollback()
 
 
 async def test_provisioning_jobs_have_durable_recovery_index(migrated_db):

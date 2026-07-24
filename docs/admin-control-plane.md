@@ -43,7 +43,7 @@ Failed jobs retain only the encrypted staging envelope for controlled retry, use
 `PlatformApp` owns application-level webhook credentials and one webhook route. It may contain many `PlatformAccount` rows.
 
 - Telegram: one direct `PlatformAccount`, account-level webhook.
-- Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows. App secrets sign webhook bodies and generate `appsecret_proof`; account tokens remain account-scoped.
+- Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows. App secrets sign webhook bodies and generate `appsecret_proof`; account tokens remain account-scoped. Facebook Login Instagram rows belong to family `meta` and require a Page ID; standalone Instagram Login rows belong to family `instagram` and forbid a Page ID. Shared webhook public IDs are unique across both families.
 - WhatsApp: a Meta `PlatformApp` plus one account per `phone_number_id`.
 - X: deployment-level OAuth Consumer App credentials, a tenant-shared `PlatformApp` webhook route, and one `PlatformAccount` per authorized user. Events route by `for_user_id`; legacy account-level webhook secrets remain readable during migration.
 
@@ -82,7 +82,7 @@ The built-in administration surface provides:
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
-- account enable/disable and health checks, including Messenger/Instagram token and `messages` subscription state;
+- account enable/disable and health checks, including Messenger/Instagram token and `messages` subscription state; Meta text-DM accounts are locked to `BOT_DRAFT_ONLY` and cannot be switched to `BOT_ACTIVE` from the Admin endpoint;
 - no account-creation CLI requirement.
 
 OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.

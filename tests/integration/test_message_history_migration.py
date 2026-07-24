@@ -79,6 +79,44 @@ async def test_platform_account_migration_rejects_incompatible_capability():
         await admin_engine.dispose()
 
 
+async def test_meta_route_migration_rejects_cross_family_collision():
+    base_url = make_url(get_settings().database_url)
+    database_name = f"social_reply_meta_route_{uuid.uuid4().hex[:12]}"
+    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
+    admin_engine = create_async_engine(
+        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
+    )
+    async with admin_engine.connect() as connection:
+        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+
+    try:
+        await _alembic(database_url, "upgrade", "c5a8e2f4d901")
+        engine = create_async_engine(database_url)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO platform_apps ("
+                    "id, tenant_id, platform_family, name, external_app_id, public_id, "
+                    "credential_ref, config, config_version, status) VALUES "
+                    "('00000000-0000-0000-0000-000000000101', 'tenant-a', 'meta', "
+                    "'Facebook App', 'fb-app', 'shared-route', '', '{}'::jsonb, 1, 'active'), "
+                    "('00000000-0000-0000-0000-000000000102', 'tenant-b', 'instagram', "
+                    "'Instagram App', 'ig-app', 'shared-route', '', '{}'::jsonb, 1, 'active')"
+                )
+            )
+        await engine.dispose()
+
+        result = await _run_alembic(database_url, "upgrade", "head")
+        assert result.returncode != 0
+        assert "cross-family Meta webhook public_id collision" in (result.stdout + result.stderr)
+    finally:
+        async with admin_engine.connect() as connection:
+            await connection.execute(
+                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
+            )
+        await admin_engine.dispose()
+
+
 async def test_message_history_migration_backfills_and_round_trips():
     base_url = make_url(get_settings().database_url)
     database_name = f"social_reply_history_{uuid.uuid4().hex[:12]}"
@@ -216,7 +254,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).all()
-        assert revision == "c5a8e2f4d901"
+        assert revision == "d4e7f2a9b608"
         assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {

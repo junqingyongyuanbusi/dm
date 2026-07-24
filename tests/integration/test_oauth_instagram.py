@@ -7,6 +7,7 @@ import pytest
 from apps.api.main import create_app
 from social_reply.application.account_management.meta_credentials import MetaAppCredentials
 from social_reply.application.account_management.oauth import instagram
+from social_reply.connectors.meta.client import appsecret_proof
 
 pytestmark = pytest.mark.integration
 
@@ -140,6 +141,9 @@ def instagram_env(monkeypatch):
                 json={"access_token": "long-token", "token_type": "bearer", "expires_in": 5184000},
             )
         if request.url.path.endswith("/me"):
+            assert request.url.params["appsecret_proof"] == appsecret_proof(
+                "long-token", "ig-app-secret"
+            )
             return httpx.Response(
                 200,
                 json={
@@ -207,6 +211,9 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
     assert submitted["request"]["app_id"] == "ig-app-id"
     assert submitted["request"]["app_public_id"] == "instagram_oauth"
     assert submitted["request"]["instagram_login_mode"] == "instagram_login"
+    assert submitted["request"]["enable_dm"] is True
+    assert submitted["request"]["enable_comments"] is False
+    assert submitted["request"]["automation_default"] == "BOT_DRAFT_ONLY"
     assert submitted["secrets"] == {
         "access_token": "long-token",
         "app_secret": "ig-app-secret",
