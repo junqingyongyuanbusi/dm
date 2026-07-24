@@ -113,9 +113,22 @@ these families independently.
 | `X_ACTIVITY_ENABLED` | CRC/signed webhook route, webhook health, and Activity transport |
 | `XCHAT_ENABLED` | PIN activation, subscriptions, XChat webhook processing and `x_chat_message` sending |
 
-`x_post_reply` is independent of the Legacy DM flag. Disabling a send stack preserves tokens,
-cursors, private keys and recoverable Outbox rows. Verified accounts retain low-frequency polling;
-PostgreSQL leases prevent duplicate ownership and open gaps drive resumable backfill.
+`x_post_reply` is independent of the Legacy DM flag. Disabling a stack stops its polling,
+subscription/recovery work and sending while preserving tokens, cursors, private keys and recoverable
+Outbox rows. After re-enable, PostgreSQL leases prevent duplicate ownership and open gaps drive
+resumable backfill.
+
+## Meta platform boundaries
+
+Facebook Messenger, Instagram Messaging, and WhatsApp use independent Settings gates even though
+they share the signed Meta webhook route. A disabled event family stores only a tenant/app-scoped
+audit summary and SHA-256 body digest, then acknowledges without dispatch. Existing provisioning
+jobs and direct Outbox rows pause without consuming a disabled-period attempt and recover after the
+matching flag is re-enabled.
+
+These gates are process-local configuration. Old images do not recognize them, so disabling a
+platform requires the coordinated API/Worker/Scheduler restart documented in
+`docs/configuration.md`; a mixed-version rolling window is not a valid disable procedure.
 
 ## Provisioning path
 

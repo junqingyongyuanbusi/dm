@@ -183,6 +183,8 @@ async def connect_meta_account(
     """连接 Facebook Page 或 Instagram 账号，并复用账号所属的 Meta App。"""
     if platform not in _META_PLATFORMS:
         raise ValueError(f"unsupported_meta_platform:{platform}")
+    if not get_settings().platform_integration_enabled(platform):
+        raise ValueError(f"{platform}_integration_disabled")
     if instagram_login_mode not in {"facebook_login", "instagram_login"}:
         raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
     graph_base_url = graph_base_url or (

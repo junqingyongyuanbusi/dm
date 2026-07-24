@@ -91,6 +91,9 @@ API 立即返回 `job_id`；Worker 验证 `getMe`、幂等创建或更新账号�
 
 ### 连接 Facebook / Instagram
 
+新部署默认关闭未来 Meta 消息平台。接入前必须在 API、Worker、Scheduler 同时显式设置
+`FACEBOOK_MESSENGER_ENABLED=true` 或 `INSTAGRAM_MESSAGING_ENABLED=true`。
+
 ```http
 POST /api/v1/platform-accounts/meta
 
@@ -126,9 +129,11 @@ POST /api/v1/platform-accounts/x
 
 X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_user_id` 路由到账号。旧 `environment` 字段仅作请求兼容，缺省为 `oauth`，当前 v2 运行链路不读取 Account Activity environment 名称。`X_LEGACY_DM_ENABLED=true` 时 Worker 额外读取 `/2/dm_events` 验证 Direct Messages 权限；关闭时跳过该探测并暂停 `x_dm` 发送。Legacy DM 或 XChat 任一开启时，X App 都必须授予 Direct Messages 权限。`X_ACTIVITY_ENABLED` 控制 CRC/webhook 与健康巡检。`XCHAT_ENABLED` 控制实验性的加密消息补拉、subscription 和发送，新部署建议保持 `false`，仅对少量已完成 PIN 密钥登记的账号开启。
 
-功能开关暂停对应的实时入口、自动订阅和发送，不清除 token、游标或 XChat 私钥；重新开启后对应 Outbox 自动恢复。在 durable checkpoint/backfill 完成前，已有且已验证能力的账号仍保留低频 reconciliation，避免长时间停用放大平台历史窗口缺口。X post reply 不受 Legacy DM 开关影响。
+功能开关暂停对应的实时入口、轮询、自动订阅和发送，不清除 token、游标或 XChat 私钥；重新开启后对应 Outbox 自动恢复。Legacy DM 与 XChat 已使用 PostgreSQL checkpoint、lease 和 resumable gap/backfill。X post reply 不受 Legacy DM 开关影响。
 
 ### 连接 WhatsApp Cloud API
+
+新部署默认关闭 WhatsApp；接入前必须在三个应用角色同时设置 `WHATSAPP_ENABLED=true`。
 
 在 `/admin` 中填写 `phone_number_id`、Meta App ID、App Secret 和 Access Token；或调用 `POST /api/v1/platform-accounts/whatsapp`。WhatsApp 与 Facebook/Instagram 共用 Meta App 级 webhook，系统根据 `phone_number_id` 动态路由到隔离账号。当前自动发送仅允许客户服务窗口内的 session text；窗口外模板消息需要在 Meta 审核后扩展 capability。
 

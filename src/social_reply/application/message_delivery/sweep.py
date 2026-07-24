@@ -19,22 +19,50 @@ async def sweep_outbox() -> list[uuid.UUID]:
     settings = get_settings()
     recoverable_routes = []
     if settings.chatwoot_enabled:
-        recoverable_routes.append(("chatwoot_conversation", "CHATWOOT_DISABLED", None))
+        recoverable_routes.append(("chatwoot_conversation", "CHATWOOT_DISABLED", None, None))
     if settings.x_legacy_dm_enabled:
-        recoverable_routes.append(("x_dm", "X_LEGACY_DM_DISABLED", CapabilityKey.DM.value))
+        recoverable_routes.append(("x_dm", "X_LEGACY_DM_DISABLED", CapabilityKey.DM.value, "x"))
     if settings.xchat_enabled:
-        recoverable_routes.append(("x_chat_message", "XCHAT_DISABLED", CapabilityKey.X_CHAT.value))
+        recoverable_routes.append(
+            ("x_chat_message", "XCHAT_DISABLED", CapabilityKey.X_CHAT.value, "x")
+        )
+    if getattr(settings, "facebook_messenger_enabled", True):
+        recoverable_routes.extend(
+            (
+                ("meta_messenger_dm", "FACEBOOK_MESSENGER_DISABLED", "dm", "facebook"),
+                ("meta_public_comment", "FACEBOOK_MESSENGER_DISABLED", "comments", "facebook"),
+                ("meta_private_reply", "FACEBOOK_MESSENGER_DISABLED", "comments", "facebook"),
+            )
+        )
+    if getattr(settings, "instagram_messaging_enabled", True):
+        recoverable_routes.extend(
+            (
+                ("meta_instagram_dm", "INSTAGRAM_MESSAGING_DISABLED", "dm", "instagram"),
+                ("meta_public_comment", "INSTAGRAM_MESSAGING_DISABLED", "comments", "instagram"),
+                ("meta_private_reply", "INSTAGRAM_MESSAGING_DISABLED", "comments", "instagram"),
+            )
+        )
+    if getattr(settings, "whatsapp_enabled", True):
+        recoverable_routes.append(
+            ("whatsapp_session_message", "WHATSAPP_DISABLED", "session_messages", "whatsapp")
+        )
     async with get_session_factory()() as session:
-        for destination_type, error_code, capability_key in recoverable_routes:
+        for destination_type, error_code, capability_key, platform in recoverable_routes:
             statement = update(models.OutboxMessage).where(
                 models.OutboxMessage.status == "NEEDS_REVIEW",
                 models.OutboxMessage.destination_type == destination_type,
                 models.OutboxMessage.last_error_code == error_code,
             )
-            if capability_key is not None:
-                capable_accounts = select(models.PlatformAccount.id).where(
-                    models.PlatformAccount.capability[capability_key].as_boolean().is_(True)
-                )
+            if capability_key is not None or platform is not None:
+                capable_accounts = select(models.PlatformAccount.id)
+                if platform is not None:
+                    capable_accounts = capable_accounts.where(
+                        models.PlatformAccount.platform == platform
+                    )
+                if capability_key is not None:
+                    capable_accounts = capable_accounts.where(
+                        models.PlatformAccount.capability[capability_key].as_boolean().is_(True)
+                    )
                 statement = statement.where(
                     models.OutboxMessage.platform_account_id.in_(capable_accounts)
                 )

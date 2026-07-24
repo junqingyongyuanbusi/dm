@@ -42,6 +42,9 @@ def test_direct_only_production_modules_import_without_chatwoot_credentials():
             "X_LEGACY_DM_ENABLED": "false",
             "X_ACTIVITY_ENABLED": "false",
             "XCHAT_ENABLED": "false",
+            "FACEBOOK_MESSENGER_ENABLED": "false",
+            "INSTAGRAM_MESSAGING_ENABLED": "false",
+            "WHATSAPP_ENABLED": "false",
             "CONTROL_API_KEY": "control-token",
             "ADMIN_SESSION_SECRET": "x" * 32,
             "ADMIN_USERNAME": "admin",
@@ -67,8 +70,7 @@ def test_direct_only_production_modules_import_without_chatwoot_credentials():
                 "assert 'social_reply.connectors.x.router' not in sys.modules; "
                 "assert 'social_reply.application.event_ingestion.xchat_actors' in sys.modules; "
                 "assert {name for name, _ in scheduler._SWEEPS} == "
-                "{'sweep_provisioning_jobs', 'sweep_decision_jobs', 'sweep_outbox', "
-                "'poll_x_direct_messages', 'poll_xchat_messages'}"
+                "{'sweep_provisioning_jobs', 'sweep_decision_jobs', 'sweep_outbox'}"
             ),
         ],
         cwd=os.getcwd(),
@@ -198,8 +200,8 @@ def test_scheduler_sweeps_follow_feature_flags():
 
     assert chatwoot[0] == "reconcile_chatwoot_messages"
     assert chatwoot[1:] == base
-    assert "poll_x_direct_messages" in no_legacy
-    assert "poll_xchat_messages" in no_xchat
+    assert "poll_x_direct_messages" not in no_legacy
+    assert "poll_xchat_messages" not in no_xchat
     assert "ensure_xchat_subscriptions" in no_xchat
     assert "sweep_xchat_recovery" not in no_xchat
     assert "ensure_x_webhooks_valid" not in no_activity

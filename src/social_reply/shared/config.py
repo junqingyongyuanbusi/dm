@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     x_activity_enabled: bool = True
     xchat_enabled: bool = True
     x_oauth_legacy_state_write: bool = False
+    facebook_messenger_enabled: bool = True
+    instagram_messaging_enabled: bool = True
+    whatsapp_enabled: bool = True
     facebook_app_id: str = ""
     facebook_app_secret: SecretStr = SecretStr("")
     meta_verify_token: SecretStr = SecretStr("")
@@ -140,6 +143,27 @@ class Settings(BaseSettings):
     @property
     def x_integration_enabled(self) -> bool:
         return self.x_legacy_dm_enabled or self.x_activity_enabled or self.xchat_enabled
+
+    def platform_integration_enabled(self, platform: str) -> bool:
+        if platform == "facebook":
+            return self.facebook_messenger_enabled
+        if platform == "instagram":
+            return self.instagram_messaging_enabled
+        if platform == "whatsapp":
+            return self.whatsapp_enabled
+        if platform == "x":
+            return self.x_integration_enabled
+        return True
+
+    def platform_disabled_code(self, platform: str) -> str | None:
+        if self.platform_integration_enabled(platform):
+            return None
+        return {
+            "facebook": "FACEBOOK_MESSENGER_DISABLED",
+            "instagram": "INSTAGRAM_MESSAGING_DISABLED",
+            "whatsapp": "WHATSAPP_DISABLED",
+            "x": "X_INTEGRATION_DISABLED",
+        }.get(platform, "PLATFORM_DISABLED")
 
     @property
     def facebook_app_credentials(self) -> tuple[str, str] | None:

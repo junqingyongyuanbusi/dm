@@ -27,14 +27,14 @@ from social_reply.application.account_management.oauth.common import (
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
 
 _API_VERSION = "v23.0"
 _SCOPES = (
-    "instagram_business_basic,instagram_business_manage_messages,"
-    "instagram_business_manage_comments"
+    "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments"
 )
 
 
@@ -49,6 +49,10 @@ async def instagram_oauth_start(request: Request) -> Response:
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    if not get_settings().instagram_messaging_enabled:
+        return notice(
+            "Instagram 集成已关闭", "当前环境未启用 Instagram Messaging。", status_code=503
+        )
     tenant_id = (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
@@ -101,6 +105,8 @@ async def instagram_oauth_callback(request: Request) -> Response:
             "授权已取消",
             request.query_params.get("error_description") or "用户取消了授权。",
         )
+    if not get_settings().instagram_messaging_enabled:
+        return notice("Instagram 集成已关闭", "授权期间 Instagram 已被关闭。", status_code=503)
     context = await take_oauth_state("instagram", state_token) if state_token else None
     if context is None:
         return notice(
@@ -179,6 +185,8 @@ async def instagram_oauth_callback(request: Request) -> Response:
             status_code=403,
         )
 
+    if not get_settings().instagram_messaging_enabled:
+        return notice("Instagram 集成已关闭", "提交接入前 Instagram 已被关闭。", status_code=503)
     external_account_id = str(profile.get("user_id") or profile.get("id") or "")
     if not external_account_id:
         return notice("账号识别失败", "Instagram 未返回专业账号 ID。", status_code=502)

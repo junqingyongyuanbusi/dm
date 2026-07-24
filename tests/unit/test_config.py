@@ -1,4 +1,6 @@
 # 配置校验测试（Plan 2c Task 0）：生产环境拒绝默认/空凭证
+from pathlib import Path
+
 import pytest
 
 from social_reply.shared.config import Settings
@@ -18,6 +20,9 @@ _ENV_KEYS = [
     "X_ACTIVITY_ENABLED",
     "XCHAT_ENABLED",
     "X_OAUTH_LEGACY_STATE_WRITE",
+    "FACEBOOK_MESSENGER_ENABLED",
+    "INSTAGRAM_MESSAGING_ENABLED",
+    "WHATSAPP_ENABLED",
     "FACEBOOK_APP_ID",
     "FACEBOOK_APP_SECRET",
     "META_VERIFY_TOKEN",
@@ -56,6 +61,9 @@ def test_testing_true_默认值可用() -> None:
     assert settings.x_activity_enabled is True
     assert settings.xchat_enabled is True
     assert settings.x_integration_enabled is True
+    assert settings.facebook_messenger_enabled is True
+    assert settings.instagram_messaging_enabled is True
+    assert settings.whatsapp_enabled is True
 
 
 def test_非测试环境_默认_chatwoot_api_token_拒绝() -> None:
@@ -160,6 +168,31 @@ def test_x_feature_flags_are_independent() -> None:
 def test_x_oauth_legacy_state_write_is_typed_setting() -> None:
     assert _make(testing=True).x_oauth_legacy_state_write is False
     assert _make(testing=True, x_oauth_legacy_state_write=True).x_oauth_legacy_state_write is True
+
+
+def test_future_platform_flags_are_independent() -> None:
+    settings = _make(
+        testing=True,
+        facebook_messenger_enabled=False,
+        instagram_messaging_enabled=True,
+        whatsapp_enabled=False,
+    )
+    assert settings.platform_integration_enabled("facebook") is False
+    assert settings.platform_integration_enabled("instagram") is True
+    assert settings.platform_integration_enabled("whatsapp") is False
+    assert settings.platform_disabled_code("facebook") == "FACEBOOK_MESSENGER_DISABLED"
+    assert settings.platform_disabled_code("instagram") is None
+    assert settings.platform_disabled_code("whatsapp") == "WHATSAPP_DISABLED"
+    assert settings.platform_integration_enabled("telegram") is True
+
+
+def test_environment_templates_disable_future_platforms() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for relative_path in (".env.example", "deploy/vps/.env.example"):
+        content = (root / relative_path).read_text()
+        assert "FACEBOOK_MESSENGER_ENABLED=false" in content
+        assert "INSTAGRAM_MESSAGING_ENABLED=false" in content
+        assert "WHATSAPP_ENABLED=false" in content
 
 
 def test_meta_app_credentials_must_be_configured_as_pairs() -> None:

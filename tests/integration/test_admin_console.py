@@ -88,6 +88,40 @@ async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
     assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
 
 
+async def test_accounts_page_hides_future_platform_forms_when_disabled(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "facebook_messenger_enabled": False,
+            "instagram_messaging_enabled": False,
+            "whatsapp_enabled": False,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    assert (
+        '<form class="card" style="display:none" method="post" '
+        'action="/admin/oauth/meta/start">' in response.text
+    )
+    assert (
+        '<form class="card" style="display:none" method="post" '
+        'action="/admin/oauth/instagram/start">' in response.text
+    )
+    assert (
+        '<form class="card" style="display:none" method="post" '
+        'action="/admin/connect/meta">' in response.text
+    )
+    assert (
+        '<form class="card" style="display:none" method="post" '
+        'action="/admin/connect/whatsapp">' in response.text
+    )
+
+
 async def test_accounts_page_hides_x_forms_when_all_stacks_disabled(migrated_db, monkeypatch):
     from social_reply.application.account_management import admin_console
 

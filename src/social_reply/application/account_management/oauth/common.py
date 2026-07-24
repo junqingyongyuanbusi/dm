@@ -67,6 +67,38 @@ async def store_oauth_state(namespace: str, key: str, payload: Mapping[str, Any]
         await redis.aclose()
 
 
+def _decode_oauth_state(value: bytes | str | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        envelope = json.loads(value)
+        if not isinstance(envelope, dict):
+            return None
+        decrypted = decrypt_secret_bundle(envelope)
+        payload = decrypted.get("payload")
+        return json.loads(payload) if isinstance(payload, str) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+async def peek_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
+    if not key:
+        return None
+    redis = oauth_redis()
+    redis_keys = _oauth_state_lookup_keys(namespace, key)
+    try:
+        async with redis.pipeline(transaction=True) as pipe:
+            for redis_key in redis_keys:
+                pipe.get(redis_key)
+            values = await pipe.execute()
+    finally:
+        await redis.aclose()
+    return next(
+        (payload for value in values if (payload := _decode_oauth_state(value)) is not None),
+        None,
+    )
+
+
 async def take_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
     if not key:
         return None
@@ -80,19 +112,10 @@ async def take_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
             results = await pipe.execute()
     finally:
         await redis.aclose()
-    values = results[0::2]
-    value = next((item for item in values if item is not None), None)
-    if value is None:
-        return None
-    try:
-        envelope = json.loads(value)
-        if not isinstance(envelope, dict):
-            return None
-        decrypted = decrypt_secret_bundle(envelope)
-        payload = decrypted.get("payload")
-        return json.loads(payload) if isinstance(payload, str) else None
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
+    return next(
+        (payload for value in results[0::2] if (payload := _decode_oauth_state(value)) is not None),
+        None,
+    )
 
 
 async def principal_from_oauth_context(context: Mapping[str, Any]) -> Principal | None:

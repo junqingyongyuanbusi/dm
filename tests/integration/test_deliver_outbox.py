@@ -410,6 +410,70 @@ async def test_finalize_does_not_overwrite_non_sending_row(session, monkeypatch,
     ).first() is None
 
 
+async def _seed_direct_platform(
+    session,
+    *,
+    platform: str,
+    destination_type: str,
+    capability: dict,
+    target: dict,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    account_id, contact_id, conv_id, ob_id = (
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform=platform,
+            name="direct",
+            status="active",
+            capability=capability,
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="default",
+            platform=platform,
+            platform_account_id=account_id,
+            external_user_id="user-1",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conv_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform=platform,
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"{platform}:{account_id}:user-1",
+        )
+    )
+    await ensure_state(session, conv_id, "BOT_ACTIVE")
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=ob_id,
+            tenant_id="default",
+            conversation_id=conv_id,
+            platform_account_id=account_id,
+            destination_type=destination_type,
+            destination_id=f"{platform}:user-1",
+            message_type="text",
+            payload={"text": "hi", "target": target},
+            idempotency_key=str(ob_id),
+            status="PENDING",
+        )
+    )
+    await session.commit()
+    return account_id, ob_id
+
+
 async def _seed_direct_x(
     session,
     *,
@@ -540,6 +604,12 @@ async def test_x_stack_disabled_outbox_pauses_and_recovers(
     paused = await session.get(models.OutboxMessage, ob_id)
     assert paused.attempt_count == 0
     assert paused.last_error_code == error_code
+    assert (
+        await session.scalar(
+            select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == ob_id)
+        )
+        is None
+    )
 
     recovered_values = (
         {"x_legacy_dm_enabled": True} if destination_type == "x_dm" else {"xchat_enabled": True}
@@ -550,6 +620,98 @@ async def test_x_stack_disabled_outbox_pauses_and_recovers(
 
     monkeypatch.setattr(outbox_module, "get_settings", recovered_settings)
     monkeypatch.setattr(sweep_module, "get_settings", recovered_settings)
+    assert ob_id in await sweep_outbox()
+    session.expire_all()
+    recovered = await session.get(models.OutboxMessage, ob_id)
+    assert recovered.status == "PENDING"
+    assert recovered.last_error_code is None
+
+
+@pytest.mark.parametrize(
+    (
+        "platform",
+        "destination_type",
+        "capability",
+        "target",
+        "settings_update",
+        "error_code",
+    ),
+    [
+        (
+            "facebook",
+            "meta_messenger_dm",
+            {"dm": True, "comments": False, "max_text_length": 2000},
+            {"kind": "dm", "recipient_id": "user-1"},
+            {"facebook_messenger_enabled": False},
+            "FACEBOOK_MESSENGER_DISABLED",
+        ),
+        (
+            "instagram",
+            "meta_instagram_dm",
+            {"dm": True, "comments": False, "max_text_length": 1000},
+            {"kind": "dm", "recipient_id": "user-1"},
+            {"instagram_messaging_enabled": False},
+            "INSTAGRAM_MESSAGING_DISABLED",
+        ),
+        (
+            "whatsapp",
+            "whatsapp_session_message",
+            {
+                "dm": True,
+                "session_messages": True,
+                "templates": False,
+                "max_text_length": 4096,
+            },
+            {"kind": "dm", "to": "user-1"},
+            {"whatsapp_enabled": False},
+            "WHATSAPP_DISABLED",
+        ),
+    ],
+)
+async def test_future_platform_disabled_outbox_pauses_and_recovers(
+    session,
+    monkeypatch,
+    platform,
+    destination_type,
+    capability,
+    target,
+    settings_update,
+    error_code,
+):
+    _account_id, ob_id = await _seed_direct_platform(
+        session,
+        platform=platform,
+        destination_type=destination_type,
+        capability=capability,
+        target=target,
+    )
+    disabled = outbox_module.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: disabled)
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("disabled platform must not resolve a sender")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    paused = await session.get(models.OutboxMessage, ob_id)
+    assert paused.attempt_count == 0
+    assert paused.last_error_code == error_code
+    assert (
+        await session.scalar(
+            select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == ob_id)
+        )
+        is None
+    )
+
+    enabled = disabled.model_copy(
+        update={
+            "facebook_messenger_enabled": True,
+            "instagram_messaging_enabled": True,
+            "whatsapp_enabled": True,
+        }
+    )
+    monkeypatch.setattr(sweep_module, "get_settings", lambda: enabled)
     assert ob_id in await sweep_outbox()
     session.expire_all()
     recovered = await session.get(models.OutboxMessage, ob_id)

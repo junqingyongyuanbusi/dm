@@ -11,6 +11,7 @@ from social_reply.application.account_management.service import (
     _webhook_url,
 )
 from social_reply.connectors.whatsapp.client import WhatsAppClient
+from social_reply.shared.config import get_settings
 
 
 async def connect_whatsapp_account(
@@ -34,6 +35,8 @@ async def connect_whatsapp_account(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AccountConnectionResult:
     """Connect one WhatsApp Cloud API phone_number_id under a shared Meta App."""
+    if not get_settings().whatsapp_enabled:
+        raise ValueError("whatsapp_integration_disabled")
     _validate_automation_default(automation_default)
     external_account_id = _require_secret(external_account_id, "phone_number_id")
     access_token = _require_secret(access_token, "whatsapp_access_token")

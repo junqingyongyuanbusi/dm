@@ -25,6 +25,9 @@ _TEST_DEFAULTS = {
     "X_LEGACY_DM_ENABLED": "true",
     "X_ACTIVITY_ENABLED": "true",
     "XCHAT_ENABLED": "true",
+    "FACEBOOK_MESSENGER_ENABLED": "true",
+    "INSTAGRAM_MESSAGING_ENABLED": "true",
+    "WHATSAPP_ENABLED": "true",
     "FACEBOOK_APP_ID": "fb-app",
     "FACEBOOK_APP_SECRET": "fb-app-secret",
     "META_VERIFY_TOKEN": "meta-verify-token",
@@ -44,6 +47,4 @@ for _k, _v in _TEST_DEFAULTS.items():
 
 _database_name = make_url(os.environ["DATABASE_URL"]).database or ""
 if not _database_name.endswith("_test"):
-    raise RuntimeError(
-        f"pytest refuses to use non-test database: {_database_name or '<missing>'}"
-    )
+    raise RuntimeError(f"pytest refuses to use non-test database: {_database_name or '<missing>'}")

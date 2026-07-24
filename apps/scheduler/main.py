@@ -34,10 +34,10 @@ def _build_sweeps(settings: Settings) -> tuple[tuple[str, Callable[[], Awaitable
             ("sweep_decision_jobs", sweep_decision_jobs),
         )
     )
-    # 轮询在 feature flag 关闭时仍为已有可用账号做低频对账，避免在 durable
-    # checkpoint/backfill 上线前因长时间暂停放大平台历史窗口缺口。
-    sweeps.append(("poll_x_direct_messages", poll_x_direct_messages))
-    sweeps.append(("poll_xchat_messages", poll_xchat_messages))
+    if settings.x_legacy_dm_enabled:
+        sweeps.append(("poll_x_direct_messages", poll_x_direct_messages))
+    if settings.xchat_enabled:
+        sweeps.append(("poll_xchat_messages", poll_xchat_messages))
     if settings.x_activity_enabled:
         sweeps.append(("ensure_xchat_subscriptions", ensure_xchat_subscriptions))
     if settings.xchat_enabled:

@@ -6,6 +6,7 @@ import pytest
 from chat_xdk import Chat
 
 from social_reply.application.account_management import service
+from social_reply.application.account_management import whatsapp as whatsapp_service
 from social_reply.application.platform_accounts import PlatformAccountRuntime
 from social_reply.connectors.xchat.crypto import export_private_key_b64
 
@@ -64,6 +65,58 @@ async def test_connect_telegram_validates_and_configures_webhook(monkeypatch, tm
     set_webhook = json.loads(calls[1].content)
     assert set_webhook["url"] == result.webhook_url
     assert set_webhook["secret_token"]
+
+
+@pytest.mark.parametrize(
+    ("platform", "settings_update", "error"),
+    [
+        ("facebook", {"facebook_messenger_enabled": False}, "facebook_integration_disabled"),
+        ("instagram", {"instagram_messaging_enabled": False}, "instagram_integration_disabled"),
+    ],
+)
+async def test_connect_meta_rechecks_feature_flags_before_platform_calls(
+    monkeypatch, tmp_path, platform, settings_update, error
+):
+    settings = service.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
+
+    class UnexpectedClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("disabled platform must not construct a Graph client")
+
+    monkeypatch.setattr(service, "MetaGraphClient", UnexpectedClient)
+    with pytest.raises(ValueError, match=error):
+        await service.connect_meta_account(
+            platform=platform,
+            external_account_id="account-1",
+            access_token="token",
+            app_secret="secret",
+            public_base_url="https://reply.example.com",
+            verify_token="verify",
+            app_id="app-1",
+            secrets_root=tmp_path,
+        )
+
+
+async def test_connect_whatsapp_rechecks_feature_flag_before_platform_calls(monkeypatch, tmp_path):
+    settings = whatsapp_service.get_settings().model_copy(update={"whatsapp_enabled": False})
+    monkeypatch.setattr(whatsapp_service, "get_settings", lambda: settings)
+
+    class UnexpectedClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("disabled WhatsApp must not construct a client")
+
+    monkeypatch.setattr(whatsapp_service, "WhatsAppClient", UnexpectedClient)
+    with pytest.raises(ValueError, match="whatsapp_integration_disabled"):
+        await whatsapp_service.connect_whatsapp_account(
+            external_account_id="phone-1",
+            access_token="token",
+            app_secret="secret",
+            public_base_url="https://reply.example.com",
+            verify_token="verify",
+            app_id="app-1",
+            secrets_root=tmp_path,
+        )
 
 
 async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path):

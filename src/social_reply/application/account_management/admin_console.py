@@ -1214,17 +1214,35 @@ async def accounts_page(request: Request) -> Response:
         else "Activity webhook 已关闭，系统仅使用低频 reconciliation。"
     )
     x_card_style = "" if settings.x_integration_enabled else ' style="display:none"'
+    meta_enabled = settings.facebook_messenger_enabled or settings.instagram_messaging_enabled
+    meta_card_style = "" if meta_enabled else ' style="display:none"'
+    instagram_card_style = "" if settings.instagram_messaging_enabled else ' style="display:none"'
+    whatsapp_card_style = "" if settings.whatsapp_enabled else ' style="display:none"'
+    meta_options = "".join(
+        option
+        for enabled, option in (
+            (
+                settings.facebook_messenger_enabled,
+                '<option value="facebook">Facebook Page</option>',
+            ),
+            (
+                settings.instagram_messaging_enabled,
+                '<option value="instagram">关联 Facebook Page 的 Instagram 专业账号</option>',
+            ),
+        )
+        if enabled
+    )
     connect_open = "" if principal.is_superadmin else " open"
     connect_title = "接入新平台账号" if principal.is_superadmin else "授权新平台账号"
     connect_forms = f"""<details class="collapse"{connect_open}><summary>{connect_title}</summary><div class="inner">
 <p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。OAuth 卡片会跳转平台授权页自动换取凭证；手工卡片用于粘贴已有凭证。</p>
 <div class="grid">
 <form class="card"{x_card_style} method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{xchat_oauth_input}<p class="hint">使用环境变量 <code>X_API_KEY</code> / <code>X_API_SECRET</code> 中的 Consumer Keys；每次点击都可授权一个账号，账号 Token 会独立加密入库。X Developer Portal 中将 {x_permission_hint}、App type 设为 Web App，并精确登记 Callback URI <code>{html.escape(oauth_callback)}</code>。{x_activity_hint}</p><button class="btn-block">授权新的 X 账号</button></form>
-<form class="card" method="post" action="/admin/oauth/meta/start"><h3>Facebook Login · 多账号 OAuth</h3>{oauth_common}<label for="f-oauth-meta-platform">目标</label><select id="f-oauth-meta-platform" name="platform"><option value="facebook">Facebook Page</option><option value="instagram">关联 Facebook Page 的 Instagram 专业账号</option></select><p class="hint">使用部署级 <code>FACEBOOK_APP_ID</code> / <code>FACEBOOK_APP_SECRET</code> / <code>META_VERIFY_TOKEN</code>，授权后列出全部可管理目标并选择一个接入，可反复授权多个账号。Callback：<code>{html.escape(meta_callback)}</code>；Webhook：<code>{html.escape(meta_webhook)}</code>。</p><button class="btn-block">跳转 Facebook 授权</button></form>
-<form class="card" method="post" action="/admin/oauth/instagram/start"><h3>Instagram Login · 独立账号 OAuth</h3>{oauth_common}<p class="hint">无需 Facebook Page，适用于 Instagram 专业账号。使用 <code>INSTAGRAM_APP_ID</code> / <code>INSTAGRAM_APP_SECRET</code>；Callback：<code>{html.escape(instagram_callback)}</code>；Webhook：<code>{html.escape(instagram_webhook)}</code>。</p><button class="btn-block">跳转 Instagram 授权</button></form>
+<form class="card"{meta_card_style} method="post" action="/admin/oauth/meta/start"><h3>Facebook Login · 多账号 OAuth</h3>{oauth_common}<label for="f-oauth-meta-platform">目标</label><select id="f-oauth-meta-platform" name="platform">{meta_options}</select><p class="hint">使用部署级 <code>FACEBOOK_APP_ID</code> / <code>FACEBOOK_APP_SECRET</code> / <code>META_VERIFY_TOKEN</code>，授权后列出全部可管理目标并选择一个接入，可反复授权多个账号。Callback：<code>{html.escape(meta_callback)}</code>；Webhook：<code>{html.escape(meta_webhook)}</code>。</p><button class="btn-block">跳转 Facebook 授权</button></form>
+<form class="card"{instagram_card_style} method="post" action="/admin/oauth/instagram/start"><h3>Instagram Login · 独立账号 OAuth</h3>{oauth_common}<p class="hint">无需 Facebook Page，适用于 Instagram 专业账号。使用 <code>INSTAGRAM_APP_ID</code> / <code>INSTAGRAM_APP_SECRET</code>；Callback：<code>{html.escape(instagram_callback)}</code>；Webhook：<code>{html.escape(instagram_webhook)}</code>。</p><button class="btn-block">跳转 Instagram 授权</button></form>
 <form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<p class="hint">Telegram 无 OAuth：在 Telegram 中找 @BotFather 发送 /newbot 创建机器人，把返回的 Token 粘贴到上方，提交后自动校验并注册 webhook。</p><button class="btn-block">连接 Telegram</button></form>
-<form class="card" method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform"><option>facebook</option><option>instagram</option></select>{_input("external_account_id", "Page / IG Account ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 Meta</button></form>
-<form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
+<form class="card"{meta_card_style} method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform">{meta_options}</select>{_input("external_account_id", "Page / IG Account ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 Meta</button></form>
+<form class="card"{whatsapp_card_style} method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
 <form class="card"{x_card_style} method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}<input type="hidden" name="environment" value="oauth">{xchat_manual_input}<button class="btn-block">连接 X</button></form>
 </div></div></details>"""
     account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""

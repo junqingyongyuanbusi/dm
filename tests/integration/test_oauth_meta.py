@@ -63,6 +63,57 @@ async def _login(client: httpx.AsyncClient) -> str:
     return csrf
 
 
+async def test_meta_oauth_start_rejects_disabled_platform_before_state_storage(
+    migrated_db, monkeypatch
+):
+    settings = meta.get_settings().model_copy(update={"facebook_messenger_enabled": False})
+    monkeypatch.setattr(meta, "get_settings", lambda: settings)
+
+    async def unexpected_store(*_args, **_kwargs):
+        raise AssertionError("disabled OAuth must not store state")
+
+    monkeypatch.setattr(meta, "store_oauth_state", unexpected_store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="http://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        response = await client.post(
+            "/admin/oauth/meta/start",
+            data={
+                "csrf_token": csrf,
+                "platform": "facebook",
+                "tenant_id": "default",
+                "brand_id": "default",
+            },
+        )
+    assert response.status_code == 503
+    assert "平台集成已关闭" in response.text
+
+
+async def test_meta_oauth_callback_does_not_consume_state_when_target_is_disabled(
+    migrated_db, monkeypatch
+):
+    settings = meta.get_settings().model_copy(update={"instagram_messaging_enabled": False})
+    monkeypatch.setattr(meta, "get_settings", lambda: settings)
+
+    async def pending_state(_namespace, _key):
+        return {"platform": "instagram"}
+
+    async def unexpected_take(*_args, **_kwargs):
+        raise AssertionError("disabled callback must preserve OAuth state")
+
+    monkeypatch.setattr(meta, "peek_oauth_state", pending_state)
+    monkeypatch.setattr(meta, "take_oauth_state", unexpected_take)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
+    ) as client:
+        response = await client.get("/admin/oauth/meta/callback?code=code&state=state-token")
+    assert response.status_code == 503
+    assert "平台集成已关闭" in response.text
+
+
 @pytest.fixture
 def meta_env(monkeypatch):
     calls: list[str] = []
@@ -179,6 +230,50 @@ async def test_instagram_filters_pages_without_ig_and_shows_picker(session, meta
     assert "No IG Page" not in picker.text
     assert meta._PICK_COOKIE in picker.cookies
     assert not meta_env["submitted"]  # 选择前不提交
+
+
+async def test_instagram_picker_does_not_consume_state_when_platform_is_disabled(
+    session, meta_env, monkeypatch
+):
+    await _seed_meta_app(session)
+    meta_env["pages"]["pages"] = [
+        {
+            "id": "page-b",
+            "name": "Shop B",
+            "access_token": "T-B",
+            "instagram_business_account": {"id": "ig-b", "username": "shopb"},
+        },
+        {
+            "id": "page-c",
+            "name": "Shop C",
+            "access_token": "T-C",
+            "instagram_business_account": {"id": "ig-c", "username": "shopc"},
+        },
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        start = await _run_start(client, csrf, "instagram")
+        state_token = start.headers["location"].split("state=")[1].split("&")[0]
+        picker = await client.get(f"/admin/oauth/meta/callback?code=code-ig&state={state_token}")
+        assert picker.status_code == 200
+        disabled = meta.get_settings().model_copy(update={"instagram_messaging_enabled": False})
+        monkeypatch.setattr(meta, "get_settings", lambda: disabled)
+
+        async def unexpected_take(*_args, **_kwargs):
+            raise AssertionError("disabled picker must preserve OAuth state")
+
+        monkeypatch.setattr(meta, "take_oauth_state", unexpected_take)
+        select_response = await client.post(
+            "/admin/oauth/meta/select",
+            data={"csrf_token": client.cookies["reply_admin_csrf"], "choice": "1"},
+        )
+    assert select_response.status_code == 503
+    assert "平台集成已关闭" in select_response.text
+    assert not meta_env["submitted"]
 
 
 async def test_instagram_select_finalizes_with_ig_id(session, meta_env):

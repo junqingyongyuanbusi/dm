@@ -137,6 +137,11 @@ def require_control_api_key(
     )
 
 
+def _require_platform_enabled(platform: str) -> None:
+    if not get_settings().platform_integration_enabled(platform):
+        raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
+
+
 def _split_request(platform: str, request: BaseModel) -> tuple[dict, dict[str, str]]:
     values = request.model_dump()
     for key in (
@@ -193,6 +198,7 @@ async def create_or_update_meta_account(
     request: MetaAccountRequest,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> ProvisioningJobResponse:
+    _require_platform_enabled(request.platform)
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request(request.platform, request)
     job_id = await submit_provisioning_job(
@@ -212,6 +218,7 @@ async def create_or_update_whatsapp_account(
     request: WhatsAppAccountRequest,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> ProvisioningJobResponse:
+    _require_platform_enabled("whatsapp")
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request("whatsapp", request)
     job_id = await submit_provisioning_job(
@@ -308,6 +315,7 @@ async def retry_job(
         job = await session.get(models.ProvisioningJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
+    _require_platform_enabled(job.platform)
     principal.require_tenant(job.tenant_id)
     try:
         await retry_provisioning_job(job_id)

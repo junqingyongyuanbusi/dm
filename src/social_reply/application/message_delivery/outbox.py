@@ -137,16 +137,17 @@ async def _record_outcome(
                 )
                 .on_conflict_do_nothing(index_elements=["source_outbox_id"])
             )
-    await session.execute(
-        insert(models.DeliveryAttempt).values(
-            outbox_id=outbox_id,
-            attempt_no=attempt_no,
-            outcome=actual_status,
-            error_code=actual_error_code,
-            error_message=actual_error_message,
-            chatwoot_message_id=chatwoot_message_id,
+    if count_attempt:
+        await session.execute(
+            insert(models.DeliveryAttempt).values(
+                outbox_id=outbox_id,
+                attempt_no=attempt_no,
+                outcome=actual_status,
+                error_code=actual_error_code,
+                error_message=actual_error_message,
+                chatwoot_message_id=chatwoot_message_id,
+            )
         )
-    )
     await session.commit()
     return actual_status
 
@@ -205,6 +206,17 @@ async def _validate_direct_send(
         return await _stop_before_send(
             session, row.id, "NEEDS_REVIEW", "ACCOUNT_NOT_ACTIVE", attempt_no
         ), None
+    if account.platform in {"facebook", "instagram", "whatsapp"}:
+        disabled_code = get_settings().platform_disabled_code(account.platform)
+        if disabled_code is not None:
+            return await _stop_before_send(
+                session,
+                row.id,
+                "NEEDS_REVIEW",
+                disabled_code,
+                attempt_no,
+                count_attempt=False,
+            ), None
     destination = DIRECT_DESTINATION_CAPABILITIES.get(row.destination_type)
     try:
         platform = account_platform(account.platform)

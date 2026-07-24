@@ -54,20 +54,41 @@ Code defaults preserve upgrades, while both deployment templates explicitly set
 `XCHAT_ENABLED=false` for new environments. Legacy DM or XChat requires the X application to have
 Read and write and Direct message permission.
 
-Disabling a stack is not credential deletion. Recoverable sends pause, durable account material is
-preserved, and verified accounts retain low-frequency polling until durable checkpoints/backfill are
-implemented.
+Disabling a stack is not credential deletion. Recoverable sends pause and durable account material
+is preserved. Legacy DM and XChat polling use PostgreSQL checkpoints, leases and resumable gaps;
+a disabled polling stack performs no provider reconciliation until it is re-enabled.
 
 ## Meta and Instagram applications
 
+Code defaults keep existing deployments enabled during upgrades. Both environment templates
+explicitly set the three platform flags to `false`, so new deployments do not expose unfinished
+platform integrations. API, Worker and Scheduler must use the same values.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `FACEBOOK_MESSENGER_ENABLED` | `true` | Facebook Page messaging/comment ingress, provisioning and sending |
+| `INSTAGRAM_MESSAGING_ENABLED` | `true` | Instagram messaging/comment ingress, provisioning and sending |
+| `WHATSAPP_ENABLED` | `true` | WhatsApp Cloud API ingress, provisioning and sending |
 | `FACEBOOK_APP_ID` | empty | Facebook Login App ID |
 | `FACEBOOK_APP_SECRET` | empty | Must be paired with Facebook App ID |
 | `META_VERIFY_TOKEN` | empty | Shared Meta webhook verify token |
 | `INSTAGRAM_APP_ID` | empty | Standalone Instagram Login App ID |
 | `INSTAGRAM_APP_SECRET` | empty | Must be paired with Instagram App ID |
 | `INSTAGRAM_VERIFY_TOKEN` | empty | Falls back to `META_VERIFY_TOKEN` when empty |
+
+Changing one of these flags is a coordinated three-role operation, not an ordinary mixed-version
+rolling update. Old images do not understand the flags and can still accept or send traffic. Use
+this sequence:
+
+1. Deploy the flag-aware image to API, Worker and Scheduler with the existing values still `true`.
+2. Confirm all old containers have exited and all three roles report the same configuration.
+3. Stop API, Worker and Scheduler together, change the flag to `false`, then start all three roles.
+   This brief coordinated restart is required because an old Worker can still send queued work.
+4. To re-enable, restart all three roles with the flag set to `true`; paused provisioning and Outbox
+   work will return to their durable queues automatically.
+
+A disabled signed webhook stores only a tenant/app-scoped audit summary and SHA-256 body digest. It
+does not copy message text, names or phone numbers into the gate audit row.
 
 ## Decision, LLM and knowledge
 
@@ -100,6 +121,9 @@ them requires recreating API/Worker/Scheduler containers as applicable.
 | `XCHAT_POLL_INTERVAL_SECONDS` | `900` | Scheduler XChat poll |
 | `XCHAT_MAX_CONVERSATIONS_PER_POLL` | `10` | XChat poll work budget |
 | `XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | `600` | Scheduler XChat subscription reconciliation |
+| `XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS` | `30` | Scheduler XChat RawEvent recovery sweep |
+| `XCHAT_READY_PROBE_INTERVAL_SECONDS` | `21600` | Public-key health probe for ready XChat accounts |
+| `XCHAT_PENDING_PROBE_INTERVAL_SECONDS` | `600` | Public-key health probe for pending XChat accounts |
 
 ## Deployment-only variables
 

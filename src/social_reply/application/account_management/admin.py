@@ -555,12 +555,11 @@ async def _submit_form(
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
     principal.require_tenant(tenant_id)
-    if platform == "x":
-        settings = get_settings()
-        if not settings.x_integration_enabled:
-            raise HTTPException(status_code=503, detail="x_integration_disabled")
-        if (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
-            raise HTTPException(status_code=422, detail="xchat_disabled")
+    settings = get_settings()
+    if not settings.platform_integration_enabled(platform):
+        raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
+    if platform == "x" and (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
+        raise HTTPException(status_code=422, detail="xchat_disabled")
     brand_id = form.get("brand_id", "default") or "default"
     request_data, secrets_data = split_submission(platform, form)
     job_id = await submit_provisioning_job(
@@ -665,6 +664,8 @@ async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
         job = await session.get(models.ProvisioningJob, job_id)
     if job is None or job.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
+    if not get_settings().platform_integration_enabled(job.platform):
+        raise HTTPException(status_code=503, detail=f"{job.platform}_integration_disabled")
     try:
         await retry_provisioning_job(job_id)
     except ValueError as exc:

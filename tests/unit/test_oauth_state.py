@@ -63,6 +63,19 @@ async def test_oauth_state_is_encrypted_and_consumed_once(monkeypatch):
     assert await common.take_oauth_state("x", "request-token") is None
 
 
+async def test_oauth_state_can_be_inspected_without_consuming_it(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(common, "oauth_redis", lambda: redis)
+    payload = {"platform": "instagram", "tenant_id": "tenant-a"}
+
+    await common.store_oauth_state("meta", "state-token", payload)
+
+    assert await common.peek_oauth_state("meta", "state-token") == payload
+    assert await common.peek_oauth_state("meta", "state-token") == payload
+    assert await common.take_oauth_state("meta", "state-token") == payload
+    assert await common.peek_oauth_state("meta", "state-token") is None
+
+
 async def test_x_oauth_state_can_use_legacy_writer_during_rolling_deploy(monkeypatch):
     redis = FakeRedis()
     monkeypatch.setattr(common, "oauth_redis", lambda: redis)

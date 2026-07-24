@@ -1,5 +1,7 @@
+import hashlib
 import json
 import logging
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import insert
@@ -16,6 +18,7 @@ from social_reply.domain.messages.canonical import canonical_event_to_dict
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,6 +68,39 @@ async def meta_webhook(app_public_id: str, request: Request) -> Response:
     object_type = payload.get("object")
     if object_type not in {"page", "instagram", "whatsapp_business_account"}:
         return Response(status_code=200)
+    platform = {
+        "page": "facebook",
+        "instagram": "instagram",
+        "whatsapp_business_account": "whatsapp",
+    }[object_type]
+    settings = get_settings()
+    disabled_code = settings.platform_disabled_code(platform)
+    if disabled_code is not None:
+        payload_digest = hashlib.sha256(body).hexdigest()
+        async with get_session_factory()() as session:
+            await session.execute(
+                insert(models.RawEvent).values(
+                    tenant_id=app.tenant_id,
+                    source="meta",
+                    ingress_kind="webhook_gate",
+                    event_namespace="meta.disabled",
+                    external_event_id=payload_digest,
+                    payload={"object": object_type},
+                    headers={
+                        "signature_verified": True,
+                        "ingress_gate": disabled_code,
+                        "payload_sha256": payload_digest,
+                    },
+                    context={
+                        "app_id": str(app.id),
+                        "app_public_id": app_public_id,
+                    },
+                    processing_status="IGNORED_AT_INGRESS",
+                    processed_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+        return Response(status_code=200)
     queued_events = []
     for entry in payload.get("entry", []):
         if object_type == "whatsapp_business_account":
@@ -93,7 +129,6 @@ async def meta_webhook(app_public_id: str, request: Request) -> Response:
                 )
             continue
 
-        platform = "instagram" if object_type == "instagram" else "facebook"
         external_account_id = str(entry.get("id", ""))
         if not external_account_id:
             continue

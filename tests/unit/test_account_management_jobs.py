@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import httpx
+import pytest
 
 from social_reply.application.account_management import jobs
 from social_reply.application.account_management.service import AccountConnectionResult
@@ -59,6 +60,29 @@ def test_error_explains_missing_x_direct_message_permission():
     assert code == "X_DM_PERMISSION_REQUIRED"
     assert "Read and write and Direct message" in message
     assert retryable is False
+
+
+@pytest.mark.parametrize(
+    ("platform", "settings_update"),
+    [
+        ("facebook", {"facebook_messenger_enabled": False}),
+        ("instagram", {"instagram_messaging_enabled": False}),
+        ("whatsapp", {"whatsapp_enabled": False}),
+    ],
+)
+async def test_provisioning_execution_rechecks_platform_flag_before_decrypting_secrets(
+    monkeypatch, platform, settings_update
+):
+    settings = jobs.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+
+    def unexpected_decrypt(_value):
+        raise AssertionError("disabled platform must not decrypt staging credentials")
+
+    monkeypatch.setattr(jobs, "decrypt_secret_bundle", unexpected_decrypt)
+    job = type("Job", (), {"platform": platform})()
+    with pytest.raises(ValueError, match=f"{platform}_integration_disabled"):
+        await jobs._connect(job)
 
 
 def test_result_payload_does_not_expose_verify_token():

@@ -98,6 +98,54 @@ async def test_process_job_completes_and_deletes_staging_secret(migrated_db, tmp
     get_settings.cache_clear()
 
 
+async def test_disabled_platform_job_pauses_without_attempt_and_recovers(migrated_db, monkeypatch):
+    disabled = jobs.get_settings().model_copy(update={"facebook_messenger_enabled": False})
+    monkeypatch.setattr(jobs, "get_settings", lambda: disabled)
+    job_id = await jobs.submit_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform="facebook",
+        actor="user:admin",
+        request={
+            "external_account_id": "page-1",
+            "idempotency_key": "disabled-facebook",
+        },
+        secrets={
+            "access_token": "token",
+            "app_secret": "secret",
+            "verify_token": "verify",
+        },
+    )
+
+    assert await jobs.process_provisioning_job(str(job_id)) == "PAUSED_PLATFORM_DISABLED"
+    async with get_session_factory()() as session:
+        paused = await session.get(models.ProvisioningJob, job_id)
+    assert paused.status == "PAUSED_PLATFORM_DISABLED"
+    assert paused.attempt_count == 0
+    assert paused.last_error_code == "FACEBOOK_MESSENGER_DISABLED"
+    assert decrypt_secret_bundle(paused.staging_secret)["access_token"] == "token"
+
+    enabled = disabled.model_copy(update={"facebook_messenger_enabled": True})
+    monkeypatch.setattr(jobs, "get_settings", lambda: enabled)
+    dispatched = []
+    from social_reply.application.account_management.actors import (
+        process_platform_provisioning,
+    )
+
+    monkeypatch.setattr(
+        process_platform_provisioning,
+        "send",
+        lambda pending_id: dispatched.append(pending_id),
+    )
+    assert job_id in await jobs.sweep_provisioning_jobs()
+    assert dispatched == [str(job_id)]
+    async with get_session_factory()() as session:
+        recovered = await session.get(models.ProvisioningJob, job_id)
+    assert recovered.status == "PENDING"
+    assert recovered.attempt_count == 0
+    assert recovered.last_error_code is None
+
+
 async def test_xchat_failure_requires_pin_resubmission_instead_of_auto_retry(
     migrated_db, monkeypatch
 ):
@@ -138,14 +186,10 @@ async def test_xchat_failure_requires_pin_resubmission_instead_of_auto_retry(
     assert "xchat_pin" not in staged
     assert staged["access_token"] == "at"
 
-    with pytest.raises(
-        ValueError, match="provisioning_secret_resubmission_required"
-    ):
+    with pytest.raises(ValueError, match="provisioning_secret_resubmission_required"):
         await jobs.retry_provisioning_job(job_id)
 
-    with pytest.raises(
-        ValueError, match="provisioning_secret_resubmission_required"
-    ):
+    with pytest.raises(ValueError, match="provisioning_secret_resubmission_required"):
         await jobs.submit_provisioning_job(
             tenant_id="tenant-a",
             brand_id="brand-a",

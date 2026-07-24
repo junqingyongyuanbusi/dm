@@ -44,6 +44,20 @@ Workers continue registering all durable actors so already accepted work can dra
 accounts retain low-frequency reconciliation; PostgreSQL checkpoint leases serialize poll ownership
 and open gaps trigger resumable backfill. `x_post_reply` is independent of the Legacy DM flag.
 
+## Facebook, Instagram and WhatsApp feature flags
+
+`FACEBOOK_MESSENGER_ENABLED`, `INSTAGRAM_MESSAGING_ENABLED`, and `WHATSAPP_ENABLED` default to
+`true` in code for upgrade compatibility. New deployment templates explicitly set all three to
+`false`. API, Worker and Scheduler must receive identical values.
+
+First deploy the flag-aware image to every role while preserving the existing `true` values. Verify
+that no old container remains. To disable a platform, stop API, Worker and Scheduler together,
+change the flag, and restart all three roles; an old image does not understand these gates and an
+old Worker can still send queued work. Re-enabling also requires a coordinated three-role restart.
+Paused provisioning jobs and Outbox rows resume automatically without consuming a disabled-period
+attempt. Signed webhooks received while disabled retain only tenant/app ownership, the event family,
+and a SHA-256 body digest, not the original message payload.
+
 ## Polling RawEvent journal
 
 Revision `d6b8f0a2c431` adds tenant/account/stream/conversation/occurrence metadata to `raw_events` and preserves Legacy X DM plus XChat polling occurrences before normalization or decryption side effects. It also persists external conversation and event metadata on `normalized_events`.
