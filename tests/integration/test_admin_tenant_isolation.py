@@ -103,7 +103,7 @@ async def test_tenant_user_can_authorize_accounts_without_global_switch(
             name="Tenant A Bot",
             public_id="tenant-a-bot",
             automation_default="BOT_DRAFT_ONLY",
-            status="CONNECTED",
+            status="active",
         )
     )
     await session.commit()

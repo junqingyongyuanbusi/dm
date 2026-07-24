@@ -18,6 +18,7 @@ from social_reply.application.account_management.service import (
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.domain.platform_accounts import SUPPORTED_ACCOUNT_PLATFORMS
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
@@ -78,7 +79,7 @@ async def submit_provisioning_job(
     secrets: dict[str, str],
     admin_session_id: uuid.UUID | str | None = None,
 ) -> uuid.UUID:
-    if platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+    if platform not in SUPPORTED_ACCOUNT_PLATFORMS:
         raise ValueError(f"unsupported_platform:{platform}")
     if not tenant_id or not all(ch.isalnum() or ch in {"_", "-"} for ch in tenant_id):
         raise ValueError("invalid_tenant_id")

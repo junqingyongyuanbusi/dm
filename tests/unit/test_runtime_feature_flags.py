@@ -1,9 +1,14 @@
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from apps.scheduler import main as scheduler
-from social_reply.application.event_ingestion import x_webhook_health, xchat_subscription
+from social_reply.application.event_ingestion import (
+    x_webhook_health,
+    xchat_poll,
+    xchat_subscription,
+)
 from social_reply.shared.config import Settings
 
 
@@ -102,6 +107,27 @@ async def test_disabled_activity_sweeps_do_not_load_accounts(monkeypatch):
 
     assert await xchat_subscription.ensure_xchat_subscriptions() == []
     assert await x_webhook_health.ensure_x_webhooks_valid() == []
+
+
+async def test_xchat_poll_requires_strict_capability(monkeypatch):
+    accounts = [
+        SimpleNamespace(capability={}),
+        SimpleNamespace(capability={"x_chat": False}),
+        SimpleNamespace(capability={"x_chat": "false"}),
+    ]
+
+    async def list_accounts(_platform):
+        return accounts
+
+    def unexpected_credentials(_account):
+        raise AssertionError("invalid XChat capability must not read credentials")
+
+    monkeypatch.setattr(xchat_poll, "list_active_accounts_by_platform", list_accounts)
+    monkeypatch.setattr(xchat_poll, "x_credentials", unexpected_credentials)
+    monkeypatch.setattr(xchat_poll.time, "monotonic", lambda: 1000.0)
+    xchat_poll._last_poll_at = 0.0
+
+    assert await xchat_poll.poll_xchat_messages() == []
 
 
 def test_scheduler_sweeps_follow_feature_flags():

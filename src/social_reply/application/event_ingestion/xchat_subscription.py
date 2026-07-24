@@ -7,6 +7,7 @@ import time
 from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 from social_reply.connectors.xchat.client import XChatClient
+from social_reply.domain.platform_accounts import CapabilityKey, capability_enabled
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ async def ensure_xchat_subscriptions() -> list[str]:
     seen_apps: dict[str, list[dict]] = {}
     for account in await list_active_accounts_by_platform("x"):
         credentials = x_credentials(account)
-        if not (account.capability or {}).get("x_chat"):
+        if not capability_enabled(account.capability or {}, CapabilityKey.X_CHAT):
             continue
         if not credentials.get("xchat_private_keys_b64") or not credentials.get(
             "xchat_signing_key_version"

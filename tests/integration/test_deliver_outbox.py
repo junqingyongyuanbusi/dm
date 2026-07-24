@@ -426,7 +426,7 @@ async def _seed_direct_x(
             platform="x",
             name="x-bot",
             status="active",
-            capability=capability or {"dm": True, "max_text_length": 10000},
+            capability=capability or {"dm": True, "max_text_length": 280},
         )
     )
     await session.execute(
@@ -467,20 +467,43 @@ async def _seed_direct_x(
 
 
 @pytest.mark.parametrize(
+    ("destination_type", "capability", "error_code"),
+    [
+        ("x_dm", {"dm": "false", "max_text_length": 280}, "CAPABILITY_INVALID"),
+        ("x_dm", {"dm": True, "max_text_length": 10000}, "CAPABILITY_INVALID"),
+        ("telegram_dm", {"dm": True, "max_text_length": 280}, "DELIVERY_ROUTE_INVALID"),
+    ],
+)
+async def test_direct_delivery_fails_closed_for_invalid_account_contract(
+    session, destination_type, capability, error_code
+):
+    _account_id, ob_id = await _seed_direct_x(
+        session,
+        destination_type=destination_type,
+        capability=capability,
+    )
+
+    assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, ob_id)
+    assert outbox.last_error_code == error_code
+
+
+@pytest.mark.parametrize(
     ("destination_type", "settings_values", "error_code", "capability", "target"),
     [
         (
             "x_dm",
             {"x_legacy_dm_enabled": False, "xchat_enabled": True},
             "X_LEGACY_DM_DISABLED",
-            {"dm": True, "max_text_length": 10000},
+            {"dm": True, "max_text_length": 280},
             {"kind": "dm", "participant_id": "u1"},
         ),
         (
             "x_chat_message",
             {"x_legacy_dm_enabled": True, "xchat_enabled": False},
             "XCHAT_DISABLED",
-            {"x_chat": True, "max_text_length": 10000},
+            {"x_chat": True, "max_text_length": 280},
             {"kind": "x_chat", "conversation_id": "u1-u2"},
         ),
     ],
@@ -537,7 +560,7 @@ async def test_x_stack_disabled_outbox_pauses_and_recovers(
 async def test_x_paused_outbox_waits_for_capability_reconciliation(session, monkeypatch):
     _account_id, ob_id = await _seed_direct_x(
         session,
-        capability={"dm": False, "max_text_length": 10000},
+        capability={"dm": False, "max_text_length": 280},
     )
 
     def disabled_settings():
@@ -578,7 +601,7 @@ async def test_x_post_reply_is_not_blocked_by_legacy_dm_flag(session, monkeypatc
     account_id, ob_id = await _seed_direct_x(
         session,
         destination_type="x_post_reply",
-        capability={"mentions": True, "max_text_length": 10000},
+        capability={"mentions": True, "max_text_length": 280},
         target={"kind": "reply", "in_reply_to_post_id": "post-1"},
     )
 

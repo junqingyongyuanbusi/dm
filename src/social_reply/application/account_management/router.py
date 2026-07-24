@@ -14,6 +14,10 @@ from social_reply.application.account_management.jobs import (
     submit_provisioning_job,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.domain.platform_accounts import (
+    ACTIVE_ACCOUNT_STATUS,
+    DISABLED_ACCOUNT_STATUS,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -332,7 +336,7 @@ async def disable_account(
     account_id: uuid.UUID,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> dict[str, str]:
-    return {"status": await _set_account_status(account_id, principal, "DISABLED")}
+    return {"status": await _set_account_status(account_id, principal, DISABLED_ACCOUNT_STATUS)}
 
 
 @router.post("/{account_id}/enable")
@@ -340,4 +344,4 @@ async def enable_account(
     account_id: uuid.UUID,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> dict[str, str]:
-    return {"status": await _set_account_status(account_id, principal, "active")}
+    return {"status": await _set_account_status(account_id, principal, ACTIVE_ACCOUNT_STATUS)}

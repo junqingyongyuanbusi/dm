@@ -12,6 +12,7 @@ from social_reply.application.event_ingestion.direct import ingest_canonical_eve
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
 from social_reply.connectors.x.adapter import XWebhookAdapter
 from social_reply.connectors.x.client import XClient
+from social_reply.domain.platform_accounts import CapabilityKey, capability_enabled
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -38,7 +39,7 @@ async def poll_x_direct_messages() -> list[str]:
 
     ingested: list[str] = []
     for account in await list_active_accounts_by_platform("x"):
-        dm_capable = bool((account.capability or {}).get("dm"))
+        dm_capable = capability_enabled(account.capability or {}, CapabilityKey.DM)
         if not settings.x_legacy_dm_enabled and not dm_capable:
             continue
         try:
@@ -186,7 +187,9 @@ async def _mark_dm_capable(account_id) -> None:
             update(models.PlatformAccount)
             .where(models.PlatformAccount.id == account_id)
             .values(
-                capability=models.PlatformAccount.capability.op("||")({"dm": True}),
+                capability=models.PlatformAccount.capability.op("||")(
+                    {CapabilityKey.DM.value: True}
+                ),
                 config_version=models.PlatformAccount.config_version + 1,
             )
         )

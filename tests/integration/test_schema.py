@@ -74,6 +74,64 @@ async def test_admin_auth_tables_have_constraints_and_indexes(migrated_db):
     assert "ix_admin_sessions_expires_at" in session_indexes
 
 
+async def test_platform_account_contract_constraints_exist(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='platform_accounts'"
+                )
+            )
+        }
+    assert {
+        "ck_platform_accounts_platform",
+        "ck_platform_accounts_status",
+        "ck_platform_accounts_capability_object",
+    } <= constraints
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"platform": "unknown"},
+        {"status": "CONNECTED"},
+        {"capability": "not-an-object"},
+    ],
+)
+async def test_platform_account_contract_rejects_invalid_rows(session, overrides):
+    values = {
+        "id": uuid.uuid4(),
+        "tenant_id": "default",
+        "brand_id": "b1",
+        "platform": "telegram",
+        "name": "invalid",
+        "status": "active",
+        "capability": {"dm": True, "max_text_length": 4096},
+        **overrides,
+    }
+    with pytest.raises(IntegrityError):
+        await session.execute(insert(models.PlatformAccount).values(**values))
+        await session.commit()
+    await session.rollback()
+
+
+async def test_platform_account_model_defaults_to_canonical_active_status(session):
+    account = models.PlatformAccount(
+        id=uuid.uuid4(),
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        name="default-status",
+        capability={"dm": True, "max_text_length": 4096},
+    )
+    session.add(account)
+    await session.commit()
+    assert account.status == "active"
+
+
 async def test_platform_apps_and_account_fk_exist(migrated_db):
     engine = get_engine()
     async with engine.connect() as conn:
@@ -158,8 +216,7 @@ async def test_message_history_columns_and_indexes(migrated_db):
             row[0]
             for row in await conn.execute(
                 text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name='messages'"
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='messages'"
                 )
             )
         }

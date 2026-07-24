@@ -23,6 +23,7 @@ from social_reply.connectors.xchat.key_cache import (
     canonical_conversation_id,
     save_conversation_key_events,
 )
+from social_reply.domain.platform_accounts import CapabilityKey, capability_enabled
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 
@@ -45,6 +46,8 @@ async def poll_xchat_messages() -> list[str]:
 
     ingested: list[str] = []
     for account in await list_active_accounts_by_platform("x"):
+        if not capability_enabled(account.capability or {}, CapabilityKey.X_CHAT):
+            continue
         if not x_credentials(account).get("xchat_private_keys_b64"):
             continue
         try:

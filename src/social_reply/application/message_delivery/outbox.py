@@ -14,7 +14,14 @@ from social_reply.connectors.errors import (
     RetryableSendError,
 )
 from social_reply.connectors.registry import get_platform_sender
-from social_reply.domain.platform_accounts import is_active_account_status
+from social_reply.domain.platform_accounts import (
+    DIRECT_DESTINATION_CAPABILITIES,
+    CapabilityKey,
+    account_platform,
+    capability_enabled,
+    is_active_account_status,
+    normalize_account_capability,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -22,17 +29,6 @@ from social_reply.shared.config import get_settings
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 5
-_DIRECT_CAPABILITY = {
-    "telegram_dm": "dm",
-    "meta_messenger_dm": "dm",
-    "meta_instagram_dm": "dm",
-    "meta_public_comment": "comments",
-    "meta_private_reply": "comments",
-    "whatsapp_session_message": "session_messages",
-    "x_dm": "dm",
-    "x_chat_message": "x_chat",
-    "x_post_reply": "mentions",
-}
 
 
 def _safe_error(exc: Exception) -> str:
@@ -209,9 +205,19 @@ async def _validate_direct_send(
         return await _stop_before_send(
             session, row.id, "NEEDS_REVIEW", "ACCOUNT_NOT_ACTIVE", attempt_no
         ), None
-    capability = dict(account.capability or {})
-    required = _DIRECT_CAPABILITY.get(row.destination_type)
-    if required is None or not capability.get(required, False):
+    destination = DIRECT_DESTINATION_CAPABILITIES.get(row.destination_type)
+    try:
+        platform = account_platform(account.platform)
+        capability = normalize_account_capability(account.platform, dict(account.capability or {}))
+    except ValueError:
+        return await _stop_before_send(
+            session, row.id, "NEEDS_REVIEW", "CAPABILITY_INVALID", attempt_no
+        ), None
+    if destination is None or platform not in destination.platforms:
+        return await _stop_before_send(
+            session, row.id, "NEEDS_REVIEW", "DELIVERY_ROUTE_INVALID", attempt_no
+        ), None
+    if not capability_enabled(capability, destination.capability):
         return await _stop_before_send(
             session, row.id, "NEEDS_REVIEW", "CAPABILITY_NOT_ALLOWED", attempt_no
         ), None
@@ -219,7 +225,7 @@ async def _validate_direct_send(
         return await _stop_before_send(
             session, row.id, "NEEDS_REVIEW", "DELIVERY_WINDOW_EXPIRED", attempt_no
         ), None
-    if len(str(payload.get("text", ""))) > int(capability.get("max_text_length", 4096)):
+    if len(str(payload.get("text", ""))) > capability[CapabilityKey.MAX_TEXT_LENGTH.value]:
         return await _stop_before_send(
             session, row.id, "NEEDS_REVIEW", "CAPABILITY_TEXT_TOO_LONG", attempt_no
         ), None

@@ -40,6 +40,29 @@ Workers continue registering all durable actors so already accepted work can dra
 checkpoint/backfill lands, verified accounts retain low-frequency reconciliation to avoid enlarging
 provider-history gaps. `x_post_reply` is independent of the Legacy DM flag.
 
+## Platform account contract
+
+Revision `92a6e3f1c4d8` converts legacy `platform_accounts.status='CONNECTED'` rows to the canonical
+`active` value, fills missing capability keys with fail-closed defaults, and adds database checks for
+supported platforms, account statuses, and JSON-object capability storage. The application also
+rejects non-boolean permission flags, platform limits above the provider maximum, and delivery
+routes that do not belong to the account platform.
+
+The migration aborts instead of guessing when it finds an unknown platform/status, a non-object
+capability, an unknown capability key, a non-boolean permission flag, or an invalid platform text
+limit. Start with this coarse inventory before deployment; the migration's error identifies the first
+account that fails the complete application contract:
+
+```sql
+SELECT platform, status, jsonb_typeof(capability), count(*)
+FROM platform_accounts
+GROUP BY platform, status, jsonb_typeof(capability)
+ORDER BY platform, status;
+```
+
+Back up the database before applying the revision. Fix unsupported values through an explicit data
+repair reviewed by an operator; do not coerce them during application startup.
+
 ### Previously released `a3f9c2e14b78` databases
 
 An earlier implementation dropped `credential_ref`, `webhook_secret_ref`, and

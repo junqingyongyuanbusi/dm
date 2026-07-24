@@ -7,6 +7,7 @@ from social_reply.application.reply_decision.jobs import snapshot_to_dict
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.domain.messages.canonical import CanonicalEvent
+from social_reply.domain.platform_accounts import is_active_account_status
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -30,6 +31,15 @@ async def ingest_canonical_event(
         ).scalar_one_or_none()
         if account is None:
             raise LookupError(f"unknown_{event.platform}_account")
+        if not is_active_account_status(account.status):
+            if raw_event_id is not None:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == raw_event_id)
+                    .values(processing_status="IGNORED_ACCOUNT_INACTIVE")
+                )
+            await session.commit()
+            return None
 
         if raw_event_id is not None:
             await session.execute(
@@ -45,9 +55,7 @@ async def ingest_canonical_event(
                 event_uuid = uuid.UUID(event.external_event_id)
             except ValueError:
                 pass
-            echo_conditions = [
-                models.OutboxMessage.platform_message_id == event.external_event_id
-            ]
+            echo_conditions = [models.OutboxMessage.platform_message_id == event.external_event_id]
             if event_uuid is not None:
                 echo_conditions.append(models.OutboxMessage.id == event_uuid)
             managed_echo = (
@@ -232,6 +240,21 @@ async def ingest_canonical_event(
                     select(models.DecisionJob.id).where(models.DecisionJob.message_id == message_id)
                 )
             ).scalar_one()
+        latest_status = await session.scalar(
+            select(models.PlatformAccount.status)
+            .where(models.PlatformAccount.id == account.id)
+            .with_for_update()
+        )
+        if latest_status is None or not is_active_account_status(latest_status):
+            await session.rollback()
+            if raw_event_id is not None:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == raw_event_id)
+                    .values(processing_status="IGNORED_ACCOUNT_INACTIVE")
+                )
+                await session.commit()
+            return None
         await session.commit()
 
     from social_reply.application.reply_decision.actors import process_reply_decision

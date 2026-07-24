@@ -6,6 +6,12 @@ from pathlib import Path  # noqa: F401  secrets_root 参数签名保留（内联
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from social_reply.domain.platform_accounts import (
+    ACTIVE_ACCOUNT_STATUS,
+    account_platform,
+    canonical_account_status,
+    normalize_account_capability,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
@@ -101,7 +107,11 @@ async def provision_platform_app(
         "credential_bundle": encrypt_secret_bundle(credential_bundle),
         "config": config,
         "config_version": existing.config_version + 1 if existing is not None else 1,
-        "status": existing.status if existing is not None else "active",
+        "status": (
+            canonical_account_status(existing.status)
+            if existing is not None
+            else ACTIVE_ACCOUNT_STATUS
+        ),
     }
     if rotating_external_app_id:
         async with get_session_factory()() as session:
@@ -171,6 +181,8 @@ async def provision_direct_account(
     preserve_existing_webhook_secret: bool = False,
 ) -> tuple[uuid.UUID, str]:
     """幂等创建/更新直连账号；每个账号拥有独立凭证目录。"""
+    platform = account_platform(platform).value
+    capability = normalize_account_capability(platform, capability)
     async with get_session_factory()() as session:
         existing = (
             await session.execute(
@@ -215,7 +227,11 @@ async def provision_direct_account(
         "config_version": existing.config_version + 1 if existing is not None else 1,
         "chatwoot_inbox_id": None,
         "automation_default": automation_default,
-        "status": existing.status if existing is not None else "active",
+        "status": (
+            canonical_account_status(existing.status)
+            if existing is not None
+            else ACTIVE_ACCOUNT_STATUS
+        ),
     }
     async with get_session_factory()() as session:
         account_id = (

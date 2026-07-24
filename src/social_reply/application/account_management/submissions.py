@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from social_reply.domain.platform_accounts import AccountPlatform
+
 
 @dataclass(frozen=True)
 class PlatformSubmissionSpec:
@@ -27,25 +29,25 @@ _META_APP_PUBLIC = frozenset(
 )
 
 PLATFORM_SUBMISSIONS = {
-    "telegram": PlatformSubmissionSpec(
+    AccountPlatform.TELEGRAM.value: PlatformSubmissionSpec(
         public_fields=_COMMON_PUBLIC | {"drop_pending_updates", "rotate_webhook_secret"},
         secret_fields=frozenset({"token"}),
     ),
-    "facebook": PlatformSubmissionSpec(
+    AccountPlatform.FACEBOOK.value: PlatformSubmissionSpec(
         public_fields=_COMMON_PUBLIC | _META_APP_PUBLIC | {"enable_dm", "enable_comments"},
         secret_fields=frozenset({"access_token", "app_secret", "verify_token"}),
     ),
-    "instagram": PlatformSubmissionSpec(
+    AccountPlatform.INSTAGRAM.value: PlatformSubmissionSpec(
         public_fields=_COMMON_PUBLIC
         | _META_APP_PUBLIC
         | {"enable_dm", "enable_comments", "instagram_login_mode", "page_id"},
         secret_fields=frozenset({"access_token", "app_secret", "verify_token"}),
     ),
-    "whatsapp": PlatformSubmissionSpec(
+    AccountPlatform.WHATSAPP.value: PlatformSubmissionSpec(
         public_fields=_COMMON_PUBLIC | _META_APP_PUBLIC,
         secret_fields=frozenset({"access_token", "app_secret", "verify_token"}),
     ),
-    "x": PlatformSubmissionSpec(
+    AccountPlatform.X.value: PlatformSubmissionSpec(
         public_fields=_COMMON_PUBLIC | {"environment"},
         secret_fields=frozenset(
             {

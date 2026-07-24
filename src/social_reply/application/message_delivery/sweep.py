@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import insert, or_, select, update
 
+from social_reply.domain.platform_accounts import CapabilityKey
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -20,9 +21,9 @@ async def sweep_outbox() -> list[uuid.UUID]:
     if settings.chatwoot_enabled:
         recoverable_routes.append(("chatwoot_conversation", "CHATWOOT_DISABLED", None))
     if settings.x_legacy_dm_enabled:
-        recoverable_routes.append(("x_dm", "X_LEGACY_DM_DISABLED", "dm"))
+        recoverable_routes.append(("x_dm", "X_LEGACY_DM_DISABLED", CapabilityKey.DM.value))
     if settings.xchat_enabled:
-        recoverable_routes.append(("x_chat_message", "XCHAT_DISABLED", "x_chat"))
+        recoverable_routes.append(("x_chat_message", "XCHAT_DISABLED", CapabilityKey.X_CHAT.value))
     async with get_session_factory()() as session:
         for destination_type, error_code, capability_key in recoverable_routes:
             statement = update(models.OutboxMessage).where(

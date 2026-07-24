@@ -21,6 +21,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from social_reply.domain.platform_accounts import ACTIVE_ACCOUNT_STATUS
+
 
 class Base(DeclarativeBase):
     pass
@@ -100,6 +102,18 @@ class PlatformAccount(Base):
     __table_args__ = (
         UniqueConstraint("platform", "public_id"),
         UniqueConstraint("tenant_id", "platform", "external_account_id"),
+        CheckConstraint(
+            "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x')",
+            name="ck_platform_accounts_platform",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'DISABLED')",
+            name="ck_platform_accounts_status",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(capability) = 'object'",
+            name="ck_platform_accounts_capability_object",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
@@ -118,7 +132,7 @@ class PlatformAccount(Base):
     config_version: Mapped[int] = mapped_column(Integer, default=1)
     chatwoot_inbox_id: Mapped[int | None] = mapped_column(Integer, unique=True)
     automation_default: Mapped[str] = mapped_column(Text, default="BOT_DRAFT_ONLY")
-    status: Mapped[str] = mapped_column(Text, default="CONNECTED")
+    status: Mapped[str] = mapped_column(Text, default=ACTIVE_ACCOUNT_STATUS)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -179,9 +193,7 @@ class Message(Base):
     text: Mapped[str | None] = mapped_column(Text)
     chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     platform_message_id: Mapped[str | None] = mapped_column(Text, index=True)
-    source_outbox_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("outbox_messages.id")
-    )
+    source_outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
     reply_target: Mapped[dict] = mapped_column(JSONB, default=dict)
     private: Mapped[bool] = mapped_column(Boolean, default=False)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
