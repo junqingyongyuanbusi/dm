@@ -45,7 +45,7 @@ Failed jobs retain only the encrypted staging envelope for controlled retry, use
 - Telegram: one direct `PlatformAccount`, account-level webhook.
 - Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows.
 - WhatsApp: a Meta `PlatformApp` plus one account per `phone_number_id`.
-- X: one direct `PlatformAccount`, account-level webhook/subscription.
+- X: deployment-level OAuth Consumer App credentials, a tenant-shared `PlatformApp` webhook route, and one `PlatformAccount` per authorized user. Events route by `for_user_id`; legacy account-level webhook secrets remain readable during migration.
 
 Each account owns tenant, brand, external ID, route ID, credential reference, capabilities, automation mode, config version, and lifecycle status.
 
@@ -62,6 +62,7 @@ Supported destination commands:
 - `meta_private_reply`
 - `whatsapp_session_message`
 - `x_dm`
+- `x_chat_message`
 - `x_post_reply`
 
 Direct-platform drafts are never sent to customers. A `DRAFT` decision is retained in `reply_decisions` for future approval/inbox workflows and has no direct Outbox until approved. Chatwoot private notes remain supported for legacy Chatwoot-backed accounts.
@@ -89,4 +90,4 @@ Production deployments should put `/admin` behind an identity-aware proxy or rep
 
 ## OAuth evolution
 
-Meta Embedded Signup/OAuth and X OAuth are adapters into the same ProvisioningJob boundary. OAuth callbacks must stage exchanged tokens in `SecretStore`, store only grant metadata in PostgreSQL, and submit the same platform provisioning operations. Platform App Review, Business Verification, WhatsApp template approval, and X product-tier permissions remain external prerequisites and are surfaced as capabilities/manual steps rather than bypassed.
+Meta and X OAuth are adapters into the same `ProvisioningJob` boundary. OAuth transaction state is encrypted and short-lived in Redis. Exchanged platform credentials are encrypted with `PLATFORM_SECRET_KEYS` and staged in the durable job row, then stored as encrypted PostgreSQL bundles on the resulting `PlatformApp` / `PlatformAccount`; completed jobs clear the staging bundle. `ACCOUNT_SECRETS_ROOT` is retained only for legacy `file://` migration. Platform App Review, Business Verification, WhatsApp template approval, and X product-tier permissions remain external prerequisites and are surfaced as capabilities/manual steps rather than bypassed.

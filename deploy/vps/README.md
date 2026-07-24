@@ -1,7 +1,8 @@
 # Social Reply · VPS 部署手册(Ubuntu + Docker + Cloudflare Tunnel)
 
-拓扑:`cloudflared`(出站穿透)→ `api` → `worker`/`scheduler` + `postgres(pgvector)` + `redis`。
-全栈跑在 compose 内网,**零入站端口**——VPS 防火墙只需开 SSH。
+拓扑：`cloudflared → API`；API 通过 PostgreSQL 提交事实并通过 Redis/Dramatiq 派发 Worker，Scheduler 独立扫描 PostgreSQL、补队列并执行平台对账。API、Worker、Scheduler 都直接访问 PostgreSQL/Redis，只有 API 经 Tunnel 对外暴露。
+
+全栈跑在 compose 内网，**零入站业务端口**，VPS 防火墙只需开放 SSH。
 
 ## 一次性准备
 
@@ -17,8 +18,8 @@ sudo usermod -aG docker $USER && newgrp docker
 Cloudflare Zero Trust 控制台 → Networks → Tunnels → Create tunnel(Cloudflared 类型):
 
 1. 复制 token(形如 `eyJh...`)填入 `.env` 的 `CLOUDFLARE_TUNNEL_TOKEN`
-2. Public Hostname 添加:`relay.nexory.top` → Service 选 **HTTP**,URL 填 `api:8000`
-   (cloudflared 与 api 同 compose 网络,容器名直连)
+2. Public Hostname 添加 `<PUBLIC_HOST>`（必须与 `.env` 的 `PUBLIC_BASE_URL` 主机名一致）→ Service 选 **HTTP**，URL 填 `api:8000`。
+   cloudflared 与 API 在同一 compose 网络，使用容器名直连。
 3. Cloudflare 会自动创建该域名的 DNS 记录——**先把现有指向 Railway 的 CNAME 删掉**,否则冲突
 
 ### 3. 准备目录与配置
@@ -57,10 +58,11 @@ docker compose up -d
 docker compose ps                          # 六个容器全部 Up
 docker compose logs api | tail -20         # 应见 prepare_database + uvicorn 启动
 docker compose logs scheduler | tail -5    # 应见 sweep 循环,无 traceback
-curl -s https://relay.nexory.top/healthz   # {"status":"ok"}(经 Cloudflare 全链路)
+set -a; . ./.env; set +a
+curl -s "$PUBLIC_BASE_URL/healthz"         # {"status":"ok"}(经 Cloudflare 全链路)
 ```
 
-使用 `.env` 中的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 作为 bootstrap 超级管理员登录 `https://relay.nexory.top/admin`。在“用户”页创建一个绑定到单一 Tenant 的普通用户，确认其首次登录被强制修改密码，且改密后只能看到该 Tenant 数据；再发一条 Telegram 消息验证端到端自动回复。
+使用 `.env` 中的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 作为 bootstrap 超级管理员登录 `$PUBLIC_BASE_URL/admin`。在“用户”页创建一个绑定到单一 Tenant 的普通用户，确认其首次登录被强制修改密码，且改密后只能看到该 Tenant 数据；再发一条 Telegram 消息验证端到端自动回复。
 稳定运行几天后再停掉 Railway 服务(保留作回滚退路)。
 
 ### Chatwoot 开关
@@ -111,6 +113,7 @@ Phase 2 后若需要回滚，只能回滚到具备双读能力的版本；若必
 **更新发布**（API 先迁移，Worker/Scheduler 后启动）：
 
 ```bash
+set -euo pipefail
 cd ~/reply-core
 mkdir -p backups
 docker compose exec -T postgres pg_dump -U app -Fc social_reply \
@@ -121,18 +124,27 @@ docker compose pull api worker scheduler
 docker compose up -d --no-deps --force-recreate api
 docker compose logs --tail=80 api
 
-# 确认迁移到当前 head 后再启动后台进程
-docker compose exec -T postgres psql -U app -d social_reply -Atc \
-  'SELECT version_num FROM alembic_version;'
+# 动态比较镜像声明的唯一 head 与数据库 current；不要在手册中写死 revision。
+heads_output=$(docker compose run --rm --no-deps --entrypoint alembic api heads)
+head_count=$(printf '%s\n' "$heads_output" | awk 'NF {count++} END {print count + 0}')
+if [ "$head_count" -ne 1 ]; then
+  echo "expected one Alembic head, got: $heads_output" >&2
+  exit 1
+fi
+expected_head=$(printf '%s\n' "$heads_output" | awk 'NF {print $1}')
+current_head=$(docker compose exec -T postgres psql -U app -d social_reply -Atc \
+  'SELECT version_num FROM alembic_version;')
+if [ -z "$current_head" ] || [ "$expected_head" != "$current_head" ]; then
+  echo "database revision mismatch: expected=$expected_head current=$current_head" >&2
+  exit 1
+fi
 docker compose up -d --no-deps --force-recreate worker scheduler
 curl -fsS http://127.0.0.1:8000/healthz
 ```
 
-当前 Alembic head 为 `f3a6c1d8e250`。升级会短暂锁定 `messages` 与
-`outbox_messages`，为现有消息回填稳定历史序号，并把已确认 `SENT` 的文本 Outbox
-补成 assistant 历史。若 VPS 曾应用早期的 `da4e19c7b203` 但缺少
-`admin_sessions.credential_fingerprint`，前一修复 revision 也会自动补列。
-不要只执行 `docker compose restart`：它不会拉取 Docker Hub 上更新后的标签。
+每个 release 的锁表、回填和兼容要求以 `docs/production-migration.md` 及对应 Alembic revision 为准。不要只执行 `docker compose restart`：它不会拉取 Docker Hub 上更新后的标签。
+
+当前验证矩阵：本地开发使用 pgvector PostgreSQL 17 + Redis 8，GitHub CI 使用固定 digest 的 PostgreSQL 17 + Redis 8，VPS compose 使用 PostgreSQL 18 + Redis 7。应用只依赖 PostgreSQL/Redis 的共同支持能力；升级任一生产镜像前仍需备份并跑 Alembic/全量测试。
 
 **每日自动备份**(crontab -e):
 
@@ -155,7 +167,7 @@ sudo sysctl vm.overcommit_memory=1                                        # 立�
 echo 'vm.overcommit_memory = 1' | sudo tee /etc/sysctl.d/99-redis.conf    # 重启后仍生效
 ```
 
-**监控**:用 UptimeRobot(免费)盯 `https://relay.nexory.top/healthz`;
+**监控**：用 UptimeRobot（免费）监控 `${PUBLIC_BASE_URL}/healthz`；
 `df -h` 留意磁盘(日志已限 20MB×5/容器,pgdata 随业务增长)。
 
 ## 回滚

@@ -1,7 +1,8 @@
 # Reply Core · VPS 生产部署(Ubuntu + Docker Compose + Cloudflare Tunnel)
 #
-# 拓扑:cloudflared 出站穿透 → api(:8000);worker/scheduler 消费队列;
-#       postgres(pgvector)与 redis 仅内网互通,全栈零入站端口暴露。
+# 拓扑:cloudflared 出站穿透 → api(:8000);API 经 Redis/Dramatiq 派发 Worker;
+#       Scheduler 独立扫描 PostgreSQL/补队列/平台对账;三角色都访问 PostgreSQL/Redis。
+#       postgres(pgvector)与 redis 仅内网互通,全栈零入站业务端口暴露。
 # 启动顺序由健康检查 + 各角色 entrypoint 自协调:api 负责迁移与凭证加密自检,
 # worker/scheduler 的 assert_database_ready 未就绪即退出,restart 策略自动重试。
 

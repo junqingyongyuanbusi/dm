@@ -1,5 +1,9 @@
 # Production migration notes
 
+This file covers database, encrypted-secret and staged rollout requirements. See
+`docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables,
+and `deploy/vps/README.md` for day-to-day VPS operations.
+
 ## Platform secret encryption
 
 Set `PLATFORM_SECRET_KEYS` before deploying. The first comma-separated Fernet key encrypts new

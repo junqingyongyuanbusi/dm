@@ -6,21 +6,15 @@
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
-uv sync
-cp .env.example .env
-# 直连模式默认关闭 Chatwoot，无需配置 Chatwoot secret/token。
-# CHATWOOT_ENABLED=false
+uv sync --frozen --all-groups
+cp .env.example .env   # 仅本地开发模板，已启用 TESTING/stub
 uv run alembic upgrade head
 
-# 终端 1：API
+# 本地 smoke 模式：TESTING=true 会内联 actor，并使用 stub LLM；知识检索默认关闭。
 uv run uvicorn apps.api.main:app --port 8000
-# 终端 2：worker
-uv run dramatiq apps.worker.main
-# 终端 3：scheduler
-uv run python -m apps.scheduler.main
 ```
 
-通过 `http://localhost:8000/admin` 连接平台账号。新账号默认 `BOT_DRAFT_ONLY`，平台事件经统一决策与 Outbox 链路处理。
+通过 `http://localhost:8000/admin` 连接平台账号。新账号默认 `BOT_DRAFT_ONLY`，平台事件经统一决策与 Outbox 链路处理。根模板只用于单进程 smoke/debug；验证真实 Redis/Dramatiq 三角色拓扑时，使用生产式配置（`TESTING=false`、真实强密钥和 OpenAI 凭证），再分别启动 `uv run dramatiq apps.worker.main` 与 `uv run python -m apps.scheduler.main`。
 
 ## 可选 Chatwoot Bridge
 
@@ -37,7 +31,7 @@ uv run python -m apps.scheduler.main
    ```
 
 3. 确保 `platform_accounts.chatwoot_inbox_id` 与 `conversation_mappings` 已建立。
-4. 将 Chatwoot webhook 指向 `https://<PUBLIC_BASE_URL>/webhooks/chatwoot`。
+4. 将 Chatwoot webhook 指向 `${PUBLIC_BASE_URL}/webhooks/chatwoot`。
 
 关闭开关后，Chatwoot 路由和补拉任务不会注册；历史 Chatwoot Outbox 会进入 `NEEDS_REVIEW/CHATWOOT_DISABLED`，不会使用占位凭证发送，并在重新启用后自动回到投递队列。
 
@@ -46,7 +40,7 @@ uv run python -m apps.scheduler.main
 生产账号通过 Web 管理后台连接，不再要求运营人员运行账号创建 CLI：
 
 ```text
-https://<PUBLIC_BASE_URL>/admin
+${PUBLIC_BASE_URL}/admin
 ```
 
 控制面与 webhook 数据面分离：
@@ -55,7 +49,7 @@ https://<PUBLIC_BASE_URL>/admin
 - Provisioning API：`/api/v1/platform-accounts/*`，使用独立 `CONTROL_API_KEY`，只供服务间调用；
 - 数据面：`/webhooks/telegram/*`、`/webhooks/meta/*`、`/webhooks/x/*`；
 - Durable provisioning：提交后返回 `202 + job_id`，Worker 执行平台验证/落库/Webhook 配置，Scheduler 恢复失败或中断任务；
-- Secret isolation：Token 只进入 SecretStore，PostgreSQL 的 `provisioning_jobs` 只保存引用和脱敏结果；
+- Secret isolation：OAuth 临时状态加密存入 Redis；平台凭证由 `PLATFORM_SECRET_KEYS` 加密后暂存于 durable ProvisioningJob，并最终写入 PostgreSQL encrypted bundle；
 - 安全默认：新账号默认为 `BOT_DRAFT_ONLY`。直连平台草稿只保存在 `reply_decisions`，绝不会作为客户消息发送。
 
 先配置：
@@ -67,7 +61,7 @@ ADMIN_USERNAME=admin
 ADMIN_PASSWORD=<强密码>
 ADMIN_ALLOWED_TENANTS=default,tenant-a
 PUBLIC_BASE_URL=https://reply.example.com
-ACCOUNT_SECRETS_ROOT=/secure/social-reply/accounts
+PLATFORM_SECRET_KEYS=<Fernet key；轮换时逗号分隔>
 ```
 
 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 是 bootstrap 超级管理员：可查看 `ADMIN_ALLOWED_TENANTS` 中全部数据，并在 `/admin/users` 直接创建绑定到单一 Tenant 的普通用户。普通用户首次登录必须修改初始密码，之后可在“账号”页自行授权和管理本 Tenant 的平台账号，但无权操作租户总开关；系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
@@ -142,14 +136,26 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 
 ```text
 平台 Webhook
-→ 账号级签名校验
-→ CanonicalEvent
-→ ingest_canonical_event
-→ 统一规则 / RAG / LLM / Final Guard
-→ Transactional Outbox
-→ 账号级 Sender
-→ Telegram / Facebook / Instagram / X API
+→ 验签并提交 RawEvent
+→ Redis / Dramatiq dispatch
+→ CanonicalEvent + NormalizedEvent 去重
+→ Message + DecisionJob（同一事务）
+→ Rules / RAG / LLM / Final Guard
+→ ReplyDecision + Transactional Outbox（同一事务）
+→ 发送前状态/capability/接管复检
+→ Telegram / Facebook / Instagram / WhatsApp / X / XChat
 ```
+
+PostgreSQL 是消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Worker 提交 Outbox 后走低延迟 Fast Path，Scheduler 仍从数据库补扫崩溃或队列丢失的工作。
+
+## 文档
+
+- [运行架构](docs/architecture.md)
+- [配置参考](docs/configuration.md)
+- [账号控制面](docs/admin-control-plane.md)
+- [生产迁移](docs/production-migration.md)
+- [VPS 运维](deploy/vps/README.md)
+- [文档地图与历史材料](docs/README.md)
 
 ## 测试与 CI
 
