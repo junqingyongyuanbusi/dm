@@ -1,9 +1,20 @@
+from dataclasses import dataclass
+
 import httpx
 
 from social_reply.connectors.meta.client import appsecret_proof
 
 _FACEBOOK_FIELDS = ("messages", "feed")
 _INSTAGRAM_FIELDS = ("messages", "comments")
+
+# Meta 只在「App 级 Webhooks 产品」和「账号级订阅」都列出某个字段时才投递事件。
+# App 级订阅挂在 Meta App 上，即使账号流量走 graph.instagram.com 也不例外。
+_APP_SUBSCRIPTION_BASE_URL = "https://graph.facebook.com"
+_APP_SUBSCRIPTION_OBJECTS = {
+    "facebook": "page",
+    "instagram": "instagram",
+    "whatsapp": "whatsapp_business_account",
+}
 
 
 def _subscription_endpoint(
@@ -155,3 +166,138 @@ def meta_subscription_fields(
         elif field in {"feed", "comments"} and enable_comments:
             wanted.append(field)
     return tuple(wanted)
+
+
+def meta_app_subscription_object(platform: str) -> str:
+    """Map a platform onto the webhook `object` its app-level subscription uses."""
+    try:
+        return _APP_SUBSCRIPTION_OBJECTS[platform]
+    except KeyError:
+        raise ValueError(f"unsupported_meta_platform:{platform}") from None
+
+
+@dataclass(frozen=True)
+class MetaAppSubscription:
+    object_type: str
+    callback_url: str
+    active: bool
+    fields: tuple[str, ...]
+
+
+def _app_subscription_client(
+    *,
+    app_id: str,
+    app_secret: str,
+    api_version: str,
+    transport: httpx.AsyncBaseTransport | None,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=f"{_APP_SUBSCRIPTION_BASE_URL}/{api_version.strip('/')}",
+        timeout=15,
+        transport=transport,
+        params={"access_token": f"{app_id}|{app_secret}"},
+    )
+
+
+async def get_meta_app_subscription(
+    *,
+    app_id: str,
+    app_secret: str,
+    object_type: str,
+    api_version: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> MetaAppSubscription | None:
+    """Read the app-level webhook subscription installed for one object, if any."""
+    async with _app_subscription_client(
+        app_id=app_id,
+        app_secret=app_secret,
+        api_version=api_version,
+        transport=transport,
+    ) as client:
+        response = await client.get(f"/{app_id}/subscriptions")
+        response.raise_for_status()
+        payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if not isinstance(item, dict) or item.get("object") != object_type:
+            continue
+        raw_fields = item.get("fields")
+        fields = (
+            tuple(
+                sorted(
+                    str(entry["name"])
+                    for entry in raw_fields
+                    if isinstance(entry, dict) and entry.get("name")
+                )
+            )
+            if isinstance(raw_fields, list)
+            else ()
+        )
+        return MetaAppSubscription(
+            object_type=object_type,
+            callback_url=str(item.get("callback_url") or ""),
+            active=bool(item.get("active")),
+            fields=fields,
+        )
+    return None
+
+
+async def reconcile_meta_app_subscription(
+    *,
+    app_id: str,
+    app_secret: str,
+    object_type: str,
+    desired_fields: tuple[str, ...],
+    callback_url: str,
+    verify_token: str,
+    api_version: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[str, ...]:
+    """Install the app-level webhook fields Meta needs before it delivers anything.
+
+    An app-level subscription whose callback URL is registered but whose field list is
+    empty looks healthy in the App Dashboard yet drops every event, so reconcile on the
+    field set rather than on the subscription's existence.
+    """
+    if not desired_fields:
+        return ()
+    current = await get_meta_app_subscription(
+        app_id=app_id,
+        app_secret=app_secret,
+        object_type=object_type,
+        api_version=api_version,
+        transport=transport,
+    )
+    if (
+        current is not None
+        and current.active
+        and current.callback_url == callback_url
+        and set(desired_fields).issubset(current.fields)
+    ):
+        return current.fields
+    # POST replaces the whole object subscription, so union the desired fields with what
+    # is already installed; another account on this app may depend on the extras.
+    merged = tuple(sorted(set(desired_fields) | set(current.fields if current else ())))
+    async with _app_subscription_client(
+        app_id=app_id,
+        app_secret=app_secret,
+        api_version=api_version,
+        transport=transport,
+    ) as client:
+        response = await client.post(
+            f"/{app_id}/subscriptions",
+            data={
+                "object": object_type,
+                "callback_url": callback_url,
+                "fields": ",".join(merged),
+                "verify_token": verify_token,
+                "include_values": "true",
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+    if result.get("success") is not True:
+        raise RuntimeError(f"meta_app_subscription_failed:{result}")
+    return merged

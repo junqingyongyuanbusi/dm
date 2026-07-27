@@ -306,15 +306,6 @@ async def run_and_persist_decision(
             verbatim_reply=verbatim,
             history=history,
         )
-        # 低风险 LLM 不确定不应静默、也不应永久锁死会话。仅把 LLM 自身给出的
-        # handoff 转为公开兜底；风险词、知识不足强制转人工、Guard 失败仍保持 handoff。
-        if decision.action is ReplyAction.HANDOFF and decision.source == "llm":
-            decision = ReplyDecision(
-                action=ReplyAction.AUTO_REPLY,
-                reply_text="抱歉，我暂时无法准确回答这个问题。请换一种说法或提供更多信息。",
-                reason_codes=decision.reason_codes + ("LLM_HANDOFF_FALLBACK",),
-                source="rule",
-            )
     async with get_session_factory()() as session:
         outbox_id = await persist_decision(
             session,

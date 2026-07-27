@@ -127,6 +127,11 @@ Instagram 提供两条不可混用的接入路径：
 `instagram` App family 共用 `/webhooks/meta/{app_public_id}` 路由，因此数据库会拒绝跨 family
 重复的 `app_public_id`。
 
+Meta 只在「App 级 Webhooks 产品」与「账号级订阅」都列出某个字段时才投递事件。接入与健康巡检
+会同时完成两级订阅，无需在 App Dashboard 手工填回调 URL。App 级订阅以并集方式写入，不会覆盖
+同一个 App 上其他账号依赖的字段。健康状态为 `APP_SUBSCRIPTION_MISSING` 时说明 App 级订阅仍未
+生效，此时平台不会投递任何消息。
+
 同一个 Meta App 下增加账号时，可传首次响应的 `app_public_id` 复用 webhook 路由。系统验证
 账号 token、使用 `appsecret_proof` 调用 Graph API并自动安装 `messages` subscription。本地账号
 先进入 `PROVISIONING` 以接住可能并发到达的私信 occurrence，但所有发送在 `READY` 前暂停；订阅

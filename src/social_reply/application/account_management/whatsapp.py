@@ -55,7 +55,7 @@ async def connect_whatsapp_account(
     if str(profile.get("id")) != external_account_id:
         raise ValueError("whatsapp_token_account_mismatch")
 
-    platform_app_id, resolved_app_public_id, resolved_verify_token = await provision_meta_app(
+    platform_app_id, resolved_app_public_id, resolved_verify_token, _ = await provision_meta_app(
         tenant_id=tenant_id,
         app_id=app_id,
         app_public_id=app_public_id,

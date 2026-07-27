@@ -6,8 +6,11 @@ from datetime import UTC, datetime
 import httpx
 
 from social_reply.application.account_management.meta_subscription import (
+    get_meta_app_subscription,
     get_meta_subscription_fields,
+    meta_app_subscription_object,
     meta_subscription_fields,
+    reconcile_meta_app_subscription,
     subscribe_meta_account,
 )
 from social_reply.application.platform_accounts import (
@@ -60,6 +63,7 @@ async def _save_health(
     *,
     status: str,
     subscribed_fields: tuple[str, ...] = (),
+    app_subscribed_fields: tuple[str, ...] = (),
     error_code: str | None = None,
 ) -> None:
     async with get_session_factory()() as session:
@@ -73,11 +77,46 @@ async def _save_health(
                         "meta_health_checked_at": datetime.now(UTC).isoformat(),
                         "meta_health_error_code": error_code,
                         "meta_subscribed_fields": list(subscribed_fields),
+                        "meta_app_subscribed_fields": list(app_subscribed_fields),
                     }
                 )
             )
         )
         await session.commit()
+
+
+async def _reconcile_app_subscription(
+    *,
+    app_external_id: str,
+    app_public_id: str,
+    app_secret: str,
+    verify_token: str,
+    platform: str,
+    desired: tuple[str, ...],
+    api_version: str,
+) -> tuple[str, ...]:
+    """Keep the app-level Webhooks product in sync; account-level alone delivers nothing."""
+    object_type = meta_app_subscription_object(platform)
+    current = await get_meta_app_subscription(
+        app_id=app_external_id,
+        app_secret=app_secret,
+        object_type=object_type,
+        api_version=api_version,
+    )
+    if current is not None and current.active and set(desired).issubset(current.fields):
+        return current.fields
+    if not verify_token:
+        raise ValueError("meta_app_verify_token_missing")
+    callback_url = f"{get_settings().public_base_url.rstrip('/')}/webhooks/meta/{app_public_id}"
+    return await reconcile_meta_app_subscription(
+        app_id=app_external_id,
+        app_secret=app_secret,
+        object_type=object_type,
+        desired_fields=desired,
+        callback_url=callback_url,
+        verify_token=verify_token,
+        api_version=api_version,
+    )
 
 
 async def _check_account(account: PlatformAccountRuntime) -> str | None:
@@ -182,7 +221,23 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
                 api_version=api_version,
             )
         status = "READY" if set(desired).issubset(observed) else "SUBSCRIPTION_MISSING"
-        await _save_health(account.id, status=status, subscribed_fields=observed)
+        app_observed = await _reconcile_app_subscription(
+            app_external_id=app.external_app_id,
+            app_public_id=app.public_id,
+            app_secret=app_secret,
+            verify_token=app_credentials.get("verify_token", ""),
+            platform=account.platform,
+            desired=desired,
+            api_version=api_version,
+        )
+        if not set(desired).issubset(app_observed):
+            status = "APP_SUBSCRIPTION_MISSING"
+        await _save_health(
+            account.id,
+            status=status,
+            subscribed_fields=observed,
+            app_subscribed_fields=app_observed,
+        )
         return str(account.id) if status != "READY" else None
     except Exception as exc:  # noqa: BLE001 - provider failures become sanitized health state
         error_code = _health_error_code(exc)

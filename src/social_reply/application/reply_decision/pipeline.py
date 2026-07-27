@@ -5,6 +5,9 @@ from social_reply.domain.reply.guard import redact_pii, run_final_guard
 from social_reply.domain.reply.llm import LLMClient, LLMContext
 from social_reply.domain.reply.rules import apply_rules
 
+# 低置信度的 LLM handoff 不应让会话静默，也不应永久锁死等待人工。
+LLM_HANDOFF_FALLBACK_TEXT = "抱歉，我暂时无法准确回答这个问题。请换一种说法或提供更多信息。"
+
 
 @dataclass(frozen=True)
 class DecisionSnapshot:
@@ -90,9 +93,21 @@ async def run_decision_pipeline(
             # Preserve whether retrieved knowledge influenced the model decision.
             decision = replace(decision, reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
 
+    # 仅把 LLM 自身给出的 handoff 转为公开兜底；风险词与知识不足是确定性规则（source=rule），
+    # 必须保持 handoff。Guard 失败发生在下一步，其 source=guard，因此不会被这里回滚。
+    if decision.action is ReplyAction.HANDOFF and decision.source == "llm":
+        decision = ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text=LLM_HANDOFF_FALLBACK_TEXT,
+            reason_codes=decision.reason_codes + ("LLM_HANDOFF_FALLBACK",),
+            source="rule",
+        )
+
     # 输出侧闸门
     decision = run_final_guard(decision, snapshot.platform)
 
+    # 草稿降级必须是管线的最后一步：任何把 action 改回 AUTO_REPLY 的兜底都要排在它前面，
+    # 否则决策会以 auto_reply 落库——BOT_DRAFT_ONLY 下既不外发，也进不了 admin 待审队列。
     # Persistence creates a public Outbox only when state and version still match BOT_ACTIVE.
     # Keep this draft downgrade separate from that send-time race check.
     if snapshot.automation_state == "BOT_DRAFT_ONLY" and decision.action is ReplyAction.AUTO_REPLY:

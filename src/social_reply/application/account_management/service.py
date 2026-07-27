@@ -9,7 +9,9 @@ import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
 from social_reply.application.account_management.meta_subscription import (
+    meta_app_subscription_object,
     meta_subscription_fields,
+    reconcile_meta_app_subscription,
     subscribe_meta_account,
 )
 from social_reply.application.account_management.provisioning import provision_direct_account
@@ -247,7 +249,12 @@ async def connect_meta_account(
     if str(profile.get("id")) != external_account_id:
         raise ValueError("meta_token_account_mismatch")
 
-    platform_app_id, resolved_app_public_id, resolved_verify_token = await provision_meta_app(
+    (
+        platform_app_id,
+        resolved_app_public_id,
+        resolved_verify_token,
+        external_app_id,
+    ) = await provision_meta_app(
         tenant_id=tenant_id,
         app_id=app_id,
         app_public_id=app_public_id,
@@ -268,6 +275,7 @@ async def connect_meta_account(
         enable_dm=enable_dm,
         enable_comments=enable_comments,
     )
+    webhook_url = _webhook_url(public_base_url, f"/webhooks/meta/{resolved_app_public_id}")
     account_config = {
         "graph_base_url": graph_base_url,
         "api_version": api_version,
@@ -307,6 +315,18 @@ async def connect_meta_account(
         else external_account_id
     )
     try:
+        # App-level first: without it Meta drops every event, so a failure here means the
+        # account would look connected while staying deaf.
+        app_subscribed_fields = await reconcile_meta_app_subscription(
+            app_id=external_app_id,
+            app_secret=app_secret,
+            object_type=meta_app_subscription_object(platform),
+            desired_fields=desired_fields,
+            callback_url=webhook_url,
+            verify_token=resolved_verify_token,
+            api_version=api_version,
+            transport=transport,
+        )
         subscribed_fields = await subscribe_meta_account(
             platform=platform,
             access_token=access_token,
@@ -347,6 +367,7 @@ async def connect_meta_account(
                 config=models.PlatformAccount.config.op("||")(
                     {
                         "meta_subscribed_fields": list(subscribed_fields),
+                        "meta_app_subscribed_fields": list(app_subscribed_fields),
                         "meta_health_status": "READY",
                         "meta_health_checked_at": _utc_now_iso(),
                         "meta_health_error_code": None,
@@ -361,14 +382,14 @@ async def connect_meta_account(
         platform=platform,
         external_account_id=external_account_id,
         public_id=resolved_public_id,
-        webhook_url=_webhook_url(public_base_url, f"/webhooks/meta/{resolved_app_public_id}"),
+        webhook_url=webhook_url,
         name=name or profile.get("name") or external_account_id,
         automation_default=automation_default,
         platform_app_id=platform_app_id,
         app_public_id=resolved_app_public_id,
         verify_token=resolved_verify_token,
         manual_steps=(
-            "在 Meta App Dashboard 配置返回的 webhook_url 与 verify_token。",
+            "已自动完成 App 级 Webhook 回调与字段订阅，无需在 App Dashboard 手工配置。",
             f"账号已自动订阅 webhook 字段：{', '.join(subscribed_fields)}。",
             "上线前完成 App Review / Advanced Access，并将 App 切换为 Live。",
         ),

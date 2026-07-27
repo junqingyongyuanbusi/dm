@@ -5,10 +5,34 @@ import pytest
 from sqlalchemy import insert
 
 from social_reply.application.account_management import meta_health
+from social_reply.application.account_management.meta_subscription import MetaAppSubscription
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 pytestmark = pytest.mark.integration
+
+
+def _stub_app_subscription(monkeypatch, *, installed: tuple[str, ...]) -> list[dict]:
+    """Stub the app-level Webhooks calls and record every repair attempt."""
+    calls: list[dict] = []
+
+    async def get_app_subscription(**kwargs):
+        if not installed:
+            return None
+        return MetaAppSubscription(
+            object_type=kwargs["object_type"],
+            callback_url="https://reply.example.com/webhooks/meta/app-pub",
+            active=True,
+            fields=installed,
+        )
+
+    async def reconcile(**kwargs):
+        calls.append(kwargs)
+        return kwargs["desired_fields"]
+
+    monkeypatch.setattr(meta_health, "get_meta_app_subscription", get_app_subscription)
+    monkeypatch.setattr(meta_health, "reconcile_meta_app_subscription", reconcile)
+    return calls
 
 
 async def _seed_facebook_account(session) -> tuple[uuid.UUID, uuid.UUID]:
@@ -81,16 +105,52 @@ async def test_meta_health_repairs_missing_messenger_subscription(session, monke
     monkeypatch.setattr(meta_health, "MetaGraphClient", FakeClient)
     monkeypatch.setattr(meta_health, "get_meta_subscription_fields", get_fields)
     monkeypatch.setattr(meta_health, "subscribe_meta_account", subscribe)
+    app_subscriptions = _stub_app_subscription(monkeypatch, installed=("messages",))
     meta_health._last_check_at = None
 
     assert await meta_health.reconcile_meta_account_health(force=True) == []
     assert subscriptions[0]["enable_dm"] is True
     assert subscriptions[0]["enable_comments"] is False
+    assert app_subscriptions == []
     session.expire_all()
     account = await session.get(models.PlatformAccount, account_id)
     assert account.config["meta_health_status"] == "READY"
     assert account.config["meta_subscribed_fields"] == ["messages"]
+    assert account.config["meta_app_subscribed_fields"] == ["messages"]
     assert account.config["meta_health_error_code"] is None
+
+
+async def test_meta_health_repairs_empty_app_level_subscription(session, monkeypatch):
+    # 产事故形态：账号级订阅齐全、App 级回调已注册但字段为空，Meta 静默丢弃全部事件。
+    _app_id, account_id = await _seed_facebook_account(session)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def get_account(self):
+            return {"id": "page-1", "name": "Page"}
+
+        async def aclose(self):
+            return None
+
+    async def get_fields(**_kwargs):
+        return ("messages",)
+
+    monkeypatch.setattr(meta_health, "MetaGraphClient", FakeClient)
+    monkeypatch.setattr(meta_health, "get_meta_subscription_fields", get_fields)
+    app_subscriptions = _stub_app_subscription(monkeypatch, installed=())
+    meta_health._last_check_at = None
+
+    assert await meta_health.reconcile_meta_account_health(force=True) == []
+    assert app_subscriptions[0]["object_type"] == "page"
+    assert app_subscriptions[0]["desired_fields"] == ("messages",)
+    assert app_subscriptions[0]["verify_token"] == "verify"
+    assert "/webhooks/meta/" in app_subscriptions[0]["callback_url"]
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.config["meta_health_status"] == "READY"
+    assert account.config["meta_app_subscribed_fields"] == ["messages"]
 
 
 async def test_meta_health_checks_standalone_instagram_account_path(session, monkeypatch):
@@ -156,6 +216,7 @@ async def test_meta_health_checks_standalone_instagram_account_path(session, mon
 
     monkeypatch.setattr(meta_health, "MetaGraphClient", FakeClient)
     monkeypatch.setattr(meta_health, "get_meta_subscription_fields", get_fields)
+    _stub_app_subscription(monkeypatch, installed=("messages",))
     meta_health._last_check_at = None
 
     assert await meta_health.reconcile_meta_account_health(force=True) == []

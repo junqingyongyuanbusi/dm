@@ -205,6 +205,7 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
             uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
             "meta_public",
             "existing-verify-token",
+            "app-1",
         )
 
     async def fake_provision_account(**kwargs):
@@ -220,6 +221,10 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
         return ("messages",)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/subscriptions"):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(200, json={"success": True})
         assert request.headers["Authorization"] == "Bearer access-token"
         assert request.url.params["appsecret_proof"]
         return httpx.Response(200, json={"id": "ig-1", "name": "IG Account"})
