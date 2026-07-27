@@ -82,7 +82,7 @@ The built-in administration surface provides:
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
-- account enable/disable and health checks, including Messenger/Instagram token and `messages` subscription state; Meta text-DM accounts are locked to `BOT_DRAFT_ONLY` and cannot be switched to `BOT_ACTIVE` from the Admin endpoint;
+- account enable/disable and health checks, including Messenger/Instagram token plus app-level and account-level `messages` subscription state; Meta text-DM accounts connect as `BOT_DRAFT_ONLY` and can only be promoted to `BOT_ACTIVE` when the deployment sets `META_AUTO_REPLY_ENABLED=true`, and every change is written to `audit_logs` as `SET_AUTOMATION_DEFAULT`;
 - no account-creation CLI requirement.
 
 OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.

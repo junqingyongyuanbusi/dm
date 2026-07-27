@@ -23,6 +23,7 @@ _ENV_KEYS = [
     "FACEBOOK_MESSENGER_ENABLED",
     "INSTAGRAM_MESSAGING_ENABLED",
     "WHATSAPP_ENABLED",
+    "META_AUTO_REPLY_ENABLED",
     "FACEBOOK_APP_ID",
     "FACEBOOK_APP_SECRET",
     "META_VERIFY_TOKEN",
@@ -64,6 +65,7 @@ def test_testing_true_默认值可用() -> None:
     assert settings.facebook_messenger_enabled is True
     assert settings.instagram_messaging_enabled is True
     assert settings.whatsapp_enabled is True
+    assert settings.meta_auto_reply_enabled is False
     assert settings.meta_health_check_interval_seconds == 600
 
 
@@ -253,3 +255,21 @@ def test_非测试环境_空_control_api_key_拒绝() -> None:
             chatwoot_webhook_secret="real-secret",
             chatwoot_api_token="real-token",
         )
+
+
+def test_meta_账号默认必须草稿除非显式开启自动回复() -> None:
+    locked = _make(testing=True)
+    assert locked.meta_automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
+    assert locked.meta_automation_default_allowed("facebook", "BOT_ACTIVE") is False
+    assert locked.meta_automation_default_allowed("instagram", "BOT_ACTIVE") is False
+    # 非 Meta 平台不受这个发布范围约束
+    assert locked.meta_automation_default_allowed("telegram", "BOT_ACTIVE") is True
+    assert locked.meta_automation_default_allowed("x", "BOT_ACTIVE") is True
+
+
+def test_显式开启后_meta_账号可用_bot_active() -> None:
+    unlocked = _make(testing=True, meta_auto_reply_enabled=True)
+    assert unlocked.meta_automation_default_allowed("facebook", "BOT_ACTIVE") is True
+    assert unlocked.meta_automation_default_allowed("instagram", "BOT_ACTIVE") is True
+    # 开关只解锁 BOT_ACTIVE，草稿始终允许
+    assert unlocked.meta_automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True

@@ -225,7 +225,7 @@ async def connect_meta_account(
     )
     if not enable_dm or enable_comments:
         raise ValueError("meta_private_messages_only")
-    if automation_default != "BOT_DRAFT_ONLY":
+    if not get_settings().meta_automation_default_allowed(platform, automation_default):
         raise ValueError("meta_requires_bot_draft_only")
     _validate_automation_default(automation_default)
     external_account_id = _require_secret(external_account_id, "external_account_id")

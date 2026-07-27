@@ -67,8 +67,10 @@ class MetaAccountRequest(_BaseAccountRequest):
             raise ValueError("app_id 或 app_public_id 至少填写一个")
         if not self.enable_dm or self.enable_comments:
             raise ValueError("当前 Meta 接入仅允许文本私信")
-        if self.automation_default != "BOT_DRAFT_ONLY":
-            raise ValueError("Meta 接入必须使用 BOT_DRAFT_ONLY")
+        if not get_settings().meta_automation_default_allowed(
+            self.platform, self.automation_default
+        ):
+            raise ValueError("Meta 接入必须使用 BOT_DRAFT_ONLY（未开启 META_AUTO_REPLY_ENABLED）")
         if self.platform == "facebook" and self.instagram_login_mode != "facebook_login":
             raise ValueError("Facebook 账号必须使用 facebook_login")
         if (

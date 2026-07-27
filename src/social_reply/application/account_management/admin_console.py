@@ -1385,7 +1385,9 @@ async def accounts_page(request: Request) -> Response:
         auto_target = "BOT_DRAFT_ONLY" if a.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
         auto_label = "切为草稿" if a.automation_default == "BOT_ACTIVE" else "切为自动"
         automation_form = ""
-        if a.platform not in {"facebook", "instagram"} or a.automation_default == "BOT_ACTIVE":
+        # 未开启 META_AUTO_REPLY_ENABLED 时，Meta 账号只能向草稿收敛，因此仅对历史遗留的
+        # BOT_ACTIVE 账号保留按钮（用于改回草稿）。
+        if settings.meta_automation_default_allowed(a.platform, auto_target):
             automation_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>"""
         xchat_form = ""
         channel_status = "—"
@@ -1609,9 +1611,22 @@ async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Re
         account = await session.get(models.PlatformAccount, account_id)
         if account is None or account.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="account_not_found")
-        if account.platform in {"facebook", "instagram"} and target != "BOT_DRAFT_ONLY":
+        if not get_settings().meta_automation_default_allowed(account.platform, target):
             raise HTTPException(status_code=422, detail="meta_requires_bot_draft_only")
+        previous = account.automation_default
         account.automation_default = target
+        if previous != target:
+            await session.execute(
+                models.AuditLog.__table__.insert().values(
+                    tenant_id=account.tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action="SET_AUTOMATION_DEFAULT",
+                    subject_type="platform_account",
+                    subject_id=str(account_id),
+                    detail={"from": previous, "to": target, "platform": account.platform},
+                )
+            )
         await session.commit()
     return RedirectResponse("/admin/accounts", status_code=status.HTTP_303_SEE_OTHER)
 

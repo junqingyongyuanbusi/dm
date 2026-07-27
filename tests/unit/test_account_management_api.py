@@ -318,3 +318,54 @@ async def test_whatsapp_account_api_submits_phone_number_job(monkeypatch):
         "app_secret": "secret",
         "verify_token": "verify",
     }
+
+
+async def test_meta_account_api_rejects_bot_active_while_switch_is_off():
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "platform": "facebook",
+                "external_account_id": "page-1",
+                "access_token": "page-token",
+                "app_secret": "app-secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+                "automation_default": "BOT_ACTIVE",
+            },
+        )
+    assert response.status_code == 422
+    assert "META_AUTO_REPLY_ENABLED" in response.text
+
+
+async def test_meta_account_api_accepts_bot_active_once_deployment_opts_in(monkeypatch):
+    captured = {}
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+    async def fake_enqueue(_job_id):
+        return None
+
+    settings = account_router.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "platform": "facebook",
+                "external_account_id": "page-1",
+                "access_token": "page-token",
+                "app_secret": "app-secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+                "automation_default": "BOT_ACTIVE",
+            },
+        )
+    assert response.status_code == 202
+    assert captured["request"]["automation_default"] == "BOT_ACTIVE"

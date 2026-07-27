@@ -176,6 +176,33 @@ async def test_connect_meta_rejects_out_of_scope_launch_policy_before_graph_call
         )
 
 
+async def test_connect_meta_accepts_bot_active_once_deployment_opts_in(monkeypatch, tmp_path):
+    # 开关只解锁发布范围校验：能走到构造 Graph client，就证明闸门已放行。
+    settings = service.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
+
+    class ReachedGraphCall(Exception):
+        pass
+
+    class SentinelClient:
+        def __init__(self, **_kwargs):
+            raise ReachedGraphCall
+
+    monkeypatch.setattr(service, "MetaGraphClient", SentinelClient)
+    with pytest.raises(ReachedGraphCall):
+        await service.connect_meta_account(
+            platform="facebook",
+            external_account_id="page-1",
+            access_token="token",
+            app_secret="secret",
+            public_base_url="https://reply.example.com",
+            verify_token="verify",
+            app_id="app-1",
+            automation_default="BOT_ACTIVE",
+            secrets_root=tmp_path,
+        )
+
+
 async def test_connect_whatsapp_rechecks_feature_flag_before_platform_calls(monkeypatch, tmp_path):
     settings = whatsapp_service.get_settings().model_copy(update={"whatsapp_enabled": False})
     monkeypatch.setattr(whatsapp_service, "get_settings", lambda: settings)

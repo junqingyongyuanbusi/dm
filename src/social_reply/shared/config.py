@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_META_PLATFORMS = {"facebook", "instagram"}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -38,6 +40,9 @@ class Settings(BaseSettings):
     facebook_messenger_enabled: bool = True
     instagram_messaging_enabled: bool = True
     whatsapp_enabled: bool = True
+    # Meta 发布范围默认是「人工审核后才外发」。只有部署方完成 App Review 并显式接受
+    # 自动回复的合规责任后，才能把 Meta 账号提升为 BOT_ACTIVE。
+    meta_auto_reply_enabled: bool = False
     facebook_app_id: str = ""
     facebook_app_secret: SecretStr = SecretStr("")
     meta_verify_token: SecretStr = SecretStr("")
@@ -165,6 +170,16 @@ class Settings(BaseSettings):
             "whatsapp": "WHATSAPP_DISABLED",
             "x": "X_INTEGRATION_DISABLED",
         }.get(platform, "PLATFORM_DISABLED")
+
+    def meta_automation_default_allowed(self, platform: str, automation_default: str) -> bool:
+        """Whether this deployment lets a Meta account default to something other than draft.
+
+        Draft-only stays allowed unconditionally; the switch only unlocks BOT_ACTIVE, and it
+        must be set on API and Worker alike because provisioning runs in the Worker.
+        """
+        if platform not in _META_PLATFORMS:
+            return True
+        return automation_default == "BOT_DRAFT_ONLY" or self.meta_auto_reply_enabled
 
     @property
     def facebook_app_credentials(self) -> tuple[str, str] | None:

@@ -91,9 +91,21 @@ API 立即返回 `job_id`；Worker 验证 `getMe`、幂等创建或更新账号�
 
 ### 连接 Facebook Messenger / Instagram 私信
 
-新部署默认关闭 Meta 消息平台。接入前必须在 API、Worker、Scheduler 同时显式设置
-`FACEBOOK_MESSENGER_ENABLED=true` 或 `INSTAGRAM_MESSAGING_ENABLED=true`。当前发布范围是
-专业账号文本私信，默认 `BOT_DRAFT_ONLY`；评论、附件、模板和营销消息不进入自动回复。
+`FACEBOOK_MESSENGER_ENABLED` 与 `INSTAGRAM_MESSAGING_ENABLED` 控制 Meta 消息平台，默认开启；
+需要停用时在 API、Worker、Scheduler 同时设为 `false`。当前发布范围是专业账号文本私信；评论、
+附件、模板和营销消息不进入自动回复。
+
+新接入的 Meta 账号一律以 `BOT_DRAFT_ONLY` 落库——未经人工审核的账号不应直接对客户发言。要允许
+把某个 Meta 账号提升为 `BOT_ACTIVE`（自动外发），必须在 API 和 Worker 同时显式设置
+`META_AUTO_REPLY_ENABLED=true`（Worker 执行接入任务，API 提供控制面与后台）。默认 `false`：
+
+- 关闭时：Control API 传 `automation_default=BOT_ACTIVE` 返回 422，后台「切为自动」按钮不渲染，
+  直接 POST 也返回 422 `meta_requires_bot_draft_only`。已是 `BOT_ACTIVE` 的历史账号仍可改回草稿。
+- 开启时：以上闸门放行，但**接入时的初始值仍是 `BOT_DRAFT_ONLY`**，需要在
+  `/admin/accounts` 逐个账号点「切为自动」。每次变更写入 `audit_logs`
+  （`action=SET_AUTOMATION_DEFAULT`）。
+
+这个开关不改变单会话控制：`/admin/conversations/{id}` 的状态翻转任何时候都可用。
 
 Messenger 推荐从 `/admin/accounts` 使用 Facebook Login OAuth。Control API 等价请求：
 

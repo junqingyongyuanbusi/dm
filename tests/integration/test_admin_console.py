@@ -152,7 +152,9 @@ async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypa
     assert 'name="verify_token"' in whatsapp_page.text
 
 
-async def test_meta_account_automation_only_converges_to_draft(session, migrated_db):
+async def test_meta_account_automation_only_converges_to_draft_while_switch_is_off(
+    session, migrated_db
+):
     account_id = uuid.uuid4()
     legacy_active_id = uuid.uuid4()
     await session.execute(
@@ -207,6 +209,58 @@ async def test_meta_account_automation_only_converges_to_draft(session, migrated
     legacy_active = await session.get(models.PlatformAccount, legacy_active_id)
     assert account.automation_default == "BOT_DRAFT_ONLY"
     assert legacy_active.automation_default == "BOT_DRAFT_ONLY"
+
+
+async def test_meta_account_can_be_promoted_once_deployment_opts_in(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="facebook",
+            name="Page",
+            external_account_id="page-optin",
+            public_id=f"fb_{uuid.uuid4().hex}",
+            config={"meta_health_status": "READY"},
+            capability={"dm": True, "comments": False, "max_text_length": 2000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/accounts")
+        assert f'action="/admin/accounts/{account_id}/automation"' in page.text
+        promoted = await client.post(
+            f"/admin/accounts/{account_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
+        )
+    assert promoted.status_code == 303
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.automation_default == "BOT_ACTIVE"
+    entry = (
+        await session.execute(
+            select(models.AuditLog).where(
+                models.AuditLog.subject_id == str(account_id),
+                models.AuditLog.action == "SET_AUTOMATION_DEFAULT",
+            )
+        )
+    ).scalar_one()
+    assert entry.detail == {
+        "from": "BOT_DRAFT_ONLY",
+        "to": "BOT_ACTIVE",
+        "platform": "facebook",
+    }
 
 
 async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
