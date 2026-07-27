@@ -110,13 +110,18 @@ async def test_tenant_user_can_authorize_accounts_without_global_switch(session,
     async with _client() as client:
         csrf = await _login(client)
         page = await client.get("/admin/accounts")
+        x_panel = await client.get("/admin/accounts?connect=x")
+        instagram_panel = await client.get("/admin/accounts?connect=instagram")
         assert page.status_code == 200
         assert "账号授权" in page.text
-        assert '<details class="collapse" open>' in page.text
-        assert 'action="/admin/oauth/x/start"' in page.text
-        assert 'action="/admin/oauth/meta/start"' in page.text
-        assert 'action="/admin/oauth/instagram/start"' in page.text
-        assert 'name="tenant_id" value="tenant-a"' in page.text
+        assert "添加渠道" in page.text
+        assert 'data-channel="x"' in page.text
+        assert 'data-channel="facebook"' in page.text
+        assert 'data-channel="instagram"' in page.text
+        assert 'action="/admin/oauth/x/start"' in x_panel.text
+        assert 'action="/admin/oauth/meta/start"' in instagram_panel.text
+        assert 'action="/admin/oauth/instagram/start"' in instagram_panel.text
+        assert 'name="tenant_id" value="tenant-a"' in x_panel.text
         assert f'action="/admin/accounts/{account_id}/automation"' in page.text
         assert 'name="scope" value="account"' in page.text
         assert "自动回复总开关" not in page.text

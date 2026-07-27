@@ -63,32 +63,93 @@ async def test_console_pages_render_after_login(migrated_db):
             assert marker in resp.text
 
 
-async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
-    """账号页展示 X、Facebook Login、Instagram Login 三种自动授权入口。"""
+async def test_accounts_page_renders_five_channel_tiles(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": True,
+            "facebook_messenger_enabled": True,
+            "instagram_messaging_enabled": True,
+            "whatsapp_enabled": True,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        resp = await client.get("/admin/accounts")
-    assert resp.status_code == 200
-    html = resp.text
-    assert 'action="/admin/oauth/x/start"' in html
-    assert 'action="/admin/oauth/meta/start"' in html
-    assert 'action="/admin/oauth/instagram/start"' in html
-    assert '<option value="default">default</option>' in html
-    assert 'name="brand_id" value="default"' in html
-    assert "Facebook Login · 多账号 OAuth" in html
-    assert "Instagram Login · 独立账号 OAuth" in html
-    assert 'name="platform"' in html and "关联 Facebook Page" in html
-    assert 'name="page_id"' in html
-    assert 'name="enable_comments" value="false"' in html
-    # 回调及共享 webhook URL 直接渲染在页面,便于登记到平台后台
-    assert "/admin/oauth/x/callback" in html
-    assert "授权确认页必须明确列出 Direct Messages 权限" in html
-    assert "/admin/oauth/meta/callback" in html
-    assert "/admin/oauth/instagram/callback" in html
-    assert "/webhooks/meta/meta_oauth_default" in html
-    assert "/webhooks/meta/instagram_oauth_default" in html
-    # Telegram 无 OAuth,给 BotFather 指引 + 手工表单
-    assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "添加渠道" in html
+    for channel, label in (
+        ("x", "X"),
+        ("facebook", "Facebook"),
+        ("instagram", "Instagram"),
+        ("telegram", "Telegram"),
+        ("whatsapp", "WhatsApp"),
+    ):
+        assert f'data-channel="{channel}"' in html
+        assert f"/static/channel-icons/{channel}.svg" in html
+        assert f'aria-label="连接 {label}"' in html
+    assert 'id="channel-setup"' not in html
+    assert 'action="/admin/oauth/x/start"' not in html
+    assert 'action="/admin/connect/telegram"' not in html
+
+
+async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": True,
+            "facebook_messenger_enabled": True,
+            "instagram_messaging_enabled": True,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        x_page = await client.get("/admin/accounts?connect=x")
+        facebook_page = await client.get("/admin/accounts?connect=facebook")
+        instagram_page = await client.get("/admin/accounts?connect=instagram")
+
+    assert 'action="/admin/oauth/x/start"' in x_page.text
+    assert "XChat 4 位 PIN" in x_page.text
+    assert "/admin/oauth/x/callback" in x_page.text
+    assert 'action="/admin/connect/x"' in x_page.text
+
+    assert 'action="/admin/oauth/meta/start"' in facebook_page.text
+    assert 'name="platform" value="facebook"' in facebook_page.text
+    assert "pages_messaging" in facebook_page.text
+    assert 'action="/admin/connect/meta"' in facebook_page.text
+
+    assert 'action="/admin/oauth/instagram/start"' in instagram_page.text
+    assert 'action="/admin/oauth/meta/start"' in instagram_page.text
+    assert 'name="platform" value="instagram"' in instagram_page.text
+    assert "不需要关联 Facebook Page" in instagram_page.text
+    assert "适用于已关联 Facebook Page" in instagram_page.text
+    assert 'name="page_id"' in instagram_page.text
+    assert 'name="enable_comments" value="false"' in instagram_page.text
+
+
+async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"whatsapp_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        telegram_page = await client.get("/admin/accounts?connect=telegram")
+        whatsapp_page = await client.get("/admin/accounts?connect=whatsapp")
+
+    assert 'action="/admin/connect/telegram"' in telegram_page.text
+    assert "@BotFather" in telegram_page.text
+    assert 'name="token"' in telegram_page.text
+    assert 'action="/admin/connect/whatsapp"' in whatsapp_page.text
+    assert "Phone Number ID" in whatsapp_page.text
+    assert 'name="access_token"' in whatsapp_page.text
+    assert 'name="verify_token"' in whatsapp_page.text
 
 
 async def test_meta_account_automation_only_converges_to_draft(session, migrated_db):
@@ -148,7 +209,9 @@ async def test_meta_account_automation_only_converges_to_draft(session, migrated
     assert legacy_active.automation_default == "BOT_DRAFT_ONLY"
 
 
-async def test_accounts_page_hides_future_platform_forms_when_disabled(migrated_db, monkeypatch):
+async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
+    migrated_db, monkeypatch
+):
     from social_reply.application.account_management import admin_console
 
     settings = admin_console.get_settings().model_copy(
@@ -162,27 +225,20 @@ async def test_accounts_page_hides_future_platform_forms_when_disabled(migrated_
     async with _app_client() as client:
         await _login(client)
         response = await client.get("/admin/accounts")
+        disabled = await client.get("/admin/accounts?connect=instagram")
 
     assert response.status_code == 200
-    assert (
-        '<form class="card" style="display:none" method="post" '
-        'action="/admin/oauth/meta/start">' in response.text
-    )
-    assert (
-        '<form class="card" style="display:none" method="post" '
-        'action="/admin/oauth/instagram/start">' in response.text
-    )
-    assert (
-        '<form class="card" style="display:none" method="post" '
-        'action="/admin/connect/meta">' in response.text
-    )
-    assert (
-        '<form class="card" style="display:none" method="post" '
-        'action="/admin/connect/whatsapp">' in response.text
-    )
+    for channel in ("facebook", "instagram", "whatsapp"):
+        assert f'data-channel="{channel}" role="listitem" aria-disabled="true"' in response.text
+        assert f'href="/admin/accounts?connect={channel}' not in response.text
+    assert 'action="/admin/oauth/meta/start"' not in response.text
+    assert 'action="/admin/oauth/instagram/start"' not in response.text
+    assert 'action="/admin/connect/whatsapp"' not in response.text
+    assert "该渠道尚未在当前部署启用" in disabled.text
+    assert 'id="channel-setup"' not in disabled.text
 
 
-async def test_accounts_page_hides_x_forms_when_all_stacks_disabled(migrated_db, monkeypatch):
+async def test_accounts_page_disables_x_tile_when_all_stacks_are_off(migrated_db, monkeypatch):
     from social_reply.application.account_management import admin_console
 
     settings = admin_console.get_settings().model_copy(
@@ -196,17 +252,15 @@ async def test_accounts_page_hides_x_forms_when_all_stacks_disabled(migrated_db,
     async with _app_client() as client:
         await _login(client)
         response = await client.get("/admin/accounts")
+        disabled = await client.get("/admin/accounts?connect=x")
 
     assert response.status_code == 200
-    assert (
-        '<form class="card" style="display:none" method="post" '
-        'action="/admin/oauth/x/start">' in response.text
-    )
-    assert (
-        '<form class="card" style="display:none" method="post" '
-        'action="/admin/connect/x">' in response.text
-    )
-    assert "XChat 4 位 PIN" not in response.text
+    assert 'data-channel="x" role="listitem" aria-disabled="true"' in response.text
+    assert 'href="/admin/accounts?connect=x' not in response.text
+    assert 'action="/admin/oauth/x/start"' not in response.text
+    assert 'action="/admin/connect/x"' not in response.text
+    assert "XChat 4 位 PIN" not in disabled.text
+    assert "该渠道尚未在当前部署启用" in disabled.text
 
 
 async def test_accounts_page_renders_x_oauth_result_banner(migrated_db):

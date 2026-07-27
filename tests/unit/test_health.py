@@ -23,6 +23,16 @@ async def test_healthz_returns_ok():
     assert resp.json() == {"status": "ok"}
 
 
+async def test_channel_icon_assets_are_served_locally():
+    app = create_app(_settings(chatwoot_enabled=False))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/static/channel-icons/facebook.svg")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert b"Facebook" in response.content
+
+
 async def test_chatwoot_router_follows_feature_flag():
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app(_settings(chatwoot_enabled=False))),

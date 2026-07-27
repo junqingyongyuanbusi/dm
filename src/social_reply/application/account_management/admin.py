@@ -203,6 +203,39 @@ tbody tr:hover{{background:#F7F5EF}}
 .msg.out{{align-self:flex-end;background:var(--accent-tint);border-bottom-right-radius:4px}}
 .msg .meta{{font-size:11.5px;color:var(--muted);margin-top:4px}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}}
+.channel-section{{margin:0 0 24px}}
+.channel-heading{{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:12px}}
+.channel-heading p{{margin:0;color:var(--muted);font-size:13.5px}}
+.channel-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}}
+.channel-tile{{min-width:0;min-height:112px;padding:14px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);text-decoration:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;text-align:center;transition:border-color .18s,background .18s,box-shadow .18s,transform .18s}}
+.channel-tile:hover{{color:var(--text);border-color:var(--border-strong);background:#F7F5EF;transform:translateY(-1px)}}
+.channel-tile[aria-current="page"]{{border-color:var(--accent);box-shadow:0 0 0 2px rgba(193,95,60,.12);background:var(--accent-tint)}}
+.channel-tile.disabled{{opacity:.56;cursor:not-allowed;background:var(--surface-2);transform:none}}
+.channel-icon{{width:42px;height:42px;display:grid;place-items:center}}
+.channel-icon img{{display:block;width:36px;height:36px;object-fit:contain}}
+.channel-name{{font-size:14px;font-weight:600;line-height:1.25;overflow-wrap:anywhere}}
+.channel-kind{{color:var(--muted);font-size:11.5px;line-height:1.2}}
+.channel-setup{{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:22px 24px;margin:0 0 24px;scroll-margin-top:84px}}
+.channel-setup-head{{display:flex;align-items:center;gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border)}}
+.channel-setup-head .channel-icon{{width:36px;height:36px}}
+.channel-setup-head .channel-icon img{{width:32px;height:32px}}
+.channel-setup-head h2{{font-family:var(--sans);font-size:18px;margin:0}}
+.channel-setup-head p{{color:var(--muted);font-size:13px;margin:1px 0 0}}
+.channel-form{{max-width:680px;padding-top:4px}}
+.channel-meta{{display:grid;grid-template-columns:140px minmax(0,1fr);gap:7px 12px;margin:16px 0 4px;font-size:13px}}
+.channel-meta dt{{color:var(--muted)}}
+.channel-meta dd{{margin:0;min-width:0;overflow-wrap:anywhere}}
+.channel-mode-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0;margin-top:16px}}
+.channel-mode{{min-width:0;padding:0 22px 4px}}
+.channel-mode:first-child{{padding-left:0}}
+.channel-mode+ .channel-mode{{border-left:1px solid var(--border)}}
+.channel-mode h3{{font-family:var(--sans);font-size:15px}}
+.channel-mode .hint{{min-height:42px}}
+.advanced-connect{{border-top:1px solid var(--border);margin-top:20px;padding-top:4px}}
+.advanced-connect>summary{{cursor:pointer;color:var(--muted);font-size:13.5px;padding:12px 0;list-style:none}}
+.advanced-connect>summary::before{{content:"＋";display:inline-block;width:20px;color:var(--muted)}}
+.advanced-connect[open]>summary::before{{content:"－"}}
+.advanced-connect .advanced-body{{max-width:680px;padding:0 0 8px}}
 form.card{{margin-bottom:0}}
 label{{display:block;font-size:13px;font-weight:500;color:var(--text);margin:14px 0 5px}}
 input,select,textarea{{width:100%;padding:10px 12px;font-size:16px;font-family:var(--sans);color:var(--text);background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-md);min-height:44px;transition:border-color .18s,box-shadow .18s}}
@@ -239,7 +272,9 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 .login-wrap{{min-height:calc(100vh - 120px);display:flex;align-items:center;justify-content:center}}
 .login-card{{width:100%;max-width:400px}}
 @media (prefers-reduced-motion:reduce){{*{{transition:none!important}}}}
-@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .card{{padding:16px}} .msg{{max-width:88%}}}}
+@media (max-width:820px){{.channel-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
+@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}}}}
+@media (max-width:520px){{.channel-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}} .channel-tile{{min-height:104px}} .channel-heading{{align-items:flex-start;flex-direction:column;gap:2px}} .channel-meta{{grid-template-columns:1fr;gap:1px}} .channel-meta dd{{margin-bottom:7px}}}}
 </style></head><body>
 <header><span class="brand">Reply Core<small>Control Plane</small></span>{nav_bar}<nav>{logout}</nav></header>
 <main>{body}</main></body></html>"""

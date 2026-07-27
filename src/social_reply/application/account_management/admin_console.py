@@ -30,7 +30,6 @@ from social_reply.application.account_management.admin import (
 from social_reply.application.account_management.auth import Principal
 from social_reply.application.account_management.jobs import provisioning_job_is_in_flight
 from social_reply.application.account_management.oauth.common import notice
-from social_reply.application.account_management.provisioning import tenant_public_id
 from social_reply.application.account_management.service import enable_xchat_for_account
 from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.application.message_delivery.contracts import (
@@ -75,9 +74,10 @@ def _tenant_input(principal: Principal) -> str:
         f'<option value="{html.escape(tenant)}">{html.escape(tenant)}</option>'
         for tenant in sorted(principal.allowed_tenants)
     )
+    field_id = f"f-tenant-{uuid.uuid4().hex[:6]}"
     return (
-        '<label for="f-tenant-select">Tenant</label>'
-        f'<select id="f-tenant-select" name="tenant_id" required>{options}</select>'
+        f'<label for="{field_id}">Tenant</label>'
+        f'<select id="{field_id}" name="tenant_id" required>{options}</select>'
     )
 
 
@@ -1238,6 +1238,60 @@ def _kill_keys(tenant: str, account_ids: list[str]) -> list[str]:
     ]
 
 
+_CHANNEL_LABELS = {
+    "x": "X",
+    "facebook": "Facebook",
+    "instagram": "Instagram",
+    "telegram": "Telegram",
+    "whatsapp": "WhatsApp",
+}
+
+_CHANNEL_KINDS = {
+    "x": "OAuth",
+    "facebook": "OAuth",
+    "instagram": "2 种登录方式",
+    "telegram": "Bot Token",
+    "whatsapp": "Cloud API",
+}
+
+
+def _channel_icon(channel: str) -> str:
+    return (
+        '<span class="channel-icon" aria-hidden="true">'
+        f'<img src="/static/channel-icons/{channel}.svg" alt="" width="36" height="36">'
+        "</span>"
+    )
+
+
+def _channel_tile(channel: str, *, enabled: bool, selected: bool) -> str:
+    label = _CHANNEL_LABELS[channel]
+    icon = _channel_icon(channel)
+    status = _CHANNEL_KINDS[channel] if enabled else "未启用"
+    inner = (
+        f'{icon}<span class="channel-name">{html.escape(label)}</span>'
+        f'<span class="channel-kind">{html.escape(status)}</span>'
+    )
+    if not enabled:
+        return (
+            f'<div class="channel-tile disabled" data-channel="{channel}" role="listitem" '
+            f'aria-disabled="true" aria-label="{html.escape(label)} 未启用">{inner}</div>'
+        )
+    current = ' aria-current="page"' if selected else ""
+    return (
+        f'<a class="channel-tile" data-channel="{channel}" role="listitem"{current} '
+        f'href="/admin/accounts?connect={channel}#channel-setup" '
+        f'aria-label="连接 {html.escape(label)}">{inner}</a>'
+    )
+
+
+def _channel_setup_head(channel: str, subtitle: str) -> str:
+    return (
+        '<div class="channel-setup-head">'
+        f"{_channel_icon(channel)}<div><h2>连接 {html.escape(_CHANNEL_LABELS[channel])}</h2>"
+        f"<p>{html.escape(subtitle)}</p></div></div>"
+    )
+
+
 @router.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request) -> Response:
     principal = await _web_principal(request)
@@ -1388,38 +1442,27 @@ async def accounts_page(request: Request) -> Response:
         )
         or "<tr><td colspan='5' class='muted'>暂无任务</td></tr>"
     )
-    default_tenant = "default" if "default" in tenants else sorted(tenants)[0]
     common = (
         f'<input type="hidden" name="csrf_token" value="{csrf}">'
         + _tenant_input(principal)
         + _input("brand_id", "Brand", required=True, value="default")
         + _input("name", "显示名称（可选）", required=False)
     )
-    webhook_tenant = default_tenant
-    oauth_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/x/callback"
-    x_webhook = (
-        f"{settings.public_base_url.rstrip('/')}/webhooks/x/"
-        f"{tenant_public_id('x_oauth', webhook_tenant)}"
-    )
+
+    def oauth_fields() -> str:
+        return (
+            f'<input type="hidden" name="csrf_token" value="{csrf}">'
+            + _tenant_input(principal)
+            + _input("brand_id", "Brand", required=True, value="default")
+        )
+
+    x_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/x/callback"
     meta_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/meta/callback"
-    meta_webhook = (
-        f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
-        f"{tenant_public_id('meta_oauth', webhook_tenant)}"
-    )
     instagram_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/instagram/callback"
-    instagram_webhook = (
-        f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
-        f"{tenant_public_id('instagram_oauth', webhook_tenant)}"
-    )
-    oauth_common = (
-        f'<input type="hidden" name="csrf_token" value="{csrf}">'
-        + _tenant_input(principal)
-        + _input("brand_id", "Brand", required=True, value="default")
-    )
     xchat_oauth_input = (
         _input(
             "xchat_pin",
-            "XChat 4 位 PIN（可选，启用加密私信）",
+            "XChat 4 位 PIN（可选）",
             secret=True,
             required=False,
         )
@@ -1429,64 +1472,78 @@ async def accounts_page(request: Request) -> Response:
     xchat_manual_input = (
         _input(
             "xchat_pin",
-            "XChat 4 位 PIN（启用加密私信，建议填写）",
+            "XChat 4 位 PIN（可选）",
             secret=True,
             required=False,
         )
         if settings.xchat_enabled
         else ""
     )
-    x_permission_hint = (
-        "App permissions 设为 Read and write and Direct message；"
-        "授权确认页必须明确列出 Direct Messages 权限"
-        if settings.x_legacy_dm_enabled or settings.xchat_enabled
-        else "Legacy DM 与 XChat 均已关闭，不要求 Direct Messages 权限"
+    channel_enabled = {
+        "x": settings.x_integration_enabled,
+        "facebook": settings.facebook_messenger_enabled,
+        "instagram": settings.instagram_messaging_enabled,
+        "telegram": True,
+        "whatsapp": settings.whatsapp_enabled,
+    }
+    requested_channel = request.query_params.get("connect", "")
+    selected_channel = (
+        requested_channel
+        if requested_channel in _CHANNEL_LABELS and channel_enabled[requested_channel]
+        else ""
     )
-    x_activity_hint = (
-        f"Activity/Webhook URL 使用 <code>{html.escape(x_webhook)}</code>。"
-        if settings.x_activity_enabled
-        else "Activity webhook 已关闭，系统仅使用低频 reconciliation。"
-    )
-    x_card_style = "" if settings.x_integration_enabled else ' style="display:none"'
-    meta_enabled = settings.facebook_messenger_enabled or settings.instagram_messaging_enabled
-    meta_card_style = "" if meta_enabled else ' style="display:none"'
-    instagram_card_style = "" if settings.instagram_messaging_enabled else ' style="display:none"'
-    whatsapp_card_style = "" if settings.whatsapp_enabled else ' style="display:none"'
-    meta_options = "".join(
-        option
-        for enabled, option in (
-            (
-                settings.facebook_messenger_enabled,
-                '<option value="facebook">Facebook Page</option>',
-            ),
-            (
-                settings.instagram_messaging_enabled,
-                '<option value="instagram">关联 Facebook Page 的 Instagram 专业账号</option>',
-            ),
+    channel_notice = ""
+    if requested_channel in _CHANNEL_LABELS and not channel_enabled[requested_channel]:
+        channel_notice = '<div class="banner info">该渠道尚未在当前部署启用。</div>'
+    channel_tiles = "".join(
+        _channel_tile(
+            channel,
+            enabled=channel_enabled[channel],
+            selected=channel == selected_channel,
         )
-        if enabled
+        for channel in _CHANNEL_LABELS
     )
-    connect_open = "" if principal.is_superadmin else " open"
-    connect_title = "接入新平台账号" if principal.is_superadmin else "授权新平台账号"
-    connect_forms = f"""<details class="collapse"{connect_open}><summary>{connect_title}</summary><div class="inner">
-<p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。OAuth 卡片会跳转平台授权页自动换取凭证；手工卡片用于粘贴已有凭证。</p>
-<div class="grid">
-<form class="card"{x_card_style} method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{xchat_oauth_input}<p class="hint">使用环境变量 <code>X_API_KEY</code> / <code>X_API_SECRET</code> 中的 Consumer Keys；每次点击都可授权一个账号，账号 Token 会独立加密入库。X Developer Portal 中将 {x_permission_hint}、App type 设为 Web App，并精确登记 Callback URI <code>{html.escape(oauth_callback)}</code>。{x_activity_hint}</p><button class="btn-block">授权新的 X 账号</button></form>
-<form class="card"{meta_card_style} method="post" action="/admin/oauth/meta/start"><h3>Facebook Login · 多账号 OAuth</h3>{oauth_common}<label for="f-oauth-meta-platform">目标</label><select id="f-oauth-meta-platform" name="platform">{meta_options}</select><p class="hint">使用部署级 <code>FACEBOOK_APP_ID</code> / <code>FACEBOOK_APP_SECRET</code> / <code>META_VERIFY_TOKEN</code>，授权后列出全部可管理目标并选择一个接入，可反复授权多个账号。Callback：<code>{html.escape(meta_callback)}</code>；Webhook：<code>{html.escape(meta_webhook)}</code>。</p><button class="btn-block">跳转 Facebook 授权</button></form>
-<form class="card"{instagram_card_style} method="post" action="/admin/oauth/instagram/start"><h3>Instagram Login · 独立账号 OAuth</h3>{oauth_common}<p class="hint">无需 Facebook Page，适用于 Instagram 专业账号。使用 <code>INSTAGRAM_APP_ID</code> / <code>INSTAGRAM_APP_SECRET</code>；Callback：<code>{html.escape(instagram_callback)}</code>；Webhook：<code>{html.escape(instagram_webhook)}</code>。</p><button class="btn-block">跳转 Instagram 授权</button></form>
-<form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<p class="hint">Telegram 无 OAuth：在 Telegram 中找 @BotFather 发送 /newbot 创建机器人，把返回的 Token 粘贴到上方，提交后自动校验并注册 webhook。</p><button class="btn-block">连接 Telegram</button></form>
-<form class="card"{meta_card_style} method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform">{meta_options}</select>{_input("external_account_id", "Page / IG Account ID")}{_input("page_id", "Facebook Page ID（关联 Page 的 Instagram 必填）", required=False)}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<input type="hidden" name="instagram_login_mode" value="facebook_login"><input type="hidden" name="enable_dm" value="true"><input type="hidden" name="enable_comments" value="false"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><button class="btn-block">连接 Meta 私信</button></form>
-<form class="card"{whatsapp_card_style} method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
-<form class="card"{x_card_style} method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}<input type="hidden" name="environment" value="oauth">{xchat_manual_input}<button class="btn-block">连接 X</button></form>
-</div></div></details>"""
+    channel_picker = f"""<section class="channel-section" aria-labelledby="add-channel-title">
+<div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">5 个平台</span></div>
+<div class="channel-grid" role="list">{channel_tiles}</div></section>{channel_notice}"""
+    meta_policy_fields = """<input type="hidden" name="instagram_login_mode" value="facebook_login"><input type="hidden" name="enable_dm" value="true"><input type="hidden" name="enable_comments" value="false"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">"""
+    selected_panel = ""
+    if selected_channel == "x":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("x", "使用部署级 X OAuth 应用授权账号")}
+<form class="channel-form" method="post" action="/admin/oauth/x/start">{oauth_fields()}{xchat_oauth_input}
+<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(x_callback)}</code></dd><dt>授权范围</dt><dd>Read and write{"" if not (settings.x_legacy_dm_enabled or settings.xchat_enabled) else " and Direct message"}</dd></dl>
+<button class="btn-block">继续使用 X 授权</button></form>
+<details class="advanced-connect"><summary>高级连接：使用已有 Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/x">{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}<input type="hidden" name="environment" value="oauth">{xchat_manual_input}<button class="btn-block">连接 X</button></form></div></details></section>"""
+    elif selected_channel == "facebook":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("facebook", "连接 Facebook Page 的 Messenger 私信")}
+<form class="channel-form" method="post" action="/admin/oauth/meta/start">{oauth_fields()}<input type="hidden" name="platform" value="facebook">
+<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(meta_callback)}</code></dd><dt>权限</dt><dd>pages_show_list · pages_messaging · pages_manage_metadata</dd></dl>
+<button class="btn-block">继续使用 Facebook 登录</button></form>
+<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="facebook">{_input("external_account_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{meta_policy_fields}<button class="btn-block">连接 Facebook</button></form></div></details></section>"""
+    elif selected_channel == "instagram":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("instagram", "选择 Instagram 专业账号的登录方式")}
+<div class="channel-mode-grid"><div class="channel-mode"><h3>Instagram 登录</h3><p class="hint">不需要关联 Facebook Page</p><form method="post" action="/admin/oauth/instagram/start">{oauth_fields()}<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(instagram_callback)}</code></dd></dl><button class="btn-block">继续使用 Instagram 登录</button></form></div>
+<div class="channel-mode"><h3>Facebook 登录</h3><p class="hint">适用于已关联 Facebook Page 的专业账号</p><form method="post" action="/admin/oauth/meta/start">{oauth_fields()}<input type="hidden" name="platform" value="instagram"><dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(meta_callback)}</code></dd></dl><button class="btn-block">继续使用 Facebook 登录</button></form></div></div>
+<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="instagram">{_input("external_account_id", "Instagram Professional Account ID")}{_input("page_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{meta_policy_fields}<button class="btn-block">连接 Instagram</button></form></div></details></section>"""
+    elif selected_channel == "telegram":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("telegram", "连接 Telegram Bot")}
+<form class="channel-form" method="post" action="/admin/connect/telegram">{common}{_input("token", "Bot Token", secret=True)}<p class="hint">Token 由 @BotFather 创建 Bot 后提供。</p><button class="btn-block">连接 Telegram</button></form></section>"""
+    elif selected_channel == "whatsapp":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("whatsapp", "连接 WhatsApp Cloud API 号码")}
+<form class="channel-form" method="post" action="/admin/connect/whatsapp">{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form></section>"""
     account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:
         body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>
-{oauth_banner}{killswitch_card}{account_card}{jobs_card}{connect_forms}"""
+{oauth_banner}{channel_picker}{selected_panel}{killswitch_card}{account_card}{jobs_card}"""
     else:
         body = f"""<h1>账号授权</h1><p class="lede">授权并管理当前 Tenant 的平台账号。</p>
-{oauth_banner}{connect_forms}{account_card}{jobs_card}"""
+{oauth_banner}{channel_picker}{selected_panel}{account_card}{jobs_card}"""
     response = HTMLResponse(
         _page("账号", body, active="accounts", show_users=principal.is_superadmin)
     )

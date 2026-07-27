@@ -1,7 +1,9 @@
 import logging
+from importlib.resources import files
 
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from social_reply.application.account_management.admin import router as admin_router
 from social_reply.application.account_management.admin_console import router as admin_console_router
@@ -58,6 +60,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     _install_access_log_redaction()
     _install_application_logging()
     app = FastAPI(title="Reply Core")
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(files("social_reply").joinpath("static"))),
+        name="static",
+    )
 
     @app.middleware("http")
     async def x_oauth_callback_security(request: Request, call_next):
