@@ -187,15 +187,15 @@ verify_sha_image() {
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
 
-select_builder_args() {
+select_builder() {
   if [[ -n "${BUILDX_BUILDER:-}" ]]; then
-    printf '%s\n' "--builder" "$BUILDX_BUILDER"
+    printf '%s\n' "$BUILDX_BUILDER"
     return
   fi
   local candidate
   for candidate in orbstack default; do
     if docker buildx inspect "$candidate" >/dev/null 2>&1; then
-      printf '%s\n' "--builder" "$candidate"
+      printf '%s\n' "$candidate"
       return
     fi
   done
@@ -368,7 +368,11 @@ if [[ "$sha_image_state" == "exists" ]]; then
   log "verified existing immutable SHA image: $sha_ref"
 else
   revalidate_dev_head
-  mapfile -t builder_args < <(select_builder_args)
+  builder_name="$(select_builder)"
+  builder_args=()
+  if [[ -n "$builder_name" ]]; then
+    builder_args=(--builder "$builder_name")
+  fi
   build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   log "building and pushing $sha_ref for linux/amd64"
   docker buildx build \
@@ -390,14 +394,27 @@ rollback_digest=""
 if [[ "$rollback_image_state" == "exists" ]]; then
   rollback_digest="$(image_digest "$rollback_ref")"
 fi
-declare -A active_ids=()
-declare -A active_digests=()
-for service in "${RAILWAY_SERVICES[@]}"; do
-  active="$(active_deployment_json "$service")"
-  active_ids[$service]="$(jq -r '.id // ""' <<<"$active")"
-  active_digests[$service]="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
-  [[ -n "${active_ids[$service]}" && "${active_digests[$service]}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail "Railway $service has no active successful deployment metadata"
+active_api="$(active_deployment_json api)"
+active_worker="$(active_deployment_json worker)"
+active_scheduler="$(active_deployment_json scheduler)"
+active_api_id="$(jq -r '.id // ""' <<<"$active_api")"
+active_worker_id="$(jq -r '.id // ""' <<<"$active_worker")"
+active_scheduler_id="$(jq -r '.id // ""' <<<"$active_scheduler")"
+active_api_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active_api")"
+active_worker_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active_worker")"
+active_scheduler_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active_scheduler")"
+for active_value in \
+  "$active_api_id" \
+  "$active_worker_id" \
+  "$active_scheduler_id" \
+  "$active_api_digest" \
+  "$active_worker_digest" \
+  "$active_scheduler_digest"; do
+  [[ -n "$active_value" ]] || fail "Railway has incomplete active deployment metadata"
+done
+for active_digest in "$active_api_digest" "$active_worker_digest" "$active_scheduler_digest"; do
+  [[ "$active_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "Railway has an invalid active image digest: $active_digest"
 done
 
 if [[ -n "$rollback_digest" ]]; then
@@ -405,11 +422,10 @@ if [[ -n "$rollback_digest" ]]; then
   [[ "$previous_digest" != "$expected_digest" ]] \
     || fail "rollback tag unexpectedly points to the target release"
 else
-  previous_digest="${active_digests[api]}"
-  for service in worker scheduler; do
-    [[ "${active_digests[$service]}" == "$previous_digest" ]] \
-      || fail "mixed Railway digests require an existing immutable rollback tag"
-  done
+  previous_digest="$active_api_digest"
+  [[ "$active_worker_digest" == "$previous_digest" \
+    && "$active_scheduler_digest" == "$previous_digest" ]] \
+    || fail "mixed Railway digests require an existing immutable rollback tag"
   [[ "$previous_digest" != "$expected_digest" ]] \
     || fail "cannot reconstruct the predecessor after all roles reached the target digest"
   revalidate_dev_head
@@ -429,7 +445,11 @@ else
 fi
 
 for service in "${RAILWAY_SERVICES[@]}"; do
-  current_digest="${active_digests[$service]}"
+  case "$service" in
+    api) current_digest="$active_api_digest" ;;
+    worker) current_digest="$active_worker_digest" ;;
+    scheduler) current_digest="$active_scheduler_digest" ;;
+  esac
   if [[ "$current_digest" != "$previous_digest" && "$current_digest" != "$expected_digest" ]]; then
     fail "$service is on unrelated digest $current_digest"
   fi
