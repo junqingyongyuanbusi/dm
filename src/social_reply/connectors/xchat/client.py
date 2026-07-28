@@ -5,6 +5,10 @@ from collections.abc import Mapping
 import httpx
 from authlib.integrations.httpx_client import AsyncOAuth1Client
 
+# XAA 可创建的事件类型。这份名单同时约束订阅协调循环（见 xchat_subscription），
+# 两边曾各持一份独立列表，改了一边另一边就在运行时才报 unsupported。
+SUPPORTED_ACTIVITY_EVENT_TYPES = ("dm.received", "chat.received", "post.mention.create")
+
 
 class XChatClient:
     """Small async client for the X Chat and X Activity endpoints.
@@ -128,7 +132,7 @@ class XChatClient:
         webhook_id: str | None = None,
         tag: str,
     ) -> dict:
-        if event_type not in {"chat.received", "dm.received"}:
+        if event_type not in SUPPORTED_ACTIVITY_EVENT_TYPES:
             raise ValueError(f"unsupported_x_activity_event_type:{event_type}")
         body: dict[str, object] = {
             "event_type": event_type,

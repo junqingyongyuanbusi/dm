@@ -11,7 +11,7 @@ from sqlalchemy import select, text
 
 from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
-from social_reply.connectors.xchat.client import XChatClient
+from social_reply.connectors.xchat.client import SUPPORTED_ACTIVITY_EVENT_TYPES, XChatClient
 from social_reply.connectors.xchat.state import (
     XChatKeyState,
     XChatState,
@@ -33,7 +33,8 @@ _READY_PROBE_INTERVAL = timedelta(
 _PENDING_PROBE_INTERVAL = timedelta(
     seconds=int(os.getenv("XCHAT_PENDING_PROBE_INTERVAL_SECONDS", "600"))
 )
-_EVENT_TYPES = ("dm.received", "chat.received", "post.mention.create")
+# 订阅对象与客户端允许创建的事件必须是同一份名单，否则会在运行时才暴露。
+_EVENT_TYPES = SUPPORTED_ACTIVITY_EVENT_TYPES
 _last_check_at: float | None = None
 
 

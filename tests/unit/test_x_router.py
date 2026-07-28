@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 from fastapi import HTTPException
 
 from social_reply.connectors.x import router
@@ -281,3 +282,21 @@ def test_other_post_events_are_ignored_even_when_mentions_are_enabled():
     )
     assert filtered == []
     assert status == "IGNORED_X_ACTIVITY_EVENT"
+
+
+def test_client_allowlist_and_reconcile_loop_share_one_source():
+    # 两边曾各持一份独立列表：订阅循环加了 post.mention.create，客户端没加，
+    # 结果订阅在生产环境才炸成 X_ACTIVITY_RECONCILE_FAILED。
+    from social_reply.application.event_ingestion import xchat_subscription
+    from social_reply.connectors.xchat.client import SUPPORTED_ACTIVITY_EVENT_TYPES
+
+    assert xchat_subscription._EVENT_TYPES is SUPPORTED_ACTIVITY_EVENT_TYPES
+    assert "post.mention.create" in SUPPORTED_ACTIVITY_EVENT_TYPES
+
+
+async def test_client_rejects_event_types_outside_the_allowlist():
+    from social_reply.connectors.xchat.client import XChatClient
+
+    client = XChatClient.__new__(XChatClient)
+    with pytest.raises(ValueError, match="unsupported_x_activity_event_type:like.create"):
+        await client.create_activity_subscription(event_type="like.create", user_id="1", tag="t")
