@@ -19,6 +19,7 @@ _ENV_KEYS = [
     "X_LEGACY_DM_ENABLED",
     "X_ACTIVITY_ENABLED",
     "XCHAT_ENABLED",
+    "X_PUBLIC_REPLY_ENABLED",
     "X_OAUTH_LEGACY_STATE_WRITE",
     "FACEBOOK_MESSENGER_ENABLED",
     "INSTAGRAM_MESSAGING_ENABLED",
@@ -273,3 +274,22 @@ def test_显式开启后_meta_账号可用_bot_active() -> None:
     assert unlocked.meta_automation_default_allowed("instagram", "BOT_ACTIVE") is True
     # 开关只解锁 BOT_ACTIVE，草稿始终允许
     assert unlocked.meta_automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
+
+
+def test_x_public_reply_defaults_off() -> None:
+    settings = _make(testing=True)
+    assert settings.x_public_reply_enabled is False
+    # mention 走 Activity webhook，两个开关都开才算启用
+    assert settings.x_mention_ingest_enabled is False
+
+
+def test_x_mention_ingest_requires_both_activity_and_public_reply() -> None:
+    assert (
+        _make(testing=True, x_activity_enabled=True, x_public_reply_enabled=True)
+    ).x_mention_ingest_enabled is True
+    assert (
+        _make(testing=True, x_activity_enabled=False, x_public_reply_enabled=True)
+    ).x_mention_ingest_enabled is False
+    assert (
+        _make(testing=True, x_activity_enabled=True, x_public_reply_enabled=False)
+    ).x_mention_ingest_enabled is False

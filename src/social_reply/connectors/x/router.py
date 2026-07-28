@@ -33,6 +33,7 @@ def _ingress_plan(
     *,
     legacy_enabled: bool,
     xchat_enabled: bool,
+    mention_enabled: bool = False,
     activity_status: str | None = None,
 ) -> tuple[list[CanonicalEvent], str, bool]:
     if event_type == "chat.received":
@@ -40,6 +41,12 @@ def _ingress_plan(
             return [], "IGNORED_XCHAT_DISABLED", False
         return [], "XCHAT_DECRYPTION_PENDING", True
     if event_type.startswith("chat."):
+        return [], "IGNORED_X_ACTIVITY_EVENT", False
+    if event_type == "post.mention.create":
+        if not mention_enabled:
+            return [], "IGNORED_X_PUBLIC_REPLY_DISABLED", False
+        return events, activity_status or ("PENDING" if events else "IGNORED_AT_INGRESS"), False
+    if event_type.startswith("post."):
         return [], "IGNORED_X_ACTIVITY_EVENT", False
     if event_type == "dm.received":
         if not legacy_enabled:
@@ -114,6 +121,8 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
     activity_status = None
     if event_type == "dm.received":
         normalized, activity_status = adapter.normalize_activity_dm(payload)
+    elif event_type == "post.mention.create":
+        normalized, activity_status = adapter.normalize_activity_mention(payload)
     else:
         normalized = adapter.normalize(payload)
     events, processing_status, dispatch_xchat = _ingress_plan(
@@ -122,6 +131,7 @@ async def x_webhook(public_id: str, request: Request) -> dict[str, bool]:
         normalized,
         legacy_enabled=settings.x_legacy_dm_enabled,
         xchat_enabled=settings.xchat_enabled,
+        mention_enabled=settings.x_mention_ingest_enabled,
         activity_status=activity_status,
     )
     event_payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}

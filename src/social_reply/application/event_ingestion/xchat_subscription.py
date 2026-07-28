@@ -33,7 +33,7 @@ _READY_PROBE_INTERVAL = timedelta(
 _PENDING_PROBE_INTERVAL = timedelta(
     seconds=int(os.getenv("XCHAT_PENDING_PROBE_INTERVAL_SECONDS", "600"))
 )
-_EVENT_TYPES = ("dm.received", "chat.received")
+_EVENT_TYPES = ("dm.received", "chat.received", "post.mention.create")
 _last_check_at: float | None = None
 
 
@@ -113,6 +113,8 @@ async def _ensure_xchat_subscriptions_unlocked(
                 "dm.received": settings.x_legacy_dm_enabled
                 and capability_enabled(account.capability or {}, CapabilityKey.DM),
                 "chat.received": settings.xchat_enabled and xchat_registered,
+                "post.mention.create": settings.x_mention_ingest_enabled
+                and capability_enabled(account.capability or {}, CapabilityKey.MENTIONS),
             }
             configured_webhook_id = (account.config or {}).get("x_webhook_id")
             webhook_id = str(configured_webhook_id) if configured_webhook_id else None

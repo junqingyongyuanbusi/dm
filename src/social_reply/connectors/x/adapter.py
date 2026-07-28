@@ -59,6 +59,52 @@ class XWebhookAdapter:
             )
         ], "PENDING"
 
+    def normalize_activity_mention(self, payload: dict) -> tuple[list[CanonicalEvent], str]:
+        """XAA ``post.mention.create``：有人在帖子里 @ 本账号。
+
+        与旧 Account Activity API 的 ``tweet_create_events`` 不同，这里的事件包在
+        ``data.payload`` 里，且带 ``conversation_id``。会话键按 thread 而非单条帖子，
+        否则同一个对话里的每条回复都会变成孤立会话，拿不到上下文。
+        """
+        data = payload.get("data") or {}
+        if data.get("event_type") != "post.mention.create":
+            return [], "IGNORED_AT_INGRESS"
+        event = data.get("payload")
+        if not isinstance(event, dict):
+            return [], "X_ACTIVITY_MENTION_SCHEMA_UNSUPPORTED"
+        author_id = str(event.get("author_id") or "")
+        event_id = event.get("id")
+        text = event.get("text")
+        # 本账号发的帖也会 @ 到自己（例如回复自己的 thread），不自接自答。
+        if author_id and author_id == self._external_account_id:
+            return [], "IGNORED_SELF_MENTION"
+        if not author_id or not event_id or not isinstance(text, str) or not text.strip():
+            return [], "X_ACTIVITY_MENTION_SCHEMA_UNSUPPORTED"
+        conversation_id = str(event.get("conversation_id") or event_id)
+        return [
+            CanonicalEvent(
+                platform=self.platform,
+                platform_account_key=self._account_id,
+                external_event_id=str(event_id),
+                external_user_id=author_id,
+                conversation_key=f"x_reply:{self._account_id}:{conversation_id}",
+                text=text,
+                channel_type=ChannelType.MENTION,
+                occurred_at=_parse_time(event.get("created_at")),
+                event_namespace="x.activity.post_mention_create",
+                external_conversation_id=conversation_id,
+                event_metadata={
+                    "activity_event_uuid": data.get("event_uuid"),
+                    "conversation_id": conversation_id,
+                    # 发送时可能因为楼主限制了回复对象而失败，先存证以便事后定位。
+                    "reply_settings": event.get("reply_settings"),
+                    "lang": event.get("lang"),
+                },
+                reply_target={"kind": "reply", "in_reply_to_post_id": str(event_id)},
+                raw_payload=event,
+            )
+        ], "PENDING"
+
     def normalize(self, payload: dict) -> list[CanonicalEvent]:
         events: list[CanonicalEvent] = []
         if (payload.get("data") or {}).get("event_type") == "dm.received":
@@ -101,31 +147,6 @@ class XWebhookAdapter:
                         "dm_conversation_id": event.get("dm_conversation_id"),
                     },
                     reply_target={"kind": "dm", "participant_id": sender_id},
-                    raw_payload=event,
-                )
-            )
-        for event in payload.get("tweet_create_events", []) + payload.get("post_create_events", []):
-            author_id = str(event.get("user_id_str") or event.get("author_id") or "")
-            event_id = event.get("id_str") or event.get("id")
-            text = event.get("text")
-            if (
-                not author_id
-                or not event_id
-                or author_id == self._external_account_id
-                or not isinstance(text, str)
-            ):
-                continue
-            events.append(
-                CanonicalEvent(
-                    platform=self.platform,
-                    platform_account_key=self._account_id,
-                    external_event_id=str(event_id),
-                    external_user_id=author_id,
-                    conversation_key=f"x_reply:{self._account_id}:{event_id}",
-                    text=text,
-                    channel_type=ChannelType.MENTION,
-                    event_namespace="x.activity",
-                    reply_target={"kind": "reply", "in_reply_to_post_id": str(event_id)},
                     raw_payload=event,
                 )
             )

@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     x_legacy_dm_enabled: bool = True
     x_activity_enabled: bool = True
     xchat_enabled: bool = True
+    # 公开回复 @mention。X 开发者条款对“AI 生成并发布的回复”要求事先报批，且每次互动
+    # 最多回 1 条；默认关，开启前确保已获 X 批准并已标注为自动账号。
+    x_public_reply_enabled: bool = False
     x_oauth_legacy_state_write: bool = False
     facebook_messenger_enabled: bool = True
     instagram_messaging_enabled: bool = True
@@ -148,7 +151,17 @@ class Settings(BaseSettings):
 
     @property
     def x_integration_enabled(self) -> bool:
-        return self.x_legacy_dm_enabled or self.x_activity_enabled or self.xchat_enabled
+        return (
+            self.x_legacy_dm_enabled
+            or self.x_activity_enabled
+            or self.xchat_enabled
+            or self.x_public_reply_enabled
+        )
+
+    @property
+    def x_mention_ingest_enabled(self) -> bool:
+        """Mentions ride the Activity webhook, so both switches must be on."""
+        return self.x_activity_enabled and self.x_public_reply_enabled
 
     def platform_integration_enabled(self, platform: str) -> bool:
         if platform == "facebook":
