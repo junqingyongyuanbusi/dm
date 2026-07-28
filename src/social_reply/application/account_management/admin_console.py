@@ -8,6 +8,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlencode
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -36,11 +37,19 @@ from social_reply.application.message_delivery.contracts import (
     build_direct_reply_destination,
 )
 from social_reply.application.reply_decision.persist import _idempotency_key
+from social_reply.application.reply_decision.persona import (
+    PERSONA_MAX_CHARS,
+    load_persona,
+    validate_persona,
+)
 from social_reply.domain.automation.state_machine import (
     AutomationStateEnum,
     can_transition,
     flip_to_human_active,
 )
+from social_reply.domain.reply.guard import redact_pii
+from social_reply.domain.reply.llm import LLMContext
+from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -1107,6 +1116,193 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
     return RedirectResponse(
         "/admin/knowledge?notice=deleted", status_code=status.HTTP_303_SEE_OTHER
     )
+
+
+# ---------- 提示词人设 ----------
+
+_PROMPT_BANNERS = {
+    "saved": ("ok", "人设已保存，下一条决策立即生效。"),
+    "persona_required": ("err", "人设不能为空。"),
+    "persona_too_long": ("err", f"人设过长：最多 {PERSONA_MAX_CHARS} 字符。"),
+}
+
+
+def _prompt_tenant(principal: Principal, requested: str) -> str:
+    tenant = (requested or "").strip() or (principal.tenant_id or "")
+    if not tenant:
+        tenant = sorted(principal.allowed_tenants)[0]
+    if tenant not in principal.allowed_tenants:
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    return tenant
+
+
+@router.get("/prompt", response_class=HTMLResponse)
+async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    csrf = _csrf(request)
+    tenant = _prompt_tenant(principal, tenant_id)
+    brand = (request.query_params.get("brand_id") or "default").strip() or "default"
+    async with get_session_factory()() as session:
+        resolved = await load_persona(session, tenant, brand)
+    banner = ""
+    if notice in _PROMPT_BANNERS:
+        tone, text = _PROMPT_BANNERS[notice]
+        banner = f'<div class="banner {tone}">{html.escape(text)}</div>'
+    origin = (
+        '<span class="pill warn">代码内置默认</span>'
+        if resolved.is_default
+        else f'<span class="pill ok">已自定义 · 第 {resolved.revision} 版</span>'
+    )
+    trial = ""
+    if request.query_params.get("trial"):
+        trial = _render_trial(request)
+    body = f"""<h1>提示词</h1><p class="lede">编辑 LLM 人设段；动作语义与安全约束由系统固定追加，不可修改。</p>{banner}
+<section class="card"><h2>人设 {origin}</h2>
+<p class="hint">决定语言、语气与身份。知识库命中并原文直答时不经过它——它只影响需要 LLM 生成的回复。</p>
+<form method="post" action="/admin/prompt/save"><input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
+<input type="hidden" name="brand_id" value="{html.escape(brand)}">
+<label for="f-persona">人设内容（最多 {PERSONA_MAX_CHARS} 字符）</label>
+<textarea id="f-persona" name="persona" rows="10" required>{html.escape(resolved.text)}</textarea>
+<button class="btn-block">保存</button></form></section>
+
+<section class="card"><h2>系统固定追加</h2>
+<p class="hint">以下内容始终拼在人设之后，后台无法编辑。删掉它们会让防注入失效或结构化输出校验开始失败。</p>
+<pre class="thread" style="white-space:pre-wrap">{html.escape(CONTRACT_PROMPT)}</pre></section>
+
+<section class="card"><h2>试运行</h2>
+<p class="hint">用当前保存的人设跑一次真实 LLM 调用，只看结果，不写库、不建 outbox、不发送。</p>
+<form method="post" action="/admin/prompt/trial"><input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
+<input type="hidden" name="brand_id" value="{html.escape(brand)}">
+{_input("text", "测试消息（模拟客户发来的内容）")}
+<button class="btn-block">试运行</button></form>{trial}</section>"""
+    response = HTMLResponse(
+        _page("提示词", body, active="prompt", show_users=principal.is_superadmin)
+    )
+    return _ensure_csrf(response, request, csrf)
+
+
+def _render_trial(request: Request) -> str:
+    q = request.query_params
+    if q.get("trial") == "failed":
+        return '<div class="banner err">试运行失败：LLM 调用出错，请检查供应商配置与额度。</div>'
+    rows = "".join(
+        f"<tr><td class='muted'>{html.escape(label)}</td><td>{html.escape(q.get(key) or '—')}</td></tr>"
+        for label, key in (
+            ("动作", "action"),
+            ("意图", "intent"),
+            ("风险", "risk"),
+            ("置信度", "confidence"),
+            ("原因码", "codes"),
+        )
+    )
+    reply = q.get("reply") or ""
+    reply_block = (
+        f"<div class='msg out' style='margin-top:10px'>{html.escape(reply)}</div>"
+        if reply
+        else "<p class='muted'>该动作不产生对外回复。</p>"
+    )
+    return f"""<div class="tablewrap" style="margin-top:14px"><table><tbody>{rows}</tbody></table></div>{reply_block}"""
+
+
+@router.post("/prompt/save")
+async def prompt_save(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
+    brand = (form.get("brand_id") or "default").strip() or "default"
+    try:
+        persona = validate_persona(form.get("persona") or "")
+    except ValueError as exc:
+        return RedirectResponse(
+            f"/admin/prompt?notice={exc}", status_code=status.HTTP_303_SEE_OTHER
+        )
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(
+                select(models.ReplyPrompt).where(
+                    models.ReplyPrompt.tenant_id == tenant,
+                    models.ReplyPrompt.brand_id == brand,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            revision = 1
+            session.add(
+                models.ReplyPrompt(
+                    tenant_id=tenant,
+                    brand_id=brand,
+                    persona=persona,
+                    revision=revision,
+                    updated_by=principal.actor,
+                )
+            )
+        else:
+            revision = row.revision + 1
+            row.persona = persona
+            row.revision = revision
+            row.updated_by = principal.actor
+        await session.execute(
+            models.AuditLog.__table__.insert().values(
+                tenant_id=tenant,
+                category="admin_action",
+                actor=principal.actor,
+                action="SET_REPLY_PERSONA",
+                subject_type="reply_prompt",
+                subject_id=f"{tenant}:{brand}",
+                detail={"revision": revision, "chars": len(persona)},
+            )
+        )
+        await session.commit()
+    return RedirectResponse("/admin/prompt?notice=saved", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/prompt/trial")
+async def prompt_trial(request: Request) -> Response:
+    """用当前人设跑一次 LLM，仅回显结果——不落 reply_decisions，也不建 outbox。"""
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
+    brand = (form.get("brand_id") or "default").strip() or "default"
+    text = (form.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text_required")
+    from social_reply.application.reply_decision.runner import _get_llm
+
+    async with get_session_factory()() as session:
+        resolved = await load_persona(session, tenant, brand)
+    try:
+        decision = await _get_llm().decide(
+            LLMContext(
+                text=redact_pii(text),
+                conversation_key=f"trial:{tenant}",
+                persona=resolved.text,
+            )
+        )
+    except Exception:
+        logger.exception("prompt trial failed tenant=%s", tenant)
+        return RedirectResponse("/admin/prompt?trial=failed", status_code=status.HTTP_303_SEE_OTHER)
+    params = urlencode(
+        {
+            "trial": "1",
+            "action": decision.action.value,
+            "intent": decision.intent or "",
+            "risk": decision.risk_level.value,
+            "confidence": f"{decision.confidence:.2f}",
+            "codes": ",".join(decision.reason_codes),
+            "reply": decision.reply_text or "",
+        }
+    )
+    return RedirectResponse(f"/admin/prompt?{params}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 # ---------- 投递监控 ----------

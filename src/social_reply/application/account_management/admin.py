@@ -109,6 +109,7 @@ _NAV_ITEMS = (
     ("conversations", "/admin/conversations", "对话"),
     ("decisions", "/admin/decisions", "决策"),
     ("knowledge", "/admin/knowledge", "知识库"),
+    ("prompt", "/admin/prompt", "提示词"),
     ("delivery", "/admin/delivery", "投递"),
     ("accounts", "/admin/accounts", "账号"),
 )

@@ -83,6 +83,7 @@ The built-in administration surface provides:
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
 - account enable/disable and health checks, including Messenger/Instagram token plus app-level and account-level `messages` subscription state; Meta text-DM accounts connect as `BOT_DRAFT_ONLY` and can only be promoted to `BOT_ACTIVE` when the deployment sets `META_AUTO_REPLY_ENABLED=true`, and every change is written to `audit_logs` as `SET_AUTOMATION_DEFAULT`;
+- tenant-editable LLM persona at `/admin/prompt`, stored in PostgreSQL so the Worker sees saves immediately; only the persona is editable, while the output contract and prompt-injection defences are appended by code and rendered read-only. Saves bump a revision that is recorded in `reply_decisions.prompt_version` and audited as `SET_REPLY_PERSONA`, and a dry-run box exercises the model without persisting a decision or creating an Outbox row;
 - no account-creation CLI requirement.
 
 OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.

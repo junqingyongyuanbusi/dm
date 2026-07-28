@@ -11,6 +11,11 @@ from social_reply.application.knowledge.retrieval import (
     retrieve_hybrid_knowledge,
 )
 from social_reply.application.reply_decision.persist import persist_decision
+from social_reply.application.reply_decision.persona import (
+    ResolvedPersona,
+    load_persona,
+    prompt_version_label,
+)
 from social_reply.application.reply_decision.pipeline import (
     DecisionSnapshot,
     run_decision_pipeline,
@@ -19,7 +24,7 @@ from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbe
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
-from social_reply.domain.reply.openai_client import OpenAILLMClient
+from social_reply.domain.reply.openai_client import DEFAULT_PERSONA, OpenAILLMClient
 from social_reply.domain.reply.rules import apply_rules
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -27,6 +32,8 @@ from social_reply.infrastructure.killswitch import KillSwitchChecker
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_PERSONA = ResolvedPersona(text=DEFAULT_PERSONA, revision=None)
 
 _llm: LLMClient | None = None
 
@@ -259,9 +266,9 @@ async def run_and_persist_decision(
     返回 outbox_id（供后续投递入队）。"""
     started = time.perf_counter()
     settings = get_settings()
-    cutoff_seq = await _validate_decision_scope(
-        snapshot, conversation_id, message_id, account_id
-    )
+    cutoff_seq = await _validate_decision_scope(snapshot, conversation_id, message_id, account_id)
+    # 先给默认值：fail-closed 分支不走管线，但下面落库时仍要拿它拼 prompt_version。
+    persona = _DEFAULT_PERSONA
     try:
         killswitch = _make_killswitch()
     except Exception:
@@ -272,9 +279,7 @@ async def run_and_persist_decision(
         )
     else:
         deterministic_rule = apply_rules(snapshot.text)
-        should_retrieve = (
-            snapshot.automation_state != "HUMAN_ACTIVE" and deterministic_rule is None
-        )
+        should_retrieve = snapshot.automation_state != "HUMAN_ACTIVE" and deterministic_rule is None
         hits = await _fetch_knowledge(snapshot) if should_retrieve else ()
         # 模板直答：必须基于「相似度最高」的命中判断，不能用 RRF 序的 hits[0]——
         # RRF 分最高 ≠ 相似度最高，否则会误发词法命中的错模板，或漏发真正强命中的向量项。
@@ -284,19 +289,15 @@ async def run_and_persist_decision(
             top_by_similarity = max(hits, key=lambda h: h.similarity)
             if top_by_similarity.verbatim_safe:
                 verbatim = top_by_similarity.reply
-        require_knowledge = (
-            settings.knowledge_retrieval_enabled and settings.require_knowledge
-        )
+        require_knowledge = settings.knowledge_retrieval_enabled and settings.require_knowledge
         needs_llm_history = (
-            should_retrieve
-            and verbatim is None
-            and not (require_knowledge and not hits)
+            should_retrieve and verbatim is None and not (require_knowledge and not hits)
         )
-        history = (
-            await _fetch_history(conversation_id, cutoff_seq)
-            if needs_llm_history
-            else ()
-        )
+        history = await _fetch_history(conversation_id, cutoff_seq) if needs_llm_history else ()
+        # 人设只在真要调 LLM 时才读：确定性规则与模板直答都不经过提示词。
+        if should_retrieve and verbatim is None and not (require_knowledge and not hits):
+            async with get_session_factory()() as session:
+                persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
         decision = await run_decision_pipeline(
             snapshot,
             llm=_get_llm(),
@@ -305,6 +306,7 @@ async def run_and_persist_decision(
             require_knowledge=require_knowledge,
             verbatim_reply=verbatim,
             history=history,
+            persona=persona.text,
         )
     async with get_session_factory()() as session:
         outbox_id = await persist_decision(
@@ -314,7 +316,7 @@ async def run_and_persist_decision(
             message_id,
             account_id,
             decision,
-            settings.prompt_version,
+            prompt_version_label(settings.prompt_version, persona),
         )
         await session.commit()
     decision_ms = (time.perf_counter() - started) * 1000

@@ -33,6 +33,7 @@ async def run_decision_pipeline(
     require_knowledge: bool = False,
     verbatim_reply: str | None = None,
     history: tuple[tuple[str, str], ...] = (),
+    persona: str | None = None,
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
@@ -87,6 +88,7 @@ async def run_decision_pipeline(
                 conversation_key=snapshot.conversation_key,
                 knowledge=knowledge,
                 history=safe_history,
+                persona=persona,
             )
         )
         if knowledge:

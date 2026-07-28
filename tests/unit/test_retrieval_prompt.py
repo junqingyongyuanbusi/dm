@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from social_reply.domain.reply.llm import LLMContext
-from social_reply.domain.reply.openai_client import _SYSTEM_PROMPT, OpenAILLMClient
+from social_reply.domain.reply.openai_client import (
+    CONTRACT_PROMPT,
+    DEFAULT_PERSONA,
+    OpenAILLMClient,
+)
 
 _GOOD_OUTPUT = {
     "action": "auto_reply",
@@ -56,8 +60,9 @@ async def test_knowledge_注入后_prompt_含模板文本与防注入声明():
             knowledge=(_TEMPLATE_1, _TEMPLATE_2),
         )
     )
-    # 基础 prompt 保留
-    assert prompt.startswith(_SYSTEM_PROMPT)
+    # 默认人设与固定契约段都保留
+    assert prompt.startswith(DEFAULT_PERSONA)
+    assert CONTRACT_PROMPT in prompt
     # 逐条模板文本注入
     assert _TEMPLATE_1 in prompt
     assert _TEMPLATE_2 in prompt
@@ -74,4 +79,4 @@ async def test_knowledge_为空时_prompt_不变():
             conversation_key="cw:1:2",
         )
     )
-    assert prompt == _SYSTEM_PROMPT
+    assert prompt == f"{DEFAULT_PERSONA}\n{CONTRACT_PROMPT}"

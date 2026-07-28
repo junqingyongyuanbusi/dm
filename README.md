@@ -217,6 +217,25 @@ REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 全量
 
 GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head。
 
+## 提示词人设（后台可配）
+
+`/admin/prompt` 编辑 LLM 人设段（语言、语气、身份），保存后**下一条决策立即生效**，无需重启或发版。
+
+人设存 PostgreSQL 而非环境变量：Worker 跑决策、API 跑后台，两个进程必须看到同一份内容；
+每次决策直读也免去多 Worker 的缓存失效问题。
+
+**只有人设段可编辑。** 动作语义（何时 auto_reply / handoff / draft / ignore）与安全不变量
+（不回显 PII、防提示词注入、`handoff/ignore 时 reply_text 置空`）由代码固定追加，页面上以只读形式
+展示。这些内容是结构化输出契约的一部分——删掉任何一行都会静默废掉防注入，或让 `json_schema`
+校验开始失败（决策全部降级转人工）。
+
+- 作用域按 `(tenant_id, brand_id)`；未配置的租户回落到代码内置默认人设。
+- 每次保存 `revision` 自增，并写进 `reply_decisions.prompt_version`（形如 `v0-stub#r7`），
+  可回溯某条回复出自哪一版人设。变更记入 `audit_logs`（`action=SET_REPLY_PERSONA`）。
+- **试运行**:页面内可用当前人设跑一次真实 LLM 调用，只回显 action/回复/置信度，
+  不写 `reply_decisions`、不建 outbox、不发送。发给模型前同样做 PII 脱敏。
+- 知识库精确命中并原文直答时不经过 LLM，因此也不受人设影响；人设只作用于需要模型生成的回复。
+
 ## 回复模板导入（知识库）
 
 CSV 格式（UTF-8，表头必需 `question,reply`，可选 `brand_id,platform,category`）：

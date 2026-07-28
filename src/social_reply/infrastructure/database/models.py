@@ -611,3 +611,24 @@ class KnowledgeChunk(Base):
     embedding_version: Mapped[str] = mapped_column(String(32))  # 如 "text-embedding-3-small"
     embedding: Mapped[list[float]] = mapped_column(Vector(1536))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReplyPrompt(Base):
+    """租户可在后台编辑的 LLM 人设段。
+
+    只存人设：动作语义与安全不变量（防注入、PII、结构化输出契约）由代码固定追加，
+    不进数据库——否则一次误编辑就能悄无声息地废掉这些保护。
+    """
+
+    __tablename__ = "reply_prompts"
+    __table_args__ = (UniqueConstraint("tenant_id", "brand_id"),)
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    brand_id: Mapped[str] = mapped_column(String(64), default="default")
+    persona: Mapped[str] = mapped_column(Text)
+    # 每次保存自增，写进 reply_decisions.prompt_version，用于回溯某条回复出自哪版人设。
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    updated_by: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
