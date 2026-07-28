@@ -217,30 +217,56 @@ REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 全量
 
 GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head。
 
-## X 公开回复（@mention）
+## X 贴文评论自动回复
 
 `X_PUBLIC_REPLY_ENABLED` 默认 `false`。开启后 Scheduler 会为具备 `mentions` 能力的 X 账号订阅
-XAA 的 `post.mention.create`，有人 @ 你时进入统一决策链路。
+XAA 的 `post.mention.create`。
 
-**先读 X 的规则再开这个开关。** X 开发者指南对自动回复写得很具体：
+**X 上没有独立的「评论」实体。** 回复一条帖子就是发一条带 `replied_to` 引用的新帖，并自动带上
+原作者的 @handle，因此贴文评论与 @提及是同一个信号：
+
+```
+refs=[replied_to → 你的帖子]  in_reply_to_user_id=你  mentions=[你]
+text: "@yourhandle 联系方式"
+```
+
+XAA 的完整事件枚举里没有任何回复/评论专用事件（只有 `post.create`、`post.delete`、
+`post.mention.create`、`like.create` 等），`post.mention.create` 是感知评论的唯一 webhook 通路。
+
+### 会话键
+
+`x_reply:{account}:{conversation_id}:{author_id}` —— 必须带作者。一条帖子下所有评论共享同一个
+`conversation_id`，只按 thread 建键会让第一个评论者占坑（`Conversation` 只有一个 `contact_id`），
+后续所有人的留言都挂到他名下，LLM 还会把陌生人的评论当上下文读。带上作者后：
+
+- 同一人在同一帖下的多次评论 → 一个会话，有上下文
+- 不同人 → 互相隔离，各自绑定自己的联系人
+
+这也让 X 的「每次互动最多 1 条回复」正好等价于「每个会话最多 1 条外发」。
+
+### 政策约束
 
 | 场景 | 允许 | 说明 |
 | --- | --- | --- |
+| 回复"评论过你帖子"的人 | 有条件 | 用户先互动，**每次互动最多 1 条** |
 | 响应求助类 @mention | 是 | 用户主动发起 |
 | 按关键词自动回复任何人 | 否 | 未经邀约的骚扰 |
-| 回复"回复过你帖子"的人 | 有条件 | **每次互动最多 1 条** |
 | **AI 生成并发布回复** | **需 X 事先批准** | 未获批部署即属违规 |
 
 因此 mention 会话**一律以 `BOT_DRAFT_ONLY` 建立，即使账号默认是 `BOT_ACTIVE`**——
 公开回复只能经人工在 `/admin/decisions` 审核后外发。这既满足 X 的报批要求，也因为公开时间线上
 的错答会被截图传播，代价远高于私信。要放开自动外发，需先取得 X 批准、把账号标注为自动账号，
-并实现"同一 thread 最多回 1 次"的守卫。
+并实现「每个会话最多 1 条外发」的守卫。
 
-- 会话键按 thread（`conversation_id`）而非单条帖子，多轮对话才有上下文。
-- 本账号自己发的帖会被 `IGNORED_SELF_MENTION` 过滤，避免自接自答。
-- 未开启开关时 mention 记为 `IGNORED_X_PUBLIC_REPLY_DISABLED`，不建会话。
+### 其他行为
+
+- 回复开头的 `@handle` 前缀会被剥掉再进管线（`"@you 联系方式"` → `"联系方式"`），避免污染知识检索；
+  原文保留在 `raw_payload`。对方只 @ 了一下没写正文时保留原文。
+- 本账号自己发的帖记 `IGNORED_SELF_MENTION`，避免自接自答。
+- 未开开关时记 `IGNORED_X_PUBLIC_REPLY_DISABLED`，不建会话。
 - webhook 是 App 级共享的，其他 `post.*` 事件记 `IGNORED_X_ACTIVITY_EVENT` 后丢弃。
 - 发送侧复用既有 `x_post_reply`（`POST /2/tweets` + `reply.in_reply_to_tweet_id`），Guard 按 280 字限长。
+- 嵌套回复（别人回复评论者、没 @ 你）不会触发事件。这与 X「仅在用户与你互动时回复」的要求一致。
 
 ## 提示词人设（后台可配）
 

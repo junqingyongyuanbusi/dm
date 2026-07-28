@@ -168,26 +168,49 @@ def test_mention_normalizes_to_a_public_reply_target():
     assert event.event_namespace == "x.activity.post_mention_create"
 
 
-def test_mention_conversation_key_follows_the_thread_not_the_post():
-    # 同一 thread 的两条 mention 必须落进同一会话，否则多轮对话拿不到上下文
-    second = {
+def _variant(**payload_overrides):
+    return {
         "data": {
             **_MENTION_PAYLOAD["data"],
-            "payload": {
-                **_MENTION_PAYLOAD["data"]["payload"],
-                "id": "2080765813578199999",
-            },
+            "payload": {**_MENTION_PAYLOAD["data"]["payload"], **payload_overrides},
         }
     }
+
+
+def test_same_person_commenting_twice_shares_one_conversation():
+    # 同一人在同一条帖下的多次评论要有上下文，否则每次回复都像失忆
     (first_event,), _ = _adapter().normalize_activity_mention(_MENTION_PAYLOAD)
-    (second_event,), _ = _adapter().normalize_activity_mention(second)
+    (second_event,), _ = _adapter().normalize_activity_mention(_variant(id="2080765813578199999"))
     assert first_event.conversation_key == second_event.conversation_key
-    assert first_event.conversation_key.endswith(":2080000000000000000")
-    # 但回复目标各自指向自己那条帖子
+    # 但回复各自指向对方那条评论，而不是都回到第一条
     assert (
         first_event.reply_target["in_reply_to_post_id"]
-        != (second_event.reply_target["in_reply_to_post_id"])
+        != second_event.reply_target["in_reply_to_post_id"]
     )
+
+
+def test_different_people_under_one_post_never_share_a_conversation():
+    # 一条帖子下 50 个评论者共享同一个 conversation_id；只按 thread 建键会把
+    # 陌生人并进同一会话，联系人归属和历史上下文都会错。
+    (a,), _ = _adapter().normalize_activity_mention(_variant(id="post-a", author_id="user-a"))
+    (b,), _ = _adapter().normalize_activity_mention(_variant(id="post-b", author_id="user-b"))
+    assert a.external_conversation_id == b.external_conversation_id
+    assert a.conversation_key != b.conversation_key
+
+
+def test_reply_prefix_is_stripped_from_the_user_text():
+    # X 会给回复自动拼上被回复者 handle，真实语料形如 "@handle 联系方式"
+    (event,), _ = _adapter().normalize_activity_mention(
+        _variant(text="@ExampleUser @someone_else 联系方式")
+    )
+    assert event.text == "联系方式"
+    # 原文仍留在 raw_payload 里可追溯
+    assert event.raw_payload["text"].startswith("@ExampleUser")
+
+
+def test_bare_mention_without_body_keeps_the_original_text():
+    (event,), _ = _adapter().normalize_activity_mention(_variant(text="@ExampleUser"))
+    assert event.text == "@ExampleUser"
 
 
 def test_mention_by_the_bot_itself_is_ignored():

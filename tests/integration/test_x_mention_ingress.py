@@ -60,16 +60,18 @@ async def _seed(session, *, automation_default: str) -> uuid.UUID:
     return account_id
 
 
-def _mention_body() -> tuple[bytes, str]:
+def _mention_body(
+    *, event_uuid: str = "mention-1", post_id: str = "post-1", author_id: str = "user-9"
+) -> tuple[bytes, str]:
     payload = {
         "data": {
             "event_type": "post.mention.create",
-            "event_uuid": "mention-1",
+            "event_uuid": event_uuid,
             "filter": {"user_id": "bot-1"},
             "payload": {
-                "id": "post-1",
+                "id": post_id,
                 "conversation_id": "thread-1",
-                "author_id": "user-9",
+                "author_id": author_id,
                 "text": "@bot how do I avoid scams?",
                 "created_at": "2026-07-24T21:23:23.000Z",
                 "reply_settings": "everyone",
@@ -84,8 +86,8 @@ def _mention_body() -> tuple[bytes, str]:
     return body, signature
 
 
-async def _post_mention() -> httpx.Response:
-    body, signature = _mention_body()
+async def _post_mention(**kwargs) -> httpx.Response:
+    body, signature = _mention_body(**kwargs)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="http://test",
@@ -135,7 +137,7 @@ async def test_mention_thread_never_inherits_bot_active(session, migrated_db, mo
             select(models.Conversation).where(models.Conversation.platform_account_id == account_id)
         )
     ).scalar_one()
-    assert conversation.conversation_key.endswith(":thread-1")
+    assert conversation.conversation_key.endswith(":thread-1:user-9")
     assert conversation.channel_type == "mention"
     state = (
         await session.execute(
@@ -203,4 +205,42 @@ async def test_dm_still_inherits_the_account_default(session, migrated_db, monke
         )
     ).scalar_one()
     assert state.state == "BOT_ACTIVE"
+    get_settings.cache_clear()
+
+
+async def test_two_commenters_on_one_post_get_separate_conversations(
+    session, migrated_db, monkeypatch
+):
+    # 一条帖子下所有评论共享 conversation_id。若只按 thread 建会话键，
+    # 第一个评论者会占坑，后续所有人的留言都会挂到他的 contact 上。
+    monkeypatch.setenv("X_PUBLIC_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+    account_id = await _seed(session, automation_default="BOT_DRAFT_ONLY")
+
+    assert (
+        await _post_mention(event_uuid="m-a", post_id="p-a", author_id="user-a")
+    ).status_code == 200
+    assert (
+        await _post_mention(event_uuid="m-b", post_id="p-b", author_id="user-b")
+    ).status_code == 200
+
+    session.expire_all()
+    conversations = (
+        (
+            await session.execute(
+                select(models.Conversation).where(
+                    models.Conversation.platform_account_id == account_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(conversations) == 2
+    assert {c.conversation_key for c in conversations} == {
+        f"x_reply:{account_id}:thread-1:user-a",
+        f"x_reply:{account_id}:thread-1:user-b",
+    }
+    # 两个会话各自绑定到自己的联系人，没有串号
+    assert len({c.contact_id for c in conversations}) == 2
     get_settings.cache_clear()

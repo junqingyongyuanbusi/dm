@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime
 
 from social_reply.domain.messages.canonical import CanonicalEvent, ChannelType
@@ -11,6 +12,18 @@ def _parse_time(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _strip_reply_prefix(text: str) -> str:
+    """去掉回复开头的 @handle 前缀。
+
+    X 给回复自动拼上被回复者的 handle，真实语料里长这样：
+    ``"@yangjunqin65708 联系方式"``。用户实际说的只是“联系方式”，
+    前缀带进检索会污染 query。只剥开头连续的 handle，不动正文里的 @。
+    """
+    stripped = re.sub(r"^(?:@\w{1,15}\s+)+", "", text).strip()
+    # 对方只 @ 了一下没写正文时，保留原文而不是交一个空字符串出去。
+    return stripped or text.strip()
 
 
 class XWebhookAdapter:
@@ -81,14 +94,17 @@ class XWebhookAdapter:
         if not author_id or not event_id or not isinstance(text, str) or not text.strip():
             return [], "X_ACTIVITY_MENTION_SCHEMA_UNSUPPORTED"
         conversation_id = str(event.get("conversation_id") or event_id)
+        # 会话键必须带上作者：一条帖子下 50 个人评论共享同一个 conversation_id，
+        # 只按 thread 建键会把陆续评论的陌生人全部并进第一个人的会话，
+        # 联系人归属和历史上下文都会错。同一人在同一帖下的多次评论才算一个会话。
         return [
             CanonicalEvent(
                 platform=self.platform,
                 platform_account_key=self._account_id,
                 external_event_id=str(event_id),
                 external_user_id=author_id,
-                conversation_key=f"x_reply:{self._account_id}:{conversation_id}",
-                text=text,
+                conversation_key=f"x_reply:{self._account_id}:{conversation_id}:{author_id}",
+                text=_strip_reply_prefix(text),
                 channel_type=ChannelType.MENTION,
                 occurred_at=_parse_time(event.get("created_at")),
                 event_namespace="x.activity.post_mention_create",
@@ -99,6 +115,10 @@ class XWebhookAdapter:
                     # 发送时可能因为楼主限制了回复对象而失败，先存证以便事后定位。
                     "reply_settings": event.get("reply_settings"),
                     "lang": event.get("lang"),
+                    # 还没见过真实载荷，能拿到就存，用于事后区分
+                    # “我帖子下的评论”和“别人帖子里顺手 @ 我”。
+                    "in_reply_to_user_id": event.get("in_reply_to_user_id"),
+                    "referenced_tweets": event.get("referenced_tweets"),
                 },
                 reply_target={"kind": "reply", "in_reply_to_post_id": str(event_id)},
                 raw_payload=event,
