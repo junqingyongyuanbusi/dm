@@ -73,6 +73,40 @@ def test_meta_comment_conversation_key_is_thread_and_user_scoped():
     assert event.conversation_key == ("instagram_comment:account-uuid:media-1:comment-root:user-1")
 
 
+def _fb_feed(**value):
+    return MetaWebhookAdapter(
+        platform="facebook",
+        account_id="account-uuid",
+        external_account_id="page-1",
+    ).normalize(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "page-1",
+                    "changes": [{"field": "feed", "value": {"from": {"id": "user-1"}, **value}}],
+                }
+            ],
+        }
+    )
+
+
+def test_facebook_feed_accepts_comments():
+    (event,) = _fb_feed(
+        item="comment", verb="add", comment_id="c-1", post_id="p-1", message="hello"
+    )
+    assert event.reply_target == {"kind": "comment", "comment_id": "c-1"}
+    assert event.conversation_key == "facebook_comment:account-uuid:p-1:c-1:user-1"
+
+
+def test_facebook_feed_ignores_non_comment_items():
+    # feed 会推整个主页动态：别人在主页发的帖也带 from 和 message，
+    # 不看 item 就会把它当成评论去回复。
+    assert _fb_feed(item="status", verb="add", post_id="p-2", message="a wall post") == []
+    assert _fb_feed(item="like", verb="add", post_id="p-3") == []
+    assert _fb_feed(item="share", verb="add", post_id="p-4", message="shared") == []
+
+
 def test_x_self_echo_uses_external_account_id():
     events = XWebhookAdapter(account_id="account-uuid", external_account_id="x-bot").normalize(
         {

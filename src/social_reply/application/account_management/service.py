@@ -223,8 +223,10 @@ async def connect_meta_account(
         if platform == "instagram" and instagram_login_mode == "instagram_login"
         else "https://graph.facebook.com"
     )
-    if not enable_dm or enable_comments:
-        raise ValueError("meta_private_messages_only")
+    if not enable_dm:
+        raise ValueError("meta_dm_required")
+    if enable_comments and not get_settings().meta_comment_reply_enabled:
+        raise ValueError("meta_comment_reply_disabled")
     if not get_settings().meta_automation_default_allowed(platform, automation_default):
         raise ValueError("meta_requires_bot_draft_only")
     _validate_automation_default(automation_default)

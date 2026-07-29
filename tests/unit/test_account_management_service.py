@@ -142,8 +142,8 @@ async def test_connect_meta_rejects_invalid_login_path_before_graph_calls(
 @pytest.mark.parametrize(
     ("enable_dm", "enable_comments", "automation_default", "error"),
     [
-        (False, False, "BOT_DRAFT_ONLY", "meta_private_messages_only"),
-        (True, True, "BOT_DRAFT_ONLY", "meta_private_messages_only"),
+        (False, False, "BOT_DRAFT_ONLY", "meta_dm_required"),
+        (True, True, "BOT_DRAFT_ONLY", "meta_comment_reply_disabled"),
         (True, False, "BOT_ACTIVE", "meta_requires_bot_draft_only"),
     ],
 )

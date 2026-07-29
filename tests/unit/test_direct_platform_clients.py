@@ -35,6 +35,34 @@ async def test_meta_client_sends_dm_and_comment():
     assert requests[0].url.path.endswith("/page-1/messages")
     assert requests[0].url.params["appsecret_proof"] == appsecret_proof("token", "secret")
     assert json.loads(requests[1].content) == {"message": "ok"}
+    # Facebook 回复评论是给评论加子评论
+    assert requests[1].url.path.endswith("/c-1/comments")
+    await client.aclose()
+
+
+async def test_instagram_replies_to_comments_on_the_replies_edge():
+    # IG 的回复端点是 POST /<IG_COMMENT_ID>/replies；沿用 Facebook 的 /comments
+    # 会被 Graph 拒绝，而这条路径此前从未启用，所以一直没暴露。
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "ig-reply-1"})
+
+    client = MetaGraphClient(
+        platform="instagram",
+        access_token="page-token",
+        app_secret="secret",
+        external_account_id="ig-1",
+        page_id="page-1",
+        transport=httpx.MockTransport(handler),
+    )
+    assert (
+        await client.send_text(target={"kind": "comment", "comment_id": "igc-1"}, text="hi")
+        == "ig-reply-1"
+    )
+    assert requests[0].url.path == "/v23.0/igc-1/replies"
+    assert json.loads(requests[0].content) == {"message": "hi"}
     await client.aclose()
 
 

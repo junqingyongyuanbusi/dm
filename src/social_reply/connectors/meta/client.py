@@ -73,8 +73,11 @@ class MetaGraphClient:
                 json={"recipient": {"id": target["recipient_id"]}, "message": {"text": text}},
             )
         elif kind == "comment":
+            # Instagram 回复评论走 /replies，Facebook 走 /comments。两边同用 /comments 时
+            # IG 侧会直接失败，而这条路径此前从未启用过，所以一直没暴露。
+            edge = "replies" if self.platform == "instagram" else "comments"
             response = await self._client.post(
-                f"/{target['comment_id']}/comments",
+                f"/{target['comment_id']}/{edge}",
                 json={"message": text},
             )
         elif kind == "private_reply":

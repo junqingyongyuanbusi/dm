@@ -68,7 +68,12 @@ class MetaWebhookAdapter:
                 )
             for change in entry.get("changes", []) if self._allow_comments else ():
                 value = change.get("value") or {}
-                if change.get("field") not in {"comments", "feed"}:
+                field = change.get("field")
+                if field not in {"comments", "feed"}:
+                    continue
+                # feed 传递整个主页动态（发帖、点赞、分享…），不只是评论。
+                # 不看 item 的话，别人在主页发的帖会被当成评论回复。
+                if field == "feed" and value.get("item") != "comment":
                     continue
                 comment_id = value.get("id") or value.get("comment_id")
                 sender_id = str(
