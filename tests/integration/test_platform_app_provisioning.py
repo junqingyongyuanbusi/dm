@@ -116,9 +116,13 @@ async def test_platform_app_rotation_remains_opt_in(session, tmp_path):
         )
 
     rows = (
-        await session.execute(
-            select(models.PlatformApp).where(models.PlatformApp.platform_family == "meta")
+        (
+            await session.execute(
+                select(models.PlatformApp).where(models.PlatformApp.platform_family == "meta")
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(rows) == 1
     assert rows[0].external_app_id == "old-app"

@@ -46,9 +46,7 @@ def _parse_rows(f: TextIO, brand_id_default: str) -> tuple[list[_Row], int]:
     headers = set(reader.fieldnames or [])
     missing = _REQUIRED_HEADERS - headers
     if missing:
-        raise ValueError(
-            f"CSV 表头缺少必需列: {'、'.join(sorted(missing))}（必需 question,reply）"
-        )
+        raise ValueError(f"CSV 表头缺少必需列: {'、'.join(sorted(missing))}（必需 question,reply）")
     rows: list[_Row] = []
     blank = 0
     for raw in reader:

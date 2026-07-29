@@ -121,9 +121,9 @@ async def test_mention_is_ignored_while_public_reply_is_disabled(session, migrat
     get_settings.cache_clear()
 
 
-async def test_mention_thread_never_inherits_bot_active(session, migrated_db, monkeypatch):
-    # X 对 AI 生成的公开回复要求事先报批；账号即使是 BOT_ACTIVE，
-    # mention 也必须落进人工待审队列，不能直接对外发推。
+async def test_mention_inherits_the_account_default(session, migrated_db, monkeypatch):
+    # 评论与私信一致，均由 automation_default 决定。要改自动/草稿，
+    # 改账号的 automation_default，不在代码里按频道写死。
     monkeypatch.setenv("X_PUBLIC_REPLY_ENABLED", "true")
     get_settings.cache_clear()
     account_id = await _seed(session, automation_default="BOT_ACTIVE")
@@ -146,14 +146,40 @@ async def test_mention_thread_never_inherits_bot_active(session, migrated_db, mo
             )
         )
     ).scalar_one()
+    assert state.state == "BOT_ACTIVE"
+    get_settings.cache_clear()
+
+
+async def test_mention_stays_draft_when_the_account_is_draft_only(
+    session, migrated_db, monkeypatch
+):
+    monkeypatch.setenv("X_PUBLIC_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+    account_id = await _seed(session, automation_default="BOT_DRAFT_ONLY")
+
+    assert (await _post_mention()).status_code == 200
+
+    session.expire_all()
+    conversation = (
+        await session.execute(
+            select(models.Conversation).where(models.Conversation.platform_account_id == account_id)
+        )
+    ).scalar_one()
+    state = (
+        await session.execute(
+            select(models.AutomationState).where(
+                models.AutomationState.conversation_id == conversation.id
+            )
+        )
+    ).scalar_one()
     assert state.state == "BOT_DRAFT_ONLY"
-    # 公开回复绝不能在无人审核的情况下进入投递队列
+    # 草稿态下绝不能无人审核就进投递队列
     assert (await session.execute(select(models.OutboxMessage))).first() is None
     get_settings.cache_clear()
 
 
 async def test_dm_still_inherits_the_account_default(session, migrated_db, monkeypatch):
-    # 只有 mention 被强制降级；DM 仍然按账号默认值走，不受这次改动影响
+    # 私信路径不受这条线改动影响
     monkeypatch.setenv("X_PUBLIC_REPLY_ENABLED", "true")
     get_settings.cache_clear()
     account_id = await _seed(session, automation_default="BOT_ACTIVE")

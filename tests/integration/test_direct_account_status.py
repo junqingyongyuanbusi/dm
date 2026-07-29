@@ -234,9 +234,7 @@ async def test_stale_xchat_claim_cannot_mark_new_claim_inactive(session, monkeyp
                 update(models.RawEvent)
                 .where(models.RawEvent.id == current_raw_event_id)
                 .values(
-                    processing_claim_token=uuid.UUID(
-                        "22222222-2222-2222-2222-222222222222"
-                    ),
+                    processing_claim_token=uuid.UUID("22222222-2222-2222-2222-222222222222"),
                     processing_status="XCHAT_PROCESSING",
                 )
             )

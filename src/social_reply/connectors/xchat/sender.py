@@ -119,9 +119,7 @@ class XChatSender:
             )
         cached = {
             canonical_conversation_id(key): value
-            for key, value in (
-                (config or {}).get("xchat_conversation_key_events") or {}
-            ).items()
+            for key, value in ((config or {}).get("xchat_conversation_key_events") or {}).items()
         }
         events = [str(item) for item in cached.get(conversation_id) or [] if item]
         if events:

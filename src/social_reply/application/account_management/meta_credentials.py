@@ -50,9 +50,7 @@ def _configured_credentials(
     )
 
 
-async def _stored_credentials(
-    *, tenant_id: str, platform_family: str
-) -> MetaAppCredentials | None:
+async def _stored_credentials(*, tenant_id: str, platform_family: str) -> MetaAppCredentials | None:
     async with get_session_factory()() as session:
         apps = (
             (

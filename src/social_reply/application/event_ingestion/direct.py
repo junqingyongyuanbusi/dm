@@ -6,12 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.reply_decision.jobs import snapshot_to_dict
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
-from social_reply.domain.automation.state_machine import AutomationStateEnum, ensure_state
-from social_reply.domain.messages.canonical import (
-    CanonicalEvent,
-    CanonicalEventKind,
-    ChannelType,
-)
+from social_reply.domain.automation.state_machine import ensure_state
+from social_reply.domain.messages.canonical import CanonicalEvent, CanonicalEventKind
 from social_reply.domain.platform_accounts import is_active_account_status
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -244,14 +240,7 @@ async def ingest_canonical_event(
                 )
             )
         ).scalar_one()
-        # 公开回复不继承账号的 BOT_ACTIVE：X 对“AI 生成并发布的回复”要求事先报批，
-        # 且误答在公开时间线上会被截图传播。mention 一律先进人工待审队列。
-        default_state = (
-            AutomationStateEnum.BOT_DRAFT_ONLY
-            if event.channel_type is ChannelType.MENTION
-            else account.automation_default
-        )
-        await ensure_state(session, conversation.id, default_state)
+        await ensure_state(session, conversation.id, account.automation_default)
 
         message_id = uuid.uuid4()
         await session.execute(

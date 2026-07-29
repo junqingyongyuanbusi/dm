@@ -140,9 +140,7 @@ async def _release_dispatch_reservation(raw_event_id: uuid.UUID) -> None:
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent)
-                .where(models.RawEvent.id == raw_event_id)
-                .with_for_update()
+                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
             )
         ).scalar_one_or_none()
         if row is None:

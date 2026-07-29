@@ -120,9 +120,7 @@ async def test_managed_x_outbox_echo_is_ignored(
     assert await session.scalar(select(func.count()).select_from(models.DecisionJob)) == 0
     audit = (
         await session.execute(
-            select(models.AuditLog).where(
-                models.AuditLog.action == "managed_x_outbox_echo_ignored"
-            )
+            select(models.AuditLog).where(models.AuditLog.action == "managed_x_outbox_echo_ignored")
         )
     ).scalar_one()
     assert audit.detail["source_account_id"] == str(source_account_id)

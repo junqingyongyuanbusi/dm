@@ -178,9 +178,7 @@ async def _claim(
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent)
-                .where(models.RawEvent.id == raw_event_id)
-                .with_for_update()
+                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
             )
         ).scalar_one_or_none()
         if (
@@ -220,9 +218,7 @@ async def _mark_retryable(
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent)
-                .where(models.RawEvent.id == raw_event_id)
-                .with_for_update()
+                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
             )
         ).scalar_one_or_none()
         if row is None or str(row.processing_claim_token or "") != claim_token:
@@ -254,9 +250,7 @@ async def _mark(
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                select(models.RawEvent)
-                .where(models.RawEvent.id == raw_event_id)
-                .with_for_update()
+                select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
             )
         ).scalar_one_or_none()
         if row is None or str(row.processing_claim_token or "") != claim_token:

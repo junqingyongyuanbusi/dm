@@ -158,9 +158,7 @@ async def authenticate(username: str, password: str) -> tuple[Principal, str] | 
     async with get_session_factory()() as session:
         stored_user = (
             await session.execute(
-                select(models.AdminUser)
-                .where(models.AdminUser.id == user.id)
-                .with_for_update()
+                select(models.AdminUser).where(models.AdminUser.id == user.id).with_for_update()
             )
         ).scalar_one_or_none()
         if (
