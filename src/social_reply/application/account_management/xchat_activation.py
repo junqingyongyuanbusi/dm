@@ -84,9 +84,15 @@ async def unlock_account_xchat_keys(
     client: XChatClient,
     user_id: str,
     pin: str,
+    records: list[dict] | None = None,
 ) -> tuple[str, str]:
     try:
-        return await unlock_xchat_private_keys(client=client, user_id=user_id, pin=pin)
+        return await unlock_xchat_private_keys(
+            client=client,
+            user_id=user_id,
+            pin=pin,
+            records=records,
+        )
     except httpx.HTTPStatusError as exc:
         raise _http_activation_error(exc) from exc
     except httpx.TransportError as exc:

@@ -1,9 +1,25 @@
 import httpx
+import pytest
 
+from social_reply.connectors.chatwoot import client as chatwoot_client
 from social_reply.connectors.chatwoot.client import (
     FakeChatwootClient,
     HttpxChatwootClient,
 )
+
+
+def test_disabled_client_is_not_initialized(monkeypatch):
+    monkeypatch.setattr(
+        chatwoot_client,
+        "get_settings",
+        lambda: type("Settings", (), {"chatwoot_enabled": False, "testing": True})(),
+    )
+    chatwoot_client._fake = None
+    chatwoot_client._http = None
+    with pytest.raises(RuntimeError, match="chatwoot_disabled"):
+        chatwoot_client.get_chatwoot_client()
+    assert chatwoot_client._fake is None
+    assert chatwoot_client._http is None
 
 
 async def test_fake_records_and_returns_incrementing_id():

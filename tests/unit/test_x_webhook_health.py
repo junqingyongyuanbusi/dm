@@ -77,7 +77,7 @@ async def test_sweep_throttles_and_dedupes_by_consumer_key(monkeypatch):
     monkeypatch.setattr(x_webhook_health, "_check_app", fake_check)
     monkeypatch.setattr(x_webhook_health, "_CHECK_INTERVAL_SECONDS", 3600)
 
-    x_webhook_health._last_check_at = 0.0
+    x_webhook_health._last_check_at = None
     await x_webhook_health.ensure_x_webhooks_valid()
     assert checked == ["ck"]  # 同 consumer key 的账号只查一次
 
@@ -87,6 +87,6 @@ async def test_sweep_throttles_and_dedupes_by_consumer_key(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_throttle():
-    x_webhook_health._last_check_at = 0.0
+    x_webhook_health._last_check_at = None
     yield
-    x_webhook_health._last_check_at = 0.0
+    x_webhook_health._last_check_at = None

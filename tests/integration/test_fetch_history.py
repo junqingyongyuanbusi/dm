@@ -14,9 +14,7 @@ from social_reply.shared.config import get_settings
 pytestmark = pytest.mark.integration
 
 
-async def _seed_conversation(
-    session, *, tenant_id: str = "default"
-) -> tuple[uuid.UUID, uuid.UUID]:
+async def _seed_conversation(session, *, tenant_id: str = "default") -> tuple[uuid.UUID, uuid.UUID]:
     account_id = uuid.uuid4()
     contact_id = uuid.uuid4()
     conversation_id = uuid.uuid4()
@@ -85,12 +83,8 @@ async def _add_message(
 
 async def test_history_is_ordered_and_maps_roles(session):
     _account_id, conversation_id = await _seed_conversation(session)
-    await _add_message(
-        session, conversation_id, direction="inbound", text="想买 A 套餐", minute=1
-    )
-    await _add_message(
-        session, conversation_id, direction="outbound", text="已记录", minute=2
-    )
+    await _add_message(session, conversation_id, direction="inbound", text="想买 A 套餐", minute=1)
+    await _add_message(session, conversation_id, direction="outbound", text="已记录", minute=2)
     _current_id, current_seq = await _add_message(
         session, conversation_id, direction="inbound", text="那这个多少钱？", minute=3
     )
@@ -101,9 +95,7 @@ async def test_history_is_ordered_and_maps_roles(session):
 
 async def test_history_excludes_private_empty_and_unknown_direction(session):
     _account_id, conversation_id = await _seed_conversation(session)
-    await _add_message(
-        session, conversation_id, direction="inbound", text="正常消息", minute=1
-    )
+    await _add_message(session, conversation_id, direction="inbound", text="正常消息", minute=1)
     await _add_message(
         session,
         conversation_id,
@@ -112,12 +104,8 @@ async def test_history_excludes_private_empty_and_unknown_direction(session):
         minute=2,
         private=True,
     )
-    await _add_message(
-        session, conversation_id, direction="outbound", text=None, minute=3
-    )
-    await _add_message(
-        session, conversation_id, direction="system", text="系统事件", minute=4
-    )
+    await _add_message(session, conversation_id, direction="outbound", text=None, minute=3)
+    await _add_message(session, conversation_id, direction="system", text="系统事件", minute=4)
     _current_id, current_seq = await _add_message(
         session, conversation_id, direction="inbound", text="当前", minute=5
     )
@@ -229,9 +217,7 @@ async def test_rule_decision_does_not_fetch_history(session, monkeypatch):
 
     monkeypatch.setattr(runner, "_fetch_history", unexpected_history)
     assert (
-        await runner.run_and_persist_decision(
-            snapshot, conversation_id, message_id, account_id
-        )
+        await runner.run_and_persist_decision(snapshot, conversation_id, message_id, account_id)
         is None
     )
 
@@ -253,9 +239,7 @@ async def test_decision_scope_validation_rejects_cross_tenant_mismatch(session):
     )
 
     assert (
-        await runner._validate_decision_scope(
-            snapshot, conversation_id, message_id, account_id
-        )
+        await runner._validate_decision_scope(snapshot, conversation_id, message_id, account_id)
         == message_seq
     )
 

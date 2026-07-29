@@ -1,10 +1,13 @@
 import json
+import uuid
 
 import httpx
 import pytest
 
+from social_reply.application.platform_accounts import PlatformAccountRuntime
+from social_reply.connectors import registry
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
-from social_reply.connectors.meta.client import MetaGraphClient
+from social_reply.connectors.meta.client import MetaGraphClient, appsecret_proof
 from social_reply.connectors.x.client import XClient
 from social_reply.infrastructure.secrets import SecretStore
 
@@ -19,6 +22,7 @@ async def test_meta_client_sends_dm_and_comment():
     client = MetaGraphClient(
         platform="facebook",
         access_token="token",
+        app_secret="secret",
         external_account_id="page-1",
         transport=httpx.MockTransport(handler),
     )
@@ -29,7 +33,36 @@ async def test_meta_client_sends_dm_and_comment():
         await client.send_text(target={"kind": "comment", "comment_id": "c-1"}, text="ok") == "m-2"
     )
     assert requests[0].url.path.endswith("/page-1/messages")
+    assert requests[0].url.params["appsecret_proof"] == appsecret_proof("token", "secret")
     assert json.loads(requests[1].content) == {"message": "ok"}
+    # Facebook 回复评论是给评论加子评论
+    assert requests[1].url.path.endswith("/c-1/comments")
+    await client.aclose()
+
+
+async def test_instagram_replies_to_comments_on_the_replies_edge():
+    # IG 的回复端点是 POST /<IG_COMMENT_ID>/replies；沿用 Facebook 的 /comments
+    # 会被 Graph 拒绝，而这条路径此前从未启用，所以一直没暴露。
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "ig-reply-1"})
+
+    client = MetaGraphClient(
+        platform="instagram",
+        access_token="page-token",
+        app_secret="secret",
+        external_account_id="ig-1",
+        page_id="page-1",
+        transport=httpx.MockTransport(handler),
+    )
+    assert (
+        await client.send_text(target={"kind": "comment", "comment_id": "igc-1"}, text="hi")
+        == "ig-reply-1"
+    )
+    assert requests[0].url.path == "/v23.0/igc-1/replies"
+    assert json.loads(requests[0].content) == {"message": "hi"}
     await client.aclose()
 
 
@@ -43,6 +76,7 @@ async def test_facebook_login_instagram_sends_dm_through_page_id():
     client = MetaGraphClient(
         platform="instagram",
         access_token="page-token",
+        app_secret="secret",
         external_account_id="ig-1",
         page_id="page-1",
         transport=httpx.MockTransport(handler),
@@ -52,6 +86,7 @@ async def test_facebook_login_instagram_sends_dm_through_page_id():
         == "mid-page"
     )
     assert requests[0].url.path == "/v23.0/page-1/messages"
+    assert requests[0].url.params["appsecret_proof"] == appsecret_proof("page-token", "secret")
     await client.aclose()
 
 
@@ -67,6 +102,7 @@ async def test_standalone_instagram_client_uses_instagram_graph_endpoints():
     client = MetaGraphClient(
         platform="instagram",
         access_token="token",
+        app_secret="secret",
         external_account_id="ig-1",
         graph_base_url="https://graph.instagram.com",
         instagram_login_mode="instagram_login",
@@ -84,8 +120,52 @@ async def test_standalone_instagram_client_uses_instagram_graph_endpoints():
     )
     assert requests[0].url.host == "graph.instagram.com"
     assert requests[0].url.path == "/v23.0/me"
+    assert requests[0].url.params["appsecret_proof"] == appsecret_proof("token", "secret")
     assert requests[1].url.path == "/v23.0/ig-1/messages"
     await client.aclose()
+
+
+async def test_xchat_sender_is_not_built_when_globally_disabled(monkeypatch):
+    account = PlatformAccountRuntime(
+        id=uuid.uuid4(),
+        tenant_id="default",
+        brand_id="default",
+        platform="x",
+        platform_app_id=None,
+        name="x",
+        external_account_id="x-1",
+        public_id="x-public",
+        credential_bundle_data={},
+        webhook_secret_bundle_data=None,
+        config={"delivery_mode": "direct"},
+        capability={"dm": True, "x_chat": True},
+        config_version=1,
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    monkeypatch.setattr(
+        type(account),
+        "credential_bundle",
+        property(
+            lambda self: {
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+                "xchat_private_keys_b64": "private",
+                "xchat_signing_key_version": "7",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        registry,
+        "get_settings",
+        lambda: type("Settings", (), {"xchat_enabled": False})(),
+    )
+
+    sender = registry._build_sender(account)
+    assert isinstance(sender, XClient)
+    await sender.aclose()
 
 
 async def test_x_client_sends_dm_and_reply():
@@ -147,6 +227,7 @@ def _meta_client(handler) -> MetaGraphClient:
     return MetaGraphClient(
         platform="facebook",
         access_token="token",
+        app_secret="secret",
         external_account_id="page-1",
         transport=httpx.MockTransport(handler),
     )
@@ -209,6 +290,20 @@ async def test_meta_window_expired_raises_permanent():
     with pytest.raises(PermanentSendError) as exc_info:
         await client.send_text(target={"kind": "dm", "recipient_id": "user-1"}, text="hi")
     assert exc_info.value.code == "META_WINDOW_EXPIRED:2018278"
+    await client.aclose()
+
+
+async def test_unknown_meta_4xx_fails_permanently():
+    def rejected(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"code": 2500, "error_subcode": 99, "message": "Bad request"}},
+        )
+
+    client = _meta_client(rejected)
+    with pytest.raises(PermanentSendError) as exc_info:
+        await client.send_text(target={"kind": "dm", "recipient_id": "user-1"}, text="hi")
+    assert exc_info.value.code == "META_SEND_REJECTED_2500:99"
     await client.aclose()
 
 

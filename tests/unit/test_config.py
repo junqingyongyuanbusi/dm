@@ -1,10 +1,13 @@
 # 配置校验测试（Plan 2c Task 0）：生产环境拒绝默认/空凭证
+from pathlib import Path
+
 import pytest
 
 from social_reply.shared.config import Settings
 
 # 绕过 .env 与环境变量干扰的相关变量名
 _ENV_KEYS = [
+    "CHATWOOT_ENABLED",
     "CHATWOOT_WEBHOOK_SECRET",
     "CHATWOOT_API_TOKEN",
     "CONTROL_API_KEY",
@@ -13,6 +16,15 @@ _ENV_KEYS = [
     "PLATFORM_SECRET_KEYS",
     "X_API_KEY",
     "X_API_SECRET",
+    "X_LEGACY_DM_ENABLED",
+    "X_ACTIVITY_ENABLED",
+    "XCHAT_ENABLED",
+    "X_PUBLIC_REPLY_ENABLED",
+    "X_OAUTH_LEGACY_STATE_WRITE",
+    "FACEBOOK_MESSENGER_ENABLED",
+    "INSTAGRAM_MESSAGING_ENABLED",
+    "WHATSAPP_ENABLED",
+    "META_AUTO_REPLY_ENABLED",
     "FACEBOOK_APP_ID",
     "FACEBOOK_APP_SECRET",
     "META_VERIFY_TOKEN",
@@ -41,21 +53,53 @@ def _make(**kwargs: object) -> Settings:
 
 def test_testing_true_默认值可用() -> None:
     settings = _make(testing=True)
+    assert settings.chatwoot_enabled is False
     assert settings.chatwoot_api_token == "dev-local-token"
     assert settings.openai_api_key == ""
     assert settings.openai_base_url == "https://api.openai.com/v1"
     assert settings.openai_model == "gpt-4o-mini"
     assert settings.openai_timeout_seconds == 30.0
+    assert settings.x_legacy_dm_enabled is True
+    assert settings.x_activity_enabled is True
+    assert settings.xchat_enabled is True
+    assert settings.x_integration_enabled is True
+    assert settings.facebook_messenger_enabled is True
+    assert settings.instagram_messaging_enabled is True
+    assert settings.whatsapp_enabled is True
+    assert settings.meta_auto_reply_enabled is False
+    assert settings.meta_health_check_interval_seconds == 600
 
 
 def test_非测试环境_默认_chatwoot_api_token_拒绝() -> None:
     with pytest.raises(ValueError, match="CHATWOOT_API_TOKEN"):
-        _make(testing=False, chatwoot_webhook_secret="real-secret")
+        _make(
+            testing=False,
+            chatwoot_enabled=True,
+            chatwoot_webhook_secret="real-secret",
+        )
 
 
 def test_非测试环境_空_chatwoot_api_token_拒绝() -> None:
     with pytest.raises(ValueError, match="CHATWOOT_API_TOKEN"):
-        _make(testing=False, chatwoot_webhook_secret="real-secret", chatwoot_api_token="")
+        _make(
+            testing=False,
+            chatwoot_enabled=True,
+            chatwoot_webhook_secret="real-secret",
+            chatwoot_api_token="",
+        )
+
+
+def test_非测试环境_禁用_chatwoot_无需其凭证() -> None:
+    settings = _make(
+        testing=False,
+        chatwoot_enabled=False,
+        chatwoot_webhook_secret="",
+        chatwoot_api_token="",
+        control_api_key="control-token",
+        llm_provider="openai",
+        openai_api_key="sk-test",
+    )
+    assert settings.chatwoot_enabled is False
 
 
 def test_非测试环境_openai_provider_空_key_拒绝() -> None:
@@ -72,6 +116,7 @@ def test_非测试环境_openai_provider_空_key_拒绝() -> None:
 def test_非测试环境_凭证齐全通过() -> None:
     settings = _make(
         testing=False,
+        chatwoot_enabled=True,
         chatwoot_webhook_secret="real-secret",
         chatwoot_api_token="real-token",
         control_api_key="control-token",
@@ -101,6 +146,58 @@ def test_x_app_credentials_must_be_configured_as_a_pair() -> None:
 
     settings = _make(testing=True, x_api_key="key", x_api_secret="secret")
     assert settings.x_app_credentials == ("key", "secret")
+
+
+def test_x_feature_flags_are_independent() -> None:
+    settings = _make(
+        testing=True,
+        x_legacy_dm_enabled=False,
+        x_activity_enabled=False,
+        xchat_enabled=True,
+    )
+    assert settings.x_legacy_dm_enabled is False
+    assert settings.x_activity_enabled is False
+    assert settings.xchat_enabled is True
+    assert settings.x_integration_enabled is True
+
+    disabled = _make(
+        testing=True,
+        x_legacy_dm_enabled=False,
+        x_activity_enabled=False,
+        xchat_enabled=False,
+    )
+    assert disabled.x_integration_enabled is False
+
+
+def test_x_oauth_legacy_state_write_is_typed_setting() -> None:
+    assert _make(testing=True).x_oauth_legacy_state_write is False
+    assert _make(testing=True, x_oauth_legacy_state_write=True).x_oauth_legacy_state_write is True
+
+
+def test_future_platform_flags_are_independent() -> None:
+    settings = _make(
+        testing=True,
+        facebook_messenger_enabled=False,
+        instagram_messaging_enabled=True,
+        whatsapp_enabled=False,
+    )
+    assert settings.platform_integration_enabled("facebook") is False
+    assert settings.platform_integration_enabled("instagram") is True
+    assert settings.platform_integration_enabled("whatsapp") is False
+    assert settings.platform_disabled_code("facebook") == "FACEBOOK_MESSENGER_DISABLED"
+    assert settings.platform_disabled_code("instagram") is None
+    assert settings.platform_disabled_code("whatsapp") == "WHATSAPP_DISABLED"
+    assert settings.platform_integration_enabled("telegram") is True
+
+
+def test_environment_templates_disable_future_platforms() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for relative_path in (".env.example", "deploy/vps/.env.example"):
+        content = (root / relative_path).read_text()
+        assert "FACEBOOK_MESSENGER_ENABLED=false" in content
+        assert "INSTAGRAM_MESSAGING_ENABLED=false" in content
+        assert "WHATSAPP_ENABLED=false" in content
+        assert "META_HEALTH_CHECK_INTERVAL_SECONDS=600" in content
 
 
 def test_meta_app_credentials_must_be_configured_as_pairs() -> None:
@@ -159,3 +256,40 @@ def test_非测试环境_空_control_api_key_拒绝() -> None:
             chatwoot_webhook_secret="real-secret",
             chatwoot_api_token="real-token",
         )
+
+
+def test_meta_账号默认必须草稿除非显式开启自动回复() -> None:
+    locked = _make(testing=True)
+    assert locked.meta_automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
+    assert locked.meta_automation_default_allowed("facebook", "BOT_ACTIVE") is False
+    assert locked.meta_automation_default_allowed("instagram", "BOT_ACTIVE") is False
+    # 非 Meta 平台不受这个发布范围约束
+    assert locked.meta_automation_default_allowed("telegram", "BOT_ACTIVE") is True
+    assert locked.meta_automation_default_allowed("x", "BOT_ACTIVE") is True
+
+
+def test_显式开启后_meta_账号可用_bot_active() -> None:
+    unlocked = _make(testing=True, meta_auto_reply_enabled=True)
+    assert unlocked.meta_automation_default_allowed("facebook", "BOT_ACTIVE") is True
+    assert unlocked.meta_automation_default_allowed("instagram", "BOT_ACTIVE") is True
+    # 开关只解锁 BOT_ACTIVE，草稿始终允许
+    assert unlocked.meta_automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
+
+
+def test_x_public_reply_defaults_off() -> None:
+    settings = _make(testing=True)
+    assert settings.x_public_reply_enabled is False
+    # mention 走 Activity webhook，两个开关都开才算启用
+    assert settings.x_mention_ingest_enabled is False
+
+
+def test_x_mention_ingest_requires_both_activity_and_public_reply() -> None:
+    assert (
+        _make(testing=True, x_activity_enabled=True, x_public_reply_enabled=True)
+    ).x_mention_ingest_enabled is True
+    assert (
+        _make(testing=True, x_activity_enabled=False, x_public_reply_enabled=True)
+    ).x_mention_ingest_enabled is False
+    assert (
+        _make(testing=True, x_activity_enabled=True, x_public_reply_enabled=False)
+    ).x_mention_ingest_enabled is False

@@ -14,7 +14,20 @@ _SELF = "1740258119773458432"
 _USER = "2041798240056598528"
 
 
-async def _seed_x_account(session) -> uuid.UUID:
+async def _legacy_checkpoint(session, account_id: uuid.UUID):
+    session.expire_all()
+    return (
+        await session.execute(
+            select(models.PlatformCheckpoint).where(
+                models.PlatformCheckpoint.platform_account_id == account_id,
+                models.PlatformCheckpoint.stream == "X_LEGACY_DM",
+                models.PlatformCheckpoint.scope_key == "",
+            )
+        )
+    ).scalar_one()
+
+
+async def _seed_x_account(session, *, dm_capable: bool = True) -> uuid.UUID:
     account_id = uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -34,7 +47,7 @@ async def _seed_x_account(session) -> uuid.UUID:
             ),
             webhook_secret_bundle=encrypt_secret_bundle({"consumer_secret": "cs"}),
             config={"delivery_mode": "direct"},
-            capability={"dm": True},
+            capability={"dm": dm_capable, "x_chat": True},
             chatwoot_inbox_id=None,
             automation_default="BOT_ACTIVE",
             status="active",
@@ -44,10 +57,50 @@ async def _seed_x_account(session) -> uuid.UUID:
     return account_id
 
 
+async def test_legacy_reenable_reconciles_unknown_dm_capability(session, monkeypatch):
+    x_dm_poll._last_poll_at = None
+    account_id = await _seed_x_account(session, dm_capable=False)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def read_dm_events(self, *, max_results=100, pagination_token=None):
+            return [], None
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(x_dm_poll, "XClient", FakeClient)
+    assert await x_dm_poll.poll_x_direct_messages() == []
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.capability["dm"] is True
+    assert account.capability["x_chat"] is True
+    assert account.config_version == 2
+
+
+async def test_legacy_disabled_skips_account_without_verified_capability(session, monkeypatch):
+    x_dm_poll._last_poll_at = None
+    await _seed_x_account(session, dm_capable=False)
+    monkeypatch.setattr(
+        x_dm_poll,
+        "get_settings",
+        lambda: type("Settings", (), {"x_legacy_dm_enabled": False})(),
+    )
+
+    class UnexpectedClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("unverified legacy account must not be polled while disabled")
+
+    monkeypatch.setattr(x_dm_poll, "XClient", UnexpectedClient)
+    assert await x_dm_poll.poll_x_direct_messages() == []
+
+
 async def test_poll_ingests_user_dm_skips_self_and_advances_cursor(session, monkeypatch):
     monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "false")
     get_settings.cache_clear()
-    x_dm_poll._last_poll_at = 0.0  # 重置节流，避免跨用例串扰
+    x_dm_poll._last_poll_at = None  # 重置节流，避免跨用例串扰
     account_id = await _seed_x_account(session)
 
     # X 返回按时间倒序：自己发的回复 + 用户真实 DM
@@ -63,6 +116,8 @@ async def test_poll_ingests_user_dm_skips_self_and_advances_cursor(session, monk
             "sender_id": _USER,
             "text": "What is pip?",
             "created_at": "2026-07-17T12:47:00Z",
+            "event_type": "MessageCreate",
+            "dm_conversation_id": "dm-conversation-1",
         },
     ]
 
@@ -86,11 +141,29 @@ async def test_poll_ingests_user_dm_skips_self_and_advances_cursor(session, monk
         .all()
     )
     assert normalized == []
+    raw_events = (
+        (await session.execute(select(models.RawEvent).order_by(models.RawEvent.external_event_id)))
+        .scalars()
+        .all()
+    )
+    assert [row.external_event_id for row in raw_events] == ["100", "200"]
+    assert {row.processing_status for row in raw_events} == {"IGNORED_BOOTSTRAP"}
+    user_raw = raw_events[0]
+    assert user_raw.source == "x_dm_poll"
+    assert user_raw.ingress_kind == "poll"
+    assert user_raw.event_namespace == "x.legacy_dm"
+    assert user_raw.external_conversation_id == "dm-conversation-1"
+    assert user_raw.occurred_at.isoformat() == "2026-07-17T12:47:00+00:00"
+    assert user_raw.payload["event_type"] == "MessageCreate"
+    assert user_raw.context["poll_run_id"]
+    assert user_raw.context["page_index"] == 0
+    assert user_raw.context["item_index"] == 1
+    sync_run = await session.get(models.SyncRun, uuid.UUID(user_raw.context["poll_run_id"]))
+    assert sync_run.status == "SUCCEEDED"
 
-    # 游标推进到最新 id（200）
-    acc = await session.get(models.PlatformAccount, account_id)
-    assert acc.config.get("x_dm_cursor") == "200"
-    assert acc.config.get("x_dm_bootstrapped") is True
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    assert checkpoint.cursor == "200"
+    assert checkpoint.bootstrapped is True
 
 
 async def test_empty_bootstrap_does_not_drop_first_live_message(session, monkeypatch):
@@ -103,14 +176,14 @@ async def test_empty_bootstrap_does_not_drop_first_live_message(session, monkeyp
         return pages.pop(0)
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == []
-    session.expire_all()
-    account = await session.get(models.PlatformAccount, account_id)
-    assert account.config.get("x_dm_bootstrapped") is True
-    assert account.config.get("x_dm_cursor") is None
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    assert checkpoint.bootstrapped is True
+    assert checkpoint.cursor is None
 
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == ["100"]
 
 
@@ -129,7 +202,7 @@ async def test_poll_throttled_within_interval(session, monkeypatch):
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
     monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 60)
 
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     await x_dm_poll.poll_x_direct_messages()  # 首次真实拉取
     await x_dm_poll.poll_x_direct_messages()  # 间隔内，应跳过
     await x_dm_poll.poll_x_direct_messages()  # 间隔内，应跳过
@@ -157,7 +230,7 @@ async def test_poll_ingests_all_fresh_messages_no_drop(session, monkeypatch):
         return events, None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     ingested = await x_dm_poll.poll_x_direct_messages()
 
     # 三条按时间正序全部入站
@@ -173,13 +246,19 @@ async def test_poll_ingests_all_fresh_messages_no_drop(session, monkeypatch):
         .all()
     )
     assert sorted(n.external_event_id for n in normalized) == ["100", "200", "300"]
-    # 游标推进到最大 id
-    acc = (
-        await session.execute(
-            select(models.PlatformAccount).where(models.PlatformAccount.platform == "x")
-        )
-    ).scalar_one()
-    assert acc.config.get("x_dm_cursor") == "300"
+    raw_events = (
+        (await session.execute(select(models.RawEvent).order_by(models.RawEvent.external_event_id)))
+        .scalars()
+        .all()
+    )
+    assert [row.external_event_id for row in raw_events] == ["100", "200", "300"]
+    assert all(row.processing_status == "PROCESSED" for row in raw_events)
+    raw_by_id = {row.external_event_id: row for row in raw_events}
+    assert all(event.raw_event_id == raw_by_id[event.external_event_id].id for event in normalized)
+    assert all(event.external_conversation_id == _USER for event in normalized)
+    assert all(event.event_metadata["event_namespace"] == "x.legacy_dm" for event in normalized)
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    assert checkpoint.cursor == "300"
 
 
 async def test_existing_cursor_implies_bootstrapped_during_rollout(session, monkeypatch):
@@ -194,7 +273,7 @@ async def test_existing_cursor_implies_bootstrapped_during_rollout(session, monk
         return ([{"id": "200", "sender_id": _USER, "text": "new"}], None)
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == ["200"]
 
 
@@ -223,7 +302,7 @@ async def test_poll_reads_all_pages_until_existing_cursor(session, monkeypatch):
         )
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == [
         "2078000200000000000",
         "2078000300000000000",
@@ -251,12 +330,11 @@ async def test_late_arriving_event_within_lookback_is_recovered(session, monkeyp
         return [{"id": late_event, "sender_id": _USER, "text": "late arrival"}], None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == [late_event]
 
-    session.expire_all()
-    acc = await session.get(models.PlatformAccount, account_id)
-    assert acc.config.get("x_dm_cursor") == cursor  # 游标只进不退
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    assert checkpoint.cursor == cursor  # 游标只进不退
 
 
 async def test_page_budget_caps_requests_per_poll(session, monkeypatch):
@@ -278,19 +356,100 @@ async def test_page_budget_caps_requests_per_poll(session, monkeypatch):
 
     async def fake_read(self, *, max_results=50, pagination_token=None):
         calls.append(pagination_token)
+        if pagination_token == "t3":
+            return (
+                [{"id": "2060000000000000000", "sender_id": _USER, "text": "boundary"}],
+                None,
+            )
         page_no = len(calls)
-        event_id = str(base - page_no * 10_000_000_000)  # 递减但均在游标回看窗口之上
+        event_id = str(base - page_no * 10_000_000_000)
         return (
             [{"id": event_id, "sender_id": _USER, "text": f"page {page_no}"}],
             next_tokens[pagination_token],
         )
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
+    x_dm_poll._last_poll_at = None
     ingested = await x_dm_poll.poll_x_direct_messages()
 
-    assert calls == [None, "t1", "t2"]  # 页帽 3:恰好三次请求后截断
-    assert len(ingested) == 3  # 已拉到的三页事件正常入站
+    assert calls == [None, "t1", "t2"]
+    assert len(ingested) == 3
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    gap = (
+        await session.execute(
+            select(models.SyncGap).where(models.SyncGap.checkpoint_id == checkpoint.id)
+        )
+    ).scalar_one()
+    assert checkpoint.cursor == "2070000000000000000"
+    assert gap.status == "OPEN"
+    assert gap.gap_type == "PAGE_CAP"
+    assert gap.resume_token == "t3"
+    gap_id = gap.id
+
+    x_dm_poll._last_poll_at = None
+    assert await x_dm_poll.poll_x_direct_messages() == []
+    assert calls[-1] == "t3"
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    gap = await session.get(models.SyncGap, gap_id)
+    assert checkpoint.cursor == str(base - 10_000_000_000)
+    assert gap.status == "RESOLVED"
+
+
+async def test_expired_legacy_resume_token_restarts_from_checkpoint(session, monkeypatch):
+    account_id = await _seed_x_account(session)
+    account = await session.get(models.PlatformAccount, account_id)
+    account.config = {
+        **account.config,
+        "x_dm_cursor": "100",
+        "x_dm_bootstrapped": True,
+    }
+    await session.commit()
+    calls: list[str | None] = []
+
+    async def fake_read(self, *, max_results=100, pagination_token=None):
+        calls.append(pagination_token)
+        if pagination_token == "expired":
+            raise RuntimeError("token expired")
+        return (
+            [{"id": "200", "sender_id": _USER, "text": "recover"}],
+            "expired" if calls.count(None) == 1 else None,
+        )
+
+    monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
+    monkeypatch.setattr(x_dm_poll, "_MAX_PAGES_PER_POLL", 1)
+    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
+
+    x_dm_poll._last_poll_at = None
+    assert await x_dm_poll.poll_x_direct_messages() == ["200"]
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    gap = (
+        await session.execute(
+            select(models.SyncGap).where(models.SyncGap.checkpoint_id == checkpoint.id)
+        )
+    ).scalar_one()
+    assert checkpoint.cursor == "100"
+    assert gap.resume_token == "expired"
+    checkpoint_id = checkpoint.id
+    gap_id = gap.id
+
+    x_dm_poll._last_poll_at = None
+    assert await x_dm_poll.poll_x_direct_messages() == []
+    session.expire_all()
+    gap = await session.get(models.SyncGap, gap_id)
+    checkpoint = await session.get(models.PlatformCheckpoint, checkpoint_id)
+    assert checkpoint.cursor == "100"
+    assert gap.status == "OPEN"
+    assert gap.resume_token is None
+    assert gap.detail["restart_from_checkpoint"] is True
+
+    x_dm_poll._last_poll_at = None
+    assert await x_dm_poll.poll_x_direct_messages() == []
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    gap = await session.get(models.SyncGap, gap_id)
+    assert calls == [None, "expired", None]
+    assert checkpoint.cursor == "200"
+    assert gap.status == "RESOLVED"
 
 
 async def test_poll_cursor_numeric_comparison(session, monkeypatch):
@@ -318,13 +477,12 @@ async def test_poll_cursor_numeric_comparison(session, monkeypatch):
         return events, None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     ingested = await x_dm_poll.poll_x_direct_messages()
 
     assert ingested == ["2078120216798941669"]
-    session.expire_all()  # 丢弃身份映射缓存，读 _save_cursor 独立 session 的提交
-    acc2 = await session.get(models.PlatformAccount, account_id)
-    assert acc2.config.get("x_dm_cursor") == "2078120216798941669"
+    checkpoint = await _legacy_checkpoint(session, account_id)
+    assert checkpoint.cursor == "2078120216798941669"
 
 
 async def test_poll_is_idempotent_on_repeat(session, monkeypatch):
@@ -348,10 +506,11 @@ async def test_poll_is_idempotent_on_repeat(session, monkeypatch):
         return events, None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
+    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
 
-    x_dm_poll._last_poll_at = 0.0
+    x_dm_poll._last_poll_at = None
     first = await x_dm_poll.poll_x_direct_messages()
-    x_dm_poll._last_poll_at = 0.0  # 绕过节流，验证的是游标/去重幂等而非节流
+    x_dm_poll._last_poll_at = None  # 绕过节流，验证的是游标/去重幂等而非节流
     second = await x_dm_poll.poll_x_direct_messages()
 
     assert first == ["100"]
@@ -367,3 +526,17 @@ async def test_poll_is_idempotent_on_repeat(session, monkeypatch):
         .all()
     )
     assert len(normalized) == 1
+    raw_events = (
+        (
+            await session.execute(
+                select(models.RawEvent).where(models.RawEvent.external_event_id == "100")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(raw_events) == 2
+    assert {row.processing_status for row in raw_events} == {
+        "PROCESSED",
+        "SKIPPED_DUPLICATE",
+    }

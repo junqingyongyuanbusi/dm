@@ -18,6 +18,7 @@ from social_reply.application.account_management.service import (
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.domain.platform_accounts import SUPPORTED_ACCOUNT_PLATFORMS
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
@@ -27,6 +28,31 @@ logger = logging.getLogger(__name__)
 _MAX_BACKOFF_SECONDS = 300
 _MAX_ATTEMPTS = 8
 _STALE_AFTER = timedelta(minutes=5)
+_RETRY_DISPLAY_GRACE = timedelta(minutes=2)
+_PLATFORM_DISABLED_STATUS = "PAUSED_PLATFORM_DISABLED"
+
+
+def _disabled_platform(exc: Exception) -> str | None:
+    if not isinstance(exc, ValueError):
+        return None
+    message = str(exc)
+    for platform in SUPPORTED_ACCOUNT_PLATFORMS:
+        if message == f"{platform}_integration_disabled":
+            return platform
+    return None
+
+
+def _request_bool(request: dict[str, Any], key: str, *, default: bool) -> bool:
+    value = request.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"invalid_boolean:{key}")
 
 
 def _idempotency_key(tenant_id: str, platform: str, request: dict[str, Any]) -> str:
@@ -54,9 +80,7 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
         # The XChat PIN is removed after the first attempt. Never schedule an
         # automatic retry that would silently reconnect without unlocking keys.
         return exc.code, exc.operator_message, False
-    if isinstance(exc, ValueError) and str(exc).startswith(
-        "x_direct_message_permission_missing:"
-    ):
+    if isinstance(exc, ValueError) and str(exc).startswith("x_direct_message_permission_missing:"):
         return (
             "X_DM_PERMISSION_REQUIRED",
             "请在 X Developer Portal 将 App permissions 设为 "
@@ -79,7 +103,7 @@ async def submit_provisioning_job(
     secrets: dict[str, str],
     admin_session_id: uuid.UUID | str | None = None,
 ) -> uuid.UUID:
-    if platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+    if platform not in SUPPORTED_ACCOUNT_PLATFORMS:
         raise ValueError(f"unsupported_platform:{platform}")
     if not tenant_id or not all(ch.isalnum() or ch in {"_", "-"} for ch in tenant_id):
         raise ValueError("invalid_tenant_id")
@@ -91,9 +115,7 @@ async def submit_provisioning_job(
     safe_request = _safe_request(platform, request)
     async with get_session_factory()() as session:
         if admin_session_id is not None:
-            principal = await principal_from_session_row(
-                session, admin_session_id, for_update=True
-            )
+            principal = await principal_from_session_row(session, admin_session_id, for_update=True)
             if principal is None or tenant_id not in principal.allowed_tenants:
                 raise PermissionError("admin_session_invalid")
             actor = principal.actor
@@ -146,9 +168,7 @@ async def submit_provisioning_job(
         }
     ):
         if requires_secret_resubmission(existing_job):
-            required_secret = str(
-                (existing_job.result or {}).get("required_secret") or ""
-            )
+            required_secret = str((existing_job.result or {}).get("required_secret") or "")
             supplied_secret = secrets.get(required_secret) if required_secret else None
             if not isinstance(supplied_secret, str) or not supplied_secret.strip():
                 raise ValueError("provisioning_secret_resubmission_required")
@@ -162,6 +182,11 @@ async def submit_provisioning_job(
                     current_step="QUEUED",
                     next_attempt_at=None,
                     result={},
+                    attempt_count=(
+                        0
+                        if existing_job.attempt_count >= _MAX_ATTEMPTS
+                        else existing_job.attempt_count
+                    ),
                     last_error_code=None,
                     last_error_message=None,
                 )
@@ -178,30 +203,43 @@ async def submit_provisioning_job(
 
 
 async def _claim_job(job_id: uuid.UUID) -> models.ProvisioningJob | None:
+    now = datetime.now(UTC)
     async with get_session_factory()() as session:
         row = (
             await session.execute(
-                update(models.ProvisioningJob)
+                select(models.ProvisioningJob)
                 .where(
                     models.ProvisioningJob.id == job_id,
                     models.ProvisioningJob.status.in_(["PENDING", "FAILED"]),
+                    models.ProvisioningJob.attempt_count < _MAX_ATTEMPTS,
                     or_(
                         models.ProvisioningJob.next_attempt_at.is_(None),
-                        models.ProvisioningJob.next_attempt_at <= datetime.now(UTC),
+                        models.ProvisioningJob.next_attempt_at <= now,
                     ),
                 )
-                .values(
-                    status="PROCESSING",
-                    current_step="VALIDATE_CREDENTIAL",
-                    locked_at=datetime.now(UTC),
-                    locked_by="provisioning-worker",
-                    attempt_count=models.ProvisioningJob.attempt_count + 1,
-                    last_error_code=None,
-                    last_error_message=None,
-                )
-                .returning(models.ProvisioningJob)
+                .with_for_update(skip_locked=True)
             )
         ).scalar_one_or_none()
+        if row is None:
+            await session.commit()
+            return None
+        settings = get_settings()
+        if not settings.platform_integration_enabled(row.platform):
+            row.status = _PLATFORM_DISABLED_STATUS
+            row.current_step = _PLATFORM_DISABLED_STATUS
+            row.next_attempt_at = None
+            row.locked_at = None
+            row.locked_by = None
+            row.last_error_code = settings.platform_disabled_code(row.platform)
+            row.last_error_message = "Platform integration is disabled"
+        else:
+            row.status = "PROCESSING"
+            row.current_step = "VALIDATE_CREDENTIAL"
+            row.locked_at = now
+            row.locked_by = "provisioning-worker"
+            row.attempt_count += 1
+            row.last_error_code = None
+            row.last_error_message = None
         await session.commit()
         return row
 
@@ -225,6 +263,8 @@ def _result_payload(result: AccountConnectionResult) -> dict[str, Any]:
 
 async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
     settings = get_settings()
+    if not settings.platform_integration_enabled(job.platform):
+        raise ValueError(f"{job.platform}_integration_disabled")
     request = dict(job.request or {})
     credentials = decrypt_secret_bundle(job.staging_secret)
     common = {
@@ -256,8 +296,8 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
             api_version=request.get("api_version", "v23.0"),
             instagram_login_mode=request.get("instagram_login_mode", "facebook_login"),
             page_id=request.get("page_id"),
-            enable_dm=bool(request.get("enable_dm", True)),
-            enable_comments=bool(request.get("enable_comments", True)),
+            enable_dm=_request_bool(request, "enable_dm", default=True),
+            enable_comments=_request_bool(request, "enable_comments", default=False),
             **common,
         )
     if job.platform == "whatsapp":
@@ -279,7 +319,7 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
         consumer_secret=credentials["consumer_secret"],
         access_token=credentials["access_token"],
         access_token_secret=credentials["access_token_secret"],
-        environment=str(request["environment"]),
+        environment=str(request.get("environment") or "oauth"),
         xchat_pin=credentials.get("xchat_pin"),
         **common,
     )
@@ -290,9 +330,59 @@ async def process_provisioning_job(job_id: str) -> str:
     job = await _claim_job(jid)
     if job is None:
         return "SKIPPED_NOT_CLAIMABLE"
+    if job.status == _PLATFORM_DISABLED_STATUS:
+        await record_account_management_audit(
+            tenant_id=job.tenant_id,
+            actor=job.actor,
+            action="provisioning_paused",
+            subject_id=str(jid),
+            detail={"platform": job.platform, "error_code": job.last_error_code},
+        )
+        return _PLATFORM_DISABLED_STATUS
     try:
         result = await _connect(job)
     except Exception as exc:  # noqa: BLE001 - platform boundary is normalized below
+        disabled_platform = _disabled_platform(exc)
+        if disabled_platform is not None:
+            error_code = get_settings().platform_disabled_code(disabled_platform)
+            async with get_session_factory()() as session:
+                updated = (
+                    await session.execute(
+                        update(models.ProvisioningJob)
+                        .where(
+                            models.ProvisioningJob.id == jid,
+                            models.ProvisioningJob.status == "PROCESSING",
+                            models.ProvisioningJob.attempt_count == job.attempt_count,
+                        )
+                        .values(
+                            status=_PLATFORM_DISABLED_STATUS,
+                            current_step=_PLATFORM_DISABLED_STATUS,
+                            attempt_count=models.ProvisioningJob.attempt_count - 1,
+                            next_attempt_at=None,
+                            locked_at=None,
+                            locked_by=None,
+                            last_error_code=error_code,
+                            last_error_message="Platform integration is disabled",
+                        )
+                        .returning(models.ProvisioningJob.id)
+                    )
+                ).first()
+                await session.commit()
+            if updated is None:
+                logger.warning(
+                    "provisioning pause lost claim job_id=%s attempt=%s",
+                    jid,
+                    job.attempt_count,
+                )
+                return "STALE_CLAIM"
+            await record_account_management_audit(
+                tenant_id=job.tenant_id,
+                actor=job.actor,
+                action="provisioning_paused",
+                subject_id=str(jid),
+                detail={"platform": job.platform, "error_code": error_code},
+            )
+            return _PLATFORM_DISABLED_STATUS
         error_code, message, retryable = _error(exc)
         staging_secret = job.staging_secret
         failure_result = dict(job.result or {})
@@ -318,25 +408,36 @@ async def process_provisioning_job(job_id: str) -> str:
             delay = min(30 * 2 ** max(job.attempt_count, 1), _MAX_BACKOFF_SECONDS)
             next_attempt_at = datetime.now(UTC) + timedelta(seconds=delay)
         async with get_session_factory()() as session:
-            await session.execute(
-                update(models.ProvisioningJob)
-                .where(
-                    models.ProvisioningJob.id == jid,
-                    models.ProvisioningJob.status == "PROCESSING",
+            updated = (
+                await session.execute(
+                    update(models.ProvisioningJob)
+                    .where(
+                        models.ProvisioningJob.id == jid,
+                        models.ProvisioningJob.status == "PROCESSING",
+                        models.ProvisioningJob.attempt_count == job.attempt_count,
+                    )
+                    .values(
+                        status=status,
+                        current_step="FAILED",
+                        next_attempt_at=next_attempt_at,
+                        locked_at=None,
+                        locked_by=None,
+                        last_error_code=error_code,
+                        last_error_message=message,
+                        staging_secret=staging_secret,
+                        result=failure_result,
+                    )
+                    .returning(models.ProvisioningJob.id)
                 )
-                .values(
-                    status=status,
-                    current_step="FAILED",
-                    next_attempt_at=next_attempt_at,
-                    locked_at=None,
-                    locked_by=None,
-                    last_error_code=error_code,
-                    last_error_message=message,
-                    staging_secret=staging_secret,
-                    result=failure_result,
-                )
-            )
+            ).first()
             await session.commit()
+        if updated is None:
+            logger.warning(
+                "provisioning failure lost claim job_id=%s attempt=%s",
+                jid,
+                job.attempt_count,
+            )
+            return "STALE_CLAIM"
         await record_account_management_audit(
             tenant_id=job.tenant_id,
             actor=job.actor,
@@ -348,27 +449,38 @@ async def process_provisioning_job(job_id: str) -> str:
 
     payload = _result_payload(result)
     async with get_session_factory()() as session:
-        await session.execute(
-            update(models.ProvisioningJob)
-            .where(
-                models.ProvisioningJob.id == jid,
-                models.ProvisioningJob.status == "PROCESSING",
+        updated = (
+            await session.execute(
+                update(models.ProvisioningJob)
+                .where(
+                    models.ProvisioningJob.id == jid,
+                    models.ProvisioningJob.status == "PROCESSING",
+                    models.ProvisioningJob.attempt_count == job.attempt_count,
+                )
+                .values(
+                    status="COMPLETED",
+                    current_step="COMPLETED",
+                    account_id=result.account_id,
+                    platform_app_id=result.platform_app_id,
+                    result=payload,
+                    locked_at=None,
+                    locked_by=None,
+                    next_attempt_at=None,
+                    completed_at=datetime.now(UTC),
+                    # 连接完成即清除内联暂存 secret，与状态更新同事务原子完成
+                    staging_secret=None,
+                )
+                .returning(models.ProvisioningJob.id)
             )
-            .values(
-                status="COMPLETED",
-                current_step="COMPLETED",
-                account_id=result.account_id,
-                platform_app_id=result.platform_app_id,
-                result=payload,
-                locked_at=None,
-                locked_by=None,
-                next_attempt_at=None,
-                completed_at=datetime.now(UTC),
-                # 连接完成即清除内联暂存 secret，与状态更新同事务原子完成
-                staging_secret=None,
-            )
-        )
+        ).first()
         await session.commit()
+    if updated is None:
+        logger.warning(
+            "provisioning completion lost claim job_id=%s attempt=%s",
+            jid,
+            job.attempt_count,
+        )
+        return "STALE_CLAIM"
     await record_account_management_audit(
         tenant_id=job.tenant_id,
         actor=job.actor,
@@ -381,6 +493,19 @@ async def process_provisioning_job(job_id: str) -> str:
 
 def requires_secret_resubmission(job: models.ProvisioningJob) -> bool:
     return bool((job.result or {}).get("requires_secret_resubmission"))
+
+
+def provisioning_job_is_in_flight(
+    job: models.ProvisioningJob,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if job.status in {"PENDING", "PROCESSING"}:
+        return True
+    if job.status != "FAILED" or job.next_attempt_at is None:
+        return False
+    current = now or datetime.now(UTC)
+    return job.next_attempt_at >= current - _RETRY_DISPLAY_GRACE
 
 
 async def retry_provisioning_job(job_id: uuid.UUID) -> None:
@@ -396,6 +521,8 @@ async def retry_provisioning_job(job_id: uuid.UUID) -> None:
             raise ValueError("provisioning_job_not_retryable")
         if requires_secret_resubmission(job):
             raise ValueError("provisioning_secret_resubmission_required")
+        if job.attempt_count >= _MAX_ATTEMPTS:
+            job.attempt_count = 0
         job.status = "PENDING"
         job.current_step = "QUEUED"
         job.next_attempt_at = None
@@ -407,7 +534,25 @@ async def retry_provisioning_job(job_id: uuid.UUID) -> None:
 async def sweep_provisioning_jobs() -> list[uuid.UUID]:
     now = datetime.now(UTC)
     stale_before = now - _STALE_AFTER
+    settings = get_settings()
     async with get_session_factory()() as session:
+        paused_jobs = list(
+            (
+                await session.execute(
+                    select(models.ProvisioningJob)
+                    .where(models.ProvisioningJob.status == _PLATFORM_DISABLED_STATUS)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars()
+        )
+        for job in paused_jobs:
+            if not settings.platform_integration_enabled(job.platform):
+                continue
+            job.status = "PENDING"
+            job.current_step = "QUEUED"
+            job.next_attempt_at = None
+            job.last_error_code = None
+            job.last_error_message = None
         stale_jobs = list(
             (
                 await session.execute(
@@ -421,6 +566,15 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
             ).scalars()
         )
         for job in stale_jobs:
+            if not settings.platform_integration_enabled(job.platform):
+                job.status = _PLATFORM_DISABLED_STATUS
+                job.current_step = _PLATFORM_DISABLED_STATUS
+                job.next_attempt_at = None
+                job.locked_at = None
+                job.locked_by = None
+                job.last_error_code = settings.platform_disabled_code(job.platform)
+                job.last_error_message = "Platform integration is disabled"
+                continue
             submitted_secrets = (
                 decrypt_secret_bundle(job.staging_secret) if job.staging_secret else {}
             )
@@ -438,6 +592,11 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
                 job.last_error_message = (
                     "Stale XChat provisioning requires the PIN to be resubmitted"
                 )
+            elif job.attempt_count >= _MAX_ATTEMPTS:
+                job.status = "NEEDS_ACTION"
+                job.next_attempt_at = None
+                job.last_error_code = "RETRY_EXHAUSTED"
+                job.last_error_message = "Provisioning retry limit exhausted"
             else:
                 job.status = "FAILED"
                 job.next_attempt_at = now
@@ -446,11 +605,28 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
             job.current_step = "FAILED"
             job.locked_at = None
             job.locked_by = None
+        await session.execute(
+            update(models.ProvisioningJob)
+            .where(
+                models.ProvisioningJob.status.in_(["PENDING", "FAILED"]),
+                models.ProvisioningJob.attempt_count >= _MAX_ATTEMPTS,
+            )
+            .values(
+                status="NEEDS_ACTION",
+                current_step="FAILED",
+                next_attempt_at=None,
+                locked_at=None,
+                locked_by=None,
+                last_error_code="RETRY_EXHAUSTED",
+                last_error_message="Provisioning retry limit exhausted",
+            )
+        )
         rows = list(
             (
                 await session.execute(
                     select(models.ProvisioningJob.id).where(
                         models.ProvisioningJob.status.in_(["PENDING", "FAILED"]),
+                        models.ProvisioningJob.attempt_count < _MAX_ATTEMPTS,
                         or_(
                             models.ProvisioningJob.next_attempt_at.is_(None),
                             models.ProvisioningJob.next_attempt_at <= now,
@@ -462,9 +638,15 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
         await session.commit()
     from social_reply.application.account_management.actors import process_platform_provisioning
 
+    dispatched: list[uuid.UUID] = []
     for pending_id in rows:
-        process_platform_provisioning.send(str(pending_id))
-    return rows
+        try:
+            process_platform_provisioning.send(str(pending_id))
+        except Exception:  # noqa: BLE001 - the durable row remains eligible for recovery
+            logger.exception("provisioning dispatch failed job_id=%s", pending_id)
+        else:
+            dispatched.append(pending_id)
+    return dispatched
 
 
 def _public_result(value: Any) -> Any:

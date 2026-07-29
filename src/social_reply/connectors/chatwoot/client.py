@@ -79,6 +79,8 @@ _http: HttpxChatwootClient | None = None
 
 def get_chatwoot_client() -> ChatwootClient:
     settings = get_settings()
+    if not settings.chatwoot_enabled:
+        raise RuntimeError("chatwoot_disabled")
     if settings.testing:
         global _fake
         if _fake is None:

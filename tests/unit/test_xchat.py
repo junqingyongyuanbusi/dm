@@ -12,6 +12,7 @@ from social_reply.connectors.xchat.crypto import (
 )
 from social_reply.connectors.xchat.key_cache import canonical_conversation_id
 from social_reply.connectors.xchat.sender import XChatSender
+from social_reply.connectors.xchat.state import XChatKeyState, classify_xchat_state
 
 
 def test_xchat_adapter_normalizes_verified_text_message():
@@ -104,6 +105,34 @@ def test_xchat_private_key_roundtrip():
     assert bytes(restored.export_keys()) == bytes(original.export_keys())
 
 
+def test_xchat_state_requires_server_public_key_match():
+    from chat_xdk import Chat
+
+    chat = Chat()
+    generated = chat.generate_keypairs()
+    registration = generated.public_key
+    private_keys = export_private_key_b64(chat)
+    record = {
+        "public_key_version": "17",
+        "public_key": registration.public_key,
+        "signing_public_key": registration.signing_public_key,
+        "juicebox_config": {"tokens": {}},
+    }
+
+    ready = classify_xchat_state([record], private_keys_b64=private_keys)
+    assert ready.key_state is XChatKeyState.READY
+    assert ready.public_key_version == "17"
+
+    recovery = classify_xchat_state([record], private_keys_b64=None)
+    assert recovery.key_state is XChatKeyState.RECOVERY_REQUIRED
+
+    invalid = classify_xchat_state([record], private_keys_b64="not-base64")
+    assert invalid.key_state is XChatKeyState.INVALID
+
+    missing = classify_xchat_state([], private_keys_b64=private_keys)
+    assert missing.key_state is XChatKeyState.NOT_REGISTERED
+
+
 def test_xchat_conversation_ids_use_canonical_colon_form():
     assert canonical_conversation_id("1740258119773458432-2041798240056598528") == (
         "1740258119773458432:2041798240056598528"
@@ -177,6 +206,38 @@ async def test_xchat_client_sends_json_body_for_subscription():
 
 
 @pytest.mark.asyncio
+async def test_xchat_client_creates_legacy_dm_activity_subscription():
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        assert json.loads(request.content) == {
+            "event_type": "dm.received",
+            "filter": {"user_id": "bot-1"},
+            "tag": "legacy",
+            "webhook_id": "webhook-1",
+        }
+        return httpx.Response(200, json={"data": {"subscription_id": "dm-sub"}})
+
+    client = XChatClient(
+        consumer_key="ck",
+        consumer_secret="cs",
+        access_token="at",
+        access_token_secret="ats",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.create_activity_subscription(
+            event_type="dm.received",
+            user_id="bot-1",
+            webhook_id="webhook-1",
+            tag="legacy",
+        )
+    finally:
+        await client.aclose()
+    assert result["data"]["subscription_id"] == "dm-sub"
+
+
+@pytest.mark.asyncio
 async def test_xchat_history_converts_canonical_conversation_separator():
     seen: list[httpx.Request] = []
 
@@ -199,9 +260,7 @@ async def test_xchat_history_converts_canonical_conversation_separator():
         transport=httpx.MockTransport(handler),
     )
     try:
-        events, key_events, next_token = await client.read_conversation_events(
-            "bot-1:user-1"
-        )
+        events, key_events, next_token = await client.read_conversation_events("bot-1:user-1")
     finally:
         await client.aclose()
 

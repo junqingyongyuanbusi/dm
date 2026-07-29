@@ -1,12 +1,19 @@
+import logging
 import secrets
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
-from social_reply.application.account_management.meta_subscription import subscribe_meta_account
+from social_reply.application.account_management.meta_subscription import (
+    meta_app_subscription_object,
+    meta_subscription_fields,
+    reconcile_meta_app_subscription,
+    subscribe_meta_account,
+)
 from social_reply.application.account_management.provisioning import provision_direct_account
 from social_reply.application.account_management.x_app import ensure_x_platform_app
 from social_reply.application.account_management.x_credentials import x_credentials
@@ -21,9 +28,23 @@ from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.x.client import XClient
 from social_reply.connectors.xchat.client import XChatClient
+from social_reply.connectors.xchat.state import (
+    XChatKeyState,
+    XChatState,
+    classify_xchat_state,
+    xchat_state_config,
+)
+from social_reply.domain.platform_accounts import (
+    ACTIVE_ACCOUNT_STATUS,
+    DISABLED_ACCOUNT_STATUS,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
+from social_reply.shared.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _AUTOMATION_DEFAULTS = {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
 _META_PLATFORMS = {"facebook", "instagram"}
@@ -63,6 +84,35 @@ def _webhook_url(public_base_url: str, path: str) -> str:
     if not base_url:
         raise ValueError("missing_public_base_url")
     return f"{base_url}{path}"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _meta_provider_error_code(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            payload = exc.response.json()
+        except ValueError:
+            payload = {}
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        return f"META_HTTP_{exc.response.status_code}_{code or 'UNKNOWN'}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "META_TIMEOUT"
+    if isinstance(exc, httpx.TransportError):
+        return "META_TRANSPORT_ERROR"
+    return f"META_{exc.__class__.__name__.upper()}"
+
+
+async def _xchat_public_keys(client: XChatClient, user_id: str) -> list[dict]:
+    try:
+        return await client.get_user_public_keys(user_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return []
+        raise
 
 
 async def connect_telegram_account(
@@ -151,22 +201,34 @@ async def connect_meta_account(
     instagram_login_mode: str = "facebook_login",
     page_id: str | None = None,
     enable_dm: bool = True,
-    enable_comments: bool = True,
+    enable_comments: bool = False,
     automation_default: str = "BOT_DRAFT_ONLY",
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AccountConnectionResult:
     """连接 Facebook Page 或 Instagram 账号，并复用账号所属的 Meta App。"""
     if platform not in _META_PLATFORMS:
         raise ValueError(f"unsupported_meta_platform:{platform}")
+    if not get_settings().platform_integration_enabled(platform):
+        raise ValueError(f"{platform}_integration_disabled")
     if instagram_login_mode not in {"facebook_login", "instagram_login"}:
         raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
+    if platform == "facebook" and instagram_login_mode != "facebook_login":
+        raise ValueError("facebook_requires_facebook_login")
+    if platform == "instagram" and instagram_login_mode == "facebook_login" and not page_id:
+        raise ValueError("instagram_facebook_login_requires_page_id")
+    if platform == "instagram" and instagram_login_mode == "instagram_login" and page_id:
+        raise ValueError("instagram_login_forbids_page_id")
     graph_base_url = graph_base_url or (
         "https://graph.instagram.com"
         if platform == "instagram" and instagram_login_mode == "instagram_login"
         else "https://graph.facebook.com"
     )
-    if not enable_dm and not enable_comments:
-        raise ValueError("meta_account_requires_dm_or_comments")
+    if not enable_dm:
+        raise ValueError("meta_dm_required")
+    if enable_comments and not get_settings().meta_comment_reply_enabled:
+        raise ValueError("meta_comment_reply_disabled")
+    if not get_settings().meta_automation_default_allowed(platform, automation_default):
+        raise ValueError("meta_requires_bot_draft_only")
     _validate_automation_default(automation_default)
     external_account_id = _require_secret(external_account_id, "external_account_id")
     access_token = _require_secret(access_token, "meta_access_token")
@@ -174,6 +236,7 @@ async def connect_meta_account(
     client = MetaGraphClient(
         platform=platform,
         access_token=access_token,
+        app_secret=app_secret,
         external_account_id=external_account_id,
         graph_base_url=graph_base_url,
         api_version=api_version,
@@ -188,7 +251,12 @@ async def connect_meta_account(
     if str(profile.get("id")) != external_account_id:
         raise ValueError("meta_token_account_mismatch")
 
-    platform_app_id, resolved_app_public_id, resolved_verify_token = await provision_meta_app(
+    (
+        platform_app_id,
+        resolved_app_public_id,
+        resolved_verify_token,
+        external_app_id,
+    ) = await provision_meta_app(
         tenant_id=tenant_id,
         app_id=app_id,
         app_public_id=app_public_id,
@@ -204,8 +272,25 @@ async def connect_meta_account(
             else "meta"
         ),
     )
-    # Meta App 与账号分两次幂等 upsert：账号落库失败时 App 仍可安全复用，
-    # 但不向调用方返回成功；下次请求会使用相同 app_id/public_id 收敛。
+    desired_fields = meta_subscription_fields(
+        platform=platform,
+        enable_dm=enable_dm,
+        enable_comments=enable_comments,
+        instagram_login_mode=instagram_login_mode,
+    )
+    webhook_url = _webhook_url(public_base_url, f"/webhooks/meta/{resolved_app_public_id}")
+    account_config = {
+        "graph_base_url": graph_base_url,
+        "api_version": api_version,
+        "instagram_login_mode": instagram_login_mode,
+        **({"page_id": page_id} if page_id else {}),
+        "meta_desired_subscribed_fields": list(desired_fields),
+        "meta_subscribed_fields": [],
+        "meta_health_status": "PROVISIONING",
+        "meta_health_checked_at": _utc_now_iso(),
+        "meta_health_error_code": None,
+    }
+    # Route inbound occurrences immediately; delivery remains blocked while provisioning.
     account_id, resolved_public_id = await provision_direct_account(
         platform=platform,
         external_account_id=external_account_id,
@@ -217,12 +302,7 @@ async def connect_meta_account(
         secrets_root=secrets_root,
         credential_bundle={"access_token": access_token},
         webhook_secret_bundle=None,
-        config={
-            "graph_base_url": graph_base_url,
-            "api_version": api_version,
-            "instagram_login_mode": instagram_login_mode,
-            **({"page_id": page_id} if page_id else {}),
-        },
+        config=account_config,
         capability={
             "dm": enable_dm,
             "comments": enable_comments,
@@ -230,35 +310,89 @@ async def connect_meta_account(
         },
         automation_default=automation_default,
         platform_app_id=platform_app_id,
+        status=ACTIVE_ACCOUNT_STATUS,
     )
-    subscribed_fields = await subscribe_meta_account(
-        platform=platform,
-        access_token=access_token,
-        external_account_id=(
-            page_id
-            if platform == "instagram" and instagram_login_mode == "facebook_login" and page_id
-            else external_account_id
-        ),
-        instagram_login_mode=instagram_login_mode,
-        graph_base_url=graph_base_url,
-        api_version=api_version,
-        enable_dm=enable_dm,
-        enable_comments=enable_comments,
-        transport=transport,
+    subscription_account_id = (
+        page_id
+        if platform == "instagram" and instagram_login_mode == "facebook_login"
+        else external_account_id
     )
+    try:
+        # App-level first: without it Meta drops every event, so a failure here means the
+        # account would look connected while staying deaf.
+        app_subscribed_fields = await reconcile_meta_app_subscription(
+            app_id=external_app_id,
+            app_secret=app_secret,
+            object_type=meta_app_subscription_object(platform),
+            desired_fields=desired_fields,
+            callback_url=webhook_url,
+            verify_token=resolved_verify_token,
+            api_version=api_version,
+            transport=transport,
+        )
+        subscribed_fields = await subscribe_meta_account(
+            platform=platform,
+            access_token=access_token,
+            app_secret=app_secret,
+            external_account_id=subscription_account_id,
+            instagram_login_mode=instagram_login_mode,
+            graph_base_url=graph_base_url,
+            api_version=api_version,
+            enable_dm=enable_dm,
+            enable_comments=enable_comments,
+            transport=transport,
+        )
+    except Exception as exc:
+        async with get_session_factory()() as session:
+            await session.execute(
+                models.PlatformAccount.__table__.update()
+                .where(models.PlatformAccount.id == account_id)
+                .values(
+                    status=DISABLED_ACCOUNT_STATUS,
+                    config=models.PlatformAccount.config.op("||")(
+                        {
+                            "meta_health_status": "ERROR",
+                            "meta_health_checked_at": _utc_now_iso(),
+                            "meta_health_error_code": _meta_provider_error_code(exc),
+                        }
+                    ),
+                    config_version=models.PlatformAccount.config_version + 1,
+                )
+            )
+            await session.commit()
+        raise
+    async with get_session_factory()() as session:
+        await session.execute(
+            models.PlatformAccount.__table__.update()
+            .where(models.PlatformAccount.id == account_id)
+            .values(
+                status=ACTIVE_ACCOUNT_STATUS,
+                config=models.PlatformAccount.config.op("||")(
+                    {
+                        "meta_subscribed_fields": list(subscribed_fields),
+                        "meta_app_subscribed_fields": list(app_subscribed_fields),
+                        "meta_health_status": "READY",
+                        "meta_health_checked_at": _utc_now_iso(),
+                        "meta_health_error_code": None,
+                    }
+                ),
+                config_version=models.PlatformAccount.config_version + 1,
+            )
+        )
+        await session.commit()
     return AccountConnectionResult(
         account_id=account_id,
         platform=platform,
         external_account_id=external_account_id,
         public_id=resolved_public_id,
-        webhook_url=_webhook_url(public_base_url, f"/webhooks/meta/{resolved_app_public_id}"),
+        webhook_url=webhook_url,
         name=name or profile.get("name") or external_account_id,
         automation_default=automation_default,
         platform_app_id=platform_app_id,
         app_public_id=resolved_app_public_id,
         verify_token=resolved_verify_token,
         manual_steps=(
-            "在 Meta App Dashboard 配置返回的 webhook_url 与 verify_token。",
+            "已自动完成 App 级 Webhook 回调与字段订阅，无需在 App Dashboard 手工配置。",
             f"账号已自动订阅 webhook 字段：{', '.join(subscribed_fields)}。",
             "上线前完成 App Review / Advanced Access，并将 App 切换为 Live。",
         ),
@@ -278,29 +412,46 @@ async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
         api_base_url=(account.config or {}).get("api_base_url", "https://api.x.com"),
     )
     try:
+        records = await _xchat_public_keys(client, account.external_account_id)
         private_keys, key_version = await unlock_account_xchat_keys(
             client=client,
             user_id=account.external_account_id,
             pin=_require_secret(pin, "xchat_pin"),
+            records=records,
         )
     finally:
         await client.aclose()
     credentials["xchat_private_keys_b64"] = private_keys
     credentials["xchat_signing_key_version"] = key_version
-    config = {**account.config, "xchat_enabled": True}
-    capability = {**account.capability, "x_chat": True}
+    state_config = xchat_state_config(
+        XChatState(
+            key_state=XChatKeyState.READY,
+            registered=True,
+            public_key_version=key_version,
+        ),
+        probed_at=_utc_now_iso(),
+    )
     async with get_session_factory()() as session:
         await session.execute(
             models.PlatformAccount.__table__.update()
             .where(models.PlatformAccount.id == account_id)
             .values(
                 credential_bundle=encrypt_secret_bundle(credentials),
-                config=config,
-                capability=capability,
+                config=models.PlatformAccount.config.op("||")(
+                    {"xchat_enabled": True, **state_config}
+                ),
+                capability=models.PlatformAccount.capability.op("||")({"x_chat": True}),
                 config_version=models.PlatformAccount.config_version + 1,
             )
         )
         await session.commit()
+
+    from social_reply.application.event_ingestion.xchat_actors import recover_xchat_account
+
+    try:
+        await dispatch_actor(recover_xchat_account, str(account_id))
+    except Exception:  # noqa: BLE001 - keys are already committed; scheduler remains the fallback
+        logger.exception("failed to dispatch XChat recovery account=%s", account_id)
 
 
 async def connect_x_account(
@@ -323,6 +474,11 @@ async def connect_x_account(
 ) -> AccountConnectionResult:
     """验证 X OAuth 1.0a 凭证并登记 Account Activity webhook 路由。"""
     _validate_automation_default(automation_default)
+    settings = get_settings()
+    if not settings.x_integration_enabled:
+        raise ValueError("x_integration_disabled")
+    if xchat_pin and xchat_pin.strip() and not settings.xchat_enabled:
+        raise ValueError("xchat_disabled")
     environment = _require_secret(environment, "x_environment")
     credentials = {
         "consumer_key": _require_secret(consumer_key, "x_consumer_key"),
@@ -331,24 +487,25 @@ async def connect_x_account(
         "access_token_secret": _require_secret(access_token_secret, "x_access_token_secret"),
     }
     client = XClient(**credentials, api_base_url=api_base_url, transport=transport)
+    dm_capable = False
     try:
         me = await client.get_me()
-        try:
-            await client.read_dm_events(max_results=10)
-        except httpx.HTTPStatusError as exc:
-            error_type = ""
+        if settings.x_legacy_dm_enabled or settings.xchat_enabled:
             try:
-                error_type = str(exc.response.json().get("type") or "")
-            except ValueError:
-                pass
-            if exc.response.status_code == 403 and error_type.endswith(
-                "/oauth1-permissions"
-            ):
-                raise ValueError(
-                    "x_direct_message_permission_missing: set X App permissions to "
-                    "Read and write and Direct message, then re-authorize the account"
-                ) from exc
-            raise
+                await client.read_dm_events(max_results=10)
+                dm_capable = True
+            except httpx.HTTPStatusError as exc:
+                error_type = ""
+                try:
+                    error_type = str(exc.response.json().get("type") or "")
+                except ValueError:
+                    pass
+                if exc.response.status_code == 403 and error_type.endswith("/oauth1-permissions"):
+                    raise ValueError(
+                        "x_direct_message_permission_missing: set X App permissions to "
+                        "Read and write and Direct message, then re-authorize the account"
+                    ) from exc
+                raise
     finally:
         await client.aclose()
     external_account_id = str(me["id"])
@@ -364,27 +521,73 @@ async def connect_x_account(
     existing_xchat_credentials = (
         existing_runtime.credential_bundle if existing_runtime is not None else {}
     )
-    xchat_enabled = bool(existing_xchat_credentials.get("xchat_private_keys_b64"))
-    if xchat_pin and xchat_pin.strip():
-        xchat = XChatClient(**credentials, api_base_url=api_base_url, transport=transport)
+    private_keys = existing_xchat_credentials.get("xchat_private_keys_b64")
+    stored_key_version = existing_xchat_credentials.get("xchat_signing_key_version")
+    if private_keys:
+        credentials["xchat_private_keys_b64"] = private_keys
+    if stored_key_version:
+        credentials["xchat_signing_key_version"] = stored_key_version
+
+    if settings.xchat_enabled:
+        xchat = XChatClient(
+            consumer_key=credentials["consumer_key"],
+            consumer_secret=credentials["consumer_secret"],
+            access_token=credentials["access_token"],
+            access_token_secret=credentials["access_token_secret"],
+            api_base_url=api_base_url,
+            transport=transport,
+        )
         try:
-            private_keys, key_version = await unlock_account_xchat_keys(
-                client=xchat,
-                user_id=external_account_id,
-                pin=xchat_pin.strip(),
-            )
+            public_key_records = await _xchat_public_keys(xchat, external_account_id)
+            if xchat_pin and xchat_pin.strip():
+                private_keys, stored_key_version = await unlock_account_xchat_keys(
+                    client=xchat,
+                    user_id=external_account_id,
+                    pin=xchat_pin.strip(),
+                    records=public_key_records,
+                )
+                credentials["xchat_private_keys_b64"] = private_keys
+                credentials["xchat_signing_key_version"] = stored_key_version
         finally:
             await xchat.aclose()
-        credentials["xchat_private_keys_b64"] = private_keys
-        credentials["xchat_signing_key_version"] = key_version
-        xchat_enabled = True
-    elif xchat_enabled:
-        credentials["xchat_private_keys_b64"] = existing_xchat_credentials[
-            "xchat_private_keys_b64"
-        ]
-        credentials["xchat_signing_key_version"] = existing_xchat_credentials[
-            "xchat_signing_key_version"
-        ]
+        if xchat_pin and xchat_pin.strip():
+            xchat_state = XChatState(
+                key_state=XChatKeyState.READY,
+                registered=True,
+                public_key_version=str(stored_key_version),
+            )
+        else:
+            xchat_state = classify_xchat_state(
+                public_key_records,
+                private_keys_b64=private_keys,
+            )
+        if xchat_state.key_state is XChatKeyState.READY:
+            credentials["xchat_signing_key_version"] = str(xchat_state.public_key_version)
+    else:
+        existing_config = existing_runtime.config if existing_runtime is not None else {}
+        existing_state_value = existing_config.get("xchat_key_state")
+        try:
+            existing_state = XChatKeyState(str(existing_state_value))
+        except ValueError:
+            existing_state = (
+                XChatKeyState.READY
+                if private_keys and stored_key_version
+                else XChatKeyState.NOT_REGISTERED
+            )
+        xchat_state = XChatState(
+            key_state=existing_state,
+            registered=bool(existing_config.get("xchat_registered", private_keys)),
+            public_key_version=existing_config.get("xchat_public_key_version", stored_key_version),
+        )
+    xchat_ready = xchat_state.key_state is XChatKeyState.READY
+    if settings.xchat_enabled:
+        xchat_config = xchat_state_config(xchat_state, probed_at=_utc_now_iso())
+    else:
+        xchat_config = {
+            "xchat_registered": xchat_state.registered,
+            "xchat_key_state": xchat_state.key_state.value,
+            "xchat_public_key_version": xchat_state.public_key_version,
+        }
     platform_app_id, app_public_id = await ensure_x_platform_app(
         tenant_id=tenant_id,
         consumer_key=credentials["consumer_key"],
@@ -405,11 +608,12 @@ async def connect_x_account(
             **(existing_runtime.config if existing_runtime is not None else {}),
             "api_base_url": api_base_url,
             "environment": environment,
-            "xchat_enabled": xchat_enabled,
+            "xchat_enabled": xchat_ready,
+            **xchat_config,
         },
         capability={
-            "dm": True,
-            "x_chat": xchat_enabled,
+            "dm": dm_capable,
+            "x_chat": xchat_ready,
             "mentions": True,
             "max_text_length": 280,
         },
@@ -427,11 +631,21 @@ async def connect_x_account(
         platform_app_id=platform_app_id,
         app_public_id=app_public_id,
         manual_steps=(
-            "在 X Developer Portal 注册返回的 webhook_url，并保留 legacy 订阅。",
             (
-                "XChat 已解锁：scheduler 将通过 Chat API 补拉加密消息。"
-                if xchat_enabled
-                else "尚未提供 XChat PIN：已迁移到 XChat 的私信仍无法解密；请重新接入并填写 PIN。"
+                "在 X Developer Portal 注册返回的共享 webhook_url。"
+                if settings.x_activity_enabled
+                else "X Activity webhook 已关闭；当前仅使用启用中的轮询栈。"
+            ),
+            (
+                "XChat 全局开关已关闭，密钥材料会保留但不会补拉或发送。"
+                if not settings.xchat_enabled
+                else "XChat 已解锁：实时 webhook 与 Chat API 补拉均已启用。"
+                if xchat_ready
+                else "账号已注册 XChat，但需要提交 4 位 PIN 恢复现有密钥。"
+                if xchat_state.key_state is XChatKeyState.RECOVERY_REQUIRED
+                else "账号尚未注册 XChat；未加密 DM 仍继续通过 legacy 通道处理。"
+                if xchat_state.key_state is XChatKeyState.NOT_REGISTERED
+                else "XChat 公私钥不匹配或配置不完整；已关闭加密消息发送。"
             ),
         ),
     )

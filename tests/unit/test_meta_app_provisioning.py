@@ -24,7 +24,7 @@ async def test_existing_meta_app_preserves_stored_verify_token(monkeypatch, tmp_
     monkeypatch.setattr(meta_app, "_find_platform_app_external_id", find_external)
     monkeypatch.setattr(meta_app, "provision_platform_app", provision)
 
-    _, _, token = await meta_app.provision_meta_app(
+    _, _, token, external_app_id = await meta_app.provision_meta_app(
         tenant_id="default",
         app_id=None,
         app_public_id="meta-public",
@@ -36,6 +36,8 @@ async def test_existing_meta_app_preserves_stored_verify_token(monkeypatch, tmp_
         api_version="v23.0",
     )
     assert token == "stored-token"
+    # App 级 Webhook 订阅需要 Meta 的 external app id，而调用方可能只传了 app_public_id。
+    assert external_app_id == "app-1"
 
 
 async def test_existing_meta_app_rejects_verify_token_rotation(monkeypatch, tmp_path):

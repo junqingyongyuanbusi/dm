@@ -1,5 +1,11 @@
+# Historical design exploration
 
- **Chatwoot 作为客服工作台和人工接管界面 + 独立 FastAPI 自动回复核心 + 平台适配器 + PostgreSQL/pgvector + Redis + Outbox 可靠发送。**
+> [!WARNING]
+> This document preserves the original design research and is not the current runtime contract.
+> Use `docs/architecture.md` for implemented architecture, `docs/configuration.md` for environment
+> variables, and `deploy/vps/README.md` for production operations.
+
+**Chatwoot 作为客服工作台和人工接管界面 + 独立 FastAPI 自动回复核心 + 平台适配器 + PostgreSQL/pgvector + Redis + Outbox 可靠发送。**
 
 其中：
 

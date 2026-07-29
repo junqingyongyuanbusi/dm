@@ -35,7 +35,7 @@ async def provision_meta_app(
     graph_base_url: str,
     api_version: str,
     platform_family: str = "meta",
-) -> tuple[object, str, str]:
+) -> tuple[object, str, str, str]:
     app_id = app_id.strip() if app_id else None
     app_public_id = app_public_id.strip() if app_public_id else None
     if not app_id and not app_public_id:
@@ -93,4 +93,4 @@ async def provision_meta_app(
         credential_bundle={"app_secret": app_secret, "verify_token": resolved_verify_token},
         config={"graph_base_url": graph_base_url, "api_version": api_version},
     )
-    return platform_app_id, resolved_public_id, resolved_verify_token
+    return platform_app_id, resolved_public_id, resolved_verify_token, app_id

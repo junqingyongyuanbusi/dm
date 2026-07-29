@@ -1,6 +1,7 @@
 import uuid
 
 import httpx
+import pytest
 
 from apps.api.main import create_app
 from social_reply.application.account_management import router as account_router
@@ -53,6 +54,38 @@ async def test_telegram_account_api_submits_durable_job(monkeypatch):
     assert "token" not in captured["request"]
 
 
+async def test_messenger_account_api_defaults_to_dm_only_draft_mode(monkeypatch):
+    captured = {}
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+    async def fake_enqueue(_job_id):
+        return None
+
+    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "platform": "facebook",
+                "external_account_id": "page-1",
+                "access_token": "page-token",
+                "app_secret": "app-secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+            },
+        )
+    assert response.status_code == 202
+    assert captured["platform"] == "facebook"
+    assert captured["request"]["enable_dm"] is True
+    assert captured["request"]["enable_comments"] is False
+    assert captured["request"]["automation_default"] == "BOT_DRAFT_ONLY"
+
+
 async def test_meta_account_api_rejects_missing_app_identity():
     async with await _client() as client:
         response = await client.post(
@@ -66,6 +99,191 @@ async def test_meta_account_api_rejects_missing_app_identity():
             },
         )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "platform": "facebook",
+            "external_account_id": "page-1",
+            "access_token": "token",
+            "app_secret": "secret",
+            "app_id": "app-1",
+            "verify_token": "verify",
+            "instagram_login_mode": "instagram_login",
+        },
+        {
+            "platform": "instagram",
+            "external_account_id": "ig-1",
+            "access_token": "token",
+            "app_secret": "secret",
+            "app_id": "app-1",
+            "verify_token": "verify",
+            "instagram_login_mode": "facebook_login",
+        },
+        {
+            "platform": "instagram",
+            "external_account_id": "ig-1",
+            "access_token": "token",
+            "app_secret": "secret",
+            "app_id": "app-1",
+            "verify_token": "verify",
+            "instagram_login_mode": "instagram_login",
+            "page_id": "page-1",
+        },
+    ],
+)
+async def test_meta_account_api_rejects_mixed_login_paths(payload):
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json=payload,
+        )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"enable_dm": False},
+        {"enable_comments": True},
+        {"automation_default": "BOT_ACTIVE"},
+    ],
+)
+async def test_meta_account_api_rejects_out_of_scope_launch_policy(overrides):
+    payload = {
+        "platform": "facebook",
+        "external_account_id": "page-1",
+        "access_token": "token",
+        "app_secret": "secret",
+        "app_id": "app-1",
+        "verify_token": "verify",
+        **overrides,
+    }
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json=payload,
+        )
+    assert response.status_code == 422
+
+
+async def test_x_account_api_rejects_disabled_features(monkeypatch):
+    settings = account_router.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": False,
+            "x_activity_enabled": False,
+            "xchat_enabled": False,
+        }
+    )
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/x",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+                "environment": "oauth",
+            },
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "x_integration_disabled"
+
+
+async def test_x_account_api_rejects_pin_when_xchat_disabled(monkeypatch):
+    settings = account_router.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": True,
+            "x_activity_enabled": True,
+            "xchat_enabled": False,
+        }
+    )
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/x",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "consumer_key": "ck",
+                "consumer_secret": "cs",
+                "access_token": "at",
+                "access_token_secret": "ats",
+                "environment": "oauth",
+                "xchat_pin": "1234",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "xchat_disabled"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "settings_update", "payload", "detail"),
+    [
+        (
+            "/api/v1/platform-accounts/meta",
+            {"facebook_messenger_enabled": False},
+            {
+                "platform": "facebook",
+                "external_account_id": "page-1",
+                "access_token": "token",
+                "app_secret": "secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+            },
+            "facebook_integration_disabled",
+        ),
+        (
+            "/api/v1/platform-accounts/meta",
+            {"instagram_messaging_enabled": False},
+            {
+                "platform": "instagram",
+                "external_account_id": "ig-1",
+                "access_token": "token",
+                "app_secret": "secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+                "page_id": "page-1",
+            },
+            "instagram_integration_disabled",
+        ),
+        (
+            "/api/v1/platform-accounts/whatsapp",
+            {"whatsapp_enabled": False},
+            {
+                "external_account_id": "phone-1",
+                "access_token": "token",
+                "app_secret": "secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+            },
+            "whatsapp_integration_disabled",
+        ),
+    ],
+)
+async def test_future_platform_account_api_rejects_disabled_integrations(
+    monkeypatch, endpoint, settings_update, payload, detail
+):
+    settings = account_router.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+
+    async def unexpected_submit(**_kwargs):
+        raise AssertionError("disabled platform must not submit a provisioning job")
+
+    monkeypatch.setattr(account_router, "submit_provisioning_job", unexpected_submit)
+    async with await _client() as client:
+        response = await client.post(
+            endpoint,
+            headers={"Authorization": "Bearer test-control-key"},
+            json=payload,
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == detail
 
 
 async def test_whatsapp_account_api_submits_phone_number_job(monkeypatch):
@@ -100,3 +318,54 @@ async def test_whatsapp_account_api_submits_phone_number_job(monkeypatch):
         "app_secret": "secret",
         "verify_token": "verify",
     }
+
+
+async def test_meta_account_api_rejects_bot_active_while_switch_is_off():
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "platform": "facebook",
+                "external_account_id": "page-1",
+                "access_token": "page-token",
+                "app_secret": "app-secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+                "automation_default": "BOT_ACTIVE",
+            },
+        )
+    assert response.status_code == 422
+    assert "META_AUTO_REPLY_ENABLED" in response.text
+
+
+async def test_meta_account_api_accepts_bot_active_once_deployment_opts_in(monkeypatch):
+    captured = {}
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+    async def fake_enqueue(_job_id):
+        return None
+
+    settings = account_router.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/meta",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "platform": "facebook",
+                "external_account_id": "page-1",
+                "access_token": "page-token",
+                "app_secret": "app-secret",
+                "app_id": "app-1",
+                "verify_token": "verify",
+                "automation_default": "BOT_ACTIVE",
+            },
+        )
+    assert response.status_code == 202
+    assert captured["request"]["automation_default"] == "BOT_ACTIVE"

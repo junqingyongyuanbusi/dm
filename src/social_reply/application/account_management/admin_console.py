@@ -6,12 +6,14 @@
 import hashlib
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlencode
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import desc, func, select, update
+from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.application.account_management.admin import (
@@ -27,12 +29,27 @@ from social_reply.application.account_management.admin import (
     html,
 )
 from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.jobs import provisioning_job_is_in_flight
 from social_reply.application.account_management.oauth.common import notice
-from social_reply.application.account_management.provisioning import tenant_public_id
 from social_reply.application.account_management.service import enable_xchat_for_account
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.application.message_delivery.contracts import (
+    build_direct_reply_destination,
+)
 from social_reply.application.reply_decision.persist import _idempotency_key
-from social_reply.domain.automation.state_machine import AutomationStateEnum, can_transition
+from social_reply.application.reply_decision.persona import (
+    PERSONA_MAX_CHARS,
+    load_persona,
+    validate_persona,
+)
+from social_reply.domain.automation.state_machine import (
+    AutomationStateEnum,
+    can_transition,
+    flip_to_human_active,
+)
+from social_reply.domain.reply.guard import redact_pii
+from social_reply.domain.reply.llm import LLMContext
+from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -49,7 +66,7 @@ def _fmt(dt: datetime | None) -> str:
 def _ensure_csrf(response: Response, request: Request, csrf: str) -> Response:
     if not request.cookies.get(_CSRF_COOKIE):
         response.set_cookie(
-            _CSRF_COOKIE, csrf, httponly=False, samesite="strict", secure=_secure_cookie(request)
+            _CSRF_COOKIE, csrf, httponly=False, samesite="lax", secure=_secure_cookie(request)
         )
     return response
 
@@ -66,13 +83,223 @@ def _tenant_input(principal: Principal) -> str:
         f'<option value="{html.escape(tenant)}">{html.escape(tenant)}</option>'
         for tenant in sorted(principal.allowed_tenants)
     )
+    field_id = f"f-tenant-{uuid.uuid4().hex[:6]}"
     return (
-        '<label for="f-tenant-select">Tenant</label>'
-        f'<select id="f-tenant-select" name="tenant_id" required>{options}</select>'
+        f'<label for="{field_id}">Tenant</label>'
+        f'<select id="{field_id}" name="tenant_id" required>{options}</select>'
     )
 
 
 # ---------- 总览 ----------
+
+
+_RAW_ACTION_STATUSES = (
+    "INITIAL_DISPATCH_DEAD",
+    "DECISION_NEEDS_REVIEW",
+    "XCHAT_PIN_REQUIRED",
+    "XCHAT_KEY_RECOVERY_REQUIRED",
+    "XCHAT_DECRYPT_FAILED",
+    "XCHAT_RETRY_EXHAUSTED",
+    "XCHAT_REAUTHORIZATION_REQUIRED",
+    "XCHAT_ACCESS_FORBIDDEN",
+    "XCHAT_DECRYPT_MISSING_OUTPUT",
+    "XCHAT_PUBLIC_KEY_LOOKUP_FAILED",
+)
+_RAW_WARNING_STATUSES = (
+    "INITIAL_DISPATCH_RETRY",
+    "INITIAL_DISPATCHING",
+    "DECISION_PENDING",
+    "DECISION_DEFERRED",
+    "XCHAT_DECRYPTION_PENDING",
+    "XCHAT_PROCESSING",
+    "XCHAT_RETRYABLE_ERROR",
+)
+
+
+def _raw_action_condition():
+    return or_(
+        models.RawEvent.processing_status.in_(_RAW_ACTION_STATUSES),
+        models.RawEvent.processing_status.like("XCHAT_PUBLIC_KEY_HTTP_%"),
+    )
+
+
+def _raw_warning_condition():
+    return or_(
+        and_(
+            models.RawEvent.processing_status == "PENDING",
+            models.RawEvent.context.op("?")("initial_dispatch"),
+        ),
+        models.RawEvent.processing_status.in_(_RAW_WARNING_STATUSES),
+    )
+
+
+@dataclass(frozen=True)
+class _HealthMetric:
+    key: str
+    label: str
+    action_count: int
+    warning_count: int
+    oldest_at: datetime | None
+    href: str
+
+    @property
+    def level(self) -> str:
+        if self.action_count:
+            return "ACTION"
+        if self.warning_count:
+            return "WARNING"
+        return "HEALTHY"
+
+
+def _health_age(now: datetime, oldest_at: datetime | None) -> str:
+    if oldest_at is None:
+        return "—"
+    if oldest_at.tzinfo is None:
+        oldest_at = oldest_at.replace(tzinfo=UTC)
+    seconds = max(int((now - oldest_at).total_seconds()), 0)
+    if seconds < 60:
+        return "刚刚"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} 小时"
+    return f"{hours // 24} 天"
+
+
+async def _load_health_metrics(
+    session, tenants: frozenset[str], now: datetime
+) -> list[_HealthMetric]:
+    raw_action = _raw_action_condition()
+    raw_warning = _raw_warning_condition()
+    raw_row = (
+        await session.execute(
+            select(
+                func.count().filter(raw_action),
+                func.count().filter(raw_warning),
+                func.min(models.RawEvent.received_at).filter(or_(raw_action, raw_warning)),
+            ).where(models.RawEvent.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    decision_action = models.DecisionJob.status == "NEEDS_REVIEW"
+    decision_warning = models.DecisionJob.status.in_(
+        ("PENDING", "PROCESSING", "FAILED", "DEFERRED_CHATWOOT")
+    )
+    decision_row = (
+        await session.execute(
+            select(
+                func.count().filter(decision_action),
+                func.count().filter(decision_warning),
+                func.min(models.DecisionJob.created_at).filter(
+                    or_(decision_action, decision_warning)
+                ),
+            )
+            .select_from(models.DecisionJob)
+            .join(
+                models.PlatformAccount,
+                models.PlatformAccount.id == models.DecisionJob.account_id,
+            )
+            .where(models.PlatformAccount.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    outbox_action = models.OutboxMessage.status == "NEEDS_REVIEW"
+    outbox_warning = models.OutboxMessage.status.in_(("PENDING", "SENDING", "FAILED"))
+    outbox_row = (
+        await session.execute(
+            select(
+                func.count().filter(outbox_action),
+                func.count().filter(outbox_warning),
+                func.min(models.OutboxMessage.created_at).filter(
+                    or_(outbox_action, outbox_warning)
+                ),
+            ).where(models.OutboxMessage.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    retry_grace = now - timedelta(minutes=2)
+    provisioning_action = or_(
+        models.ProvisioningJob.status == "NEEDS_ACTION",
+        and_(
+            models.ProvisioningJob.status == "FAILED",
+            or_(
+                models.ProvisioningJob.next_attempt_at.is_(None),
+                models.ProvisioningJob.next_attempt_at < retry_grace,
+            ),
+        ),
+    )
+    provisioning_warning = or_(
+        models.ProvisioningJob.status.in_(("PENDING", "PROCESSING", "PAUSED_PLATFORM_DISABLED")),
+        and_(
+            models.ProvisioningJob.status == "FAILED",
+            models.ProvisioningJob.next_attempt_at >= retry_grace,
+        ),
+    )
+    provisioning_row = (
+        await session.execute(
+            select(
+                func.count().filter(provisioning_action),
+                func.count().filter(provisioning_warning),
+                func.min(models.ProvisioningJob.created_at).filter(
+                    or_(provisioning_action, provisioning_warning)
+                ),
+            ).where(models.ProvisioningJob.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    active_gap = models.SyncGap.status.in_(("OPEN", "RETRYING"))
+    sync_action = and_(active_gap, models.SyncGap.gap_type == "DECRYPT_ERROR")
+    sync_warning = and_(active_gap, models.SyncGap.gap_type != "DECRYPT_ERROR")
+    sync_row = (
+        await session.execute(
+            select(
+                func.count().filter(sync_action),
+                func.count().filter(sync_warning),
+                func.min(models.SyncGap.created_at).filter(active_gap),
+            )
+            .select_from(models.SyncGap)
+            .join(
+                models.PlatformCheckpoint,
+                models.PlatformCheckpoint.id == models.SyncGap.checkpoint_id,
+            )
+            .join(
+                models.PlatformAccount,
+                models.PlatformAccount.id == models.PlatformCheckpoint.platform_account_id,
+            )
+            .where(
+                models.PlatformCheckpoint.tenant_id.in_(tenants),
+                models.PlatformAccount.tenant_id.in_(tenants),
+            )
+        )
+    ).one()
+
+    account_action = models.PlatformAccount.status == "DISABLED"
+    account_row = (
+        await session.execute(
+            select(
+                func.count().filter(account_action),
+                func.min(models.PlatformAccount.created_at).filter(account_action),
+            ).where(models.PlatformAccount.tenant_id.in_(tenants))
+        )
+    ).one()
+
+    return [
+        _HealthMetric("ingestion", "入站恢复", *raw_row, "/admin/delivery"),
+        _HealthMetric("decisions", "决策任务", *decision_row, "/admin/decisions"),
+        _HealthMetric("delivery", "消息投递", *outbox_row, "/admin/delivery"),
+        _HealthMetric("provisioning", "账号接入", *provisioning_row, "/admin/accounts"),
+        _HealthMetric("sync", "X 同步", *sync_row, "/admin/accounts"),
+        _HealthMetric(
+            "accounts",
+            "账号状态",
+            int(account_row[0]),
+            0,
+            account_row[1],
+            "/admin/accounts",
+        ),
+    ]
 
 
 @router.get("", response_class=HTMLResponse)
@@ -153,6 +380,7 @@ async def overview(request: Request) -> Response:
             .scalars()
             .all()
         )
+        health_metrics = await _load_health_metrics(session, tenants, now)
 
     auto = action_counts.get("auto_reply", 0)
     handled = auto + action_counts.get("draft", 0) + action_counts.get("handoff", 0)
@@ -184,6 +412,16 @@ async def overview(request: Request) -> Response:
         f'<span class="bar-count">{action_counts.get(a, 0)}</span></div>'
         for a in ("auto_reply", "draft", "handoff", "ignore")
     )
+    health_rows = "".join(
+        f'<tr data-health="{metric.key}"><td><strong>{metric.label}</strong></td>'
+        f"<td>{_pill(metric.level)}</td>"
+        f"<td>{metric.action_count} 需处理 · {metric.warning_count} 恢复中</td>"
+        f"<td class='muted'>{_health_age(now, metric.oldest_at)}</td>"
+        f"<td><a href='{metric.href}'>查看</a></td></tr>"
+        for metric in health_metrics
+    )
+    health = f"""<section class="card"><h2>运行健康</h2><p class="hint">当前积压与需人工处理项。</p>
+<div class="tablewrap"><table><thead><tr><th>环节</th><th>状态</th><th>积压</th><th>最老等待</th><th></th></tr></thead><tbody>{health_rows}</tbody></table></div></section>"""
     recent_rows = (
         "".join(
             f"<tr><td class='muted'>{_fmt(d.created_at)}</td><td>{_pill(d.action)}</td>"
@@ -194,14 +432,12 @@ async def overview(request: Request) -> Response:
         )
         or "<tr><td colspan='5' class='muted'>暂无决策记录</td></tr>"
     )
-    body = f"""<h1>总览</h1><p class="lede">自动回复运行状况与近 7 日决策分布。</p>{stats}
+    body = f"""<h1>总览</h1><p class="lede">自动回复运行状况与近 7 日决策分布。</p>{stats}{health}
 <div class="grid" style="grid-template-columns:1fr 1.4fr">
 <section class="card"><h2>决策分布</h2><p class="hint">近 7 日各动作占比。</p>{bars}</section>
 <section class="card"><h2>最近决策</h2><p class="hint">最新 8 条 AI 决策。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复预览</th><th></th></tr></thead><tbody>{recent_rows}</tbody></table></div></section>
 </div>"""
-    return HTMLResponse(
-        _page("总览", body, active="overview", show_users=principal.is_superadmin)
-    )
+    return HTMLResponse(_page("总览", body, active="overview", show_users=principal.is_superadmin))
 
 
 # ---------- 对话收件箱 ----------
@@ -383,18 +619,27 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
         if conv is None or conv.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         # CAS：仅当仍处于提交时看到的状态才翻转（防并发接管竞态）
-        await session.execute(
-            update(models.AutomationState)
-            .where(
-                models.AutomationState.conversation_id == conversation_id,
-                models.AutomationState.state == expect,
+        if target == AutomationStateEnum.HUMAN_ACTIVE:
+            await flip_to_human_active(
+                session,
+                conversation_id,
+                principal.actor,
+                "admin_manual",
+                expected_state=AutomationStateEnum(expect),
             )
-            .values(
-                state=target,
-                state_version=models.AutomationState.state_version + 1,
-                state_changed_reason="admin_manual",
+        else:
+            await session.execute(
+                update(models.AutomationState)
+                .where(
+                    models.AutomationState.conversation_id == conversation_id,
+                    models.AutomationState.state == expect,
+                )
+                .values(
+                    state=target,
+                    state_version=models.AutomationState.state_version + 1,
+                    state_changed_reason="admin_manual",
+                )
             )
-        )
         await session.commit()
     return RedirectResponse(
         f"/admin/conversations/{conversation_id}", status_code=status.HTTP_303_SEE_OTHER
@@ -523,42 +768,23 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
                 raise HTTPException(status_code=409, detail="decision_message_scope_mismatch")
             reply_target = dict(msg.reply_target or {})
             occurred_at = msg.occurred_at
-        kind = reply_target.get("kind", "dm")
         visibility = decision.reply_visibility or "public"
-        # 目的地映射与 persist_decision 保持一致（DRY 的最小可行复制，含会话时限）
-        if account.platform == "telegram":
-            destination_type = "telegram_dm"
-        elif account.platform == "x":
-            destination_type = (
-                "x_post_reply"
-                if kind == "reply"
-                else "x_chat_message"
-                if kind == "x_chat"
-                else "x_dm"
+        try:
+            destination = build_direct_reply_destination(
+                platform=account.platform,
+                reply_target=reply_target,
+                visibility=visibility,
+                occurred_at=occurred_at,
+                now=datetime.now(UTC),
             )
-        elif account.platform == "whatsapp":
-            destination_type = "whatsapp_session_message"
-        elif account.platform in {"facebook", "instagram"}:
-            if visibility == "private" and kind == "comment":
-                destination_type = "meta_private_reply"
-                reply_target = {**reply_target, "kind": "private_reply"}
-            elif kind == "comment":
-                destination_type = "meta_public_comment"
-            else:
-                destination_type = (
-                    "meta_messenger_dm" if account.platform == "facebook" else "meta_instagram_dm"
-                )
-        else:
-            raise HTTPException(status_code=409, detail="unsupported_platform_for_approve")
-        valid_until = None
-        if destination_type in {
-            "meta_messenger_dm",
-            "meta_instagram_dm",
-            "whatsapp_session_message",
-        }:
-            valid_until = (occurred_at or datetime.now(UTC)) + timedelta(hours=24)
-        elif destination_type == "meta_private_reply":
-            valid_until = datetime.now(UTC) + timedelta(days=7)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="unsupported_platform_for_approve",
+            ) from exc
+        destination_type = destination.destination_type
+        reply_target = destination.target
+        valid_until = destination.valid_until
         outbox_id = (
             await session.execute(
                 pg_insert(models.OutboxMessage)
@@ -892,6 +1118,193 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
     )
 
 
+# ---------- 提示词人设 ----------
+
+_PROMPT_BANNERS = {
+    "saved": ("ok", "人设已保存，下一条决策立即生效。"),
+    "persona_required": ("err", "人设不能为空。"),
+    "persona_too_long": ("err", f"人设过长：最多 {PERSONA_MAX_CHARS} 字符。"),
+}
+
+
+def _prompt_tenant(principal: Principal, requested: str) -> str:
+    tenant = (requested or "").strip() or (principal.tenant_id or "")
+    if not tenant:
+        tenant = sorted(principal.allowed_tenants)[0]
+    if tenant not in principal.allowed_tenants:
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    return tenant
+
+
+@router.get("/prompt", response_class=HTMLResponse)
+async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    csrf = _csrf(request)
+    tenant = _prompt_tenant(principal, tenant_id)
+    brand = (request.query_params.get("brand_id") or "default").strip() or "default"
+    async with get_session_factory()() as session:
+        resolved = await load_persona(session, tenant, brand)
+    banner = ""
+    if notice in _PROMPT_BANNERS:
+        tone, text = _PROMPT_BANNERS[notice]
+        banner = f'<div class="banner {tone}">{html.escape(text)}</div>'
+    origin = (
+        '<span class="pill warn">代码内置默认</span>'
+        if resolved.is_default
+        else f'<span class="pill ok">已自定义 · 第 {resolved.revision} 版</span>'
+    )
+    trial = ""
+    if request.query_params.get("trial"):
+        trial = _render_trial(request)
+    body = f"""<h1>提示词</h1><p class="lede">编辑 LLM 人设段；动作语义与安全约束由系统固定追加，不可修改。</p>{banner}
+<section class="card"><h2>人设 {origin}</h2>
+<p class="hint">决定语言、语气与身份。知识库命中并原文直答时不经过它——它只影响需要 LLM 生成的回复。</p>
+<form method="post" action="/admin/prompt/save"><input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
+<input type="hidden" name="brand_id" value="{html.escape(brand)}">
+<label for="f-persona">人设内容（最多 {PERSONA_MAX_CHARS} 字符）</label>
+<textarea id="f-persona" name="persona" rows="10" required>{html.escape(resolved.text)}</textarea>
+<button class="btn-block">保存</button></form></section>
+
+<section class="card"><h2>系统固定追加</h2>
+<p class="hint">以下内容始终拼在人设之后，后台无法编辑。删掉它们会让防注入失效或结构化输出校验开始失败。</p>
+<pre class="thread" style="white-space:pre-wrap">{html.escape(CONTRACT_PROMPT)}</pre></section>
+
+<section class="card"><h2>试运行</h2>
+<p class="hint">用当前保存的人设跑一次真实 LLM 调用，只看结果，不写库、不建 outbox、不发送。</p>
+<form method="post" action="/admin/prompt/trial"><input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
+<input type="hidden" name="brand_id" value="{html.escape(brand)}">
+{_input("text", "测试消息（模拟客户发来的内容）")}
+<button class="btn-block">试运行</button></form>{trial}</section>"""
+    response = HTMLResponse(
+        _page("提示词", body, active="prompt", show_users=principal.is_superadmin)
+    )
+    return _ensure_csrf(response, request, csrf)
+
+
+def _render_trial(request: Request) -> str:
+    q = request.query_params
+    if q.get("trial") == "failed":
+        return '<div class="banner err">试运行失败：LLM 调用出错，请检查供应商配置与额度。</div>'
+    rows = "".join(
+        f"<tr><td class='muted'>{html.escape(label)}</td><td>{html.escape(q.get(key) or '—')}</td></tr>"
+        for label, key in (
+            ("动作", "action"),
+            ("意图", "intent"),
+            ("风险", "risk"),
+            ("置信度", "confidence"),
+            ("原因码", "codes"),
+        )
+    )
+    reply = q.get("reply") or ""
+    reply_block = (
+        f"<div class='msg out' style='margin-top:10px'>{html.escape(reply)}</div>"
+        if reply
+        else "<p class='muted'>该动作不产生对外回复。</p>"
+    )
+    return f"""<div class="tablewrap" style="margin-top:14px"><table><tbody>{rows}</tbody></table></div>{reply_block}"""
+
+
+@router.post("/prompt/save")
+async def prompt_save(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
+    brand = (form.get("brand_id") or "default").strip() or "default"
+    try:
+        persona = validate_persona(form.get("persona") or "")
+    except ValueError as exc:
+        return RedirectResponse(
+            f"/admin/prompt?notice={exc}", status_code=status.HTTP_303_SEE_OTHER
+        )
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(
+                select(models.ReplyPrompt).where(
+                    models.ReplyPrompt.tenant_id == tenant,
+                    models.ReplyPrompt.brand_id == brand,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            revision = 1
+            session.add(
+                models.ReplyPrompt(
+                    tenant_id=tenant,
+                    brand_id=brand,
+                    persona=persona,
+                    revision=revision,
+                    updated_by=principal.actor,
+                )
+            )
+        else:
+            revision = row.revision + 1
+            row.persona = persona
+            row.revision = revision
+            row.updated_by = principal.actor
+        await session.execute(
+            models.AuditLog.__table__.insert().values(
+                tenant_id=tenant,
+                category="admin_action",
+                actor=principal.actor,
+                action="SET_REPLY_PERSONA",
+                subject_type="reply_prompt",
+                subject_id=f"{tenant}:{brand}",
+                detail={"revision": revision, "chars": len(persona)},
+            )
+        )
+        await session.commit()
+    return RedirectResponse("/admin/prompt?notice=saved", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/prompt/trial")
+async def prompt_trial(request: Request) -> Response:
+    """用当前人设跑一次 LLM，仅回显结果——不落 reply_decisions，也不建 outbox。"""
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
+    brand = (form.get("brand_id") or "default").strip() or "default"
+    text = (form.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text_required")
+    from social_reply.application.reply_decision.runner import _get_llm
+
+    async with get_session_factory()() as session:
+        resolved = await load_persona(session, tenant, brand)
+    try:
+        decision = await _get_llm().decide(
+            LLMContext(
+                text=redact_pii(text),
+                conversation_key=f"trial:{tenant}",
+                persona=resolved.text,
+            )
+        )
+    except Exception:
+        logger.exception("prompt trial failed tenant=%s", tenant)
+        return RedirectResponse("/admin/prompt?trial=failed", status_code=status.HTTP_303_SEE_OTHER)
+    params = urlencode(
+        {
+            "trial": "1",
+            "action": decision.action.value,
+            "intent": decision.intent or "",
+            "risk": decision.risk_level.value,
+            "confidence": f"{decision.confidence:.2f}",
+            "codes": ",".join(decision.reason_codes),
+            "reply": decision.reply_text or "",
+        }
+    )
+    return RedirectResponse(f"/admin/prompt?{params}", status_code=status.HTTP_303_SEE_OTHER)
+
+
 # ---------- 投递监控 ----------
 
 
@@ -921,7 +1334,7 @@ async def delivery_page(request: Request) -> Response:
                 select(
                     models.RawEvent.source,
                     models.RawEvent.processing_status,
-                    func.count(models.RawEvent.id),
+                    func.count(func.distinct(models.RawEvent.id)),
                     func.max(models.RawEvent.received_at),
                 )
                 .outerjoin(
@@ -929,14 +1342,17 @@ async def delivery_page(request: Request) -> Response:
                     models.NormalizedEvent.raw_event_id == models.RawEvent.id,
                 )
                 .where(
-                    models.RawEvent.received_at >= day_ago,
-                    (
-                        models.NormalizedEvent.tenant_id.in_(tenants)
-                        | (
-                            models.NormalizedEvent.id.is_(None)
-                            if principal.is_superadmin
-                            else False
-                        )
+                    or_(
+                        models.RawEvent.tenant_id.in_(tenants),
+                        and_(
+                            models.RawEvent.tenant_id.is_(None),
+                            models.NormalizedEvent.tenant_id.in_(tenants),
+                        ),
+                    ),
+                    or_(
+                        models.RawEvent.received_at >= day_ago,
+                        _raw_action_condition(),
+                        _raw_warning_condition(),
                     ),
                 )
                 .group_by(models.RawEvent.source, models.RawEvent.processing_status)
@@ -1018,11 +1434,86 @@ def _kill_keys(tenant: str, account_ids: list[str]) -> list[str]:
     ]
 
 
+_CHANNEL_LABELS = {
+    "x": "X",
+    "facebook": "Facebook",
+    "instagram": "Instagram",
+    "telegram": "Telegram",
+    "whatsapp": "WhatsApp",
+}
+
+_CHANNEL_KINDS = {
+    "x": "OAuth",
+    "facebook": "OAuth",
+    "instagram": "2 种登录方式",
+    "telegram": "Bot Token",
+    "whatsapp": "Cloud API",
+}
+
+
+def _channel_icon(channel: str) -> str:
+    return (
+        '<span class="channel-icon" aria-hidden="true">'
+        f'<img src="/static/channel-icons/{channel}.svg" alt="" width="36" height="36">'
+        "</span>"
+    )
+
+
+def _channel_tile(channel: str, *, enabled: bool, selected: bool) -> str:
+    label = _CHANNEL_LABELS[channel]
+    icon = _channel_icon(channel)
+    status = _CHANNEL_KINDS[channel] if enabled else "未启用"
+    inner = (
+        f'{icon}<span class="channel-name">{html.escape(label)}</span>'
+        f'<span class="channel-kind">{html.escape(status)}</span>'
+    )
+    if not enabled:
+        return (
+            f'<div class="channel-tile disabled" data-channel="{channel}" role="listitem" '
+            f'aria-disabled="true" aria-label="{html.escape(label)} 未启用">{inner}</div>'
+        )
+    current = ' aria-current="page"' if selected else ""
+    return (
+        f'<a class="channel-tile" data-channel="{channel}" role="listitem"{current} '
+        f'href="/admin/accounts?connect={channel}#channel-setup" '
+        f'aria-label="连接 {html.escape(label)}">{inner}</a>'
+    )
+
+
+def _channel_setup_head(channel: str, subtitle: str) -> str:
+    return (
+        '<div class="channel-setup-head">'
+        f"{_channel_icon(channel)}<div><h2>连接 {html.escape(_CHANNEL_LABELS[channel])}</h2>"
+        f"<p>{html.escape(subtitle)}</p></div></div>"
+    )
+
+
 @router.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
+    oauth_banner = ""
+    if request.query_params.get("provider") == "x":
+        oauth_status = request.query_params.get("status")
+        if oauth_status == "connected":
+            oauth_banner = '<div class="banner ok">X 账号授权并连接成功。</div>'
+        elif oauth_status == "processing":
+            oauth_banner = '<div class="banner info">X 账号连接正在后台完成，请稍后刷新。</div>'
+        elif oauth_status == "error":
+            raw_code = request.query_params.get("code") or "oauth_failed"
+            safe_code = (
+                "".join(
+                    character
+                    for character in raw_code[:64]
+                    if character.isascii() and (character.isalnum() or character in {"_", "-"})
+                )
+                or "oauth_failed"
+            )
+            oauth_banner = (
+                '<div class="banner err">X 授权未完成。错误代码：'
+                f"<code>{html.escape(safe_code)}</code></div>"
+            )
     csrf = _csrf(request)
     settings = get_settings()
     tenants = principal.allowed_tenants
@@ -1089,78 +1580,168 @@ async def accounts_page(request: Request) -> Response:
         ks_cls = "btn-ghost" if stopped else "btn-danger"
         auto_target = "BOT_DRAFT_ONLY" if a.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
         auto_label = "切为草稿" if a.automation_default == "BOT_ACTIVE" else "切为自动"
+        automation_form = ""
+        # 未开启 META_AUTO_REPLY_ENABLED 时，Meta 账号只能向草稿收敛，因此仅对历史遗留的
+        # BOT_ACTIVE 账号保留按钮（用于改回草稿）。
+        if settings.meta_automation_default_allowed(a.platform, auto_target):
+            automation_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>"""
         xchat_form = ""
-        if a.platform == "x" and not (a.capability or {}).get("x_chat", False):
-            xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="csrf_token" value="{csrf}"><input type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><button class="btn-sm btn-ghost">启用 XChat</button></form>"""
+        channel_status = "—"
+        if a.platform == "x":
+            account_config = dict(a.config or {})
+            capability = dict(a.capability or {})
+            xchat_state = str(
+                account_config.get("xchat_key_state")
+                or ("READY" if capability.get("x_chat") else "UNKNOWN")
+            )
+            xchat_registered = account_config.get("xchat_registered") is True
+            subscriptions = dict(account_config.get("x_activity_subscriptions") or {})
+            legacy_subscription = str(
+                (subscriptions.get("dm.received") or {}).get("status") or "UNKNOWN"
+            )
+            xchat_subscription = str(
+                (subscriptions.get("chat.received") or {}).get("status") or "UNKNOWN"
+            )
+            channel_status = (
+                f"<div>Legacy DM {_pill('READY' if capability.get('dm') else 'DISABLED')}</div>"
+                f"<div>DM Activity {_pill(legacy_subscription)}</div>"
+                f"<div>XChat Key {_pill(xchat_state)}</div>"
+                f"<div>XChat Activity {_pill(xchat_subscription)}</div>"
+            )
+            if settings.xchat_enabled and xchat_registered and not capability.get("x_chat", False):
+                xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="csrf_token" value="{csrf}"><input type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><button class="btn-sm btn-ghost">恢复 XChat 密钥</button></form>"""
+        elif a.platform in {"facebook", "instagram"}:
+            account_config = dict(a.config or {})
+            health_status = str(account_config.get("meta_health_status") or "UNKNOWN")
+            subscribed = ", ".join(account_config.get("meta_subscribed_fields") or []) or "—"
+            error_code = str(account_config.get("meta_health_error_code") or "—")
+            channel_status = (
+                f"<div>Messaging {_pill(health_status)}</div>"
+                f"<div class='muted'>{html.escape(subscribed)}</div>"
+                f"<div class='muted'>{html.escape(error_code)}</div>"
+            )
         account_rows += (
             f"<tr><td>{html.escape(a.platform)}</td><td>{html.escape(a.name)}</td>"
-            f"<td>{_pill(a.status)}</td><td>{_pill(a.automation_default)}</td><td>{ks_pill}</td>"
-            f"""<td><form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>
+            f"<td>{_pill(a.status)}</td><td>{channel_status}</td>"
+            f"<td>{_pill(a.automation_default)}</td><td>{ks_pill}</td>"
+            f"""<td>{automation_form}
 <form class="inline" method="post" action="/admin/killswitch/toggle"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="scope" value="account"><input type="hidden" name="account_id" value="{a.id}"><input type="hidden" name="tenant_id" value="{html.escape(a.tenant_id)}"><button class="btn-sm {ks_cls}">{ks_btn}</button></form>{xchat_form}</td></tr>"""
         )
-    account_rows = account_rows or "<tr><td colspan='6' class='muted'>尚未连接账号</td></tr>"
+    account_rows = account_rows or "<tr><td colspan='7' class='muted'>尚未连接账号</td></tr>"
 
     job_rows = (
         "".join(
             f"<tr><td><a href='/admin/jobs/{row.id}'><code>{str(row.id)[:8]}</code></a></td>"
-            f"<td>{html.escape(row.platform)}</td><td>{_pill(row.status)}</td>"
+            f"<td>{html.escape(row.platform)}</td>"
+            f"<td>{_pill('PROCESSING' if row.status == 'FAILED' and provisioning_job_is_in_flight(row) else row.status)}</td>"
             f"<td class='muted'>{html.escape(row.current_step)}</td>"
             f"<td class='muted'>{html.escape(row.last_error_code or '—')}</td></tr>"
             for row in jobs
         )
         or "<tr><td colspan='5' class='muted'>暂无任务</td></tr>"
     )
-    default_tenant = "default" if "default" in tenants else sorted(tenants)[0]
     common = (
         f'<input type="hidden" name="csrf_token" value="{csrf}">'
         + _tenant_input(principal)
         + _input("brand_id", "Brand", required=True, value="default")
         + _input("name", "显示名称（可选）", required=False)
     )
-    webhook_tenant = default_tenant
-    oauth_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/x/callback"
-    x_webhook = (
-        f"{settings.public_base_url.rstrip('/')}/webhooks/x/"
-        f"{tenant_public_id('x_oauth', webhook_tenant)}"
-    )
+
+    def oauth_fields() -> str:
+        return (
+            f'<input type="hidden" name="csrf_token" value="{csrf}">'
+            + _tenant_input(principal)
+            + _input("brand_id", "Brand", required=True, value="default")
+        )
+
+    x_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/x/callback"
     meta_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/meta/callback"
-    meta_webhook = (
-        f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
-        f"{tenant_public_id('meta_oauth', webhook_tenant)}"
+    instagram_callback = f"{settings.public_base_url.rstrip('/')}/admin/oauth/instagram/callback"
+    xchat_oauth_input = (
+        _input(
+            "xchat_pin",
+            "XChat 4 位 PIN（可选）",
+            secret=True,
+            required=False,
+        )
+        if settings.xchat_enabled
+        else ""
     )
-    instagram_callback = (
-        f"{settings.public_base_url.rstrip('/')}/admin/oauth/instagram/callback"
+    xchat_manual_input = (
+        _input(
+            "xchat_pin",
+            "XChat 4 位 PIN（可选）",
+            secret=True,
+            required=False,
+        )
+        if settings.xchat_enabled
+        else ""
     )
-    instagram_webhook = (
-        f"{settings.public_base_url.rstrip('/')}/webhooks/meta/"
-        f"{tenant_public_id('instagram_oauth', webhook_tenant)}"
+    channel_enabled = {
+        "x": settings.x_integration_enabled,
+        "facebook": settings.facebook_messenger_enabled,
+        "instagram": settings.instagram_messaging_enabled,
+        "telegram": True,
+        "whatsapp": settings.whatsapp_enabled,
+    }
+    requested_channel = request.query_params.get("connect", "")
+    selected_channel = (
+        requested_channel
+        if requested_channel in _CHANNEL_LABELS and channel_enabled[requested_channel]
+        else ""
     )
-    oauth_common = (
-        f'<input type="hidden" name="csrf_token" value="{csrf}">'
-        + _tenant_input(principal)
-        + _input("brand_id", "Brand", required=True, value="default")
+    channel_notice = ""
+    if requested_channel in _CHANNEL_LABELS and not channel_enabled[requested_channel]:
+        channel_notice = '<div class="banner info">该渠道尚未在当前部署启用。</div>'
+    channel_tiles = "".join(
+        _channel_tile(
+            channel,
+            enabled=channel_enabled[channel],
+            selected=channel == selected_channel,
+        )
+        for channel in _CHANNEL_LABELS
     )
-    connect_open = "" if principal.is_superadmin else " open"
-    connect_title = "接入新平台账号" if principal.is_superadmin else "授权新平台账号"
-    connect_forms = f"""<details class="collapse"{connect_open}><summary>{connect_title}</summary><div class="inner">
-<p class="hint">提交后创建持久化任务；凭证只进入 Secret 存储，不写入任务 JSON。OAuth 卡片会跳转平台授权页自动换取凭证；手工卡片用于粘贴已有凭证。</p>
-<div class="grid">
-<form class="card" method="post" action="/admin/oauth/x/start"><h3>X · OAuth 一键授权（推荐）</h3>{oauth_common}{_input("xchat_pin", "XChat 4 位 PIN（可选，启用加密私信）", secret=True, required=False)}<p class="hint">使用环境变量 <code>X_API_KEY</code> / <code>X_API_SECRET</code> 中的 Consumer Keys；每次点击都可授权一个账号，账号 Token 会独立加密入库。X Developer Portal 中将 App permissions 设为 Read and write and Direct message、App type 设为 Web App，并精确登记 Callback URI <code>{html.escape(oauth_callback)}</code>。Activity/Webhook URL 使用 <code>{html.escape(x_webhook)}</code>。授权确认页必须明确列出 Direct Messages 权限；若未出现，请不要继续授权。</p><button class="btn-block">授权新的 X 账号</button></form>
-<form class="card" method="post" action="/admin/oauth/meta/start"><h3>Facebook Login · 多账号 OAuth</h3>{oauth_common}<label for="f-oauth-meta-platform">目标</label><select id="f-oauth-meta-platform" name="platform"><option value="facebook">Facebook Page</option><option value="instagram">关联 Facebook Page 的 Instagram 专业账号</option></select><p class="hint">使用部署级 <code>FACEBOOK_APP_ID</code> / <code>FACEBOOK_APP_SECRET</code> / <code>META_VERIFY_TOKEN</code>，授权后列出全部可管理目标并选择一个接入，可反复授权多个账号。Callback：<code>{html.escape(meta_callback)}</code>；Webhook：<code>{html.escape(meta_webhook)}</code>。</p><button class="btn-block">跳转 Facebook 授权</button></form>
-<form class="card" method="post" action="/admin/oauth/instagram/start"><h3>Instagram Login · 独立账号 OAuth</h3>{oauth_common}<p class="hint">无需 Facebook Page，适用于 Instagram 专业账号。使用 <code>INSTAGRAM_APP_ID</code> / <code>INSTAGRAM_APP_SECRET</code>；Callback：<code>{html.escape(instagram_callback)}</code>；Webhook：<code>{html.escape(instagram_webhook)}</code>。</p><button class="btn-block">跳转 Instagram 授权</button></form>
-<form class="card" method="post" action="/admin/connect/telegram"><h3>Telegram</h3>{common}{_input("token", "Bot Token", secret=True)}<p class="hint">Telegram 无 OAuth：在 Telegram 中找 @BotFather 发送 /newbot 创建机器人，把返回的 Token 粘贴到上方，提交后自动校验并注册 webhook。</p><button class="btn-block">连接 Telegram</button></form>
-<form class="card" method="post" action="/admin/connect/meta"><h3>Facebook / Instagram</h3>{common}<label for="f-meta-platform">平台</label><select id="f-meta-platform" name="platform"><option>facebook</option><option>instagram</option></select>{_input("external_account_id", "Page / IG Account ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 Meta</button></form>
-<form class="card" method="post" action="/admin/connect/whatsapp"><h3>WhatsApp</h3>{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form>
-<form class="card" method="post" action="/admin/connect/x"><h3>X</h3>{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}{_input("environment", "Account Activity Environment")}{_input("xchat_pin", "XChat 4 位 PIN（启用加密私信，建议填写）", secret=True, required=False)}<button class="btn-block">连接 X</button></form>
-</div></div></details>"""
-    account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
+    channel_picker = f"""<section class="channel-section" aria-labelledby="add-channel-title">
+<div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">5 个平台</span></div>
+<div class="channel-grid" role="list">{channel_tiles}</div></section>{channel_notice}"""
+    meta_policy_fields = """<input type="hidden" name="instagram_login_mode" value="facebook_login"><input type="hidden" name="enable_dm" value="true"><input type="hidden" name="enable_comments" value="false"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">"""
+    selected_panel = ""
+    if selected_channel == "x":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("x", "使用部署级 X OAuth 应用授权账号")}
+<form class="channel-form" method="post" action="/admin/oauth/x/start">{oauth_fields()}{xchat_oauth_input}
+<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(x_callback)}</code></dd><dt>授权范围</dt><dd>Read and write{"" if not (settings.x_legacy_dm_enabled or settings.xchat_enabled) else " and Direct message"}</dd></dl>
+<button class="btn-block">继续使用 X 授权</button></form>
+<details class="advanced-connect"><summary>高级连接：使用已有 Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/x">{common}{_input("consumer_key", "Consumer Key", secret=True)}{_input("consumer_secret", "Consumer Secret", secret=True)}{_input("access_token", "Access Token", secret=True)}{_input("access_token_secret", "Access Token Secret", secret=True)}<input type="hidden" name="environment" value="oauth">{xchat_manual_input}<button class="btn-block">连接 X</button></form></div></details></section>"""
+    elif selected_channel == "facebook":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("facebook", "连接 Facebook Page 的 Messenger 私信")}
+<form class="channel-form" method="post" action="/admin/oauth/meta/start">{oauth_fields()}<input type="hidden" name="platform" value="facebook">
+<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(meta_callback)}</code></dd><dt>权限</dt><dd>pages_show_list · pages_messaging · pages_manage_metadata</dd></dl>
+<button class="btn-block">继续使用 Facebook 登录</button></form>
+<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="facebook">{_input("external_account_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{meta_policy_fields}<button class="btn-block">连接 Facebook</button></form></div></details></section>"""
+    elif selected_channel == "instagram":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("instagram", "选择 Instagram 专业账号的登录方式")}
+<div class="channel-mode-grid"><div class="channel-mode"><h3>Instagram 登录</h3><p class="hint">不需要关联 Facebook Page</p><form method="post" action="/admin/oauth/instagram/start">{oauth_fields()}<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(instagram_callback)}</code></dd></dl><button class="btn-block">继续使用 Instagram 登录</button></form></div>
+<div class="channel-mode"><h3>Facebook 登录</h3><p class="hint">适用于已关联 Facebook Page 的专业账号</p><form method="post" action="/admin/oauth/meta/start">{oauth_fields()}<input type="hidden" name="platform" value="instagram"><dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(meta_callback)}</code></dd></dl><button class="btn-block">继续使用 Facebook 登录</button></form></div></div>
+<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="instagram">{_input("external_account_id", "Instagram Professional Account ID")}{_input("page_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{meta_policy_fields}<button class="btn-block">连接 Instagram</button></form></div></details></section>"""
+    elif selected_channel == "telegram":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("telegram", "连接 Telegram Bot")}
+<form class="channel-form" method="post" action="/admin/connect/telegram">{common}{_input("token", "Bot Token", secret=True)}<p class="hint">Token 由 @BotFather 创建 Bot 后提供。</p><button class="btn-block">连接 Telegram</button></form></section>"""
+    elif selected_channel == "whatsapp":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("whatsapp", "连接 WhatsApp Cloud API 号码")}
+<form class="channel-form" method="post" action="/admin/connect/whatsapp">{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form></section>"""
+    account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:
         body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>
-{killswitch_card}{account_card}{jobs_card}{connect_forms}"""
+{oauth_banner}{channel_picker}{selected_panel}{killswitch_card}{account_card}{jobs_card}"""
     else:
         body = f"""<h1>账号授权</h1><p class="lede">授权并管理当前 Tenant 的平台账号。</p>
-{connect_forms}{account_card}{jobs_card}"""
+{oauth_banner}{channel_picker}{selected_panel}{account_card}{jobs_card}"""
     response = HTMLResponse(
         _page("账号", body, active="accounts", show_users=principal.is_superadmin)
     )
@@ -1172,11 +1753,17 @@ async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Respo
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
+    if not get_settings().xchat_enabled:
+        raise HTTPException(status_code=503, detail="xchat_disabled")
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         account = await session.get(models.PlatformAccount, account_id)
-    if account is None or account.tenant_id not in principal.allowed_tenants or account.platform != "x":
+    if (
+        account is None
+        or account.tenant_id not in principal.allowed_tenants
+        or account.platform != "x"
+    ):
         raise HTTPException(status_code=404, detail="x_account_not_found")
     pin = (form.get("xchat_pin") or "").strip()
     if len(pin) != 4 or not pin.isdigit():
@@ -1220,7 +1807,22 @@ async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Re
         account = await session.get(models.PlatformAccount, account_id)
         if account is None or account.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="account_not_found")
+        if not get_settings().meta_automation_default_allowed(account.platform, target):
+            raise HTTPException(status_code=422, detail="meta_requires_bot_draft_only")
+        previous = account.automation_default
         account.automation_default = target
+        if previous != target:
+            await session.execute(
+                models.AuditLog.__table__.insert().values(
+                    tenant_id=account.tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action="SET_AUTOMATION_DEFAULT",
+                    subject_type="platform_account",
+                    subject_id=str(account_id),
+                    detail={"from": previous, "to": target, "platform": account.platform},
+                )
+            )
         await session.commit()
     return RedirectResponse("/admin/accounts", status_code=status.HTTP_303_SEE_OTHER)
 

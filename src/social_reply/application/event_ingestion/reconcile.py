@@ -3,7 +3,10 @@ import logging
 import httpx
 from sqlalchemy import select
 
-from social_reply.application.event_ingestion.actors import process_chatwoot_event
+from social_reply.application.event_ingestion.raw_recovery import (
+    chatwoot_dispatch_context,
+    dispatch_initial_raw_event,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -18,6 +21,8 @@ async def reconcile_chatwoot_messages() -> list[str]:
     唯一键去重，因此与迟到 webhook 并发也不会重复回复。
     """
     settings = get_settings()
+    if not settings.chatwoot_enabled:
+        return []
     async with get_session_factory()() as session:
         mappings = (
             await session.execute(
@@ -82,14 +87,16 @@ async def reconcile_chatwoot_messages() -> list[str]:
                             models.RawEvent.__table__.insert()
                             .values(
                                 source="chatwoot_reconcile",
+                                ingress_kind="reconcile",
                                 payload=payload,
                                 headers={},
+                                context=chatwoot_dispatch_context(),
                                 processing_status="PENDING",
                             )
                             .returning(models.RawEvent.id)
                         )
                     ).scalar_one()
                     await session.commit()
-                process_chatwoot_event.send(str(raw_id))
+                await dispatch_initial_raw_event(raw_id)
                 created.append(str(raw_id))
     return created

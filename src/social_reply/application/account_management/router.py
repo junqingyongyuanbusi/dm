@@ -14,6 +14,10 @@ from social_reply.application.account_management.jobs import (
     submit_provisioning_job,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.domain.platform_accounts import (
+    ACTIVE_ACCOUNT_STATUS,
+    DISABLED_ACCOUNT_STATUS,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -55,14 +59,32 @@ class MetaAccountRequest(_BaseAccountRequest):
     instagram_login_mode: Literal["facebook_login", "instagram_login"] = "facebook_login"
     page_id: str | None = Field(default=None, min_length=1, max_length=255)
     enable_dm: bool = True
-    enable_comments: bool = True
+    enable_comments: bool = False
 
     @model_validator(mode="after")
     def _validate_meta_request(self) -> "MetaAccountRequest":
         if not self.app_id and not self.app_public_id:
             raise ValueError("app_id 或 app_public_id 至少填写一个")
-        if not self.enable_dm and not self.enable_comments:
-            raise ValueError("enable_dm 与 enable_comments 至少启用一个")
+        if not self.enable_dm or self.enable_comments:
+            raise ValueError("当前 Meta 接入仅允许文本私信")
+        if not get_settings().meta_automation_default_allowed(
+            self.platform, self.automation_default
+        ):
+            raise ValueError("Meta 接入必须使用 BOT_DRAFT_ONLY（未开启 META_AUTO_REPLY_ENABLED）")
+        if self.platform == "facebook" and self.instagram_login_mode != "facebook_login":
+            raise ValueError("Facebook 账号必须使用 facebook_login")
+        if (
+            self.platform == "instagram"
+            and self.instagram_login_mode == "facebook_login"
+            and not self.page_id
+        ):
+            raise ValueError("Facebook Login Instagram 必须填写 page_id")
+        if (
+            self.platform == "instagram"
+            and self.instagram_login_mode == "instagram_login"
+            and self.page_id
+        ):
+            raise ValueError("Instagram Login 不允许填写 page_id")
         return self
 
 
@@ -88,7 +110,7 @@ class XAccountRequest(_BaseAccountRequest):
     consumer_secret: SecretStr
     access_token: SecretStr
     access_token_secret: SecretStr
-    environment: str = Field(min_length=1, max_length=128)
+    environment: str = Field(default="oauth", min_length=1, max_length=128)
     xchat_pin: SecretStr | None = None
 
 
@@ -131,6 +153,11 @@ def require_control_api_key(
     return ControlPrincipal(
         actor="service:control_api", allowed_tenants=settings.allowed_admin_tenants
     )
+
+
+def _require_platform_enabled(platform: str) -> None:
+    if not get_settings().platform_integration_enabled(platform):
+        raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
 
 
 def _split_request(platform: str, request: BaseModel) -> tuple[dict, dict[str, str]]:
@@ -189,6 +216,7 @@ async def create_or_update_meta_account(
     request: MetaAccountRequest,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> ProvisioningJobResponse:
+    _require_platform_enabled(request.platform)
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request(request.platform, request)
     job_id = await submit_provisioning_job(
@@ -208,6 +236,7 @@ async def create_or_update_whatsapp_account(
     request: WhatsAppAccountRequest,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> ProvisioningJobResponse:
+    _require_platform_enabled("whatsapp")
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request("whatsapp", request)
     job_id = await submit_provisioning_job(
@@ -227,6 +256,11 @@ async def create_or_update_x_account(
     request: XAccountRequest,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> ProvisioningJobResponse:
+    settings = get_settings()
+    if not settings.x_integration_enabled:
+        raise HTTPException(status_code=503, detail="x_integration_disabled")
+    if request.xchat_pin is not None and not settings.xchat_enabled:
+        raise HTTPException(status_code=422, detail="xchat_disabled")
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request("x", request)
     job_id = await submit_provisioning_job(
@@ -299,6 +333,7 @@ async def retry_job(
         job = await session.get(models.ProvisioningJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
+    _require_platform_enabled(job.platform)
     principal.require_tenant(job.tenant_id)
     try:
         await retry_provisioning_job(job_id)
@@ -327,7 +362,7 @@ async def disable_account(
     account_id: uuid.UUID,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> dict[str, str]:
-    return {"status": await _set_account_status(account_id, principal, "DISABLED")}
+    return {"status": await _set_account_status(account_id, principal, DISABLED_ACCOUNT_STATUS)}
 
 
 @router.post("/{account_id}/enable")
@@ -335,4 +370,4 @@ async def enable_account(
     account_id: uuid.UUID,
     principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
 ) -> dict[str, str]:
-    return {"status": await _set_account_status(account_id, principal, "active")}
+    return {"status": await _set_account_status(account_id, principal, ACTIVE_ACCOUNT_STATUS)}

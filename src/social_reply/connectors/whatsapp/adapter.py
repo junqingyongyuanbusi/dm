@@ -25,6 +25,8 @@ class WhatsAppWebhookAdapter:
                     if not phone_number_id or not sender_id or not event_id:
                         continue
                     text = (message.get("text") or {}).get("body")
+                    if not isinstance(text, str):
+                        continue
                     occurred_at = None
                     if message.get("timestamp"):
                         occurred_at = datetime.fromtimestamp(int(message["timestamp"]), tz=UTC)

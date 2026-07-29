@@ -7,6 +7,7 @@ import pytest
 from apps.api.main import create_app
 from social_reply.application.account_management.meta_credentials import MetaAppCredentials
 from social_reply.application.account_management.oauth import instagram
+from social_reply.connectors.meta.client import appsecret_proof
 
 pytestmark = pytest.mark.integration
 
@@ -57,6 +58,52 @@ async def _login(client: httpx.AsyncClient) -> str:
     return csrf
 
 
+async def test_instagram_oauth_start_rejects_disabled_platform_before_state_storage(
+    migrated_db, monkeypatch
+):
+    settings = instagram.get_settings().model_copy(update={"instagram_messaging_enabled": False})
+    monkeypatch.setattr(instagram, "get_settings", lambda: settings)
+
+    async def unexpected_store(*_args, **_kwargs):
+        raise AssertionError("disabled OAuth must not store state")
+
+    monkeypatch.setattr(instagram, "store_oauth_state", unexpected_store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="http://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        response = await client.post(
+            "/admin/oauth/instagram/start",
+            data={
+                "csrf_token": csrf,
+                "tenant_id": "default",
+                "brand_id": "default",
+            },
+        )
+    assert response.status_code == 503
+    assert "Instagram 集成已关闭" in response.text
+
+
+async def test_instagram_oauth_callback_does_not_consume_state_when_disabled(
+    migrated_db, monkeypatch
+):
+    settings = instagram.get_settings().model_copy(update={"instagram_messaging_enabled": False})
+    monkeypatch.setattr(instagram, "get_settings", lambda: settings)
+
+    async def unexpected_take(*_args, **_kwargs):
+        raise AssertionError("disabled callback must preserve OAuth state")
+
+    monkeypatch.setattr(instagram, "take_oauth_state", unexpected_take)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
+    ) as client:
+        response = await client.get("/admin/oauth/instagram/callback?code=code&state=state-token")
+    assert response.status_code == 503
+    assert "Instagram 集成已关闭" in response.text
+
+
 @pytest.fixture
 def instagram_env(monkeypatch):
     app = MetaAppCredentials(
@@ -94,6 +141,9 @@ def instagram_env(monkeypatch):
                 json={"access_token": "long-token", "token_type": "bearer", "expires_in": 5184000},
             )
         if request.url.path.endswith("/me"):
+            assert request.url.params["appsecret_proof"] == appsecret_proof(
+                "long-token", "ig-app-secret"
+            )
             return httpx.Response(
                 200,
                 json={
@@ -144,6 +194,7 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
         assert query["enable_fb_login"] == ["0"]
         assert query["client_id"] == ["ig-app-id"]
         assert "instagram_business_manage_messages" in query["scope"][0]
+        assert "instagram_business_manage_comments" not in query["scope"][0]
 
         callback = await client.get(
             f"/admin/oauth/instagram/callback?code=code-42&state={query['state'][0]}"
@@ -160,6 +211,9 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
     assert submitted["request"]["app_id"] == "ig-app-id"
     assert submitted["request"]["app_public_id"] == "instagram_oauth"
     assert submitted["request"]["instagram_login_mode"] == "instagram_login"
+    assert submitted["request"]["enable_dm"] is True
+    assert submitted["request"]["enable_comments"] is False
+    assert submitted["request"]["automation_default"] == "BOT_DRAFT_ONLY"
     assert submitted["secrets"] == {
         "access_token": "long-token",
         "app_secret": "ig-app-secret",

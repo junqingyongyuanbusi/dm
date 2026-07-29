@@ -15,18 +15,21 @@ import httpx
 
 from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.platform_accounts import list_active_accounts_by_platform
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 _CHECK_INTERVAL_SECONDS = int(os.getenv("X_WEBHOOK_CHECK_INTERVAL_SECONDS", "600"))
-_last_check_at: float = 0.0
+_last_check_at: float | None = None
 
 
 async def ensure_x_webhooks_valid() -> list[str]:
     """scheduler 周期任务:失效的 X webhook 触发 CRC 重验;返回重验成功的 webhook id。"""
     global _last_check_at
+    if not get_settings().x_activity_enabled:
+        return []
     now = time.monotonic()
-    if now - _last_check_at < _CHECK_INTERVAL_SECONDS:
+    if _last_check_at is not None and now - _last_check_at < _CHECK_INTERVAL_SECONDS:
         return []
     _last_check_at = now
 

@@ -4,11 +4,19 @@
 
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS base
 
+ARG RELEASE_SHA=unknown
+ARG BUILD_DATE=unknown
+ARG SOURCE_URL=https://github.com/junqingyongyuanbusi/dm
+LABEL org.opencontainers.image.revision="${RELEASE_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="${SOURCE_URL}"
+
 # uv 行为：不做符号链接（容器内无缓存卷）、字节码预编译加速冷启动
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    RELEASE_SHA="${RELEASE_SHA}"
 
 WORKDIR /app
 

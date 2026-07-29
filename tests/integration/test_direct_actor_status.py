@@ -9,9 +9,7 @@ from social_reply.infrastructure.database import models
 pytestmark = pytest.mark.integration
 
 
-async def _seed_job(
-    session, *, status: str, raw_status: str = "DECISION_PENDING"
-) -> uuid.UUID:
+async def _seed_job(session, *, status: str, raw_status: str = "DECISION_PENDING") -> uuid.UUID:
     raw_event_id = uuid.uuid4()
     account_id = uuid.uuid4()
     contact_id = uuid.uuid4()
@@ -82,6 +80,7 @@ async def _seed_job(
     [
         ("NEEDS_REVIEW", "DECISION_PENDING", "DECISION_NEEDS_REVIEW"),
         ("FAILED", "DECISION_PENDING", "DECISION_PENDING"),
+        ("DEFERRED_CHATWOOT", "DECISION_PENDING", "DECISION_DEFERRED"),
         ("COMPLETED", "DECISION_PENDING", "PROCESSED"),
         # A concurrent decision finalizer may commit review after this actor read
         # PROCESSING. The atomic CASE must never downgrade that terminal state.
@@ -91,18 +90,14 @@ async def _seed_job(
 async def test_direct_actor_preserves_decision_status_priority(
     session, job_status, initial_raw_status, expected_raw_status
 ):
-    raw_event_id = await _seed_job(
-        session, status=job_status, raw_status=initial_raw_status
-    )
+    raw_event_id = await _seed_job(session, status=job_status, raw_status=initial_raw_status)
 
     await _process_events(raw_event_id, [])
 
     session.expire_all()
     raw_status = (
         await session.execute(
-            select(models.RawEvent.processing_status).where(
-                models.RawEvent.id == raw_event_id
-            )
+            select(models.RawEvent.processing_status).where(models.RawEvent.id == raw_event_id)
         )
     ).scalar_one()
     assert raw_status == expected_raw_status
@@ -120,9 +115,7 @@ async def test_direct_actor_failure_does_not_erase_review_status(session):
     session.expire_all()
     raw_status = (
         await session.execute(
-            select(models.RawEvent.processing_status).where(
-                models.RawEvent.id == raw_event_id
-            )
+            select(models.RawEvent.processing_status).where(models.RawEvent.id == raw_event_id)
         )
     ).scalar_one()
     assert raw_status == "DECISION_NEEDS_REVIEW"

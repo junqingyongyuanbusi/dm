@@ -30,12 +30,14 @@ from social_reply.application.account_management.meta_credentials import (
 from social_reply.application.account_management.oauth.common import (
     admin_callback_url,
     notice,
+    peek_oauth_state,
     principal_from_oauth_context,
     store_oauth_state,
     take_oauth_state,
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
@@ -46,13 +48,9 @@ _API_VERSION = "v23.0"
 _DIALOG_URL = f"https://www.facebook.com/{_API_VERSION}/dialog/oauth"
 _GRAPH_BASE = f"https://graph.facebook.com/{_API_VERSION}"
 _SCOPES = {
-    "facebook": (
-        "pages_show_list,pages_messaging,pages_manage_metadata,"
-        "pages_read_engagement,pages_manage_engagement"
-    ),
+    "facebook": "pages_show_list,pages_messaging,pages_manage_metadata",
     "instagram": (
-        "pages_show_list,pages_manage_metadata,pages_read_engagement,"
-        "instagram_basic,instagram_manage_messages,instagram_manage_comments"
+        "pages_show_list,pages_manage_metadata,instagram_basic,instagram_manage_messages"
     ),
 }
 
@@ -65,9 +63,7 @@ def _proof(token: str, app_secret: str) -> str:
     return hmac.new(app_secret.encode(), token.encode(), hashlib.sha256).hexdigest()
 
 
-async def _exchange_code(
-    *, app: MetaAppCredentials, code: str, redirect_uri: str
-) -> list[dict]:
+async def _exchange_code(*, app: MetaAppCredentials, code: str, redirect_uri: str) -> list[dict]:
     async with _graph_client() as client:
         short_response = await client.get(
             "/oauth/access_token",
@@ -94,9 +90,7 @@ async def _exchange_code(
         return await _fetch_pages(client, long_token, app.app_secret)
 
 
-async def _fetch_pages(
-    client: httpx.AsyncClient, user_token: str, app_secret: str
-) -> list[dict]:
+async def _fetch_pages(client: httpx.AsyncClient, user_token: str, app_secret: str) -> list[dict]:
     params = {
         "fields": "id,name,access_token,instagram_business_account{id,username}",
         "access_token": user_token,
@@ -107,13 +101,13 @@ async def _fetch_pages(
     response.raise_for_status()
     payload = response.json()
     pages = list(payload.get("data") or [])
-    next_url = ((payload.get("paging") or {}).get("next"))
+    next_url = (payload.get("paging") or {}).get("next")
     while next_url:
         response = await client.get(next_url)
         response.raise_for_status()
         payload = response.json()
         pages.extend(payload.get("data") or [])
-        next_url = ((payload.get("paging") or {}).get("next"))
+        next_url = (payload.get("paging") or {}).get("next")
     return pages
 
 
@@ -127,6 +121,8 @@ async def meta_oauth_start(request: Request) -> Response:
     platform = form.get("platform", "")
     if platform not in _SCOPES:
         raise HTTPException(status_code=422, detail="platform_must_be_facebook_or_instagram")
+    if not get_settings().platform_integration_enabled(platform):
+        return notice("平台集成已关闭", f"当前环境未启用 {platform}。", status_code=503)
     tenant_id = (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
@@ -156,15 +152,19 @@ async def meta_oauth_start(request: Request) -> Response:
         logger.warning("meta oauth state storage failed: %s", exc)
         return notice("发起授权失败", "OAuth 临时状态存储不可用，请稍后重试。", status_code=503)
 
-    dialog_url = _DIALOG_URL + "?" + urlencode(
-        {
-            "client_id": app.app_id,
-            "redirect_uri": admin_callback_url("/admin/oauth/meta/callback"),
-            "state": state_token,
-            "response_type": "code",
-            "scope": _SCOPES[platform],
-        },
-        quote_via=quote,
+    dialog_url = (
+        _DIALOG_URL
+        + "?"
+        + urlencode(
+            {
+                "client_id": app.app_id,
+                "redirect_uri": admin_callback_url("/admin/oauth/meta/callback"),
+                "state": state_token,
+                "response_type": "code",
+                "scope": _SCOPES[platform],
+            },
+            quote_via=quote,
+        )
     )
     return RedirectResponse(dialog_url, status_code=status.HTTP_303_SEE_OTHER)
 
@@ -179,11 +179,20 @@ async def meta_oauth_callback(request: Request) -> Response:
             "授权已取消",
             f"Meta 返回：{request.query_params.get('error_description') or '用户取消了授权'}。",
         )
-    state = await take_oauth_state("meta", state_token) if state_token else None
-    if state is None:
+    pending_state = await peek_oauth_state("meta", state_token) if state_token else None
+    if pending_state is None:
         return notice(
             "授权会话无效",
             "发起记录缺失、已使用或已过期，请回到账号页重新发起。",
+            status_code=400,
+        )
+    if not get_settings().platform_integration_enabled(str(pending_state.get("platform") or "")):
+        return notice("平台集成已关闭", "授权期间该平台已被关闭，请稍后重试。", status_code=503)
+    state = await take_oauth_state("meta", state_token)
+    if state is None:
+        return notice(
+            "授权会话无效",
+            "发起记录已由另一请求使用，请回到账号页重新发起。",
             status_code=400,
         )
     principal = await principal_from_oauth_context(state)
@@ -281,11 +290,7 @@ async def _picker(request: Request, candidates: list[dict], context: dict) -> Re
         f'<label style="display:block;margin:8px 0"><input type="radio" name="choice" '
         f'value="{index}" required> {html.escape(candidate["name"])} '
         f'<span class="muted">(Page {html.escape(candidate["id"])}'
-        + (
-            f" · IG @{html.escape(candidate['ig_username'])}"
-            if candidate["ig_id"]
-            else ""
-        )
+        + (f" · IG @{html.escape(candidate['ig_username'])}" if candidate["ig_id"] else "")
         + ")</span></label>"
         for index, candidate in enumerate(candidates)
     )
@@ -324,19 +329,29 @@ async def meta_oauth_select(request: Request) -> Response:
     form = await _form(request)
     _require_csrf(request, form)
     pick_token = form.get("pick_token", "") or request.cookies.get(_PICK_COOKIE, "")
-    pick = await take_oauth_state("meta-pick", pick_token)
-    if pick is None:
+    pending_pick = await peek_oauth_state("meta-pick", pick_token)
+    if pending_pick is None:
         return notice("选择会话无效", "候选记录已使用或过期，请重新授权。", status_code=400)
-    if str(principal.session_id) != str(pick.get("session_id")):
+    if str(principal.session_id) != str(pending_pick.get("session_id")):
         return notice("选择会话无效", "请使用发起授权的同一登录会话完成选择。", status_code=403)
-    principal.require_tenant(str(pick.get("tenant_id") or ""))
+    principal.require_tenant(str(pending_pick.get("tenant_id") or ""))
+    if not get_settings().platform_integration_enabled(str(pending_pick.get("platform") or "")):
+        return notice("平台集成已关闭", "选择期间该平台已被关闭，请稍后重试。", status_code=503)
     try:
-        candidate = pick["candidates"][int(form.get("choice", ""))]
+        choice = int(form.get("choice", ""))
+        pending_pick["candidates"][choice]
     except (KeyError, TypeError, ValueError, IndexError):
-        return notice("选择无效", "所选目标不存在，请重新发起授权。", status_code=400)
-    app = await facebook_app_credentials(pick["tenant_id"])
+        return notice("选择无效", "所选目标不存在，请重新选择。", status_code=400)
+    app = await facebook_app_credentials(pending_pick["tenant_id"])
     if app is None:
         return notice("无法完成接入", "Facebook App 凭证当前不可用。", status_code=422)
+    pick = await take_oauth_state("meta-pick", pick_token)
+    if pick is None:
+        return notice("选择会话无效", "候选记录已由另一请求使用，请重新授权。", status_code=400)
+    try:
+        candidate = pick["candidates"][choice]
+    except (KeyError, TypeError, IndexError):
+        return notice("选择会话无效", "候选记录发生变化，请重新授权。", status_code=400)
     response = await _finalize(candidate, pick, app, principal)
     response.delete_cookie(_PICK_COOKIE)
     return response
@@ -349,6 +364,8 @@ async def _finalize(
     principal: Principal,
 ) -> Response:
     platform = context["platform"]
+    if not get_settings().platform_integration_enabled(platform):
+        return notice("平台集成已关闭", "提交接入前该平台已被关闭。", status_code=503)
     if platform == "instagram":
         external_account_id = candidate["ig_id"]
         display_name = (
@@ -365,6 +382,9 @@ async def _finalize(
         "api_version": _API_VERSION,
         "instagram_login_mode": "facebook_login",
         "page_id": candidate["id"],
+        "enable_dm": True,
+        "enable_comments": False,
+        "automation_default": "BOT_DRAFT_ONLY",
         "access_token": candidate["access_token"],
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,

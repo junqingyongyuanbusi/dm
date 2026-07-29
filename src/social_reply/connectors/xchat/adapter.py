@@ -60,10 +60,15 @@ def canonical_from_decrypted(
         conversation_key=f"x_chat:{account_id}:{conversation_id}",
         text=text,
         occurred_at=(
-            _parse_time(envelope.get("created_at"))
-            or _parse_msec(envelope.get("created_at_msec"))
+            _parse_time(envelope.get("created_at")) or _parse_msec(envelope.get("created_at_msec"))
         ),
+        event_namespace="x.xchat",
         external_conversation_id=conversation_id,
+        event_metadata={
+            "envelope_id": envelope.get("id"),
+            "previous_id": envelope.get("previous_id"),
+            "is_trusted": envelope.get("is_trusted"),
+        },
         reply_target={
             "kind": "x_chat",
             "conversation_id": conversation_id,

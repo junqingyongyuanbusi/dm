@@ -50,7 +50,7 @@ def classify(msg: ChatwootMessage) -> EventClass:
     if msg.private:
         return EventClass.IGNORE
     if msg.message_type == "incoming":
-        return EventClass.INBOUND_USER
+        return EventClass.INBOUND_USER if isinstance(msg.content, str) else EventClass.IGNORE
     if msg.message_type == "outgoing":
         if msg.sender_type == "agent_bot":
             return EventClass.BOT_ECHO

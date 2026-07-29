@@ -18,6 +18,9 @@ class LLMContext:
     # 同会话历史消息（按时间升序），元素为 (role, text)：
     # role ∈ {"user", "assistant"}，不含当前这条。默认空 → 单轮行为不变。
     history: tuple[tuple[str, str], ...] = ()
+    # 租户在后台编辑的人设段。None → 用代码内置默认人设。
+    # 它只能替换人设；动作语义与安全不变量由 _CONTRACT_PROMPT 固定追加。
+    persona: str | None = None
 
 
 class LLMClient(Protocol):

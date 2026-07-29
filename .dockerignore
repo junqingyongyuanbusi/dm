@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 .run/
 .spec-workflow/
+dist/
 
 # 绝不打包任何真实凭证与环境文件
 .env
@@ -25,3 +26,4 @@ docs/
 # deploy/vps 可能包含操作员从模板复制后填写的本地配置，必须始终排除。
 tests/
 deploy/vps/
+scripts/publish_railway_release.sh

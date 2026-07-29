@@ -20,6 +20,9 @@ EXPECTED_TABLES = {
     "messages",
     "raw_events",
     "normalized_events",
+    "platform_checkpoints",
+    "sync_runs",
+    "sync_gaps",
     "automation_states",
     "outbox_messages",
     "audit_logs",
@@ -74,6 +77,168 @@ async def test_admin_auth_tables_have_constraints_and_indexes(migrated_db):
     assert "ix_admin_sessions_expires_at" in session_indexes
 
 
+async def test_poll_raw_event_journal_columns_and_indexes_exist(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        columns = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='raw_events'"
+                )
+            )
+        }
+        normalized_columns = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='normalized_events'"
+                )
+            )
+        }
+        indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='raw_events'")
+            )
+        }
+    assert {
+        "tenant_id",
+        "platform_account_id",
+        "ingress_kind",
+        "event_namespace",
+        "external_event_id",
+        "external_conversation_id",
+        "context",
+        "schema_version",
+        "occurred_at",
+        "processing_claim_token",
+        "processing_claim_expires_at",
+        "processing_attempt_count",
+        "processing_next_attempt_at",
+        "processing_error_code",
+        "processing_last_dispatched_at",
+    } <= columns
+    assert {"external_conversation_id", "event_metadata"} <= normalized_columns
+    assert {
+        "ix_raw_events_status_received",
+        "ix_raw_events_account_received",
+        "ix_raw_events_processing_due",
+        "ix_raw_events_tenant_status_received",
+    } <= indexes
+
+
+async def test_platform_sync_tables_have_constraints_and_indexes(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        checkpoint_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='platform_checkpoints'"
+                )
+            )
+        }
+        gap_indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='sync_gaps'")
+            )
+        }
+    assert {
+        "ck_platform_checkpoints_stream",
+        "ck_platform_checkpoints_scope",
+        "ck_platform_checkpoints_revision",
+        "ck_platform_checkpoints_claim",
+        "uq_platform_checkpoints_account_stream_scope",
+    } <= checkpoint_constraints
+    assert {
+        "ix_sync_gaps_retry",
+        "uq_sync_gaps_active_checkpoint",
+    } <= gap_indexes
+
+
+async def test_admin_health_indexes_exist(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            text(
+                "SELECT tablename, indexname FROM pg_indexes "
+                "WHERE indexname IN ("
+                "'ix_raw_events_tenant_status_received',"
+                "'ix_outbox_tenant_status_created',"
+                "'ix_platform_accounts_tenant_status'"
+                ")"
+            )
+        )
+    assert set(rows) == {
+        ("raw_events", "ix_raw_events_tenant_status_received"),
+        ("outbox_messages", "ix_outbox_tenant_status_created"),
+        ("platform_accounts", "ix_platform_accounts_tenant_status"),
+    }
+
+
+async def test_platform_account_contract_constraints_exist(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='platform_accounts'"
+                )
+            )
+        }
+    assert {
+        "ck_platform_accounts_platform",
+        "ck_platform_accounts_status",
+        "ck_platform_accounts_capability_object",
+    } <= constraints
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"platform": "unknown"},
+        {"status": "CONNECTED"},
+        {"capability": "not-an-object"},
+    ],
+)
+async def test_platform_account_contract_rejects_invalid_rows(session, overrides):
+    values = {
+        "id": uuid.uuid4(),
+        "tenant_id": "default",
+        "brand_id": "b1",
+        "platform": "telegram",
+        "name": "invalid",
+        "status": "active",
+        "capability": {"dm": True, "max_text_length": 4096},
+        **overrides,
+    }
+    with pytest.raises(IntegrityError):
+        await session.execute(insert(models.PlatformAccount).values(**values))
+        await session.commit()
+    await session.rollback()
+
+
+async def test_platform_account_model_defaults_to_canonical_active_status(session):
+    account = models.PlatformAccount(
+        id=uuid.uuid4(),
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        name="default-status",
+        capability={"dm": True, "max_text_length": 4096},
+    )
+    session.add(account)
+    await session.commit()
+    assert account.status == "active"
+
+
 async def test_platform_apps_and_account_fk_exist(migrated_db):
     engine = get_engine()
     async with engine.connect() as conn:
@@ -86,7 +251,42 @@ async def test_platform_apps_and_account_fk_exist(migrated_db):
                 )
             )
         }
+        app_indexes = {
+            row[0]
+            for row in await conn.execute(
+                text("SELECT indexname FROM pg_indexes WHERE tablename='platform_apps'")
+            )
+        }
     assert "platform_app_id" in account_cols
+    assert "uq_platform_apps_meta_route_public_id" in app_indexes
+
+
+async def test_meta_webhook_route_id_is_unique_across_app_families(session):
+    public_id = f"shared_{uuid.uuid4().hex}"
+    await session.execute(
+        insert(models.PlatformApp).values(
+            tenant_id="tenant-a",
+            platform_family="meta",
+            name="Facebook App",
+            public_id=public_id,
+            config={},
+            status="active",
+        )
+    )
+    await session.commit()
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.PlatformApp).values(
+                tenant_id="tenant-b",
+                platform_family="instagram",
+                name="Instagram App",
+                public_id=public_id,
+                config={},
+                status="active",
+            )
+        )
+        await session.commit()
+    await session.rollback()
 
 
 async def test_provisioning_jobs_have_durable_recovery_index(migrated_db):
@@ -158,8 +358,7 @@ async def test_message_history_columns_and_indexes(migrated_db):
             row[0]
             for row in await conn.execute(
                 text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name='messages'"
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='messages'"
                 )
             )
         }

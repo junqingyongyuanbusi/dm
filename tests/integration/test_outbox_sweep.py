@@ -79,6 +79,26 @@ async def test_sweep_enqueues_pending_and_due_failed(session):
     assert not_due_id not in enqueued and sent_id not in enqueued
 
 
+async def test_outbox_sweep_isolates_broker_dispatch_failures(session, monkeypatch):
+    first = await _seed(session)
+    second = await _seed(session)
+    calls: list[uuid.UUID] = []
+    from social_reply.application.message_delivery.actors import deliver_outbox_message
+    from social_reply.application.message_delivery.sweep import sweep_outbox
+
+    def dispatch(outbox_id: str):
+        calls.append(uuid.UUID(outbox_id))
+        if len(calls) == 1:
+            raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(deliver_outbox_message, "send", dispatch)
+
+    dispatched = await sweep_outbox()
+    assert set(calls) == {first, second}
+    assert len(dispatched) == 1
+    assert dispatched[0] == calls[1]
+
+
 async def test_sweep_marks_stale_sending_needs_review(session):
     from social_reply.application.message_delivery.sweep import sweep_outbox
 

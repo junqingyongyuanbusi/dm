@@ -1,15 +1,43 @@
 import hashlib
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.message_delivery.contracts import (
+    build_direct_reply_destination,
+)
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import AutomationStateEnum
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.infrastructure.database import models
+from social_reply.shared.config import get_settings
+
+
+class ChatwootDecisionDeferred(RuntimeError):
+    pass
+
+
+class DecisionDeliveryConfigurationError(RuntimeError):
+    pass
+
+
+def ensure_decision_delivery_available(
+    *,
+    account_config: dict,
+    chatwoot_inbox_id: int | None,
+    chatwoot_enabled: bool,
+) -> bool:
+    direct_delivery = account_config.get("delivery_mode") == "direct"
+    if direct_delivery:
+        return True
+    if chatwoot_inbox_id is None:
+        raise DecisionDeliveryConfigurationError("chatwoot_inbox_id_missing")
+    if not chatwoot_enabled:
+        raise ChatwootDecisionDeferred("chatwoot_disabled")
+    return False
 
 
 def _idempotency_key(
@@ -40,9 +68,15 @@ async def persist_decision(
                 models.PlatformAccount.tenant_id,
                 models.PlatformAccount.platform,
                 models.PlatformAccount.config,
+                models.PlatformAccount.chatwoot_inbox_id,
             ).where(models.PlatformAccount.id == account_id)
         )
     ).one()
+    direct_delivery = ensure_decision_delivery_available(
+        account_config=dict(account.config or {}),
+        chatwoot_inbox_id=account.chatwoot_inbox_id,
+        chatwoot_enabled=get_settings().chatwoot_enabled,
+    )
 
     if message_id is not None:
         existing = (
@@ -73,7 +107,7 @@ async def persist_decision(
     elif decision.action is ReplyAction.DRAFT:
         # Direct platforms have no private-note channel. Retain the ReplyDecision as a
         # draft for the admin inbox; never send it to the customer before approval.
-        if (account.config or {}).get("delivery_mode") != "direct":
+        if not direct_delivery:
             message_type = "private_note"
     elif decision.action is ReplyAction.HANDOFF:
         # 转人工：置 HANDOFF_PENDING（仅当当前非终态）
@@ -93,64 +127,35 @@ async def persist_decision(
         )
 
     if message_type is not None:
+        if direct_delivery and message_id is None:
+            raise DecisionDeliveryConfigurationError("direct_delivery_message_id_missing")
         reply_target = {}
         destination_type = "chatwoot_conversation"
-        if (account.config or {}).get("delivery_mode") == "direct" and message_id is not None:
-            reply_target = dict(
-                (
-                    await session.execute(
-                        select(models.Message.reply_target).where(models.Message.id == message_id)
-                    )
-                ).scalar_one_or_none()
-                or {}
-            )
-            kind = reply_target.get("kind", "dm")
-            if account.platform == "telegram":
-                destination_type = "telegram_dm"
-            elif account.platform == "facebook":
-                destination_type = (
-                    "meta_private_reply"
-                    if decision.reply_visibility is Visibility.PRIVATE and kind == "comment"
-                    else "meta_public_comment"
-                    if kind == "comment"
-                    else "meta_messenger_dm"
-                )
-            elif account.platform == "instagram":
-                destination_type = (
-                    "meta_private_reply"
-                    if decision.reply_visibility is Visibility.PRIVATE and kind == "comment"
-                    else "meta_public_comment"
-                    if kind == "comment"
-                    else "meta_instagram_dm"
-                )
-            elif account.platform == "whatsapp":
-                destination_type = "whatsapp_session_message"
-            elif account.platform == "x":
-                destination_type = (
-                    "x_post_reply"
-                    if kind == "reply"
-                    else "x_chat_message"
-                    if kind == "x_chat"
-                    else "x_dm"
-                )
-            else:
-                raise ValueError(f"unsupported_direct_platform:{account.platform}")
-            if destination_type == "meta_private_reply":
-                reply_target = {**reply_target, "kind": "private_reply"}
         valid_until = None
-        if destination_type in {
-            "meta_messenger_dm",
-            "meta_instagram_dm",
-            "whatsapp_session_message",
-        }:
-            inbound_occurred_at = (
+        if direct_delivery:
+            message = (
                 await session.execute(
-                    select(models.Message.occurred_at).where(models.Message.id == message_id)
+                    select(
+                        models.Message.reply_target,
+                        models.Message.occurred_at,
+                    ).where(models.Message.id == message_id)
                 )
-            ).scalar_one_or_none()
-            valid_until = (inbound_occurred_at or datetime.now(UTC)) + timedelta(hours=24)
-        elif destination_type == "meta_private_reply":
-            valid_until = datetime.now(UTC) + timedelta(days=7)
+            ).one_or_none()
+            if message is None:
+                raise DecisionDeliveryConfigurationError("direct_delivery_message_missing")
+            try:
+                destination = build_direct_reply_destination(
+                    platform=account.platform,
+                    reply_target=dict(message.reply_target or {}),
+                    visibility=decision.reply_visibility,
+                    occurred_at=message.occurred_at,
+                    now=datetime.now(UTC),
+                )
+            except ValueError as exc:
+                raise DecisionDeliveryConfigurationError(str(exc)) from exc
+            destination_type = destination.destination_type
+            reply_target = destination.target
+            valid_until = destination.valid_until
         candidate_outbox_id = uuid.uuid4()
         inserted_outbox = (
             await session.execute(

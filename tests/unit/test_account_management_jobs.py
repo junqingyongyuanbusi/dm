@@ -1,10 +1,19 @@
 from pathlib import Path
 
 import httpx
+import pytest
 
 from social_reply.application.account_management import jobs
 from social_reply.application.account_management.service import AccountConnectionResult
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+
+
+def test_meta_boolean_form_values_are_parsed_strictly():
+    request = {"enable_dm": "true", "enable_comments": "false"}
+    assert jobs._request_bool(request, "enable_dm", default=False) is True
+    assert jobs._request_bool(request, "enable_comments", default=True) is False
+    with pytest.raises(ValueError, match="invalid_boolean:enable_dm"):
+        jobs._request_bool({"enable_dm": "maybe"}, "enable_dm", default=True)
 
 
 def test_safe_request_never_contains_credentials():
@@ -59,6 +68,29 @@ def test_error_explains_missing_x_direct_message_permission():
     assert code == "X_DM_PERMISSION_REQUIRED"
     assert "Read and write and Direct message" in message
     assert retryable is False
+
+
+@pytest.mark.parametrize(
+    ("platform", "settings_update"),
+    [
+        ("facebook", {"facebook_messenger_enabled": False}),
+        ("instagram", {"instagram_messaging_enabled": False}),
+        ("whatsapp", {"whatsapp_enabled": False}),
+    ],
+)
+async def test_provisioning_execution_rechecks_platform_flag_before_decrypting_secrets(
+    monkeypatch, platform, settings_update
+):
+    settings = jobs.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+
+    def unexpected_decrypt(_value):
+        raise AssertionError("disabled platform must not decrypt staging credentials")
+
+    monkeypatch.setattr(jobs, "decrypt_secret_bundle", unexpected_decrypt)
+    job = type("Job", (), {"platform": platform})()
+    with pytest.raises(ValueError, match=f"{platform}_integration_disabled"):
+        await jobs._connect(job)
 
 
 def test_result_payload_does_not_expose_verify_token():

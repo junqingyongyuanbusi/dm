@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,27 +35,55 @@ class _Outcome:
     account_id: uuid.UUID | None = None
 
 
-async def process_raw_event(raw_event_id: str) -> None:
+async def process_raw_event(
+    raw_event_id: str,
+    *,
+    raw_event_claim_token: uuid.UUID | None = None,
+) -> None:
     started = time.perf_counter()
+    event_id = uuid.UUID(raw_event_id)
     async with get_session_factory()() as session:
-        raw = (
-            await session.execute(
-                select(models.RawEvent).where(models.RawEvent.id == uuid.UUID(raw_event_id))
-            )
-        ).scalar_one()
+        raw_statement = select(models.RawEvent).where(models.RawEvent.id == event_id)
+        if raw_event_claim_token is not None:
+            raw_statement = raw_statement.with_for_update()
+        raw = (await session.execute(raw_statement)).scalar_one()
+        if raw_event_claim_token is not None:
+            database_now = await session.scalar(select(func.clock_timestamp()))
+            if (
+                raw.processing_status != "INITIAL_DISPATCHING"
+                or raw.processing_claim_token != raw_event_claim_token
+                or raw.processing_claim_expires_at is None
+                or raw.processing_claim_expires_at <= database_now
+            ):
+                await session.rollback()
+                return
         try:
             outcome = await _process(session, raw)
         except (KeyError, ValueError, TypeError, AttributeError):
             # 畸形 payload 不得卡死在 PENDING / 打死信
             await session.rollback()
             outcome = _Outcome("PARSE_FAILED")
-        await session.execute(
-            update(models.RawEvent)
-            # 用入参 UUID 而非 raw.id：异常路径 rollback 后 raw 已过期，
-            # 访问 raw.id 会触发同步上下文里的异步刷新 → MissingGreenlet
-            .where(models.RawEvent.id == uuid.UUID(raw_event_id))
-            .values(processing_status=outcome.status, processed_at=datetime.now(UTC))
-        )
+        raw_update = update(models.RawEvent).where(models.RawEvent.id == event_id)
+        raw_values = {
+            "processing_status": outcome.status,
+            "processed_at": datetime.now(UTC),
+        }
+        if raw_event_claim_token is not None:
+            raw_update = raw_update.where(
+                models.RawEvent.processing_status == "INITIAL_DISPATCHING",
+                models.RawEvent.processing_claim_token == raw_event_claim_token,
+                models.RawEvent.processing_claim_expires_at > func.clock_timestamp(),
+            )
+            raw_values.update(
+                processing_claim_token=None,
+                processing_claim_expires_at=None,
+                processing_next_attempt_at=None,
+                processing_error_code=None,
+            )
+        finalized = await session.execute(raw_update.values(**raw_values))
+        if raw_event_claim_token is not None and finalized.rowcount != 1:
+            await session.rollback()
+            return
         decision_job_id = None
         if outcome.snapshot is not None:
             # 决策任务与入站消息在 tx1 同事务落库。即使进程在 commit 后、入队前崩溃，
@@ -64,7 +92,7 @@ async def process_raw_event(raw_event_id: str) -> None:
                 await session.execute(
                     pg_insert(models.DecisionJob)
                     .values(
-                        raw_event_id=uuid.UUID(raw_event_id),
+                        raw_event_id=event_id,
                         conversation_id=outcome.conversation_id,
                         message_id=outcome.message_id,
                         account_id=outcome.account_id,
@@ -91,6 +119,38 @@ async def process_raw_event(raw_event_id: str) -> None:
         (time.perf_counter() - started) * 1000,
         decision_job_id,
     )
+
+
+async def process_claimed_raw_event(
+    raw_event_id: uuid.UUID,
+    dispatch_token: uuid.UUID,
+) -> None:
+    from social_reply.application.event_ingestion.raw_recovery import (
+        claim_initial_raw_event,
+        fail_initial_claim,
+    )
+
+    claim = await claim_initial_raw_event(
+        raw_event_id,
+        dispatch_token,
+        expected_kind="chatwoot",
+    )
+    if claim is None:
+        return
+    try:
+        await process_raw_event(
+            str(raw_event_id),
+            raw_event_claim_token=claim.token,
+        )
+    except Exception:  # noqa: BLE001 - durable RawEvent retry replaces broker retries
+        await fail_initial_claim(
+            raw_event_id,
+            claim.token,
+            error_code="INITIAL_DISPATCH_WORKER_FAILED",
+        )
+        logger.exception(
+            "initial Chatwoot RawEvent processing failed raw_event_id=%s", raw_event_id
+        )
 
 
 async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:

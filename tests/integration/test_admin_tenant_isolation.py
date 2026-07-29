@@ -1,3 +1,4 @@
+import re
 import uuid
 
 import httpx
@@ -89,9 +90,7 @@ async def test_tenant_user_only_sees_own_knowledge_and_fixed_tenant_form(session
         assert forbidden.status_code == 403
 
 
-async def test_tenant_user_can_authorize_accounts_without_global_switch(
-    session, migrated_db
-):
+async def test_tenant_user_can_authorize_accounts_without_global_switch(session, migrated_db):
     await _seed_user(session)
     account_id = uuid.uuid4()
     session.add(
@@ -103,7 +102,7 @@ async def test_tenant_user_can_authorize_accounts_without_global_switch(
             name="Tenant A Bot",
             public_id="tenant-a-bot",
             automation_default="BOT_DRAFT_ONLY",
-            status="CONNECTED",
+            status="active",
         )
     )
     await session.commit()
@@ -111,13 +110,18 @@ async def test_tenant_user_can_authorize_accounts_without_global_switch(
     async with _client() as client:
         csrf = await _login(client)
         page = await client.get("/admin/accounts")
+        x_panel = await client.get("/admin/accounts?connect=x")
+        instagram_panel = await client.get("/admin/accounts?connect=instagram")
         assert page.status_code == 200
         assert "账号授权" in page.text
-        assert '<details class="collapse" open>' in page.text
-        assert 'action="/admin/oauth/x/start"' in page.text
-        assert 'action="/admin/oauth/meta/start"' in page.text
-        assert 'action="/admin/oauth/instagram/start"' in page.text
-        assert 'name="tenant_id" value="tenant-a"' in page.text
+        assert "添加渠道" in page.text
+        assert 'data-channel="x"' in page.text
+        assert 'data-channel="facebook"' in page.text
+        assert 'data-channel="instagram"' in page.text
+        assert 'action="/admin/oauth/x/start"' in x_panel.text
+        assert 'action="/admin/oauth/meta/start"' in instagram_panel.text
+        assert 'action="/admin/oauth/instagram/start"' in instagram_panel.text
+        assert 'name="tenant_id" value="tenant-a"' in x_panel.text
         assert f'action="/admin/accounts/{account_id}/automation"' in page.text
         assert 'name="scope" value="account"' in page.text
         assert "自动回复总开关" not in page.text
@@ -131,9 +135,7 @@ async def test_tenant_user_can_authorize_accounts_without_global_switch(
         assert forbidden.json()["detail"] == "superadmin_required"
 
 
-async def test_tenant_user_can_start_oauth_only_for_own_tenant(
-    session, migrated_db, monkeypatch
-):
+async def test_tenant_user_can_start_oauth_only_for_own_tenant(session, migrated_db, monkeypatch):
     from social_reply.application.account_management.oauth import x as x_oauth
 
     await _seed_user(session)
@@ -192,6 +194,64 @@ async def test_tenant_user_cannot_open_other_tenant_job(session, migrated_db):
         await _login(client)
         response = await client.get(f"/admin/jobs/{job_id}")
     assert response.status_code == 404
+
+
+async def test_overview_health_is_tenant_scoped_and_excludes_plain_pending(session, migrated_db):
+    await _seed_user(session)
+    await session.execute(
+        insert(models.RawEvent).values(
+            tenant_id="tenant-b",
+            source="telegram",
+            payload={},
+            processing_status="INITIAL_DISPATCH_DEAD",
+        )
+    )
+    await session.execute(
+        insert(models.RawEvent).values(
+            source="unscoped",
+            payload={},
+            processing_status="INITIAL_DISPATCH_DEAD",
+        )
+    )
+    await session.execute(
+        insert(models.RawEvent).values(
+            tenant_id="tenant-a",
+            source="historical",
+            payload={},
+            context={},
+            processing_status="PENDING",
+        )
+    )
+    await session.commit()
+
+    async with _client() as client:
+        await _login(client)
+        healthy = await client.get("/admin")
+        row = re.search(
+            r'<tr data-health="ingestion">(.*?)</tr>',
+            healthy.text,
+            re.DOTALL,
+        )
+        assert row is not None and "HEALTHY" in row.group(1)
+
+        await session.execute(
+            insert(models.RawEvent).values(
+                tenant_id="tenant-a",
+                source="telegram",
+                payload={},
+                context={"initial_dispatch": {"version": 1}},
+                processing_status="INITIAL_DISPATCH_RETRY",
+            )
+        )
+        await session.commit()
+        warning = await client.get("/admin")
+        row = re.search(
+            r'<tr data-health="ingestion">(.*?)</tr>',
+            warning.text,
+            re.DOTALL,
+        )
+        assert row is not None and "WARNING" in row.group(1)
+        assert "0 需处理 · 1 恢复中" in row.group(1)
 
 
 async def test_tenant_user_does_not_see_unscoped_raw_event_health(session, migrated_db):

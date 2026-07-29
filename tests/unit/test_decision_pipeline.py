@@ -129,3 +129,48 @@ async def test_risk_word_beats_verbatim_template():
     )
     assert d.action is ReplyAction.HANDOFF
     assert "RISK_WORD" in d.reason_codes
+
+
+class _HandoffLLM:
+    async def decide(self, context):
+        return ReplyDecision(action=ReplyAction.HANDOFF, reason_codes=("OPENAI",), source="llm")
+
+
+async def test_llm_handoff_falls_back_to_auto_reply_when_bot_active():
+    d = await run_decision_pipeline(_snap(), llm=_HandoffLLM(), killswitch=_OpenSwitch())
+    assert d.action is ReplyAction.AUTO_REPLY
+    assert "LLM_HANDOFF_FALLBACK" in d.reason_codes
+
+
+async def test_llm_handoff_fallback_still_downgrades_under_draft_only():
+    # 兜底把 handoff 改回 auto_reply，若排在草稿降级之后，决策会以 auto_reply 落库：
+    # BOT_DRAFT_ONLY 下既不外发，也进不了只查 action=draft 的 admin 待审队列。
+    d = await run_decision_pipeline(
+        _snap(state="BOT_DRAFT_ONLY"), llm=_HandoffLLM(), killswitch=_OpenSwitch()
+    )
+    assert d.action is ReplyAction.DRAFT
+    assert "LLM_HANDOFF_FALLBACK" in d.reason_codes
+    assert d.reply_text
+
+
+async def test_guard_downgrade_is_not_reverted_by_the_handoff_fallback():
+    class _PiiLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="请联系 alice@example.com",
+                source="llm",
+            )
+
+    d = await run_decision_pipeline(_snap(), llm=_PiiLLM(), killswitch=_OpenSwitch())
+    assert d.action is ReplyAction.HANDOFF
+    assert "GUARD_PII_LEAK" in d.reason_codes
+    assert "LLM_HANDOFF_FALLBACK" not in d.reason_codes
+
+
+async def test_rule_handoff_is_not_converted_to_auto_reply():
+    d = await run_decision_pipeline(
+        _snap(text="我要起诉你们"), llm=_HandoffLLM(), killswitch=_OpenSwitch()
+    )
+    assert d.action is ReplyAction.HANDOFF
+    assert "LLM_HANDOFF_FALLBACK" not in d.reason_codes

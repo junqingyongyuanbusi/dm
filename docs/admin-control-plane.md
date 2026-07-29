@@ -43,9 +43,9 @@ Failed jobs retain only the encrypted staging envelope for controlled retry, use
 `PlatformApp` owns application-level webhook credentials and one webhook route. It may contain many `PlatformAccount` rows.
 
 - Telegram: one direct `PlatformAccount`, account-level webhook.
-- Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows.
+- Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows. App secrets sign webhook bodies and generate `appsecret_proof`; account tokens remain account-scoped. Facebook Login Instagram rows belong to family `meta` and require a Page ID; standalone Instagram Login rows belong to family `instagram` and forbid a Page ID. Shared webhook public IDs are unique across both families.
 - WhatsApp: a Meta `PlatformApp` plus one account per `phone_number_id`.
-- X: one direct `PlatformAccount`, account-level webhook/subscription.
+- X: deployment-level OAuth Consumer App credentials, a tenant-shared `PlatformApp` webhook route, and one `PlatformAccount` per authorized user. Events route by `for_user_id`; legacy account-level webhook secrets remain readable during migration.
 
 Each account owns tenant, brand, external ID, route ID, credential reference, capabilities, automation mode, config version, and lifecycle status.
 
@@ -62,6 +62,7 @@ Supported destination commands:
 - `meta_private_reply`
 - `whatsapp_session_message`
 - `x_dm`
+- `x_chat_message`
 - `x_post_reply`
 
 Direct-platform drafts are never sent to customers. A `DRAFT` decision is retained in `reply_decisions` for future approval/inbox workflows and has no direct Outbox until approved. Chatwoot private notes remain supported for legacy Chatwoot-backed accounts.
@@ -77,10 +78,12 @@ The built-in administration surface provides:
 - mandatory first-login password change for newly created tenant users;
 - tenant-user self-service account authorization for the user's assigned tenant, including OAuth starts and tenant-scoped provisioning jobs;
 - superadmin-only tenant-wide automation kill switch; tenant users retain account-level controls for their own accounts;
+- PostgreSQL-backed runtime health summary on `/admin`, covering ingestion recovery, decision jobs, Outbox, provisioning, active X sync gaps, and disabled accounts with oldest backlog age;
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
-- account enable/disable and health checks;
+- account enable/disable and health checks, including Messenger/Instagram token plus app-level and account-level `messages` subscription state; Meta text-DM accounts connect as `BOT_DRAFT_ONLY` and can only be promoted to `BOT_ACTIVE` when the deployment sets `META_AUTO_REPLY_ENABLED=true`, and every change is written to `audit_logs` as `SET_AUTOMATION_DEFAULT`;
+- tenant-editable LLM persona at `/admin/prompt`, stored in PostgreSQL so the Worker sees saves immediately; only the persona is editable, while the output contract and prompt-injection defences are appended by code and rendered read-only. Saves bump a revision that is recorded in `reply_decisions.prompt_version` and audited as `SET_REPLY_PERSONA`, and a dry-run box exercises the model without persisting a decision or creating an Outbox row;
 - no account-creation CLI requirement.
 
 OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.
@@ -89,4 +92,4 @@ Production deployments should put `/admin` behind an identity-aware proxy or rep
 
 ## OAuth evolution
 
-Meta Embedded Signup/OAuth and X OAuth are adapters into the same ProvisioningJob boundary. OAuth callbacks must stage exchanged tokens in `SecretStore`, store only grant metadata in PostgreSQL, and submit the same platform provisioning operations. Platform App Review, Business Verification, WhatsApp template approval, and X product-tier permissions remain external prerequisites and are surfaced as capabilities/manual steps rather than bypassed.
+Meta and X OAuth are adapters into the same `ProvisioningJob` boundary. Messenger/Instagram accounts route inbound evidence with `meta_health_status=PROVISIONING`, but send-time validation pauses customer delivery until the requested remote `messages` subscription reaches `READY`; a subscription failure disables the account. Periodic Scheduler checks repair subscription drift and expose reauthorization failures. OAuth transaction state is encrypted and short-lived in Redis. Exchanged platform credentials are encrypted with `PLATFORM_SECRET_KEYS` and staged in the durable job row, then stored as encrypted PostgreSQL bundles on the resulting `PlatformApp` / `PlatformAccount`; completed jobs clear the staging bundle. `ACCOUNT_SECRETS_ROOT` is retained only for legacy `file://` migration. Platform App Review, Business Verification, WhatsApp template approval, and X product-tier permissions remain external prerequisites and are surfaced as capabilities/manual steps rather than bypassed.

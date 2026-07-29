@@ -6,6 +6,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.advisory_locks import (
+    acquire_conversation_delivery_xact_lock,
+)
 
 
 class AutomationStateEnum(StrEnum):
@@ -67,22 +70,27 @@ async def ensure_state(
 
 
 async def flip_to_human_active(
-    session: AsyncSession, conversation_id: uuid.UUID, agent_id: str | None, reason: str
+    session: AsyncSession,
+    conversation_id: uuid.UUID,
+    agent_id: str | None,
+    reason: str,
+    *,
+    expected_state: AutomationStateEnum | None = None,
 ) -> bool:
     """人工接管翻转：非 HUMAN_ACTIVE 才更新（幂等），state_version 自增（CAS 基础）。
     返回是否发生了翻转。"""
-    stmt = (
-        update(models.AutomationState)
-        .where(
-            models.AutomationState.conversation_id == conversation_id,
-            models.AutomationState.state != AutomationStateEnum.HUMAN_ACTIVE,
-        )
-        .values(
-            state=AutomationStateEnum.HUMAN_ACTIVE,
-            state_version=models.AutomationState.state_version + 1,
-            human_agent_id=agent_id,
-            state_changed_reason=reason,
-        )
+    await acquire_conversation_delivery_xact_lock(session, conversation_id)
+    stmt = update(models.AutomationState).where(
+        models.AutomationState.conversation_id == conversation_id,
+        models.AutomationState.state != AutomationStateEnum.HUMAN_ACTIVE,
+    )
+    if expected_state is not None:
+        stmt = stmt.where(models.AutomationState.state == expected_state)
+    stmt = stmt.values(
+        state=AutomationStateEnum.HUMAN_ACTIVE,
+        state_version=models.AutomationState.state_version + 1,
+        human_agent_id=agent_id,
+        state_changed_reason=reason,
     )
     result = await session.execute(stmt)
     flipped = result.rowcount > 0
@@ -97,7 +105,7 @@ async def flip_to_human_active(
                 detail={"reason": reason},
             )
         )
-        # This cancellation narrows the takeover race; delivery still rechecks BOT_ACTIVE.
+        # The shared advisory lock serializes this cancellation with external delivery.
         await session.execute(
             update(models.OutboxMessage)
             .where(

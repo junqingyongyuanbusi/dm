@@ -73,6 +73,40 @@ def test_meta_comment_conversation_key_is_thread_and_user_scoped():
     assert event.conversation_key == ("instagram_comment:account-uuid:media-1:comment-root:user-1")
 
 
+def _fb_feed(**value):
+    return MetaWebhookAdapter(
+        platform="facebook",
+        account_id="account-uuid",
+        external_account_id="page-1",
+    ).normalize(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "page-1",
+                    "changes": [{"field": "feed", "value": {"from": {"id": "user-1"}, **value}}],
+                }
+            ],
+        }
+    )
+
+
+def test_facebook_feed_accepts_comments():
+    (event,) = _fb_feed(
+        item="comment", verb="add", comment_id="c-1", post_id="p-1", message="hello"
+    )
+    assert event.reply_target == {"kind": "comment", "comment_id": "c-1"}
+    assert event.conversation_key == "facebook_comment:account-uuid:p-1:c-1:user-1"
+
+
+def test_facebook_feed_ignores_non_comment_items():
+    # feed 会推整个主页动态：别人在主页发的帖也带 from 和 message，
+    # 不看 item 就会把它当成评论去回复。
+    assert _fb_feed(item="status", verb="add", post_id="p-2", message="a wall post") == []
+    assert _fb_feed(item="like", verb="add", post_id="p-3") == []
+    assert _fb_feed(item="share", verb="add", post_id="p-4", message="shared") == []
+
+
 def test_x_self_echo_uses_external_account_id():
     events = XWebhookAdapter(account_id="account-uuid", external_account_id="x-bot").normalize(
         {
@@ -116,6 +150,66 @@ def test_whatsapp_normalization():
         "phone_number_id": "phone-1",
         "to": "15551234567",
     }
+
+
+def test_text_only_adapters_ignore_unsupported_message_occurrences():
+    meta_events = MetaWebhookAdapter().normalize(
+        {
+            "object": "page",
+            "entry": [
+                {
+                    "id": "page-1",
+                    "messaging": [
+                        {
+                            "sender": {"id": "user-1"},
+                            "message": {"mid": "m-attachment", "attachments": [{}]},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    whatsapp_events = WhatsAppWebhookAdapter(
+        account_id="account-1",
+        phone_number_id="phone-1",
+    ).normalize(
+        {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "value": {
+                                "metadata": {"phone_number_id": "phone-1"},
+                                "messages": [
+                                    {
+                                        "id": "wamid-image",
+                                        "from": "15551234567",
+                                        "type": "image",
+                                        "image": {"id": "image-1"},
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    x_events = XWebhookAdapter(account_id="account-1").normalize(
+        {
+            "dm_events": [
+                {
+                    "id": "receipt-1",
+                    "sender_id": "user-1",
+                    "event_type": "Read",
+                    "text": "not a message",
+                }
+            ]
+        }
+    )
+    assert meta_events == []
+    assert whatsapp_events == []
+    assert x_events == []
 
 
 def test_x_crc_signature_and_dm_normalization():
@@ -171,6 +265,46 @@ def test_x_v2_direct_message_events_format():
     assert events[0].external_user_id == "2041798240056598528"
     assert events[0].text == "hi"
     assert events[0].conversation_key == "x_dm:bot-1:2041798240056598528"
+
+
+def test_x_activity_dm_received_uses_dm_event_id_for_poll_deduplication():
+    events, status = XWebhookAdapter(
+        account_id="account-1",
+        external_account_id="bot-1",
+    ).normalize_activity_dm(
+        {
+            "data": {
+                "event_type": "dm.received",
+                "event_uuid": "activity-uuid-1",
+                "filter": {"user_id": "bot-1"},
+                "payload": {
+                    "id": "dm-1",
+                    "event_type": "MessageCreate",
+                    "sender_id": "user-1",
+                    "dm_conversation_id": "conversation-1",
+                    "text": "hello",
+                    "created_at": "2026-07-20T01:51:31Z",
+                },
+            }
+        }
+    )
+
+    assert status == "PENDING"
+    assert events[0].external_event_id == "dm-1"
+    assert events[0].event_namespace == "x.activity.dm_received"
+    assert events[0].event_metadata["activity_event_uuid"] == "activity-uuid-1"
+    assert events[0].reply_target == {"kind": "dm", "participant_id": "user-1"}
+
+
+def test_x_activity_dm_received_fails_closed_on_unknown_schema():
+    events, status = XWebhookAdapter(
+        account_id="account-1",
+        external_account_id="bot-1",
+    ).normalize_activity_dm(
+        {"data": {"event_type": "dm.received", "payload": {"unexpected": True}}}
+    )
+    assert events == []
+    assert status == "X_ACTIVITY_DM_SCHEMA_UNSUPPORTED"
 
 
 def test_x_v2_dm_from_self_is_ignored():

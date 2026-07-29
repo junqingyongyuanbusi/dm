@@ -5,6 +5,10 @@ from collections.abc import Mapping
 import httpx
 from authlib.integrations.httpx_client import AsyncOAuth1Client
 
+# XAA 可创建的事件类型。这份名单同时约束订阅协调循环（见 xchat_subscription），
+# 两边曾各持一份独立列表，改了一边另一边就在运行时才报 unsupported。
+SUPPORTED_ACTIVITY_EVENT_TYPES = ("dm.received", "chat.received", "post.mention.create")
+
 
 class XChatClient:
     """Small async client for the X Chat and X Activity endpoints.
@@ -120,15 +124,18 @@ class XChatClient:
         response.raise_for_status()
         return list(response.json().get("data") or [])
 
-    async def create_received_subscription(
+    async def create_activity_subscription(
         self,
         *,
+        event_type: str,
         user_id: str,
         webhook_id: str | None = None,
-        tag: str = "reply-core xchat",
+        tag: str,
     ) -> dict:
+        if event_type not in SUPPORTED_ACTIVITY_EVENT_TYPES:
+            raise ValueError(f"unsupported_x_activity_event_type:{event_type}")
         body: dict[str, object] = {
-            "event_type": "chat.received",
+            "event_type": event_type,
             "filter": {"user_id": user_id},
             "tag": tag,
         }
@@ -141,6 +148,20 @@ class XChatClient:
         )
         response.raise_for_status()
         return response.json()
+
+    async def create_received_subscription(
+        self,
+        *,
+        user_id: str,
+        webhook_id: str | None = None,
+        tag: str = "reply-core xchat",
+    ) -> dict:
+        return await self.create_activity_subscription(
+            event_type="chat.received",
+            user_id=user_id,
+            webhook_id=webhook_id,
+            tag=tag,
+        )
 
     async def list_webhooks(self) -> list[dict]:
         bearer = await self._app_bearer_token()
@@ -193,9 +214,7 @@ class XChatClient:
     async def _app_bearer_token(self) -> str:
         if self._app_bearer:
             return self._app_bearer
-        basic = base64.b64encode(
-            f"{self._consumer_key}:{self._consumer_secret}".encode()
-        ).decode()
+        basic = base64.b64encode(f"{self._consumer_key}:{self._consumer_secret}".encode()).decode()
         response = await self._app.post(
             "/oauth2/token",
             headers={"Authorization": f"Basic {basic}"},

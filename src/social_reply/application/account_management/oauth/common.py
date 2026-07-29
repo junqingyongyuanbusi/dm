@@ -1,11 +1,13 @@
 """Short-lived OAuth state stored encrypted in Redis.
 
-The random state value sent through the browser is only a lookup key. Sensitive
-values such as request-token secrets and account tokens are encrypted with the
-same application key ring used for persisted platform credentials. States are
-consumed atomically and expire after ten minutes.
+The random state value sent through the browser is only a lookup input. X OAuth
+transactions use its SHA-256 digest as the Redis key; sensitive values such as
+request-token secrets are encrypted with the same application key ring used for
+persisted platform credentials. States are consumed atomically and expire after
+ten minutes.
 """
 
+import hashlib
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -29,16 +31,35 @@ def oauth_redis():
     return aioredis.from_url(get_settings().redis_url)
 
 
+def oauth_state_key(namespace: str, key: str) -> str:
+    if namespace == "x":
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        return f"x:oauth1:transaction:{digest}"
+    return f"oauth:{namespace}:{key}"
+
+
+def _oauth_state_lookup_keys(namespace: str, key: str) -> tuple[str, ...]:
+    primary = oauth_state_key(namespace, key)
+    if namespace == "x":
+        # Consume transactions created immediately before a rolling deploy.
+        return primary, f"oauth:{namespace}:{key}"
+    return (primary,)
+
+
+def _oauth_state_write_key(namespace: str, key: str) -> str:
+    if namespace == "x" and get_settings().x_oauth_legacy_state_write:
+        return f"oauth:{namespace}:{key}"
+    return oauth_state_key(namespace, key)
+
+
 async def store_oauth_state(namespace: str, key: str, payload: Mapping[str, Any]) -> None:
-    encrypted = encrypt_secret_bundle(
-        {"payload": json.dumps(dict(payload), separators=(",", ":"))}
-    )
+    encrypted = encrypt_secret_bundle({"payload": json.dumps(dict(payload), separators=(",", ":"))})
     if encrypted is None:
         raise ValueError("oauth_state_encryption_failed")
     redis = oauth_redis()
     try:
         await redis.set(
-            f"oauth:{namespace}:{key}",
+            _oauth_state_write_key(namespace, key),
             json.dumps(encrypted, separators=(",", ":")),
             ex=STATE_TTL_SECONDS,
         )
@@ -46,18 +67,7 @@ async def store_oauth_state(namespace: str, key: str, payload: Mapping[str, Any]
         await redis.aclose()
 
 
-async def take_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
-    if not key:
-        return None
-    redis = oauth_redis()
-    redis_key = f"oauth:{namespace}:{key}"
-    try:
-        async with redis.pipeline(transaction=True) as pipe:
-            pipe.get(redis_key)
-            pipe.delete(redis_key)
-            value, _deleted = await pipe.execute()
-    finally:
-        await redis.aclose()
+def _decode_oauth_state(value: bytes | str | None) -> dict[str, Any] | None:
     if value is None:
         return None
     try:
@@ -71,8 +81,46 @@ async def take_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
         return None
 
 
+async def peek_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
+    if not key:
+        return None
+    redis = oauth_redis()
+    redis_keys = _oauth_state_lookup_keys(namespace, key)
+    try:
+        async with redis.pipeline(transaction=True) as pipe:
+            for redis_key in redis_keys:
+                pipe.get(redis_key)
+            values = await pipe.execute()
+    finally:
+        await redis.aclose()
+    return next(
+        (payload for value in values if (payload := _decode_oauth_state(value)) is not None),
+        None,
+    )
+
+
+async def take_oauth_state(namespace: str, key: str) -> dict[str, Any] | None:
+    if not key:
+        return None
+    redis = oauth_redis()
+    redis_keys = _oauth_state_lookup_keys(namespace, key)
+    try:
+        async with redis.pipeline(transaction=True) as pipe:
+            for redis_key in redis_keys:
+                pipe.get(redis_key)
+                pipe.delete(redis_key)
+            results = await pipe.execute()
+    finally:
+        await redis.aclose()
+    return next(
+        (payload for value in results[0::2] if (payload := _decode_oauth_state(value)) is not None),
+        None,
+    )
+
+
 async def principal_from_oauth_context(context: Mapping[str, Any]) -> Principal | None:
-    principal = await principal_from_session_id(context.get("session_id"))
+    session_id = context.get("admin_session_id") or context.get("session_id")
+    principal = await principal_from_session_id(session_id)
     if principal is None or principal.must_change_password:
         return None
     tenant_id = context.get("tenant_id")

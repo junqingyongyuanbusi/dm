@@ -1,5 +1,7 @@
 import os
 
+from sqlalchemy.engine import make_url
+
 # 测试套件必须与开发者本地 .env 隔离（密闭性）：
 # pydantic-settings 中真实环境变量优先于 .env 文件，这里用 setdefault 钉住
 # 所有影响决策/验签行为的配置为"测试默认值"——.env 里的真实凭证/开关不再泄漏进测试，
@@ -8,6 +10,7 @@ _TEST_DEFAULTS = {
     "TESTING": "true",
     # 集成测试会 drop/create 全部业务表，必须固定使用独立测试库，禁止读取 .env 开发库。
     "DATABASE_URL": "postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test",
+    "CHATWOOT_ENABLED": "true",
     "CHATWOOT_WEBHOOK_SECRET": "change-me",
     "CHATWOOT_BASE_URL": "http://localhost:3000",
     "CHATWOOT_API_TOKEN": "dev-local-token",
@@ -19,6 +22,12 @@ _TEST_DEFAULTS = {
     "ADMIN_ALLOWED_TENANTS": "default,tenant-a,tenant-b",
     "X_API_KEY": "ck-app",
     "X_API_SECRET": "cs-app",
+    "X_LEGACY_DM_ENABLED": "true",
+    "X_ACTIVITY_ENABLED": "true",
+    "XCHAT_ENABLED": "true",
+    "FACEBOOK_MESSENGER_ENABLED": "true",
+    "INSTAGRAM_MESSAGING_ENABLED": "true",
+    "WHATSAPP_ENABLED": "true",
     "FACEBOOK_APP_ID": "fb-app",
     "FACEBOOK_APP_SECRET": "fb-app-secret",
     "META_VERIFY_TOKEN": "meta-verify-token",
@@ -35,3 +44,7 @@ _TEST_DEFAULTS = {
 }
 for _k, _v in _TEST_DEFAULTS.items():
     os.environ.setdefault(_k, _v)
+
+_database_name = make_url(os.environ["DATABASE_URL"]).database or ""
+if not _database_name.endswith("_test"):
+    raise RuntimeError(f"pytest refuses to use non-test database: {_database_name or '<missing>'}")

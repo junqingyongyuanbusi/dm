@@ -44,9 +44,7 @@ async def test_environment_meta_app_public_id_is_tenant_scoped(monkeypatch):
     assert tenant_b.public_id == "meta_oauth_tenant-b"
 
 
-async def test_facebook_credentials_fall_back_to_tenant_platform_app(
-    session, monkeypatch
-):
+async def test_facebook_credentials_fall_back_to_tenant_platform_app(session, monkeypatch):
     class EmptySettings:
         facebook_app_credentials = None
 

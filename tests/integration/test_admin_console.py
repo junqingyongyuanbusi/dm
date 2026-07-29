@@ -1,3 +1,6 @@
+import uuid
+from datetime import UTC, datetime, timedelta
+
 import httpx
 import pytest
 from sqlalchemy import insert, select
@@ -60,35 +63,324 @@ async def test_console_pages_render_after_login(migrated_db):
             assert marker in resp.text
 
 
-async def test_accounts_page_renders_oauth_connect_cards(migrated_db):
-    """账号页展示 X、Facebook Login、Instagram Login 三种自动授权入口。"""
+async def test_accounts_page_renders_five_channel_tiles(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": True,
+            "facebook_messenger_enabled": True,
+            "instagram_messaging_enabled": True,
+            "whatsapp_enabled": True,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        resp = await client.get("/admin/accounts")
-    assert resp.status_code == 200
-    html = resp.text
-    assert 'action="/admin/oauth/x/start"' in html
-    assert 'action="/admin/oauth/meta/start"' in html
-    assert 'action="/admin/oauth/instagram/start"' in html
-    assert '<option value="default">default</option>' in html
-    assert 'name="brand_id" value="default"' in html
-    assert "Facebook Login · 多账号 OAuth" in html
-    assert "Instagram Login · 独立账号 OAuth" in html
-    assert 'name="platform"' in html and "关联 Facebook Page" in html
-    # 回调及共享 webhook URL 直接渲染在页面,便于登记到平台后台
-    assert "/admin/oauth/x/callback" in html
-    assert "授权确认页必须明确列出 Direct Messages 权限" in html
-    assert "/admin/oauth/meta/callback" in html
-    assert "/admin/oauth/instagram/callback" in html
-    assert "/webhooks/meta/meta_oauth_default" in html
-    assert "/webhooks/meta/instagram_oauth_default" in html
-    # Telegram 无 OAuth,给 BotFather 指引 + 手工表单
-    assert "BotFather" in html and 'action="/admin/connect/telegram"' in html
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "添加渠道" in html
+    for channel, label in (
+        ("x", "X"),
+        ("facebook", "Facebook"),
+        ("instagram", "Instagram"),
+        ("telegram", "Telegram"),
+        ("whatsapp", "WhatsApp"),
+    ):
+        assert f'data-channel="{channel}"' in html
+        assert f"/static/channel-icons/{channel}.svg" in html
+        assert f'aria-label="连接 {label}"' in html
+    assert 'id="channel-setup"' not in html
+    assert 'action="/admin/oauth/x/start"' not in html
+    assert 'action="/admin/connect/telegram"' not in html
 
 
-async def test_xchat_activation_error_renders_operator_notice(
+async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": True,
+            "facebook_messenger_enabled": True,
+            "instagram_messaging_enabled": True,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        x_page = await client.get("/admin/accounts?connect=x")
+        facebook_page = await client.get("/admin/accounts?connect=facebook")
+        instagram_page = await client.get("/admin/accounts?connect=instagram")
+
+    assert 'action="/admin/oauth/x/start"' in x_page.text
+    assert "XChat 4 位 PIN" in x_page.text
+    assert "/admin/oauth/x/callback" in x_page.text
+    assert 'action="/admin/connect/x"' in x_page.text
+
+    assert 'action="/admin/oauth/meta/start"' in facebook_page.text
+    assert 'name="platform" value="facebook"' in facebook_page.text
+    assert "pages_messaging" in facebook_page.text
+    assert 'action="/admin/connect/meta"' in facebook_page.text
+
+    assert 'action="/admin/oauth/instagram/start"' in instagram_page.text
+    assert 'action="/admin/oauth/meta/start"' in instagram_page.text
+    assert 'name="platform" value="instagram"' in instagram_page.text
+    assert "不需要关联 Facebook Page" in instagram_page.text
+    assert "适用于已关联 Facebook Page" in instagram_page.text
+    assert 'name="page_id"' in instagram_page.text
+    assert 'name="enable_comments" value="false"' in instagram_page.text
+
+
+async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"whatsapp_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        telegram_page = await client.get("/admin/accounts?connect=telegram")
+        whatsapp_page = await client.get("/admin/accounts?connect=whatsapp")
+
+    assert 'action="/admin/connect/telegram"' in telegram_page.text
+    assert "@BotFather" in telegram_page.text
+    assert 'name="token"' in telegram_page.text
+    assert 'action="/admin/connect/whatsapp"' in whatsapp_page.text
+    assert "Phone Number ID" in whatsapp_page.text
+    assert 'name="access_token"' in whatsapp_page.text
+    assert 'name="verify_token"' in whatsapp_page.text
+
+
+async def test_meta_account_automation_only_converges_to_draft_while_switch_is_off(
+    session, migrated_db
+):
+    account_id = uuid.uuid4()
+    legacy_active_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="instagram",
+            name="@shop",
+            external_account_id="ig-1",
+            public_id=f"ig_{uuid.uuid4().hex}",
+            config={"meta_health_status": "READY"},
+            capability={"dm": True, "comments": False, "max_text_length": 1000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=legacy_active_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="facebook",
+            name="Legacy Page",
+            external_account_id="page-legacy",
+            public_id=f"fb_{uuid.uuid4().hex}",
+            config={"meta_health_status": "READY"},
+            capability={"dm": True, "comments": False, "max_text_length": 2000},
+            automation_default="BOT_ACTIVE",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/accounts")
+        assert f'action="/admin/accounts/{account_id}/automation"' not in page.text
+        assert f'action="/admin/accounts/{legacy_active_id}/automation"' in page.text
+        rejected = await client.post(
+            f"/admin/accounts/{account_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
+        )
+        converged = await client.post(
+            f"/admin/accounts/{legacy_active_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_DRAFT_ONLY"},
+        )
+    assert rejected.status_code == 422
+    assert converged.status_code == 303
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    legacy_active = await session.get(models.PlatformAccount, legacy_active_id)
+    assert account.automation_default == "BOT_DRAFT_ONLY"
+    assert legacy_active.automation_default == "BOT_DRAFT_ONLY"
+
+
+async def test_meta_account_can_be_promoted_once_deployment_opts_in(
     session, migrated_db, monkeypatch
 ):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="facebook",
+            name="Page",
+            external_account_id="page-optin",
+            public_id=f"fb_{uuid.uuid4().hex}",
+            config={"meta_health_status": "READY"},
+            capability={"dm": True, "comments": False, "max_text_length": 2000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/accounts")
+        assert f'action="/admin/accounts/{account_id}/automation"' in page.text
+        promoted = await client.post(
+            f"/admin/accounts/{account_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
+        )
+    assert promoted.status_code == 303
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.automation_default == "BOT_ACTIVE"
+    entry = (
+        await session.execute(
+            select(models.AuditLog).where(
+                models.AuditLog.subject_id == str(account_id),
+                models.AuditLog.action == "SET_AUTOMATION_DEFAULT",
+            )
+        )
+    ).scalar_one()
+    assert entry.detail == {
+        "from": "BOT_DRAFT_ONLY",
+        "to": "BOT_ACTIVE",
+        "platform": "facebook",
+    }
+
+
+async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
+    migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "facebook_messenger_enabled": False,
+            "instagram_messaging_enabled": False,
+            "whatsapp_enabled": False,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+        disabled = await client.get("/admin/accounts?connect=instagram")
+
+    assert response.status_code == 200
+    for channel in ("facebook", "instagram", "whatsapp"):
+        assert f'data-channel="{channel}" role="listitem" aria-disabled="true"' in response.text
+        assert f'href="/admin/accounts?connect={channel}' not in response.text
+    assert 'action="/admin/oauth/meta/start"' not in response.text
+    assert 'action="/admin/oauth/instagram/start"' not in response.text
+    assert 'action="/admin/connect/whatsapp"' not in response.text
+    assert "该渠道尚未在当前部署启用" in disabled.text
+    assert 'id="channel-setup"' not in disabled.text
+
+
+async def test_accounts_page_disables_x_tile_when_all_stacks_are_off(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": False,
+            "x_activity_enabled": False,
+            "xchat_enabled": False,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+        disabled = await client.get("/admin/accounts?connect=x")
+
+    assert response.status_code == 200
+    assert 'data-channel="x" role="listitem" aria-disabled="true"' in response.text
+    assert 'href="/admin/accounts?connect=x' not in response.text
+    assert 'action="/admin/oauth/x/start"' not in response.text
+    assert 'action="/admin/connect/x"' not in response.text
+    assert "XChat 4 位 PIN" not in disabled.text
+    assert "该渠道尚未在当前部署启用" in disabled.text
+
+
+async def test_accounts_page_renders_x_oauth_result_banner(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        connected = await client.get("/admin/accounts?provider=x&status=connected")
+        processing = await client.get(
+            "/admin/accounts?provider=x&status=processing&code=provisioning_in_progress"
+        )
+        failed = await client.get(
+            "/admin/accounts?provider=x&status=error&code=x_token_exchange_rejected"
+        )
+    assert "X 账号授权并连接成功" in connected.text
+    assert "正在后台完成" in processing.text
+    assert "x_token_exchange_rejected" in failed.text
+
+
+async def test_accounts_page_shows_independent_x_transport_states(session, migrated_db):
+    import uuid
+
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            name="@xbot",
+            external_account_id="x-1",
+            public_id="x-public-state",
+            credential_bundle=encrypt_secret_bundle(
+                {
+                    "consumer_key": "ck",
+                    "consumer_secret": "cs",
+                    "access_token": "at",
+                    "access_token_secret": "ats",
+                }
+            ),
+            config={
+                "xchat_registered": True,
+                "xchat_key_state": "RECOVERY_REQUIRED",
+                "x_activity_subscriptions": {
+                    "dm.received": {"status": "ACTIVE"},
+                    "chat.received": {"status": "ACTIVE"},
+                },
+            },
+            capability={"dm": True, "x_chat": False, "mentions": True},
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    assert "Legacy DM" in response.text
+    assert "DM Activity" in response.text
+    assert "XChat Key" in response.text
+    assert "RECOVERY_REQUIRED" in response.text
+    assert f'action="/admin/accounts/{account_id}/xchat"' in response.text
+    assert "恢复 XChat 密钥" in response.text
+
+
+async def test_xchat_activation_error_renders_operator_notice(session, migrated_db, monkeypatch):
     import uuid
 
     from social_reply.application.account_management import admin_console
@@ -143,9 +435,7 @@ async def test_xchat_activation_error_renders_operator_notice(
     assert "1234" not in response.text
 
 
-async def test_pin_provisioning_job_requires_secret_resubmission(
-    session, migrated_db
-):
+async def test_pin_provisioning_job_requires_secret_resubmission(session, migrated_db):
     import uuid
 
     job_id = uuid.uuid4()
@@ -193,9 +483,94 @@ async def test_pin_provisioning_job_requires_secret_resubmission(
     assert retry.json()["detail"] == "provisioning_secret_resubmission_required"
 
 
+async def test_retryable_provisioning_job_renders_as_processing(session, migrated_db):
+    import uuid
+
+    job_id = uuid.uuid4()
+    await session.execute(
+        insert(models.ProvisioningJob).values(
+            id=job_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            actor="user:admin",
+            idempotency_key="scheduled-retry",
+            request={"environment": "oauth"},
+            staging_secret=encrypt_secret_bundle(
+                {
+                    "consumer_key": "ck",
+                    "consumer_secret": "cs",
+                    "access_token": "at",
+                    "access_token_secret": "ats",
+                }
+            ),
+            status="FAILED",
+            current_step="FAILED",
+            next_attempt_at=datetime.now(UTC) + timedelta(minutes=1),
+            last_error_code="PLATFORM_TEMPORARY_ERROR",
+            last_error_message="temporary",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get(f"/admin/jobs/{job_id}")
+        accounts = await client.get("/admin/accounts")
+
+    assert page.status_code == 200
+    assert "PROCESSING" in page.text
+    assert "每 4 秒自动刷新" in page.text
+    assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
+    assert "PROCESSING" in accounts.text
+
+
+async def test_stalled_provisioning_retry_renders_as_failed(session, migrated_db):
+    import uuid
+
+    job_id = uuid.uuid4()
+    await session.execute(
+        insert(models.ProvisioningJob).values(
+            id=job_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="x",
+            actor="user:admin",
+            idempotency_key="stalled-retry",
+            request={"environment": "oauth"},
+            staging_secret=encrypt_secret_bundle(
+                {
+                    "consumer_key": "ck",
+                    "consumer_secret": "cs",
+                    "access_token": "at",
+                    "access_token_secret": "ats",
+                }
+            ),
+            status="FAILED",
+            current_step="FAILED",
+            next_attempt_at=datetime.now(UTC) - timedelta(minutes=5),
+            last_error_code="PLATFORM_TEMPORARY_ERROR",
+            last_error_message="temporary",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get(f"/admin/jobs/{job_id}")
+        accounts = await client.get("/admin/accounts")
+
+    assert page.status_code == 200
+    assert "FAILED" in page.text
+    assert "每 4 秒自动刷新" not in page.text
+    assert f'action="/admin/jobs/{job_id}/retry"' in page.text
+    assert "FAILED" in accounts.text
+
+
 async def test_conversation_state_flip_takeover(session, migrated_db):
     # 构造一个 BOT_ACTIVE 会话，验证人工接管把状态翻到 HUMAN_ACTIVE
-    account_id, contact_id, conv_id = (
+    account_id, contact_id, conv_id, outbox_id = (
+        __import__("uuid").uuid4(),
         __import__("uuid").uuid4(),
         __import__("uuid").uuid4(),
         __import__("uuid").uuid4(),
@@ -233,6 +608,19 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
         )
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=outbox_id,
+            conversation_id=conv_id,
+            platform_account_id=account_id,
+            destination_type="telegram_message",
+            destination_id="telegram:x:u1",
+            message_type="text",
+            payload={"text": "pending"},
+            idempotency_key=str(outbox_id),
+            status="PENDING",
+        )
+    )
     await session.commit()
 
     async with _app_client() as client:
@@ -254,6 +642,20 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
         )
     ).scalar_one()
     assert state == "HUMAN_ACTIVE"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    audit = (
+        await session.execute(
+            select(models.AuditLog).where(
+                models.AuditLog.category == "state_transition",
+                models.AuditLog.subject_id == str(conv_id),
+            )
+        )
+    ).scalar_one()
+    assert outbox.status == "CANCELLED"
+    assert outbox.last_error_code == "TAKEOVER"
+    assert audit.action == "HUMAN_ACTIVE"
+    assert audit.detail == {"reason": "admin_manual"}
 
 
 async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkeypatch):
@@ -282,7 +684,6 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
     assert any(d.question == "你们几点营业" for d in docs)
     chunk = (await session.execute(select(models.KnowledgeChunk))).scalars().first()
     assert chunk.embed_text == "你们几点营业"  # 非对称嵌入：只嵌问题
-
 
 
 async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatch):
