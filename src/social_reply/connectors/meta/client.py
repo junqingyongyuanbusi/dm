@@ -47,6 +47,10 @@ def missing_comment_permissions(
     if not isinstance(data, dict) or data.get("is_valid") is not True:
         raise ValueError("meta_access_token_invalid")
     scopes = {str(scope) for scope in data.get("scopes") or [] if isinstance(scope, str)}
+    page_target_matches: bool | None = None
+    if target_id is not None and str(data.get("type") or "").upper() == "PAGE":
+        profile_id = data.get("profile_id")
+        page_target_matches = profile_id is not None and str(profile_id) == str(target_id)
     granular: dict[str, set[str]] = {}
     for item in data.get("granular_scopes") or []:
         if not isinstance(item, dict) or not isinstance(item.get("scope"), str):
@@ -58,6 +62,12 @@ def missing_comment_permissions(
     for permission in required_permissions:
         if permission not in scopes:
             missing.append(permission)
+            continue
+        # A Page token is already bound to profile_id. Meta commonly omits
+        # granular target_ids when debugging these tokens.
+        if page_target_matches is not None:
+            if not page_target_matches:
+                missing.append(permission)
             continue
         targets = granular.get(permission)
         if targets is not None and target_id is not None and target_id not in targets:

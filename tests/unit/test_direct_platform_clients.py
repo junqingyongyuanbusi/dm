@@ -67,6 +67,50 @@ def test_facebook_comment_permissions_must_target_selected_page():
     )
 
 
+def test_page_token_uses_profile_id_when_granular_targets_are_empty():
+    payload = {
+        "data": {
+            "is_valid": True,
+            "type": "PAGE",
+            "profile_id": "page-1",
+            "scopes": [
+                "pages_read_engagement",
+                "pages_read_user_content",
+                "pages_manage_engagement",
+            ],
+            "granular_scopes": [
+                {"scope": "pages_read_engagement"},
+                {"scope": "pages_read_user_content"},
+                {"scope": "pages_manage_engagement"},
+            ],
+        }
+    }
+
+    assert missing_facebook_comment_permissions(payload, "page-1") == ()
+
+
+@pytest.mark.parametrize("profile_id", [None, "page-2"])
+def test_page_token_rejects_missing_or_mismatched_profile_id(profile_id):
+    payload = {
+        "data": {
+            "is_valid": True,
+            "type": "PAGE",
+            "profile_id": profile_id,
+            "scopes": [
+                "pages_read_engagement",
+                "pages_read_user_content",
+                "pages_manage_engagement",
+            ],
+        }
+    }
+
+    assert missing_facebook_comment_permissions(payload, "page-1") == (
+        "pages_read_engagement",
+        "pages_read_user_content",
+        "pages_manage_engagement",
+    )
+
+
 async def test_meta_client_rejects_comment_permissions_for_another_page():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v23.0/debug_token"
@@ -141,6 +185,37 @@ async def test_facebook_login_instagram_comment_permissions_target_linked_page()
     with pytest.raises(MetaCommentPermissionError) as exc_info:
         await client.require_instagram_comment_permissions(app_id="app-1")
     assert exc_info.value.missing_permissions == ("instagram_manage_comments",)
+    await client.aclose()
+
+
+async def test_facebook_login_instagram_accepts_page_token_without_granular_targets():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v23.0/debug_token"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "is_valid": True,
+                    "type": "PAGE",
+                    "profile_id": "page-1",
+                    "scopes": ["pages_read_engagement", "instagram_manage_comments"],
+                    "granular_scopes": [
+                        {"scope": "pages_read_engagement"},
+                        {"scope": "instagram_manage_comments"},
+                    ],
+                }
+            },
+        )
+
+    client = MetaGraphClient(
+        platform="instagram",
+        access_token="page-token",
+        app_secret="secret",
+        external_account_id="ig-1",
+        page_id="page-1",
+        transport=httpx.MockTransport(handler),
+    )
+    await client.require_instagram_comment_permissions(app_id="app-1")
     await client.aclose()
 
 
