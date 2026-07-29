@@ -1,8 +1,7 @@
-from social_reply.application.reply_decision.pipeline import (
-    DecisionSnapshot,
-    run_decision_pipeline,
-)
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.application.reply_decision.jobs import snapshot_from_dict, snapshot_to_dict
+from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
+from social_reply.domain.messages.canonical import ChannelType
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.llm import StubLLMClient
 
 
@@ -21,17 +20,19 @@ class _BrokenSwitch:
         raise ConnectionError("redis down")
 
 
-def _snap(state="BOT_ACTIVE", text="请问怎么改邮箱"):
-    return DecisionSnapshot(
-        text=text,
-        platform="telegram",
-        tenant_id="default",
-        brand_id="b1",
-        account_id="acc1",
-        conversation_key="telegram:acc1:9",
-        automation_state=state,
-        state_version=1,
-    )
+def _snap(state="BOT_ACTIVE", text="请问怎么改邮箱", **overrides):
+    values = {
+        "text": text,
+        "platform": "telegram",
+        "tenant_id": "default",
+        "brand_id": "b1",
+        "account_id": "acc1",
+        "conversation_key": "telegram:acc1:9",
+        "automation_state": state,
+        "state_version": 1,
+    }
+    values.update(overrides)
+    return DecisionSnapshot(**values)
 
 
 async def test_bot_active_normal_question_auto_replies_via_llm():
@@ -174,3 +175,55 @@ async def test_rule_handoff_is_not_converted_to_auto_reply():
     )
     assert d.action is ReplyAction.HANDOFF
     assert "LLM_HANDOFF_FALLBACK" not in d.reason_codes
+
+
+async def test_facebook_comment_forces_public_visibility_before_guard():
+    class _PrivateLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="公开答复",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(
+            platform="facebook",
+            channel_type=ChannelType.COMMENT,
+        ),
+        llm=_PrivateLLM(),
+        killswitch=_OpenSwitch(),
+    )
+
+    assert decision.reply_visibility is Visibility.PUBLIC
+    assert "FACEBOOK_COMMENT_PUBLIC" in decision.reason_codes
+
+
+async def test_facebook_comment_private_pii_is_blocked_after_becoming_public():
+    class _PrivatePiiLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="请联系 alice@example.com",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(platform="facebook", channel_type=ChannelType.COMMENT),
+        llm=_PrivatePiiLLM(),
+        killswitch=_OpenSwitch(),
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert "GUARD_PII_LEAK" in decision.reason_codes
+
+
+def test_decision_snapshot_channel_type_round_trips_and_old_jobs_default_to_dm():
+    comment = _snap(platform="facebook", channel_type=ChannelType.COMMENT)
+    serialized = snapshot_to_dict(comment)
+
+    assert snapshot_from_dict(serialized).channel_type is ChannelType.COMMENT
+    serialized.pop("channel_type")
+    assert snapshot_from_dict(serialized).channel_type is ChannelType.DM

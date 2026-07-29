@@ -14,6 +14,7 @@ from social_reply.application.reply_decision.runner import (
     DecisionContextScopeError,
     run_and_persist_decision,
 )
+from social_reply.domain.messages.canonical import ChannelType
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -40,6 +41,7 @@ def snapshot_to_dict(snapshot: DecisionSnapshot) -> dict[str, str | int | None]:
         "conversation_key": snapshot.conversation_key,
         "automation_state": snapshot.automation_state,
         "state_version": snapshot.state_version,
+        "channel_type": snapshot.channel_type.value,
     }
 
 
@@ -53,6 +55,7 @@ def snapshot_from_dict(value: dict) -> DecisionSnapshot:
         conversation_key=value["conversation_key"],
         automation_state=value["automation_state"],
         state_version=int(value["state_version"]),
+        channel_type=ChannelType(value.get("channel_type", ChannelType.DM)),
     )
 
 

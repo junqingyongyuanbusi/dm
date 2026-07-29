@@ -69,6 +69,8 @@ API, Worker and Scheduler must use the same values.
 | `FACEBOOK_MESSENGER_ENABLED` | `true` | Facebook Page text-DM ingress, provisioning, health reconciliation and sending |
 | `INSTAGRAM_MESSAGING_ENABLED` | `true` | Instagram professional-account text-DM ingress, provisioning, health reconciliation and sending |
 | `WHATSAPP_ENABLED` | `true` | WhatsApp Cloud API ingress, provisioning and sending |
+| `META_AUTO_REPLY_ENABLED` | `false` | Allows Meta accounts to use `BOT_ACTIVE`; account-level mode applies to both Facebook DMs and comments |
+| `META_COMMENT_REPLY_ENABLED` | `false` | Enables Facebook Page comment OAuth scopes, `feed` subscription, ingress and public child-comment replies |
 | `FACEBOOK_APP_ID` | empty | Facebook Login App ID |
 | `FACEBOOK_APP_SECRET` | empty | Must be paired with Facebook App ID |
 | `META_VERIFY_TOKEN` | empty | Shared Meta webhook verify token |
@@ -99,6 +101,17 @@ Instagram requests store one minimal verified-request record plus account-scoped
 RawEvents, so replay and tenant ownership do not depend on an account-unscoped multi-entry payload.
 Page/account Graph calls include `appsecret_proof`; the Scheduler repairs missing `messages`
 subscriptions and records sanitized provider health in `PlatformAccount.config`.
+
+Facebook comment auto-replies require `FACEBOOK_MESSENGER_ENABLED=true`,
+`META_COMMENT_REPLY_ENABLED=true`, and `META_AUTO_REPLY_ENABLED=true` on API, Worker, and Scheduler.
+New Facebook authorizations then default to `comments=true` and `BOT_ACTIVE`; Messenger DMs on the
+same Page are also automatic because automation mode is account-scoped. OAuth requests
+`pages_read_engagement`, `pages_read_user_content`, and `pages_manage_engagement`, validates that
+all three permissions target the selected Page, and subscribes the Page to `feed`. Existing Page
+tokens must be reauthorized from `/admin/accounts`; missing or wrong-Page permissions produce
+`META_COMMENT_PERMISSION_REQUIRED` and health status `REAUTH_REQUIRED`. Replies are always public
+child comments on the source comment. Instagram remains comments-disabled and draft-only by
+default.
 
 ## Decision, LLM and knowledge
 

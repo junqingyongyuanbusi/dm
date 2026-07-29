@@ -18,7 +18,7 @@ from social_reply.application.platform_accounts import (
     get_platform_app_runtime,
     list_active_accounts_by_platform,
 )
-from social_reply.connectors.meta.client import MetaGraphClient
+from social_reply.connectors.meta.client import MetaCommentPermissionError, MetaGraphClient
 from social_reply.domain.platform_accounts import CapabilityKey, capability_enabled
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -29,6 +29,8 @@ _last_check_at: float | None = None
 
 
 def _health_error_code(exc: Exception) -> str:
+    if isinstance(exc, MetaCommentPermissionError):
+        return "META_COMMENT_PERMISSION_REQUIRED"
     if isinstance(exc, httpx.HTTPStatusError):
         try:
             payload = exc.response.json()
@@ -188,6 +190,10 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
         profile = await client.get_account()
         if str(profile.get("id") or "") != account.external_account_id:
             raise ValueError("meta_token_account_mismatch")
+        if account.platform == "facebook" and capability_enabled(
+            account.capability, CapabilityKey.COMMENTS
+        ):
+            await client.require_facebook_comment_permissions(app_id=app.external_app_id)
         subscription_account_id = _subscription_account_id(account)
         observed = await get_meta_subscription_fields(
             platform=account.platform,
@@ -242,7 +248,11 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
         return str(account.id) if status != "READY" else None
     except Exception as exc:  # noqa: BLE001 - provider failures become sanitized health state
         error_code = _health_error_code(exc)
-        status = "REAUTH_REQUIRED" if error_code.endswith("_190") else "ERROR"
+        status = (
+            "REAUTH_REQUIRED"
+            if error_code.endswith("_190") or error_code == "META_COMMENT_PERMISSION_REQUIRED"
+            else "ERROR"
+        )
         await _save_health(account.id, status=status, error_code=error_code)
         logger.warning(
             "meta health check failed account=%s platform=%s code=%s",

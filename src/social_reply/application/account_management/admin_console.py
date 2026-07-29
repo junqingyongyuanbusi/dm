@@ -1612,11 +1612,14 @@ async def accounts_page(request: Request) -> Response:
                 xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="csrf_token" value="{csrf}"><input type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><button class="btn-sm btn-ghost">恢复 XChat 密钥</button></form>"""
         elif a.platform in {"facebook", "instagram"}:
             account_config = dict(a.config or {})
+            capability = dict(a.capability or {})
             health_status = str(account_config.get("meta_health_status") or "UNKNOWN")
             subscribed = ", ".join(account_config.get("meta_subscribed_fields") or []) or "—"
             error_code = str(account_config.get("meta_health_error_code") or "—")
+            comments_status = health_status if capability.get("comments") else "DISABLED"
             channel_status = (
                 f"<div>Messaging {_pill(health_status)}</div>"
+                f"<div>Comments {_pill(comments_status)}</div>"
                 f"<div class='muted'>{html.escape(subscribed)}</div>"
                 f"<div class='muted'>{html.escape(error_code)}</div>"
             )
@@ -1704,7 +1707,15 @@ async def accounts_page(request: Request) -> Response:
     channel_picker = f"""<section class="channel-section" aria-labelledby="add-channel-title">
 <div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">5 个平台</span></div>
 <div class="channel-grid" role="list">{channel_tiles}</div></section>{channel_notice}"""
-    meta_policy_fields = """<input type="hidden" name="instagram_login_mode" value="facebook_login"><input type="hidden" name="enable_dm" value="true"><input type="hidden" name="enable_comments" value="false"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">"""
+    facebook_comments = settings.meta_comment_reply_enabled
+    facebook_auto = facebook_comments and settings.meta_auto_reply_enabled
+    facebook_policy_fields = (
+        '<input type="hidden" name="instagram_login_mode" value="facebook_login">'
+        '<input type="hidden" name="enable_dm" value="true">'
+        f'<input type="hidden" name="enable_comments" value="{str(facebook_comments).lower()}">'
+        f'<input type="hidden" name="automation_default" value="{"BOT_ACTIVE" if facebook_auto else "BOT_DRAFT_ONLY"}">'
+    )
+    instagram_policy_fields = """<input type="hidden" name="instagram_login_mode" value="facebook_login"><input type="hidden" name="enable_dm" value="true"><input type="hidden" name="enable_comments" value="false"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">"""
     selected_panel = ""
     if selected_channel == "x":
         selected_panel = f"""<section class="channel-setup" id="channel-setup">
@@ -1717,15 +1728,15 @@ async def accounts_page(request: Request) -> Response:
         selected_panel = f"""<section class="channel-setup" id="channel-setup">
 {_channel_setup_head("facebook", "连接 Facebook Page 的 Messenger 私信")}
 <form class="channel-form" method="post" action="/admin/oauth/meta/start">{oauth_fields()}<input type="hidden" name="platform" value="facebook">
-<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(meta_callback)}</code></dd><dt>权限</dt><dd>pages_show_list · pages_messaging · pages_manage_metadata</dd></dl>
+<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(meta_callback)}</code></dd><dt>权限</dt><dd>pages_show_list · pages_messaging · pages_manage_metadata{" · pages_read_engagement · pages_read_user_content · pages_manage_engagement" if facebook_comments else ""}</dd></dl>
 <button class="btn-block">继续使用 Facebook 登录</button></form>
-<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="facebook">{_input("external_account_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{meta_policy_fields}<button class="btn-block">连接 Facebook</button></form></div></details></section>"""
+<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="facebook">{_input("external_account_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{facebook_policy_fields}<button class="btn-block">连接 Facebook</button></form></div></details></section>"""
     elif selected_channel == "instagram":
         selected_panel = f"""<section class="channel-setup" id="channel-setup">
 {_channel_setup_head("instagram", "选择 Instagram 专业账号的登录方式")}
 <div class="channel-mode-grid"><div class="channel-mode"><h3>Instagram 登录</h3><p class="hint">不需要关联 Facebook Page</p><form method="post" action="/admin/oauth/instagram/start">{oauth_fields()}<dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(instagram_callback)}</code></dd></dl><button class="btn-block">继续使用 Instagram 登录</button></form></div>
 <div class="channel-mode"><h3>Facebook 登录</h3><p class="hint">适用于已关联 Facebook Page 的专业账号</p><form method="post" action="/admin/oauth/meta/start">{oauth_fields()}<input type="hidden" name="platform" value="instagram"><dl class="channel-meta"><dt>Callback URI</dt><dd><code>{html.escape(meta_callback)}</code></dd></dl><button class="btn-block">继续使用 Facebook 登录</button></form></div></div>
-<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="instagram">{_input("external_account_id", "Instagram Professional Account ID")}{_input("page_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{meta_policy_fields}<button class="btn-block">连接 Instagram</button></form></div></details></section>"""
+<details class="advanced-connect"><summary>高级连接：使用已有 Page Token</summary><div class="advanced-body"><form method="post" action="/admin/connect/meta">{common}<input type="hidden" name="platform" value="instagram">{_input("external_account_id", "Instagram Professional Account ID")}{_input("page_id", "Facebook Page ID")}{_input("access_token", "Page Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}{instagram_policy_fields}<button class="btn-block">连接 Instagram</button></form></div></details></section>"""
     elif selected_channel == "telegram":
         selected_panel = f"""<section class="channel-setup" id="channel-setup">
 {_channel_setup_head("telegram", "连接 Telegram Bot")}

@@ -225,6 +225,8 @@ async def connect_meta_account(
     )
     if not enable_dm:
         raise ValueError("meta_dm_required")
+    if platform == "instagram" and enable_comments:
+        raise ValueError("instagram_comments_disabled")
     if enable_comments and not get_settings().meta_comment_reply_enabled:
         raise ValueError("meta_comment_reply_disabled")
     if not get_settings().meta_automation_default_allowed(platform, automation_default):
@@ -246,32 +248,33 @@ async def connect_meta_account(
     )
     try:
         profile = await client.get_account()
+        if str(profile.get("id")) != external_account_id:
+            raise ValueError("meta_token_account_mismatch")
+        (
+            platform_app_id,
+            resolved_app_public_id,
+            resolved_verify_token,
+            external_app_id,
+        ) = await provision_meta_app(
+            tenant_id=tenant_id,
+            app_id=app_id,
+            app_public_id=app_public_id,
+            app_name=app_name,
+            app_secret=app_secret,
+            verify_token=verify_token,
+            secrets_root=secrets_root,
+            graph_base_url=graph_base_url,
+            api_version=api_version,
+            platform_family=(
+                "instagram"
+                if platform == "instagram" and instagram_login_mode == "instagram_login"
+                else "meta"
+            ),
+        )
+        if platform == "facebook" and enable_comments:
+            await client.require_facebook_comment_permissions(app_id=external_app_id)
     finally:
         await client.aclose()
-    if str(profile.get("id")) != external_account_id:
-        raise ValueError("meta_token_account_mismatch")
-
-    (
-        platform_app_id,
-        resolved_app_public_id,
-        resolved_verify_token,
-        external_app_id,
-    ) = await provision_meta_app(
-        tenant_id=tenant_id,
-        app_id=app_id,
-        app_public_id=app_public_id,
-        app_name=app_name,
-        app_secret=app_secret,
-        verify_token=verify_token,
-        secrets_root=secrets_root,
-        graph_base_url=graph_base_url,
-        api_version=api_version,
-        platform_family=(
-            "instagram"
-            if platform == "instagram" and instagram_login_mode == "instagram_login"
-            else "meta"
-        ),
-    )
     desired_fields = meta_subscription_fields(
         platform=platform,
         enable_dm=enable_dm,

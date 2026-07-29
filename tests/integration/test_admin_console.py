@@ -71,6 +71,8 @@ async def test_accounts_page_renders_five_channel_tiles(migrated_db, monkeypatch
             "x_legacy_dm_enabled": True,
             "facebook_messenger_enabled": True,
             "instagram_messaging_enabled": True,
+            "meta_comment_reply_enabled": True,
+            "meta_auto_reply_enabled": True,
             "whatsapp_enabled": True,
         }
     )
@@ -105,6 +107,8 @@ async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypat
             "x_legacy_dm_enabled": True,
             "facebook_messenger_enabled": True,
             "instagram_messaging_enabled": True,
+            "meta_comment_reply_enabled": True,
+            "meta_auto_reply_enabled": True,
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
@@ -122,6 +126,9 @@ async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypat
     assert 'action="/admin/oauth/meta/start"' in facebook_page.text
     assert 'name="platform" value="facebook"' in facebook_page.text
     assert "pages_messaging" in facebook_page.text
+    assert "pages_read_user_content" in facebook_page.text
+    assert 'name="enable_comments" value="true"' in facebook_page.text
+    assert 'name="automation_default" value="BOT_ACTIVE"' in facebook_page.text
     assert 'action="/admin/connect/meta"' in facebook_page.text
 
     assert 'action="/admin/oauth/instagram/start"' in instagram_page.text

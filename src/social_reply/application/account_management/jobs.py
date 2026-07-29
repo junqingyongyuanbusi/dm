@@ -18,6 +18,7 @@ from social_reply.application.account_management.service import (
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.connectors.meta.client import MetaCommentPermissionError
 from social_reply.domain.platform_accounts import SUPPORTED_ACCOUNT_PLATFORMS
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -80,6 +81,12 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
         # The XChat PIN is removed after the first attempt. Never schedule an
         # automatic retry that would silently reconnect without unlocking keys.
         return exc.code, exc.operator_message, False
+    if isinstance(exc, MetaCommentPermissionError):
+        return (
+            "META_COMMENT_PERMISSION_REQUIRED",
+            "请重新授权 Facebook Page，并允许页面互动读取、用户内容读取和互动管理权限。",
+            False,
+        )
     if isinstance(exc, ValueError) and str(exc).startswith("x_direct_message_permission_missing:"):
         return (
             "X_DM_PERMISSION_REQUIRED",

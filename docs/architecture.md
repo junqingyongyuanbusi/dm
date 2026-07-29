@@ -126,12 +126,15 @@ resumable backfill.
 ## Meta platform boundaries
 
 Facebook Messenger, Instagram Messaging, and WhatsApp use independent Settings gates even though
-they share the signed Meta webhook route. Messenger and Instagram are text-DM-only launch paths:
-OAuth/provisioning request DM permissions, install the `messages` subscription, keep comments out of
-capability-gated ingress, and default new conversations to `BOT_DRAFT_ONLY`. A verified enabled
-request writes one minimal app-scoped request record plus one owned RawEvent per recognized account
-entry. A disabled event family stores only a tenant/app-scoped audit summary and SHA-256 body digest,
-then acknowledges without dispatch.
+they share the signed Meta webhook route. Instagram remains a text-DM-only, draft-first path.
+Facebook is also DM-only by default, but enabling both Meta release switches makes newly authorized
+Pages comment-capable and `BOT_ACTIVE`: OAuth validates Page-targeted comment permissions,
+provisioning installs `messages` plus `feed`, and comment decisions are forced to public visibility
+before Final Guard. Delivery therefore creates only `meta_public_comment` child replies, never
+`meta_private_reply`; the account-level automation state also applies to Messenger DMs. A verified
+enabled request writes one minimal app-scoped request record plus one owned RawEvent per recognized
+account entry. A disabled event family stores only a tenant/app-scoped audit summary and SHA-256
+body digest, then acknowledges without dispatch.
 
 Instagram credential paths remain explicit. Facebook Login stores a Page token, IG professional
 account ID and required Page ID under `PlatformApp(platform_family=meta)`; subscription and sending
@@ -143,7 +146,7 @@ these two App families.
 Meta Page/account calls include HMAC-SHA256 `appsecret_proof`. Provisioning creates an active route
 with health `PROVISIONING` so concurrent inbound occurrences remain durable, while send-time checks
 pause all Meta delivery until `READY`; subscription failure disables the account. Scheduler health
-reconciliation probes account identity,
+reconciliation probes account identity and Facebook comment permission scope,
 reads and repairs the desired subscription, and writes sanitized `READY`, `ERROR`, or
 `REAUTH_REQUIRED` state to account config. Existing provisioning jobs and direct Outbox rows pause
 without consuming a disabled-period attempt and recover after the matching flag is re-enabled.

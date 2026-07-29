@@ -15,6 +15,11 @@ from social_reply.connectors.telegram.router import router as telegram_router
 from social_reply.shared.config import Settings, get_settings
 
 _X_OAUTH_CALLBACK_PATH = "/admin/oauth/x/callback"
+_OAUTH_CALLBACK_PATHS = {
+    _X_OAUTH_CALLBACK_PATH,
+    "/admin/oauth/meta/callback",
+    "/admin/oauth/instagram/callback",
+}
 _X_OAUTH_CALLBACK_PATHS = {_X_OAUTH_CALLBACK_PATH, f"{_X_OAUTH_CALLBACK_PATH}/"}
 
 
@@ -23,13 +28,17 @@ class OAuthCallbackAccessLogFilter(logging.Filter):
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
             path = args[2]
-            if any(
-                path == callback_path or path.startswith(f"{callback_path}?")
-                for callback_path in _X_OAUTH_CALLBACK_PATHS
-            ):
-                redacted = list(args)
-                redacted[2] = _X_OAUTH_CALLBACK_PATH
-                record.args = tuple(redacted)
+            for callback_path in _OAUTH_CALLBACK_PATHS:
+                if (
+                    path == callback_path
+                    or path == f"{callback_path}/"
+                    or path.startswith(f"{callback_path}?")
+                    or path.startswith(f"{callback_path}/?")
+                ):
+                    redacted = list(args)
+                    redacted[2] = callback_path
+                    record.args = tuple(redacted)
+                    break
         return True
 
 

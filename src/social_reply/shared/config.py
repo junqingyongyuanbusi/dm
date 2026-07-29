@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     # Meta 发布范围默认是「人工审核后才外发」。只有部署方完成 App Review 并显式接受
     # 自动回复的合规责任后，才能把 Meta 账号提升为 BOT_ACTIVE。
     meta_auto_reply_enabled: bool = False
-    # 公开评论回复（FB Page feed / IG comments）。需要 App 已订阅对应 webhook 字段，
-    # 且 IG 需 instagram_manage_comments、FB 需 pages_read_user_content 与 pages_manage_engagement。
+    # Facebook Page 公开评论回复。需要 feed webhook 与 Page 读取/互动管理权限；Instagram
+    # 评论仍不在当前发布范围内。
     meta_comment_reply_enabled: bool = False
     facebook_app_id: str = ""
     facebook_app_secret: SecretStr = SecretStr("")

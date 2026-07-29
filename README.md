@@ -89,21 +89,25 @@ POST /api/v1/platform-accounts/telegram
 
 API 立即返回 `job_id`；Worker 验证 `getMe`、幂等创建或更新账号、生成账号级 webhook secret，并调用 Telegram `setWebhook`。通过 `GET /api/v1/platform-accounts/jobs/<job_id>` 查看结果。
 
-### 连接 Facebook Messenger / Instagram 私信
+### 连接 Facebook Messenger、Facebook 评论与 Instagram 私信
 
 `FACEBOOK_MESSENGER_ENABLED` 与 `INSTAGRAM_MESSAGING_ENABLED` 控制 Meta 消息平台，默认开启；
-需要停用时在 API、Worker、Scheduler 同时设为 `false`。当前发布范围是专业账号文本私信；评论、
-附件、模板和营销消息不进入自动回复。
+需要停用时在 API、Worker、Scheduler 同时设为 `false`。Instagram 当前仍仅支持专业账号文本私信；
+Facebook Page 可选择开启 Messenger 私信与公开评论回复。附件、模板和营销消息不进入自动回复。
 
-新接入的 Meta 账号一律以 `BOT_DRAFT_ONLY` 落库——未经人工审核的账号不应直接对客户发言。要允许
-把某个 Meta 账号提升为 `BOT_ACTIVE`（自动外发），必须在 API 和 Worker 同时显式设置
-`META_AUTO_REPLY_ENABLED=true`（Worker 执行接入任务，API 提供控制面与后台）。默认 `false`：
+Meta 自动外发默认关闭。要允许某个 Meta 账号使用 `BOT_ACTIVE`，API、Worker、Scheduler 必须同时
+设置 `META_AUTO_REPLY_ENABLED=true`。默认 `false`：
 
 - 关闭时：Control API 传 `automation_default=BOT_ACTIVE` 返回 422，后台「切为自动」按钮不渲染，
   直接 POST 也返回 422 `meta_requires_bot_draft_only`。已是 `BOT_ACTIVE` 的历史账号仍可改回草稿。
-- 开启时：以上闸门放行，但**接入时的初始值仍是 `BOT_DRAFT_ONLY`**，需要在
+- 开启时：以上闸门放行；普通 Meta/Instagram 接入仍默认 `BOT_DRAFT_ONLY`，可在
   `/admin/accounts` 逐个账号点「切为自动」。每次变更写入 `audit_logs`
   （`action=SET_AUTOMATION_DEFAULT`）。
+
+Facebook Page 评论自动回复还要求三个角色同时设置 `META_COMMENT_REPLY_ENABLED=true`。两个 Meta
+开关都开启时，新授权的 Facebook Page 默认 `enable_comments=true`、`BOT_ACTIVE`，并订阅 `feed`；
+评论只会在原评论下发送公开子评论，不生成私信回复。由于自动化模式属于账号级，同一 Page 的
+Messenger 私信也会自动回复。Instagram 仍固定评论关闭并默认草稿。
 
 这个开关不改变单会话控制：`/admin/conversations/{id}` 的状态翻转任何时候都可用。
 
@@ -121,10 +125,15 @@ POST /api/v1/platform-accounts/meta
   "verify_token": "<WEBHOOK_VERIFY_TOKEN>",
   "brand_id": "default",
   "enable_dm": true,
-  "enable_comments": false,
-  "automation_default": "BOT_DRAFT_ONLY"
+  "enable_comments": true,
+  "automation_default": "BOT_ACTIVE"
 }
 ```
+
+Facebook 评论授权需要 `pages_read_engagement`、`pages_read_user_content` 和
+`pages_manage_engagement`，且权限必须覆盖所选 Page。部署开关后，已有 Page 必须从
+`/admin/accounts` 重新执行 Facebook Login 授权；系统使用 `auth_type=rerequest` 请求新增权限。
+缺少权限时接入任务返回 `META_COMMENT_PERMISSION_REQUIRED`，健康状态显示 `REAUTH_REQUIRED`。
 
 Instagram 提供两条不可混用的接入路径：
 
@@ -135,7 +144,7 @@ Instagram 提供两条不可混用的接入路径：
   professional account ID，不允许 `page_id`，订阅与发送使用 Instagram Graph 的 IG 账号路径。
   Control API 传 `instagram_login_mode=instagram_login`。
 
-两条路径都固定 `enable_dm=true`、`enable_comments=false` 和 `BOT_DRAFT_ONLY`。`meta` 与
+Instagram 两条路径都固定 `enable_dm=true`、`enable_comments=false` 和 `BOT_DRAFT_ONLY`。`meta` 与
 `instagram` App family 共用 `/webhooks/meta/{app_public_id}` 路由，因此数据库会拒绝跨 family
 重复的 `app_public_id`。
 

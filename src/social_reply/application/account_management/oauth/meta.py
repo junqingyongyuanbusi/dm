@@ -53,6 +53,18 @@ _SCOPES = {
         "pages_show_list,pages_manage_metadata,instagram_basic,instagram_manage_messages"
     ),
 }
+_FACEBOOK_COMMENT_SCOPES = (
+    "pages_read_engagement",
+    "pages_read_user_content",
+    "pages_manage_engagement",
+)
+
+
+def _oauth_scopes(platform: str) -> str:
+    scopes = _SCOPES[platform].split(",")
+    if platform == "facebook" and get_settings().meta_comment_reply_enabled:
+        scopes.extend(_FACEBOOK_COMMENT_SCOPES)
+    return ",".join(scopes)
 
 
 def _graph_client(**kwargs) -> httpx.AsyncClient:
@@ -161,7 +173,12 @@ async def meta_oauth_start(request: Request) -> Response:
                 "redirect_uri": admin_callback_url("/admin/oauth/meta/callback"),
                 "state": state_token,
                 "response_type": "code",
-                "scope": _SCOPES[platform],
+                "scope": _oauth_scopes(platform),
+                **(
+                    {"auth_type": "rerequest"}
+                    if platform == "facebook" and get_settings().meta_comment_reply_enabled
+                    else {}
+                ),
             },
             quote_via=quote,
         )
@@ -364,7 +381,8 @@ async def _finalize(
     principal: Principal,
 ) -> Response:
     platform = context["platform"]
-    if not get_settings().platform_integration_enabled(platform):
+    settings = get_settings()
+    if not settings.platform_integration_enabled(platform):
         return notice("平台集成已关闭", "提交接入前该平台已被关闭。", status_code=503)
     if platform == "instagram":
         external_account_id = candidate["ig_id"]
@@ -374,6 +392,12 @@ async def _finalize(
     else:
         external_account_id = candidate["id"]
         display_name = candidate["name"]
+    enable_comments = platform == "facebook" and settings.meta_comment_reply_enabled
+    automation_default = (
+        "BOT_ACTIVE"
+        if enable_comments and settings.meta_auto_reply_enabled
+        else "BOT_DRAFT_ONLY"
+    )
     submission = {
         "name": display_name,
         "external_account_id": external_account_id,
@@ -383,8 +407,8 @@ async def _finalize(
         "instagram_login_mode": "facebook_login",
         "page_id": candidate["id"],
         "enable_dm": True,
-        "enable_comments": False,
-        "automation_default": "BOT_DRAFT_ONLY",
+        "enable_comments": enable_comments,
+        "automation_default": automation_default,
         "access_token": candidate["access_token"],
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,

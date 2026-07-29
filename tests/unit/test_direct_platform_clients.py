@@ -7,7 +7,12 @@ import pytest
 from social_reply.application.platform_accounts import PlatformAccountRuntime
 from social_reply.connectors import registry
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
-from social_reply.connectors.meta.client import MetaGraphClient, appsecret_proof
+from social_reply.connectors.meta.client import (
+    MetaCommentPermissionError,
+    MetaGraphClient,
+    appsecret_proof,
+    missing_facebook_comment_permissions,
+)
 from social_reply.connectors.x.client import XClient
 from social_reply.infrastructure.secrets import SecretStore
 
@@ -37,6 +42,74 @@ async def test_meta_client_sends_dm_and_comment():
     assert json.loads(requests[1].content) == {"message": "ok"}
     # Facebook 回复评论是给评论加子评论
     assert requests[1].url.path.endswith("/c-1/comments")
+    await client.aclose()
+
+
+def test_facebook_comment_permissions_must_target_selected_page():
+    payload = {
+        "data": {
+            "is_valid": True,
+            "scopes": [
+                "pages_read_engagement",
+                "pages_read_user_content",
+                "pages_manage_engagement",
+            ],
+            "granular_scopes": [
+                {"scope": "pages_read_engagement", "target_ids": ["page-1"]},
+                {"scope": "pages_read_user_content", "target_ids": ["other-page"]},
+                {"scope": "pages_manage_engagement", "target_ids": ["page-1"]},
+            ],
+        }
+    }
+
+    assert missing_facebook_comment_permissions(payload, "page-1") == (
+        "pages_read_user_content",
+    )
+
+
+async def test_meta_client_rejects_comment_permissions_for_another_page():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v23.0/debug_token"
+        assert request.url.params["input_token"] == "page-token"
+        assert request.url.params["access_token"] == "app-1|secret"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "is_valid": True,
+                    "scopes": [
+                        "pages_read_engagement",
+                        "pages_read_user_content",
+                        "pages_manage_engagement",
+                    ],
+                    "granular_scopes": [
+                        {
+                            "scope": "pages_read_engagement",
+                            "target_ids": ["page-1"],
+                        },
+                        {
+                            "scope": "pages_read_user_content",
+                            "target_ids": ["page-2"],
+                        },
+                        {
+                            "scope": "pages_manage_engagement",
+                            "target_ids": ["page-1"],
+                        },
+                    ],
+                }
+            },
+        )
+
+    client = MetaGraphClient(
+        platform="facebook",
+        access_token="page-token",
+        app_secret="secret",
+        external_account_id="page-1",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(MetaCommentPermissionError) as exc_info:
+        await client.require_facebook_comment_permissions(app_id="app-1")
+    assert exc_info.value.missing_permissions == ("pages_read_user_content",)
     await client.aclose()
 
 

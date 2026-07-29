@@ -81,6 +81,84 @@ async def test_messenger_provisioning_activates_only_after_dm_subscription(
     assert requests[3].url.params["subscribed_fields"] == "messages"
 
 
+async def test_messenger_comment_provisioning_checks_permissions_and_enables_feed(
+    migrated_db,
+    session,
+    tmp_path,
+    monkeypatch,
+):
+    requests: list[httpx.Request] = []
+    app_id = f"app-{uuid.uuid4().hex}"
+    settings = service.get_settings().model_copy(
+        update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(service, "get_settings", lambda: settings)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/page-1"):
+            return httpx.Response(200, json={"id": "page-1", "name": "Support"})
+        if request.url.path.endswith("/debug_token"):
+            permissions = [
+                "pages_read_engagement",
+                "pages_read_user_content",
+                "pages_manage_engagement",
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "is_valid": True,
+                        "scopes": permissions,
+                        "granular_scopes": [
+                            {"scope": permission, "target_ids": ["page-1"]}
+                            for permission in permissions
+                        ],
+                    }
+                },
+            )
+        if request.url.path.endswith("/subscriptions"):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(200, json={"success": True})
+        if request.method == "POST" and request.url.path.endswith("/subscribed_apps"):
+            return httpx.Response(200, json={"success": True})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    result = await connect_meta_account(
+        platform="facebook",
+        external_account_id="page-1",
+        access_token="page-token",
+        app_secret="app-secret",
+        app_id=app_id,
+        app_public_id=f"messenger_{uuid.uuid4().hex}",
+        public_base_url="https://reply.example.com",
+        verify_token="verify-token",
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        enable_comments=True,
+        automation_default="BOT_ACTIVE",
+        secrets_root=tmp_path,
+        transport=httpx.MockTransport(handler),
+    )
+
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, result.account_id)
+    assert account.automation_default == "BOT_ACTIVE"
+    assert account.capability == {"dm": True, "comments": True, "max_text_length": 2000}
+    assert account.config["meta_desired_subscribed_fields"] == ["messages", "feed"]
+    assert account.config["meta_subscribed_fields"] == ["messages", "feed"]
+    assert account.config["meta_app_subscribed_fields"] == ["feed", "messages"]
+    debug_request = next(
+        request for request in requests if request.url.path.endswith("/debug_token")
+    )
+    assert debug_request.url.params["input_token"] == "page-token"
+    account_subscription = next(
+        request for request in requests if request.url.path.endswith("/subscribed_apps")
+    )
+    assert account_subscription.url.params["subscribed_fields"] == "messages,feed"
+
+
 async def test_messenger_webhook_during_subscription_is_durably_routed(
     migrated_db,
     session,

@@ -6,6 +6,7 @@ from sqlalchemy import insert
 
 from social_reply.application.account_management import meta_health
 from social_reply.application.account_management.meta_subscription import MetaAppSubscription
+from social_reply.connectors.meta.client import MetaCommentPermissionError
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
@@ -118,6 +119,42 @@ async def test_meta_health_repairs_missing_messenger_subscription(session, monke
     assert account.config["meta_subscribed_fields"] == ["messages"]
     assert account.config["meta_app_subscribed_fields"] == ["messages"]
     assert account.config["meta_health_error_code"] is None
+
+
+async def test_meta_health_requires_reauthorization_when_comment_permission_drifts(
+    session, monkeypatch
+):
+    _app_id, account_id = await _seed_facebook_account(session)
+    account = await session.get(models.PlatformAccount, account_id)
+    account.capability = {"dm": True, "comments": True, "max_text_length": 2000}
+    account.config = {
+        **account.config,
+        "meta_desired_subscribed_fields": ["messages", "feed"],
+    }
+    await session.commit()
+
+    class MissingPermissionClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def get_account(self):
+            return {"id": "page-1", "name": "Page"}
+
+        async def require_facebook_comment_permissions(self, *, app_id):
+            assert app_id == "app-1"
+            raise MetaCommentPermissionError(("pages_read_user_content",))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(meta_health, "MetaGraphClient", MissingPermissionClient)
+    meta_health._last_check_at = None
+
+    assert await meta_health.reconcile_meta_account_health(force=True) == [str(account_id)]
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.config["meta_health_status"] == "REAUTH_REQUIRED"
+    assert account.config["meta_health_error_code"] == "META_COMMENT_PERMISSION_REQUIRED"
 
 
 async def test_meta_health_repairs_empty_app_level_subscription(session, monkeypatch):

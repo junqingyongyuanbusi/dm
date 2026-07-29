@@ -177,6 +177,7 @@ async def _validate_decision_scope(
                     models.Conversation.platform == snapshot.platform,
                     models.Conversation.platform_account_id == account_id,
                     models.Conversation.conversation_key == snapshot.conversation_key,
+                    models.Conversation.channel_type == snapshot.channel_type,
                     models.PlatformAccount.id == account_id,
                     models.PlatformAccount.tenant_id == snapshot.tenant_id,
                     models.PlatformAccount.brand_id == snapshot.brand_id,

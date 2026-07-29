@@ -1,6 +1,7 @@
 from dataclasses import dataclass, replace
 
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.messages.canonical import ChannelType
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import redact_pii, run_final_guard
 from social_reply.domain.reply.llm import LLMClient, LLMContext
 from social_reply.domain.reply.rules import apply_rules
@@ -22,6 +23,7 @@ class DecisionSnapshot:
     conversation_key: str
     automation_state: str
     state_version: int
+    channel_type: ChannelType = ChannelType.DM
 
 
 async def run_decision_pipeline(
@@ -103,6 +105,15 @@ async def run_decision_pipeline(
             reply_text=LLM_HANDOFF_FALLBACK_TEXT,
             reason_codes=decision.reason_codes + ("LLM_HANDOFF_FALLBACK",),
             source="rule",
+        )
+
+    # Facebook 评论只能在原评论下公开回复。先固定 visibility 再执行 Final Guard，
+    # 否则模型给出的 private 会绕过公开回复的 PII 检查，随后再被改成公开发送。
+    if snapshot.platform == "facebook" and snapshot.channel_type is ChannelType.COMMENT:
+        decision = replace(
+            decision,
+            reply_visibility=Visibility.PUBLIC,
+            reason_codes=decision.reason_codes + ("FACEBOOK_COMMENT_PUBLIC",),
         )
 
     # 输出侧闸门

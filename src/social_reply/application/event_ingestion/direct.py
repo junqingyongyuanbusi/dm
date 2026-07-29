@@ -276,6 +276,7 @@ async def ingest_canonical_event(
             conversation_key=conversation.conversation_key,
             automation_state=state.state,
             state_version=state.state_version,
+            channel_type=event.channel_type,
         )
         job_id = (
             await session.execute(

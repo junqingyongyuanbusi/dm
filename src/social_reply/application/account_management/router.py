@@ -63,13 +63,25 @@ class MetaAccountRequest(_BaseAccountRequest):
 
     @model_validator(mode="after")
     def _validate_meta_request(self) -> "MetaAccountRequest":
+        settings = get_settings()
         if not self.app_id and not self.app_public_id:
             raise ValueError("app_id 或 app_public_id 至少填写一个")
-        if not self.enable_dm or self.enable_comments:
-            raise ValueError("当前 Meta 接入仅允许文本私信")
-        if not get_settings().meta_automation_default_allowed(
-            self.platform, self.automation_default
+        if not self.enable_dm:
+            raise ValueError("Meta 接入必须启用文本私信")
+        if self.platform == "facebook" and "enable_comments" not in self.model_fields_set:
+            self.enable_comments = settings.meta_comment_reply_enabled
+        if self.platform == "instagram" and self.enable_comments:
+            raise ValueError("Instagram 评论回复未启用")
+        if self.enable_comments and not settings.meta_comment_reply_enabled:
+            raise ValueError("Meta 评论回复未启用")
+        if (
+            self.platform == "facebook"
+            and self.enable_comments
+            and "automation_default" not in self.model_fields_set
+            and settings.meta_auto_reply_enabled
         ):
+            self.automation_default = "BOT_ACTIVE"
+        if not settings.meta_automation_default_allowed(self.platform, self.automation_default):
             raise ValueError("Meta 接入必须使用 BOT_DRAFT_ONLY（未开启 META_AUTO_REPLY_ENABLED）")
         if self.platform == "facebook" and self.instagram_login_mode != "facebook_login":
             raise ValueError("Facebook 账号必须使用 facebook_login")

@@ -19,6 +19,7 @@ async def _seed_messenger_account(
     *,
     dm: bool = True,
     comments: bool = False,
+    automation_default: str = "BOT_DRAFT_ONLY",
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     app_id, account_id = uuid.uuid4(), uuid.uuid4()
     app_public_id = f"meta_messenger_{uuid.uuid4().hex}"
@@ -58,7 +59,7 @@ async def _seed_messenger_account(
                 "meta_health_status": "READY",
             },
             capability={"dm": dm, "comments": comments, "max_text_length": 2000},
-            automation_default="BOT_DRAFT_ONLY",
+            automation_default=automation_default,
             status="active",
         )
     )
@@ -192,3 +193,79 @@ async def test_messenger_dm_capability_blocks_decision_but_keeps_occurrence(sess
     assert occurrence.context.get("initial_dispatch") is None
     assert await session.scalar(select(func.count()).select_from(models.NormalizedEvent)) == 0
     assert await session.scalar(select(func.count()).select_from(models.DecisionJob)) == 0
+
+
+async def test_facebook_comment_webhook_sends_only_public_child_reply(session, monkeypatch):
+    from social_reply.application.message_delivery import outbox as outbox_module
+
+    _app_id, account_id, app_public_id = await _seed_messenger_account(
+        session,
+        comments=True,
+        automation_default="BOT_ACTIVE",
+    )
+    sent: list[dict] = []
+
+    class FakeSender:
+        async def send_text(self, *, target: dict, text: str) -> str:
+            sent.append({"target": target, "text": text})
+            return "facebook-reply-1"
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fake_sender(_account_id):
+        assert _account_id == account_id
+        return FakeSender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", fake_sender)
+    payload = {
+        "object": "page",
+        "entry": [
+            {
+                "id": "page-1",
+                "changes": [
+                    {
+                        "field": "feed",
+                        "value": {
+                            "item": "comment",
+                            "verb": "add",
+                            "comment_id": "comment-1",
+                            "post_id": "post-1",
+                            "from": {"id": "user-1"},
+                            "message": "How can I order?",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    body, signature = _signed_body(payload)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            f"/webhooks/meta/{app_public_id}",
+            content=body,
+            headers={"X-Hub-Signature-256": signature},
+        )
+    assert response.status_code == 200
+
+    session.expire_all()
+    conversation = (await session.execute(select(models.Conversation))).scalar_one()
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    outbox = (await session.execute(select(models.OutboxMessage))).scalar_one()
+    assert conversation.channel_type == "comment"
+    assert decision.action == "auto_reply"
+    assert decision.reply_visibility == "public"
+    assert "FACEBOOK_COMMENT_PUBLIC" in decision.reason_codes
+    assert outbox.destination_type == "meta_public_comment"
+    assert outbox.status == "SENT"
+    assert outbox.platform_message_id == "facebook-reply-1"
+    assert outbox.payload["target"] == {"kind": "comment", "comment_id": "comment-1"}
+    assert sent == [{"target": outbox.payload["target"], "text": outbox.payload["text"]}]
+    assert await session.scalar(
+        select(func.count())
+        .select_from(models.OutboxMessage)
+        .where(models.OutboxMessage.destination_type == "meta_private_reply")
+    ) == 0
