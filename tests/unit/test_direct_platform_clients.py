@@ -113,6 +113,61 @@ async def test_meta_client_rejects_comment_permissions_for_another_page():
     await client.aclose()
 
 
+async def test_facebook_login_instagram_comment_permissions_target_linked_page():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v23.0/debug_token"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "is_valid": True,
+                    "scopes": ["pages_read_engagement", "instagram_manage_comments"],
+                    "granular_scopes": [
+                        {"scope": "pages_read_engagement", "target_ids": ["page-1"]},
+                        {"scope": "instagram_manage_comments", "target_ids": ["page-2"]},
+                    ],
+                }
+            },
+        )
+
+    client = MetaGraphClient(
+        platform="instagram",
+        access_token="page-token",
+        app_secret="secret",
+        external_account_id="ig-1",
+        page_id="page-1",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(MetaCommentPermissionError) as exc_info:
+        await client.require_instagram_comment_permissions(app_id="app-1")
+    assert exc_info.value.missing_permissions == ("instagram_manage_comments",)
+    await client.aclose()
+
+
+async def test_instagram_login_uses_business_comment_permission_debug_endpoint():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "graph.instagram.com"
+        assert request.url.path == "/debug_access_token"
+        return httpx.Response(
+            200,
+            json={"data": {"is_valid": True, "scopes": ["instagram_business_basic"]}},
+        )
+
+    client = MetaGraphClient(
+        platform="instagram",
+        access_token="instagram-token",
+        app_secret="secret",
+        external_account_id="ig-1",
+        graph_base_url="https://graph.instagram.com",
+        instagram_login_mode="instagram_login",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(MetaCommentPermissionError) as exc_info:
+        await client.require_instagram_comment_permissions(app_id="app-1")
+    assert exc_info.value.missing_permissions == ("instagram_business_manage_comments",)
+    await client.aclose()
+
+
 async def test_instagram_replies_to_comments_on_the_replies_edge():
     # IG 的回复端点是 POST /<IG_COMMENT_ID>/replies；沿用 Facebook 的 /comments
     # 会被 Graph 拒绝，而这条路径此前从未启用，所以一直没暴露。

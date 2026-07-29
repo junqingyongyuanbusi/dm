@@ -190,7 +190,9 @@ async def test_meta_health_repairs_empty_app_level_subscription(session, monkeyp
     assert account.config["meta_app_subscribed_fields"] == ["messages"]
 
 
-async def test_meta_health_checks_standalone_instagram_account_path(session, monkeypatch):
+async def test_meta_health_checks_standalone_instagram_comments_and_permission_drift(
+    session, monkeypatch
+):
     app_id, account_id = uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.PlatformApp).values(
@@ -223,14 +225,17 @@ async def test_meta_health_checks_standalone_instagram_account_path(session, mon
                 "graph_base_url": "https://graph.instagram.com",
                 "api_version": "v23.0",
                 "instagram_login_mode": "instagram_login",
-                "meta_desired_subscribed_fields": ["messages"],
+                "meta_desired_subscribed_fields": ["messages", "comments"],
+                "meta_desired_app_subscribed_fields": ["messages", "comments"],
             },
-            capability={"dm": True, "comments": False, "max_text_length": 1000},
-            automation_default="BOT_DRAFT_ONLY",
+            capability={"dm": True, "comments": True, "max_text_length": 1000},
+            automation_default="BOT_ACTIVE",
             status="active",
         )
     )
     await session.commit()
+
+    permission_missing = [False]
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -241,6 +246,11 @@ async def test_meta_health_checks_standalone_instagram_account_path(session, mon
         async def get_account(self):
             return {"id": "ig-1", "username": "shop"}
 
+        async def require_instagram_comment_permissions(self, *, app_id):
+            assert app_id == "ig-app-1"
+            if permission_missing[0]:
+                raise MetaCommentPermissionError(("instagram_business_manage_comments",))
+
         async def aclose(self):
             return None
 
@@ -249,18 +259,25 @@ async def test_meta_health_checks_standalone_instagram_account_path(session, mon
         assert kwargs["external_account_id"] == "ig-1"
         assert kwargs["instagram_login_mode"] == "instagram_login"
         assert kwargs["app_id"] == "ig-app-1"
-        return ("messages",)
+        return ("messages", "comments")
 
     monkeypatch.setattr(meta_health, "MetaGraphClient", FakeClient)
     monkeypatch.setattr(meta_health, "get_meta_subscription_fields", get_fields)
-    _stub_app_subscription(monkeypatch, installed=("messages",))
+    _stub_app_subscription(monkeypatch, installed=("messages", "comments"))
     meta_health._last_check_at = None
 
     assert await meta_health.reconcile_meta_account_health(force=True) == []
     session.expire_all()
     account = await session.get(models.PlatformAccount, account_id)
     assert account.config["meta_health_status"] == "READY"
-    assert account.config["meta_subscribed_fields"] == ["messages"]
+    assert account.config["meta_subscribed_fields"] == ["messages", "comments"]
+
+    permission_missing[0] = True
+    assert await meta_health.reconcile_meta_account_health(force=True) == [str(account_id)]
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.config["meta_health_status"] == "REAUTH_REQUIRED"
+    assert account.config["meta_health_error_code"] == "META_COMMENT_PERMISSION_REQUIRED"
 
 
 async def test_meta_health_marks_expired_token_for_reauthorization(session, monkeypatch):

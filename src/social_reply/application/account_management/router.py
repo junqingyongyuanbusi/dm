@@ -68,15 +68,12 @@ class MetaAccountRequest(_BaseAccountRequest):
             raise ValueError("app_id 或 app_public_id 至少填写一个")
         if not self.enable_dm:
             raise ValueError("Meta 接入必须启用文本私信")
-        if self.platform == "facebook" and "enable_comments" not in self.model_fields_set:
+        if "enable_comments" not in self.model_fields_set:
             self.enable_comments = settings.meta_comment_reply_enabled
-        if self.platform == "instagram" and self.enable_comments:
-            raise ValueError("Instagram 评论回复未启用")
         if self.enable_comments and not settings.meta_comment_reply_enabled:
             raise ValueError("Meta 评论回复未启用")
         if (
-            self.platform == "facebook"
-            and self.enable_comments
+            self.enable_comments
             and "automation_default" not in self.model_fields_set
             and settings.meta_auto_reply_enabled
         ):

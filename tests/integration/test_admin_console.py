@@ -137,7 +137,10 @@ async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypat
     assert "不需要关联 Facebook Page" in instagram_page.text
     assert "适用于已关联 Facebook Page" in instagram_page.text
     assert 'name="page_id"' in instagram_page.text
-    assert 'name="enable_comments" value="false"' in instagram_page.text
+    assert "instagram_business_manage_comments" in instagram_page.text
+    assert "instagram_manage_comments" in instagram_page.text
+    assert 'name="enable_comments" value="true"' in instagram_page.text
+    assert 'name="automation_default" value="BOT_ACTIVE"' in instagram_page.text
 
 
 async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypatch):

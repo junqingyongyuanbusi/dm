@@ -227,6 +227,34 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
     ]
 
 
+async def test_instagram_login_defaults_to_active_comments_when_enabled(
+    instagram_env, migrated_db, monkeypatch
+):
+    settings = instagram.get_settings().model_copy(
+        update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(instagram, "get_settings", lambda: settings)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        start = await client.post(
+            "/admin/oauth/instagram/start",
+            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-ig"},
+        )
+        query = parse_qs(urlparse(start.headers["location"]).query)
+        assert "instagram_business_manage_comments" in query["scope"][0]
+        callback = await client.get(
+            f"/admin/oauth/instagram/callback?code=code-42&state={query['state'][0]}"
+        )
+
+    assert callback.status_code == 303
+    assert instagram_env["submitted"]["request"]["enable_comments"] is True
+    assert instagram_env["submitted"]["request"]["automation_default"] == "BOT_ACTIVE"
+
+
 async def test_instagram_callback_state_is_one_time(instagram_env, migrated_db):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),

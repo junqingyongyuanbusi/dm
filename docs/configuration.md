@@ -70,14 +70,14 @@ API, Worker and Scheduler must use the same values.
 | `INSTAGRAM_MESSAGING_ENABLED` | `true` | Instagram professional-account text-DM ingress, provisioning, health reconciliation and sending |
 | `WHATSAPP_ENABLED` | `true` | WhatsApp Cloud API ingress, provisioning and sending |
 | `META_AUTO_REPLY_ENABLED` | `false` | Allows Meta accounts to use `BOT_ACTIVE`; account-level mode applies to both Facebook DMs and comments |
-| `META_COMMENT_REPLY_ENABLED` | `false` | Enables Facebook Page comment OAuth scopes, `feed` subscription, ingress and public child-comment replies |
+| `META_COMMENT_REPLY_ENABLED` | `false` | Enables Facebook/Instagram comment OAuth scopes, webhook subscriptions, ingress and public child-comment replies |
 | `FACEBOOK_APP_ID` | empty | Facebook Login App ID |
 | `FACEBOOK_APP_SECRET` | empty | Must be paired with Facebook App ID |
 | `META_VERIFY_TOKEN` | empty | Shared Meta webhook verify token |
 | `INSTAGRAM_APP_ID` | empty | Standalone Instagram Login App ID |
 | `INSTAGRAM_APP_SECRET` | empty | Must be paired with Instagram App ID |
 | `INSTAGRAM_VERIFY_TOKEN` | empty | Falls back to `META_VERIFY_TOKEN` when empty |
-| `META_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler token and `messages` subscription reconciliation; range 60-86400 |
+| `META_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler token, permission and desired subscription reconciliation; range 60-86400 |
 
 `FACEBOOK_APP_*` owns Messenger Pages and Facebook Login Instagram accounts. `INSTAGRAM_APP_*`
 owns standalone Instagram Login accounts. The first path requires a Page ID and Page token; the
@@ -99,19 +99,25 @@ A disabled signed webhook stores only a tenant/app-scoped audit summary and SHA-
 does not copy message text, names or phone numbers into the gate audit row. Enabled Messenger and
 Instagram requests store one minimal verified-request record plus account-scoped occurrence
 RawEvents, so replay and tenant ownership do not depend on an account-unscoped multi-entry payload.
-Page/account Graph calls include `appsecret_proof`; the Scheduler repairs missing `messages`
+Page/account Graph calls include `appsecret_proof`; the Scheduler repairs missing desired
 subscriptions and records sanitized provider health in `PlatformAccount.config`.
 
-Facebook comment auto-replies require `FACEBOOK_MESSENGER_ENABLED=true`,
-`META_COMMENT_REPLY_ENABLED=true`, and `META_AUTO_REPLY_ENABLED=true` on API, Worker, and Scheduler.
-New Facebook authorizations then default to `comments=true` and `BOT_ACTIVE`; Messenger DMs on the
-same Page are also automatic because automation mode is account-scoped. OAuth requests
+Meta comment auto-replies require the platform gate plus `META_COMMENT_REPLY_ENABLED=true` and
+`META_AUTO_REPLY_ENABLED=true` on API, Worker, and Scheduler. New Facebook and Instagram
+authorizations then default to `comments=true` and `BOT_ACTIVE`; DMs on the same account are also
+automatic because automation mode is account-scoped. Facebook OAuth requests
 `pages_read_engagement`, `pages_read_user_content`, and `pages_manage_engagement`, validates that
 all three permissions target the selected Page, and subscribes the Page to `feed`. Existing Page
 tokens must be reauthorized from `/admin/accounts`; missing or wrong-Page permissions produce
 `META_COMMENT_PERMISSION_REQUIRED` and health status `REAUTH_REQUIRED`. Replies are always public
-child comments on the source comment. Instagram remains comments-disabled and draft-only by
-default.
+child comments on the source comment.
+
+Facebook Login Instagram OAuth requests `pages_read_engagement` and `instagram_manage_comments`;
+its linked Page remains subscribed only to `messages`, while the App-level `instagram` webhook
+object adds `comments`. Standalone Instagram Login requests
+`instagram_business_manage_comments` and adds `comments` to both App-level and account-level
+subscriptions. Existing Instagram tokens must be reauthorized through the same login path that
+created them.
 
 ## Decision, LLM and knowledge
 

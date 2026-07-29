@@ -9,6 +9,7 @@ import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
 from social_reply.application.account_management.meta_subscription import (
+    meta_app_subscription_fields,
     meta_app_subscription_object,
     meta_subscription_fields,
     reconcile_meta_app_subscription,
@@ -225,8 +226,6 @@ async def connect_meta_account(
     )
     if not enable_dm:
         raise ValueError("meta_dm_required")
-    if platform == "instagram" and enable_comments:
-        raise ValueError("instagram_comments_disabled")
     if enable_comments and not get_settings().meta_comment_reply_enabled:
         raise ValueError("meta_comment_reply_disabled")
     if not get_settings().meta_automation_default_allowed(platform, automation_default):
@@ -273,6 +272,8 @@ async def connect_meta_account(
         )
         if platform == "facebook" and enable_comments:
             await client.require_facebook_comment_permissions(app_id=external_app_id)
+        if platform == "instagram" and enable_comments:
+            await client.require_instagram_comment_permissions(app_id=external_app_id)
     finally:
         await client.aclose()
     desired_fields = meta_subscription_fields(
@@ -281,6 +282,11 @@ async def connect_meta_account(
         enable_comments=enable_comments,
         instagram_login_mode=instagram_login_mode,
     )
+    desired_app_fields = meta_app_subscription_fields(
+        platform=platform,
+        enable_dm=enable_dm,
+        enable_comments=enable_comments,
+    )
     webhook_url = _webhook_url(public_base_url, f"/webhooks/meta/{resolved_app_public_id}")
     account_config = {
         "graph_base_url": graph_base_url,
@@ -288,6 +294,7 @@ async def connect_meta_account(
         "instagram_login_mode": instagram_login_mode,
         **({"page_id": page_id} if page_id else {}),
         "meta_desired_subscribed_fields": list(desired_fields),
+        "meta_desired_app_subscribed_fields": list(desired_app_fields),
         "meta_subscribed_fields": [],
         "meta_health_status": "PROVISIONING",
         "meta_health_checked_at": _utc_now_iso(),
@@ -327,7 +334,7 @@ async def connect_meta_account(
             app_id=external_app_id,
             app_secret=app_secret,
             object_type=meta_app_subscription_object(platform),
-            desired_fields=desired_fields,
+            desired_fields=desired_app_fields,
             callback_url=webhook_url,
             verify_token=resolved_verify_token,
             api_version=api_version,

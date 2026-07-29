@@ -89,11 +89,11 @@ POST /api/v1/platform-accounts/telegram
 
 API 立即返回 `job_id`；Worker 验证 `getMe`、幂等创建或更新账号、生成账号级 webhook secret，并调用 Telegram `setWebhook`。通过 `GET /api/v1/platform-accounts/jobs/<job_id>` 查看结果。
 
-### 连接 Facebook Messenger、Facebook 评论与 Instagram 私信
+### 连接 Facebook Messenger、Facebook 评论与 Instagram 私信/评论
 
 `FACEBOOK_MESSENGER_ENABLED` 与 `INSTAGRAM_MESSAGING_ENABLED` 控制 Meta 消息平台，默认开启；
-需要停用时在 API、Worker、Scheduler 同时设为 `false`。Instagram 当前仍仅支持专业账号文本私信；
-Facebook Page 可选择开启 Messenger 私信与公开评论回复。附件、模板和营销消息不进入自动回复。
+需要停用时在 API、Worker、Scheduler 同时设为 `false`。Facebook Page 与 Instagram 专业账号均可
+开启文本私信和公开评论回复；附件、模板和营销消息不进入自动回复。
 
 Meta 自动外发默认关闭。要允许某个 Meta 账号使用 `BOT_ACTIVE`，API、Worker、Scheduler 必须同时
 设置 `META_AUTO_REPLY_ENABLED=true`。默认 `false`：
@@ -104,10 +104,10 @@ Meta 自动外发默认关闭。要允许某个 Meta 账号使用 `BOT_ACTIVE`�
   `/admin/accounts` 逐个账号点「切为自动」。每次变更写入 `audit_logs`
   （`action=SET_AUTOMATION_DEFAULT`）。
 
-Facebook Page 评论自动回复还要求三个角色同时设置 `META_COMMENT_REPLY_ENABLED=true`。两个 Meta
-开关都开启时，新授权的 Facebook Page 默认 `enable_comments=true`、`BOT_ACTIVE`，并订阅 `feed`；
-评论只会在原评论下发送公开子评论，不生成私信回复。由于自动化模式属于账号级，同一 Page 的
-Messenger 私信也会自动回复。Instagram 仍固定评论关闭并默认草稿。
+Facebook 与 Instagram 评论自动回复还要求三个角色同时设置
+`META_COMMENT_REPLY_ENABLED=true`。两个 Meta 开关都开启时，新授权账号默认
+`enable_comments=true`、`BOT_ACTIVE`；评论只会在原评论下发送公开子评论，不生成私信回复。
+由于自动化模式属于账号级，同一账号的 Messenger/Instagram 私信也会自动回复。
 
 这个开关不改变单会话控制：`/admin/conversations/{id}` 的状态翻转任何时候都可用。
 
@@ -139,14 +139,18 @@ Instagram 提供两条不可混用的接入路径：
 
 - **Facebook Login**：从 `/admin/accounts` 的 Facebook Login 卡片选择关联 Page 的 Instagram
   专业账号；保存 Page access token、IG professional account ID 和必填 `page_id`，订阅与发送使用
-  Facebook Graph 的 Page 路径。Control API 传 `instagram_login_mode=facebook_login`。
+  Facebook Graph 路径。评论需要 `pages_read_engagement`、`instagram_manage_comments`；Page
+  账号级只订阅 `messages`，评论通过 App 级 `instagram/comments` webhook 投递。Control API 传
+  `instagram_login_mode=facebook_login`。
 - **Instagram Login**：从独立 Instagram Login 卡片授权；保存 Instagram long-lived token 和 IG
   professional account ID，不允许 `page_id`，订阅与发送使用 Instagram Graph 的 IG 账号路径。
-  Control API 传 `instagram_login_mode=instagram_login`。
+  评论需要 `instagram_business_manage_comments`，App 级与账号级都订阅 `comments`。Control API
+  传 `instagram_login_mode=instagram_login`。
 
-Instagram 两条路径都固定 `enable_dm=true`、`enable_comments=false` 和 `BOT_DRAFT_ONLY`。`meta` 与
-`instagram` App family 共用 `/webhooks/meta/{app_public_id}` 路由，因此数据库会拒绝跨 family
-重复的 `app_public_id`。
+评论开关关闭时，两条路径仍默认 `enable_comments=false`、`BOT_DRAFT_ONLY`；两个 Meta 开关都
+开启时则默认启用评论和自动回复。已有 Instagram token 必须从 `/admin/accounts` 按原登录路径
+重新授权。`meta` 与 `instagram` App family 共用 `/webhooks/meta/{app_public_id}` 路由，因此数据库
+会拒绝跨 family 重复的 `app_public_id`。
 
 Meta 只在「App 级 Webhooks 产品」与「账号级订阅」都列出某个字段时才投递事件。接入与健康巡检
 会同时完成两级订阅，无需在 App Dashboard 手工填回调 URL。App 级订阅以并集方式写入，不会覆盖

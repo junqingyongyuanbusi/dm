@@ -34,7 +34,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
 
 _API_VERSION = "v23.0"
-_SCOPES = "instagram_business_basic,instagram_business_manage_messages"
+_BASE_SCOPES = "instagram_business_basic,instagram_business_manage_messages"
+_COMMENT_SCOPE = "instagram_business_manage_comments"
+
+
+def _oauth_scopes() -> str:
+    scopes = _BASE_SCOPES.split(",")
+    if get_settings().meta_comment_reply_enabled:
+        scopes.append(_COMMENT_SCOPE)
+    return ",".join(scopes)
 
 
 def _instagram_client(**kwargs) -> httpx.AsyncClient:
@@ -86,7 +94,7 @@ async def instagram_oauth_start(request: Request) -> Response:
             "client_id": app.app_id,
             "redirect_uri": admin_callback_url("/admin/oauth/instagram/callback"),
             "response_type": "code",
-            "scope": _SCOPES,
+            "scope": _oauth_scopes(),
             "state": state_token,
         },
         quote_via=quote,
@@ -191,6 +199,8 @@ async def instagram_oauth_callback(request: Request) -> Response:
     if not external_account_id:
         return notice("账号识别失败", "Instagram 未返回专业账号 ID。", status_code=502)
     username = str(profile.get("username") or "")
+    settings = get_settings()
+    enable_comments = settings.meta_comment_reply_enabled
     submission = {
         "name": f"@{username}" if username else str(profile.get("name") or external_account_id),
         "external_account_id": external_account_id,
@@ -199,8 +209,12 @@ async def instagram_oauth_callback(request: Request) -> Response:
         "api_version": _API_VERSION,
         "instagram_login_mode": "instagram_login",
         "enable_dm": True,
-        "enable_comments": False,
-        "automation_default": "BOT_DRAFT_ONLY",
+        "enable_comments": enable_comments,
+        "automation_default": (
+            "BOT_ACTIVE"
+            if enable_comments and settings.meta_auto_reply_enabled
+            else "BOT_DRAFT_ONLY"
+        ),
         "access_token": long_token,
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,

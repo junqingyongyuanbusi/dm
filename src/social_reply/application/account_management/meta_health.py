@@ -8,6 +8,7 @@ import httpx
 from social_reply.application.account_management.meta_subscription import (
     get_meta_app_subscription,
     get_meta_subscription_fields,
+    meta_app_subscription_fields,
     meta_app_subscription_object,
     meta_subscription_fields,
     reconcile_meta_app_subscription,
@@ -176,6 +177,17 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
             enable_comments=capability_enabled(account.capability, CapabilityKey.COMMENTS),
             instagram_login_mode=login_mode,
         )
+    desired_app = tuple(
+        str(field)
+        for field in account.config.get("meta_desired_app_subscribed_fields", [])
+        if isinstance(field, str)
+    )
+    if not desired_app:
+        desired_app = meta_app_subscription_fields(
+            platform=account.platform,
+            enable_dm=capability_enabled(account.capability, CapabilityKey.DM),
+            enable_comments=capability_enabled(account.capability, CapabilityKey.COMMENTS),
+        )
     client = MetaGraphClient(
         platform=account.platform,
         access_token=access_token,
@@ -194,6 +206,10 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
             account.capability, CapabilityKey.COMMENTS
         ):
             await client.require_facebook_comment_permissions(app_id=app.external_app_id)
+        if account.platform == "instagram" and capability_enabled(
+            account.capability, CapabilityKey.COMMENTS
+        ):
+            await client.require_instagram_comment_permissions(app_id=app.external_app_id)
         subscription_account_id = _subscription_account_id(account)
         observed = await get_meta_subscription_fields(
             platform=account.platform,
@@ -214,8 +230,10 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
                 instagram_login_mode=login_mode,
                 graph_base_url=graph_base_url,
                 api_version=api_version,
-                enable_dm="messages" in desired,
-                enable_comments=bool({"feed", "comments"}.intersection(desired)),
+                enable_dm=capability_enabled(account.capability, CapabilityKey.DM),
+                enable_comments=capability_enabled(
+                    account.capability, CapabilityKey.COMMENTS
+                ),
             )
             observed = await get_meta_subscription_fields(
                 platform=account.platform,
@@ -234,10 +252,10 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
             app_secret=app_secret,
             verify_token=app_credentials.get("verify_token", ""),
             platform=account.platform,
-            desired=desired,
+            desired=desired_app,
             api_version=api_version,
         )
-        if not set(desired).issubset(app_observed):
+        if not set(desired_app).issubset(app_observed):
             status = "APP_SUBSCRIPTION_MISSING"
         await _save_health(
             account.id,

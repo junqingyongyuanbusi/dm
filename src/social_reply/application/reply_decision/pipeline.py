@@ -107,13 +107,20 @@ async def run_decision_pipeline(
             source="rule",
         )
 
-    # Facebook 评论只能在原评论下公开回复。先固定 visibility 再执行 Final Guard，
+    # Meta 评论只能在原评论下公开回复。先固定 visibility 再执行 Final Guard，
     # 否则模型给出的 private 会绕过公开回复的 PII 检查，随后再被改成公开发送。
-    if snapshot.platform == "facebook" and snapshot.channel_type is ChannelType.COMMENT:
+    if snapshot.platform in {"facebook", "instagram"} and (
+        snapshot.channel_type is ChannelType.COMMENT
+    ):
+        reason = (
+            "FACEBOOK_COMMENT_PUBLIC"
+            if snapshot.platform == "facebook"
+            else "INSTAGRAM_COMMENT_PUBLIC"
+        )
         decision = replace(
             decision,
             reply_visibility=Visibility.PUBLIC,
-            reason_codes=decision.reason_codes + ("FACEBOOK_COMMENT_PUBLIC",),
+            reason_codes=decision.reason_codes + (reason,),
         )
 
     # 输出侧闸门

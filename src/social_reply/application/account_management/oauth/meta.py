@@ -58,12 +58,18 @@ _FACEBOOK_COMMENT_SCOPES = (
     "pages_read_user_content",
     "pages_manage_engagement",
 )
+_INSTAGRAM_COMMENT_SCOPES = (
+    "pages_read_engagement",
+    "instagram_manage_comments",
+)
 
 
 def _oauth_scopes(platform: str) -> str:
     scopes = _SCOPES[platform].split(",")
     if platform == "facebook" and get_settings().meta_comment_reply_enabled:
         scopes.extend(_FACEBOOK_COMMENT_SCOPES)
+    if platform == "instagram" and get_settings().meta_comment_reply_enabled:
+        scopes.extend(_INSTAGRAM_COMMENT_SCOPES)
     return ",".join(scopes)
 
 
@@ -176,7 +182,7 @@ async def meta_oauth_start(request: Request) -> Response:
                 "scope": _oauth_scopes(platform),
                 **(
                     {"auth_type": "rerequest"}
-                    if platform == "facebook" and get_settings().meta_comment_reply_enabled
+                    if get_settings().meta_comment_reply_enabled
                     else {}
                 ),
             },
@@ -392,7 +398,7 @@ async def _finalize(
     else:
         external_account_id = candidate["id"]
         display_name = candidate["name"]
-    enable_comments = platform == "facebook" and settings.meta_comment_reply_enabled
+    enable_comments = settings.meta_comment_reply_enabled
     automation_default = (
         "BOT_ACTIVE"
         if enable_comments and settings.meta_auto_reply_enabled

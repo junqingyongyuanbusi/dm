@@ -205,11 +205,22 @@ async def test_meta_account_api_rejects_out_of_scope_launch_policy(overrides):
     assert response.status_code == 422
 
 
-async def test_instagram_comments_stay_disabled_when_facebook_comment_switch_is_on(monkeypatch):
+async def test_instagram_account_api_defaults_to_active_comments_when_enabled(monkeypatch):
+    captured = {}
     settings = account_router.get_settings().model_copy(
         update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
     )
     monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+    async def fake_enqueue(_job_id):
+        return None
+
+    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
             "/api/v1/platform-accounts/meta",
@@ -222,10 +233,11 @@ async def test_instagram_comments_stay_disabled_when_facebook_comment_switch_is_
                 "app_id": "app-1",
                 "verify_token": "verify",
                 "page_id": "page-1",
-                "enable_comments": True,
             },
         )
-    assert response.status_code == 422
+    assert response.status_code == 202
+    assert captured["request"]["enable_comments"] is True
+    assert captured["request"]["automation_default"] == "BOT_ACTIVE"
 
 
 async def test_x_account_api_rejects_disabled_features(monkeypatch):

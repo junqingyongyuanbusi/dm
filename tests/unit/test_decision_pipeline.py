@@ -1,3 +1,5 @@
+import pytest
+
 from social_reply.application.reply_decision.jobs import snapshot_from_dict, snapshot_to_dict
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
 from social_reply.domain.messages.canonical import ChannelType
@@ -177,7 +179,14 @@ async def test_rule_handoff_is_not_converted_to_auto_reply():
     assert "LLM_HANDOFF_FALLBACK" not in d.reason_codes
 
 
-async def test_facebook_comment_forces_public_visibility_before_guard():
+@pytest.mark.parametrize(
+    ("platform", "reason"),
+    [
+        ("facebook", "FACEBOOK_COMMENT_PUBLIC"),
+        ("instagram", "INSTAGRAM_COMMENT_PUBLIC"),
+    ],
+)
+async def test_meta_comment_forces_public_visibility_before_guard(platform, reason):
     class _PrivateLLM:
         async def decide(self, context):
             return ReplyDecision(
@@ -189,7 +198,7 @@ async def test_facebook_comment_forces_public_visibility_before_guard():
 
     decision = await run_decision_pipeline(
         _snap(
-            platform="facebook",
+            platform=platform,
             channel_type=ChannelType.COMMENT,
         ),
         llm=_PrivateLLM(),
@@ -197,10 +206,11 @@ async def test_facebook_comment_forces_public_visibility_before_guard():
     )
 
     assert decision.reply_visibility is Visibility.PUBLIC
-    assert "FACEBOOK_COMMENT_PUBLIC" in decision.reason_codes
+    assert reason in decision.reason_codes
 
 
-async def test_facebook_comment_private_pii_is_blocked_after_becoming_public():
+@pytest.mark.parametrize("platform", ["facebook", "instagram"])
+async def test_meta_comment_private_pii_is_blocked_after_becoming_public(platform):
     class _PrivatePiiLLM:
         async def decide(self, context):
             return ReplyDecision(
@@ -211,7 +221,7 @@ async def test_facebook_comment_private_pii_is_blocked_after_becoming_public():
             )
 
     decision = await run_decision_pipeline(
-        _snap(platform="facebook", channel_type=ChannelType.COMMENT),
+        _snap(platform=platform, channel_type=ChannelType.COMMENT),
         llm=_PrivatePiiLLM(),
         killswitch=_OpenSwitch(),
     )

@@ -84,7 +84,7 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
     if isinstance(exc, MetaCommentPermissionError):
         return (
             "META_COMMENT_PERMISSION_REQUIRED",
-            "请重新授权 Facebook Page，并允许页面互动读取、用户内容读取和互动管理权限。",
+            "请重新授权 Meta 账号，并允许该 Facebook Page 或 Instagram 账号的评论权限。",
             False,
         )
     if isinstance(exc, ValueError) and str(exc).startswith("x_direct_message_permission_missing:"):

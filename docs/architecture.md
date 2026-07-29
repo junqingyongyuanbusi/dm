@@ -126,27 +126,29 @@ resumable backfill.
 ## Meta platform boundaries
 
 Facebook Messenger, Instagram Messaging, and WhatsApp use independent Settings gates even though
-they share the signed Meta webhook route. Instagram remains a text-DM-only, draft-first path.
-Facebook is also DM-only by default, but enabling both Meta release switches makes newly authorized
-Pages comment-capable and `BOT_ACTIVE`: OAuth validates Page-targeted comment permissions,
-provisioning installs `messages` plus `feed`, and comment decisions are forced to public visibility
-before Final Guard. Delivery therefore creates only `meta_public_comment` child replies, never
-`meta_private_reply`; the account-level automation state also applies to Messenger DMs. A verified
+they share the signed Meta webhook route. Both Facebook and Instagram remain draft-first and
+DM-only by default, but enabling both Meta release switches makes newly authorized accounts
+comment-capable and `BOT_ACTIVE`. OAuth validates target-specific comment permissions;
+provisioning installs Facebook `feed` or Instagram `comments`; and comment decisions are forced to
+public visibility before Final Guard. Delivery therefore creates only `meta_public_comment` child
+replies, never `meta_private_reply`; account-level automation state also applies to DMs. A verified
 enabled request writes one minimal app-scoped request record plus one owned RawEvent per recognized
 account entry. A disabled event family stores only a tenant/app-scoped audit summary and SHA-256
 body digest, then acknowledges without dispatch.
 
 Instagram credential paths remain explicit. Facebook Login stores a Page token, IG professional
 account ID and required Page ID under `PlatformApp(platform_family=meta)`; subscription and sending
-use the Page path. Instagram Login stores an Instagram long-lived token and IG professional account
-ID under `PlatformApp(platform_family=instagram)`; it forbids a Page ID and uses the Instagram Graph
-account path. A partial unique index makes the shared Meta webhook `public_id` unambiguous across
-these two App families.
+use the Page path, but comments are subscribed on the App-level `instagram` object because Page
+`subscribed_apps` does not accept `comments`. Instagram Login stores an Instagram long-lived token
+and IG professional account ID under `PlatformApp(platform_family=instagram)`; it forbids a Page ID
+and uses the Instagram Graph account path, where `comments` is also an account-level subscription.
+A partial unique index makes the shared Meta webhook `public_id` unambiguous across these two App
+families.
 
 Meta Page/account calls include HMAC-SHA256 `appsecret_proof`. Provisioning creates an active route
 with health `PROVISIONING` so concurrent inbound occurrences remain durable, while send-time checks
 pause all Meta delivery until `READY`; subscription failure disables the account. Scheduler health
-reconciliation probes account identity and Facebook comment permission scope,
+reconciliation probes account identity and Meta comment permission scope,
 reads and repairs the desired subscription, and writes sanitized `READY`, `ERROR`, or
 `REAUTH_REQUIRED` state to account config. Existing provisioning jobs and direct Outbox rows pause
 without consuming a disabled-period attempt and recover after the matching flag is re-enabled.

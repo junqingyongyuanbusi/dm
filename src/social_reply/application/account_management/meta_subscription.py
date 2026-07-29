@@ -175,6 +175,22 @@ def meta_subscription_fields(
     return tuple(wanted)
 
 
+def meta_app_subscription_fields(
+    *,
+    platform: str,
+    enable_dm: bool,
+    enable_comments: bool,
+) -> tuple[str, ...]:
+    """Return App-level webhook fields, independent of the account subscription path."""
+    available = _FACEBOOK_FIELDS if platform == "facebook" else _INSTAGRAM_FIELDS
+    return tuple(
+        field
+        for field in available
+        if (field == "messages" and enable_dm)
+        or (field in {"feed", "comments"} and enable_comments)
+    )
+
+
 def meta_app_subscription_object(platform: str) -> str:
     """Map a platform onto the webhook `object` its app-level subscription uses."""
     try:

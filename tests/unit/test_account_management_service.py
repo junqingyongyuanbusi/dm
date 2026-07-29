@@ -203,18 +203,21 @@ async def test_connect_meta_accepts_bot_active_once_deployment_opts_in(monkeypat
         )
 
 
-async def test_connect_meta_keeps_instagram_comments_disabled_when_switch_is_on(
-    monkeypatch, tmp_path
-):
-    settings = service.get_settings().model_copy(update={"meta_comment_reply_enabled": True})
+async def test_connect_meta_allows_instagram_comments_when_switch_is_on(monkeypatch, tmp_path):
+    settings = service.get_settings().model_copy(
+        update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
+    )
     monkeypatch.setattr(service, "get_settings", lambda: settings)
 
-    class UnexpectedClient:
-        def __init__(self, **_kwargs):
-            raise AssertionError("Instagram comments must fail before Graph calls")
+    class ReachedGraphCall(Exception):
+        pass
 
-    monkeypatch.setattr(service, "MetaGraphClient", UnexpectedClient)
-    with pytest.raises(ValueError, match="instagram_comments_disabled"):
+    class SentinelClient:
+        def __init__(self, **_kwargs):
+            raise ReachedGraphCall
+
+    monkeypatch.setattr(service, "MetaGraphClient", SentinelClient)
+    with pytest.raises(ReachedGraphCall):
         await service.connect_meta_account(
             platform="instagram",
             external_account_id="ig-1",
@@ -225,6 +228,7 @@ async def test_connect_meta_keeps_instagram_comments_disabled_when_switch_is_on(
             app_id="app-1",
             page_id="page-1",
             enable_comments=True,
+            automation_default="BOT_ACTIVE",
             secrets_root=tmp_path,
         )
 

@@ -18,10 +18,17 @@ async def _seed_instagram_account(
     session,
     *,
     login_mode: str,
+    comments: bool = False,
+    automation_default: str = "BOT_DRAFT_ONLY",
 ) -> tuple[uuid.UUID, str]:
     app_id, account_id = uuid.uuid4(), uuid.uuid4()
     app_family = "instagram" if login_mode == "instagram_login" else "meta"
     app_public_id = f"{app_family}_{uuid.uuid4().hex}"
+    account_fields = (
+        ["messages", "comments"]
+        if comments and login_mode == "instagram_login"
+        else ["messages"]
+    )
     config = {
         "delivery_mode": "direct",
         "graph_base_url": (
@@ -31,8 +38,11 @@ async def _seed_instagram_account(
         ),
         "api_version": "v23.0",
         "instagram_login_mode": login_mode,
-        "meta_desired_subscribed_fields": ["messages"],
-        "meta_subscribed_fields": ["messages"],
+        "meta_desired_subscribed_fields": account_fields,
+        "meta_desired_app_subscribed_fields": (
+            ["messages", "comments"] if comments else ["messages"]
+        ),
+        "meta_subscribed_fields": account_fields,
         "meta_health_status": "READY",
     }
     if login_mode == "facebook_login":
@@ -64,8 +74,8 @@ async def _seed_instagram_account(
             public_id=f"ig_{uuid.uuid4().hex}",
             credential_bundle=encrypt_secret_bundle({"access_token": "account-token"}),
             config=config,
-            capability={"dm": True, "comments": False, "max_text_length": 1000},
-            automation_default="BOT_DRAFT_ONLY",
+            capability={"dm": True, "comments": comments, "max_text_length": 1000},
+            automation_default=automation_default,
             status="active",
         )
     )
@@ -152,3 +162,85 @@ async def test_signed_instagram_dm_reaches_draft_for_each_login_mode(session, lo
     assert conversation.conversation_key == f"instagram_dm:{account_id}:igsid-valid"
     assert decision.action == "draft"
     assert await session.scalar(select(func.count()).select_from(models.OutboxMessage)) == 0
+
+
+@pytest.mark.parametrize("login_mode", ["facebook_login", "instagram_login"])
+async def test_instagram_comment_webhook_sends_public_reply_for_each_login_mode(
+    session, monkeypatch, login_mode
+):
+    from social_reply.application.message_delivery import outbox as outbox_module
+
+    account_id, app_public_id = await _seed_instagram_account(
+        session,
+        login_mode=login_mode,
+        comments=True,
+        automation_default="BOT_ACTIVE",
+    )
+    sent: list[dict] = []
+
+    class FakeSender:
+        async def send_text(self, *, target: dict, text: str) -> str:
+            sent.append({"target": target, "text": text})
+            return "instagram-reply-1"
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fake_sender(_account_id):
+        assert _account_id == account_id
+        return FakeSender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", fake_sender)
+    payload = {
+        "object": "instagram",
+        "entry": [
+            {
+                "id": "ig-1",
+                "changes": [
+                    {
+                        "field": "comments",
+                        "value": {
+                            "id": f"comment-{login_mode}",
+                            "media_id": "media-1",
+                            "from": {"id": "comment-user"},
+                            "text": "How can I order?",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    signature = "sha256=" + hmac.new(b"app-secret", body, hashlib.sha256).hexdigest()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            f"/webhooks/meta/{app_public_id}",
+            content=body,
+            headers={"X-Hub-Signature-256": signature},
+        )
+    assert response.status_code == 200
+
+    session.expire_all()
+    conversation = (await session.execute(select(models.Conversation))).scalar_one()
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    outbox = (await session.execute(select(models.OutboxMessage))).scalar_one()
+    assert conversation.channel_type == "comment"
+    assert decision.action == "auto_reply"
+    assert decision.reply_visibility == "public"
+    assert "INSTAGRAM_COMMENT_PUBLIC" in decision.reason_codes
+    assert outbox.destination_type == "meta_public_comment"
+    assert outbox.status == "SENT"
+    assert outbox.platform_message_id == "instagram-reply-1"
+    assert outbox.payload["target"] == {
+        "kind": "comment",
+        "comment_id": f"comment-{login_mode}",
+    }
+    assert sent == [{"target": outbox.payload["target"], "text": outbox.payload["text"]}]
+    assert await session.scalar(
+        select(func.count())
+        .select_from(models.OutboxMessage)
+        .where(models.OutboxMessage.destination_type == "meta_private_reply")
+    ) == 0
