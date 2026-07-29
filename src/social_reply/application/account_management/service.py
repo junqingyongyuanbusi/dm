@@ -276,6 +276,7 @@ async def connect_meta_account(
         platform=platform,
         enable_dm=enable_dm,
         enable_comments=enable_comments,
+        instagram_login_mode=instagram_login_mode,
     )
     webhook_url = _webhook_url(public_base_url, f"/webhooks/meta/{resolved_app_public_id}")
     account_config = {

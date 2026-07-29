@@ -79,6 +79,7 @@ async def subscribe_meta_account(
         platform=platform,
         enable_dm=enable_dm,
         enable_comments=enable_comments,
+        instagram_login_mode=instagram_login_mode,
     )
     if not fields:
         return ()
@@ -157,8 +158,14 @@ def meta_subscription_fields(
     platform: str,
     enable_dm: bool,
     enable_comments: bool,
+    instagram_login_mode: str = "facebook_login",
 ) -> tuple[str, ...]:
     available = _FACEBOOK_FIELDS if platform == "facebook" else _INSTAGRAM_FIELDS
+    # facebook_login 下 Instagram 的订阅写在关联 Page 上，而 Page 的 subscribed_fields
+    # 没有 comments（只有 feed/mention 那一套），提交会被 Graph 直接拒掉。
+    # 这种模式下 IG 评论靠 App 级 instagram 对象的 comments 字段投递。
+    if platform == "instagram" and instagram_login_mode == "facebook_login":
+        available = tuple(field for field in available if field != "comments")
     wanted = []
     for field in available:
         if field == "messages" and enable_dm:

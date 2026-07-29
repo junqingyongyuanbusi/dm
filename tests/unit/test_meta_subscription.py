@@ -6,6 +6,7 @@ from social_reply.application.account_management.meta_subscription import (
     get_meta_app_subscription,
     get_meta_subscription_fields,
     meta_app_subscription_object,
+    meta_subscription_fields,
     reconcile_meta_app_subscription,
     subscribe_meta_account,
 )
@@ -247,3 +248,31 @@ async def test_reading_app_subscription_returns_none_for_unsubscribed_object():
     )
 
     assert result is None
+
+
+def test_instagram_facebook_login_never_asks_page_for_comments():
+    # facebook_login 下订阅写在关联 Page 上，而 Page 的 subscribed_fields 枚举里
+    # 没有 comments，提交会被 Graph 以 code 100 拒掉。IG 评论走 App 级 instagram 对象。
+    assert meta_subscription_fields(
+        platform="instagram",
+        enable_dm=True,
+        enable_comments=True,
+        instagram_login_mode="facebook_login",
+    ) == ("messages",)
+
+
+def test_instagram_login_mode_still_subscribes_comments_directly():
+    # instagram_login 走 graph.instagram.com/<IG_ID>/subscribed_apps，那里接受 comments
+    assert meta_subscription_fields(
+        platform="instagram",
+        enable_dm=True,
+        enable_comments=True,
+        instagram_login_mode="instagram_login",
+    ) == ("messages", "comments")
+
+
+def test_facebook_comments_ride_the_feed_field():
+    assert meta_subscription_fields(platform="facebook", enable_dm=True, enable_comments=True) == (
+        "messages",
+        "feed",
+    )

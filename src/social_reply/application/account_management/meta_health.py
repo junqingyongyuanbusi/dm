@@ -172,6 +172,7 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
             platform=account.platform,
             enable_dm=capability_enabled(account.capability, CapabilityKey.DM),
             enable_comments=capability_enabled(account.capability, CapabilityKey.COMMENTS),
+            instagram_login_mode=login_mode,
         )
     client = MetaGraphClient(
         platform=account.platform,
