@@ -179,31 +179,146 @@ def _selected(value: str, expected: str) -> str:
     return " selected" if value == expected else ""
 
 
+_CHANNEL_FILTERS = {"all", "dm", "comment"}
+_CONVERSATION_CHANNEL_LABELS = {
+    "dm": "私信",
+    "comment": "评论",
+    "mention": "提及",
+}
+
+
+def _channel_label(channel_type: str) -> str:
+    return _CONVERSATION_CHANNEL_LABELS.get(channel_type, channel_type)
+
+
+def _channel_condition(channel: str):
+    if channel == "dm":
+        return models.Conversation.channel_type == "dm"
+    if channel == "comment":
+        return models.Conversation.channel_type.in_(("comment", "mention"))
+    return None
+
+
+def _reviewable_draft_condition():
+    draft_text = func.btrim(
+        func.coalesce(
+            models.ReplyDecision.original_reply_text,
+            models.ReplyDecision.reply_text,
+            "",
+        )
+    )
+    return and_(
+        models.ReplyDecision.action == "draft",
+        func.coalesce(models.ReplyDecision.review_action, "PENDING") == "PENDING",
+        models.ReplyDecision.outbox_id.is_(None),
+        models.ReplyDecision.message_id.is_not(None),
+        func.length(draft_text) > 0,
+    )
+
+
+def _scope_inbox_statement(
+    statement,
+    *,
+    tenant_column,
+    tenants: frozenset[str],
+    tenant_id: str,
+    account_id: uuid.UUID | None,
+    platform: str,
+    channel: str,
+):
+    statement = statement.where(
+        tenant_column.in_(tenants),
+        models.Conversation.tenant_id == tenant_column,
+        models.PlatformAccount.tenant_id == tenant_column,
+    )
+    if tenant_id:
+        statement = statement.where(tenant_column == tenant_id)
+    if account_id is not None:
+        statement = statement.where(models.Conversation.platform_account_id == account_id)
+    if platform:
+        statement = statement.where(models.PlatformAccount.platform == platform)
+    channel_filter = _channel_condition(channel)
+    if channel_filter is not None:
+        statement = statement.where(channel_filter)
+    return statement
+
+
 async def _load_inbox_summary(
-    session, tenants: frozenset[str]
+    session,
+    tenants: frozenset[str],
+    *,
+    tenant_id: str = "",
+    account_id: uuid.UUID | None = None,
+    platform: str = "",
+    channel: str = "all",
 ) -> dict[str, tuple[int, datetime | None]]:
+    scope = {
+        "tenants": tenants,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "platform": platform,
+        "channel": channel,
+    }
+    human_statement = (
+        select(func.count(), func.min(models.HumanWorkItem.created_at))
+        .join(
+            models.Conversation,
+            models.Conversation.id == models.HumanWorkItem.conversation_id,
+        )
+        .join(
+            models.PlatformAccount,
+            models.PlatformAccount.id == models.Conversation.platform_account_id,
+        )
+        .where(models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")))
+    )
     human = (
         await session.execute(
-            select(func.count(), func.min(models.HumanWorkItem.created_at)).where(
-                models.HumanWorkItem.tenant_id.in_(tenants),
-                models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
+            _scope_inbox_statement(
+                human_statement,
+                tenant_column=models.HumanWorkItem.tenant_id,
+                **scope,
             )
         )
     ).one()
+    draft_statement = (
+        select(func.count(), func.min(models.ReplyDecision.created_at))
+        .join(
+            models.Conversation,
+            models.Conversation.id == models.ReplyDecision.conversation_id,
+        )
+        .join(
+            models.PlatformAccount,
+            models.PlatformAccount.id == models.Conversation.platform_account_id,
+        )
+        .where(_reviewable_draft_condition())
+    )
     drafts = (
         await session.execute(
-            select(func.count(), func.min(models.ReplyDecision.created_at)).where(
-                models.ReplyDecision.tenant_id.in_(tenants),
-                models.ReplyDecision.action == "draft",
-                func.coalesce(models.ReplyDecision.review_action, "PENDING") == "PENDING",
+            _scope_inbox_statement(
+                draft_statement,
+                tenant_column=models.ReplyDecision.tenant_id,
+                **scope,
             )
         )
     ).one()
+    delivery_statement = (
+        select(func.count(), func.min(models.OutboxMessage.created_at))
+        .join(
+            models.Conversation,
+            models.Conversation.id == models.OutboxMessage.conversation_id,
+        )
+        .join(
+            models.PlatformAccount,
+            models.PlatformAccount.id == models.Conversation.platform_account_id,
+        )
+        .where(models.OutboxMessage.status.in_(("FAILED", "NEEDS_REVIEW")))
+    )
     delivery = (
         await session.execute(
-            select(func.count(), func.min(models.OutboxMessage.created_at)).where(
-                models.OutboxMessage.tenant_id.in_(tenants),
-                models.OutboxMessage.status.in_(("FAILED", "NEEDS_REVIEW")),
+            _scope_inbox_statement(
+                delivery_statement,
+                tenant_column=models.OutboxMessage.tenant_id,
+                **scope,
             )
         )
     ).one()
@@ -222,6 +337,7 @@ def _inbox_filter_form(
     tenant_id: str,
     account_id: str,
     platform: str,
+    channel: str,
     queue_status: str,
     reason: str,
 ) -> str:
@@ -249,11 +365,42 @@ def _inbox_filter_form(
     )
     return f"""<form class="filters" method="get" action="/admin/inbox">
 <input type="hidden" name="queue" value="{queue}">
+<input type="hidden" name="channel" value="{channel}">
 <div><label for="inbox-tenant">Tenant</label><select id="inbox-tenant" name="tenant_id">{tenant_options}</select></div>
 <div><label for="inbox-account">账号</label><select id="inbox-account" name="account_id">{account_options}</select></div>
 <div><label for="inbox-platform">平台</label><select id="inbox-platform" name="platform">{platform_options}</select></div>
 <div><label for="inbox-status">状态</label><select id="inbox-status" name="status">{status_options}</select></div>
 <div><label for="inbox-reason">原因代码</label><input id="inbox-reason" name="reason" value="{html.escape(reason, quote=True)}" maxlength="128" placeholder="全部原因"></div>
+<button>筛选</button></form>"""
+
+
+def _conversation_filter_form(
+    *,
+    principal: Principal,
+    accounts: list[models.PlatformAccount],
+    tenant_id: str,
+    account_id: str,
+    platform: str,
+    channel: str,
+) -> str:
+    tenant_options = '<option value="">全部 Tenant</option>' + "".join(
+        f'<option value="{html.escape(value)}"{_selected(tenant_id, value)}>{html.escape(value)}</option>'
+        for value in sorted(principal.allowed_tenants)
+    )
+    account_options = '<option value="">全部账号</option>' + "".join(
+        f'<option value="{account.id}"{_selected(account_id, str(account.id))}>{html.escape(account.name)}</option>'
+        for account in accounts
+        if not tenant_id or account.tenant_id == tenant_id
+    )
+    platform_options = '<option value="">全部平台</option>' + "".join(
+        f'<option value="{value}"{_selected(platform, value)}>{html.escape(value)}</option>'
+        for value in ("telegram", "facebook", "instagram", "whatsapp", "x")
+    )
+    return f"""<form class="filters" method="get" action="/admin/conversations">
+<input type="hidden" name="channel" value="{channel}">
+<div><label for="conversation-tenant">Tenant</label><select id="conversation-tenant" name="tenant_id">{tenant_options}</select></div>
+<div><label for="conversation-account">账号</label><select id="conversation-account" name="account_id">{account_options}</select></div>
+<div><label for="conversation-platform">平台</label><select id="conversation-platform" name="platform">{platform_options}</select></div>
 <button>筛选</button></form>"""
 
 
@@ -470,9 +617,9 @@ async def _load_health_metrics(
     ).one()
 
     return [
-        _HealthMetric("ingestion", "入站恢复", *raw_row, "/admin/delivery"),
-        _HealthMetric("decisions", "决策任务", *decision_row, "/admin/decisions"),
-        _HealthMetric("delivery", "消息投递", *outbox_row, "/admin/delivery"),
+        _HealthMetric("ingestion", "入站恢复", *raw_row, "/admin/health#ingress"),
+        _HealthMetric("decisions", "决策任务", *decision_row, "/admin/health#decisions"),
+        _HealthMetric("delivery", "消息投递", *outbox_row, "/admin/inbox?queue=delivery"),
         _HealthMetric("provisioning", "账号接入", *provisioning_row, "/admin/accounts"),
         _HealthMetric("sync", "X 同步", *sync_row, "/admin/accounts"),
         _HealthMetric(
@@ -633,6 +780,7 @@ def _draft_review_card(
     conversation: models.Conversation,
     display_name: str,
     platform: str,
+    channel_type: str,
     account_name: str,
     csrf: str,
     now: datetime,
@@ -641,7 +789,7 @@ def _draft_review_card(
     original_text = decision.original_reply_text or decision.reply_text or ""
     heading = (
         f'<section class="card"><h3>{html.escape(display_name)} · '
-        f"{html.escape(platform)}</h3>"
+        f"{html.escape(platform)} · {html.escape(_channel_label(channel_type))}</h3>"
         f'<p class="hint">{html.escape(account_name)} · {_pill(review_action)} · '
         f"等待 {_health_age(now, decision.created_at)} · "
         f'<a href="/admin/conversations/{conversation.id}">查看上下文</a></p>'
@@ -665,8 +813,42 @@ async def inbox_counts(request: Request) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
+    tenant_id = request.query_params.get("tenant_id", "").strip()
+    if tenant_id:
+        principal.require_tenant(tenant_id)
+    account_id = request.query_params.get("account_id", "").strip()
+    account_uuid: uuid.UUID | None = None
+    if account_id:
+        try:
+            account_uuid = uuid.UUID(account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
+    platform = request.query_params.get("platform", "").strip()
+    if platform and platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+        raise HTTPException(status_code=422, detail="invalid_platform_filter")
+    channel = request.query_params.get("channel", "all").strip()
+    if channel not in _CHANNEL_FILTERS:
+        raise HTTPException(status_code=422, detail="invalid_channel_filter")
     async with get_session_factory()() as session:
-        summary = await _load_inbox_summary(session, principal.allowed_tenants)
+        if account_uuid is not None:
+            account_exists = await session.scalar(
+                select(func.count())
+                .select_from(models.PlatformAccount)
+                .where(
+                    models.PlatformAccount.id == account_uuid,
+                    models.PlatformAccount.tenant_id.in_(principal.allowed_tenants),
+                )
+            )
+            if not account_exists:
+                raise HTTPException(status_code=404, detail="account_not_found")
+        summary = await _load_inbox_summary(
+            session,
+            principal.allowed_tenants,
+            tenant_id=tenant_id,
+            account_id=account_uuid,
+            platform=platform,
+            channel=channel,
+        )
     return JSONResponse({key: value[0] for key, value in summary.items()})
 
 
@@ -693,6 +875,9 @@ async def inbox_page(request: Request) -> Response:
     platform = request.query_params.get("platform", "").strip()
     if platform and platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
         raise HTTPException(status_code=422, detail="invalid_platform_filter")
+    channel = request.query_params.get("channel", "all").strip()
+    if channel not in _CHANNEL_FILTERS:
+        raise HTTPException(status_code=422, detail="invalid_channel_filter")
     queue_status = request.query_params.get("status", "").strip()
     valid_statuses = {
         "human": {"WAITING", "CLAIMED", "RESOLVED", "CANCELLED"},
@@ -717,7 +902,14 @@ async def inbox_page(request: Request) -> Response:
         )
         if account_uuid is not None and all(account.id != account_uuid for account in accounts):
             raise HTTPException(status_code=404, detail="account_not_found")
-        summary = await _load_inbox_summary(session, tenants)
+        summary = await _load_inbox_summary(
+            session,
+            tenants,
+            tenant_id=tenant_id,
+            account_id=account_uuid,
+            platform=platform,
+            channel=channel,
+        )
         now = datetime.now(UTC)
 
         if queue == "human":
@@ -745,7 +937,12 @@ async def inbox_page(request: Request) -> Response:
                     models.AutomationState.conversation_id == models.Conversation.id,
                     isouter=True,
                 )
-                .where(models.HumanWorkItem.tenant_id.in_(tenants))
+                .where(
+                    models.HumanWorkItem.tenant_id.in_(tenants),
+                    models.Conversation.tenant_id == models.HumanWorkItem.tenant_id,
+                    models.PlatformAccount.tenant_id == models.HumanWorkItem.tenant_id,
+                    models.Contact.tenant_id == models.HumanWorkItem.tenant_id,
+                )
             )
             if queue_status:
                 statement = statement.where(models.HumanWorkItem.status == queue_status)
@@ -759,6 +956,9 @@ async def inbox_page(request: Request) -> Response:
                 statement = statement.where(models.Conversation.platform_account_id == account_uuid)
             if platform:
                 statement = statement.where(models.PlatformAccount.platform == platform)
+            channel_filter = _channel_condition(channel)
+            if channel_filter is not None:
+                statement = statement.where(channel_filter)
             items = (
                 await session.execute(
                     statement.order_by(models.HumanWorkItem.created_at).limit(100)
@@ -786,12 +986,15 @@ async def inbox_page(request: Request) -> Response:
                 .where(
                     models.ReplyDecision.tenant_id.in_(tenants),
                     models.ReplyDecision.action == "draft",
+                    models.Conversation.tenant_id == models.ReplyDecision.tenant_id,
+                    models.PlatformAccount.tenant_id == models.ReplyDecision.tenant_id,
+                    models.Contact.tenant_id == models.ReplyDecision.tenant_id,
                 )
             )
-            statement = statement.where(
-                func.coalesce(models.ReplyDecision.review_action, "PENDING")
-                == (queue_status or "PENDING")
-            )
+            if queue_status and queue_status != "PENDING":
+                statement = statement.where(models.ReplyDecision.review_action == queue_status)
+            else:
+                statement = statement.where(_reviewable_draft_condition())
             if reason:
                 statement = statement.where(models.ReplyDecision.reason_codes.contains([reason]))
             if tenant_id:
@@ -800,6 +1003,9 @@ async def inbox_page(request: Request) -> Response:
                 statement = statement.where(models.Conversation.platform_account_id == account_uuid)
             if platform:
                 statement = statement.where(models.PlatformAccount.platform == platform)
+            channel_filter = _channel_condition(channel)
+            if channel_filter is not None:
+                statement = statement.where(channel_filter)
             items = (
                 await session.execute(
                     statement.order_by(models.ReplyDecision.created_at).limit(100)
@@ -826,6 +1032,9 @@ async def inbox_page(request: Request) -> Response:
                 )
                 .where(
                     models.OutboxMessage.tenant_id.in_(tenants),
+                    models.Conversation.tenant_id == models.OutboxMessage.tenant_id,
+                    models.PlatformAccount.tenant_id == models.OutboxMessage.tenant_id,
+                    models.Contact.tenant_id == models.OutboxMessage.tenant_id,
                     models.OutboxMessage.status.in_(
                         (queue_status,) if queue_status else ("FAILED", "NEEDS_REVIEW")
                     ),
@@ -841,22 +1050,55 @@ async def inbox_page(request: Request) -> Response:
                 )
             if platform:
                 statement = statement.where(models.PlatformAccount.platform == platform)
+            channel_filter = _channel_condition(channel)
+            if channel_filter is not None:
+                statement = statement.where(channel_filter)
             items = (
                 await session.execute(
                     statement.order_by(models.OutboxMessage.created_at).limit(100)
                 )
             ).all()
 
+    shared_query = {
+        key: value
+        for key, value in (
+            ("tenant_id", tenant_id),
+            ("account_id", account_id),
+            ("platform", platform),
+            ("channel", channel if channel != "all" else ""),
+        )
+        if value
+    }
     queue_tabs = (
         '<div class="queue-tabs">'
         + "".join(
-            f'<a class="queue-tab{" active" if queue == key else ""}" href="/admin/inbox?queue={key}">'
+            f'<a class="queue-tab{" active" if queue == key else ""}" href="/admin/inbox?{urlencode({"queue": key, **shared_query})}">'
             f"<strong>{summary[key][0]}</strong><span>{label} · 最老 {_health_age(now, summary[key][1])}</span></a>"
             for key, label in (
                 ("human", "待人工"),
                 ("drafts", "待审核"),
                 ("delivery", "投递异常"),
             )
+        )
+        + "</div>"
+    )
+    channel_query = {
+        key: value
+        for key, value in (
+            ("queue", queue),
+            ("tenant_id", tenant_id),
+            ("account_id", account_id),
+            ("platform", platform),
+            ("status", queue_status),
+            ("reason", reason),
+        )
+        if value
+    }
+    channel_tabs = (
+        '<div class="chips" aria-label="互动类型">'
+        + "".join(
+            f'<a class="chip{" active" if channel == value else ""}" href="/admin/inbox?{urlencode({**channel_query, "channel": value})}">{label}</a>'
+            for value, label in (("all", "全部"), ("dm", "私信"), ("comment", "评论与提及"))
         )
         + "</div>"
     )
@@ -867,6 +1109,7 @@ async def inbox_page(request: Request) -> Response:
         tenant_id=tenant_id,
         account_id=account_id,
         platform=platform,
+        channel=channel,
         queue_status=queue_status,
         reason=reason,
     )
@@ -876,7 +1119,7 @@ async def inbox_page(request: Request) -> Response:
             "".join(
                 f"<tr><td class='muted'>{_health_age(now, work.created_at)}</td>"
                 f"<td><a href='/admin/conversations/{conv.id}'>{html.escape(display or external or '匿名用户')}</a></td>"
-                f"<td>{html.escape(platform_name)} · {html.escape(account_name)}</td>"
+                f"<td>{html.escape(platform_name)} · {html.escape(_channel_label(conv.channel_type))}<br><span class='muted'>{html.escape(account_name)}</span></td>"
                 f"<td>{_pill(work.status)}</td><td>{html.escape(_reason_label(work.reason_code))}</td>"
                 f"<td class='muted'>{html.escape(work.assigned_actor or str(work.assigned_user_id or '未认领'))}</td>"
                 "<td>"
@@ -885,12 +1128,7 @@ async def inbox_page(request: Request) -> Response:
                     if work.status == "WAITING"
                     else ""
                 )
-                + (
-                    f'<form class="inline" method="post" action="/admin/work-items/{work.id}/resolve"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work.version}"><button class="btn-sm btn-ghost">解决</button></form>'
-                    if work.status == "CLAIMED"
-                    and (principal.is_superadmin or work.assigned_actor == principal.actor)
-                    else ""
-                )
+                + f"<a href='/admin/conversations/{conv.id}'>打开</a>"
                 + "</td></tr>"
                 for work, conv, display, external, account_name, platform_name, _automation in items
             )
@@ -905,6 +1143,7 @@ async def inbox_page(request: Request) -> Response:
                     conversation=conv,
                     display_name=display or external or "匿名用户",
                     platform=platform_name,
+                    channel_type=conv.channel_type,
                     account_name=account_name,
                     csrf=csrf,
                     now=now,
@@ -919,7 +1158,7 @@ async def inbox_page(request: Request) -> Response:
             "".join(
                 f"<tr><td class='muted'>{_health_age(now, outbox.created_at)}</td>"
                 f"<td><a href='/admin/conversations/{conv.id}'>{html.escape(display or external or '匿名用户')}</a></td>"
-                f"<td>{html.escape(platform_name)} · {html.escape(account_name)}</td>"
+                f"<td>{html.escape(platform_name)} · {html.escape(_channel_label(conv.channel_type))}<br><span class='muted'>{html.escape(account_name)}</span></td>"
                 f"<td>{_pill(outbox.status)}</td><td>{html.escape(_reason_label(outbox.last_error_code))}</td>"
                 f"<td class='muted'>{html.escape(outbox.last_error_message or '—')}</td>"
                 + (
@@ -934,14 +1173,14 @@ async def inbox_page(request: Request) -> Response:
         )
         content = f"<section class='card'><div class='tablewrap'><table><thead><tr><th>等待</th><th>联系人</th><th>渠道</th><th>状态</th><th>错误</th><th>详情</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>"
 
-    body = f"""<h1>收件箱</h1><p class="lede">人工处理、草稿审核与投递异常的统一工作队列。</p>{queue_tabs}
+    body = f"""<h1>收件箱</h1><p class="lede">人工处理、草稿审核与投递异常的统一工作队列。</p>{queue_tabs}{channel_tabs}
 <section class="card">{filters}</section>{content}"""
     response = HTMLResponse(
         _page(
             "收件箱",
             body,
             active="inbox",
-            refresh_seconds=20,
+            refresh_seconds=0 if queue == "drafts" else 20,
             show_users=principal.is_superadmin,
         )
     )
@@ -957,6 +1196,22 @@ async def conversations_page(request: Request) -> Response:
     if isinstance(principal, Response):
         return principal
     tenants = principal.allowed_tenants
+    tenant_id = request.query_params.get("tenant_id", "").strip()
+    if tenant_id:
+        principal.require_tenant(tenant_id)
+    account_id = request.query_params.get("account_id", "").strip()
+    account_uuid: uuid.UUID | None = None
+    if account_id:
+        try:
+            account_uuid = uuid.UUID(account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
+    platform = request.query_params.get("platform", "").strip()
+    if platform and platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+        raise HTTPException(status_code=422, detail="invalid_platform_filter")
+    channel = request.query_params.get("channel", "all").strip()
+    if channel not in _CHANNEL_FILTERS:
+        raise HTTPException(status_code=422, detail="invalid_channel_filter")
     last_msg = (
         select(
             models.Message.conversation_id.label("cid"),
@@ -966,45 +1221,91 @@ async def conversations_page(request: Request) -> Response:
         .subquery()
     )
     async with get_session_factory()() as session:
+        accounts = list(
+            (
+                await session.execute(
+                    select(models.PlatformAccount)
+                    .where(models.PlatformAccount.tenant_id.in_(tenants))
+                    .order_by(models.PlatformAccount.name)
+                )
+            ).scalars()
+        )
+        if account_uuid is not None and all(account.id != account_uuid for account in accounts):
+            raise HTTPException(status_code=404, detail="account_not_found")
+        statement = (
+            select(
+                models.Conversation,
+                models.Contact.display_name,
+                models.Contact.external_user_id,
+                models.PlatformAccount.name.label("account_name"),
+                last_msg.c.last_at,
+            )
+            .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+            .join(
+                models.PlatformAccount,
+                models.Conversation.platform_account_id == models.PlatformAccount.id,
+            )
+            .join(last_msg, last_msg.c.cid == models.Conversation.id, isouter=True)
+            .where(
+                models.Conversation.tenant_id.in_(tenants),
+                models.Contact.tenant_id == models.Conversation.tenant_id,
+                models.PlatformAccount.tenant_id == models.Conversation.tenant_id,
+            )
+        )
+        if tenant_id:
+            statement = statement.where(models.Conversation.tenant_id == tenant_id)
+        if account_uuid:
+            statement = statement.where(models.Conversation.platform_account_id == account_uuid)
+        if platform:
+            statement = statement.where(models.PlatformAccount.platform == platform)
+        channel_filter = _channel_condition(channel)
+        if channel_filter is not None:
+            statement = statement.where(channel_filter)
         rows = (
             await session.execute(
-                select(
-                    models.Conversation,
-                    models.Contact.display_name,
-                    models.Contact.external_user_id,
-                    models.AutomationState.state,
-                    models.PlatformAccount.name.label("account_name"),
-                    last_msg.c.last_at,
-                )
-                .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
-                .join(
-                    models.AutomationState,
-                    models.AutomationState.conversation_id == models.Conversation.id,
-                    isouter=True,
-                )
-                .join(
-                    models.PlatformAccount,
-                    models.Conversation.platform_account_id == models.PlatformAccount.id,
-                )
-                .join(last_msg, last_msg.c.cid == models.Conversation.id, isouter=True)
-                .where(models.Conversation.tenant_id.in_(tenants))
-                .order_by(desc(func.coalesce(last_msg.c.last_at, models.Conversation.created_at)))
-                .limit(50)
+                statement.order_by(
+                    desc(func.coalesce(last_msg.c.last_at, models.Conversation.created_at))
+                ).limit(50)
             )
         ).all()
+    shared_query = {
+        key: value
+        for key, value in (
+            ("tenant_id", tenant_id),
+            ("account_id", account_id),
+            ("platform", platform),
+        )
+        if value
+    }
+    channel_tabs = (
+        '<div class="chips">'
+        + "".join(
+            f'<a class="chip{" active" if channel == value else ""}" href="/admin/conversations?{urlencode({"channel": value, **shared_query})}">{label}</a>'
+            for value, label in (("all", "全部"), ("dm", "私信"), ("comment", "评论与提及"))
+        )
+        + "</div>"
+    )
+    filters = _conversation_filter_form(
+        principal=principal,
+        accounts=accounts,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        platform=platform,
+        channel=channel,
+    )
     trs = (
         "".join(
-            f"<tr><td>{html.escape(conv.platform)}</td>"
+            f"<tr><td>{html.escape(conv.platform)} · {html.escape(_channel_label(conv.channel_type))}</td>"
             f"<td><a href='/admin/conversations/{conv.id}'>{html.escape(display or external or '匿名用户')}</a></td>"
             f"<td class='muted'>{html.escape(account_name)}</td>"
-            f"<td>{_pill(state or 'BOT_DRAFT_ONLY')}</td>"
             f"<td class='muted'>{_fmt(last_at or conv.created_at)}</td></tr>"
-            for conv, display, external, state, account_name, last_at in rows
+            for conv, display, external, account_name, last_at in rows
         )
-        or "<tr><td colspan='5' class='muted'>暂无对话</td></tr>"
+        or "<tr><td colspan='4' class='muted'>暂无对话</td></tr>"
     )
-    body = f"""<h1>对话</h1><p class="lede">最近活跃的客户对话；点击进入线程查看与接管。</p>
-<section class="card"><div class="tablewrap"><table><thead><tr><th>平台</th><th>联系人</th><th>账号</th><th>自动化状态</th><th>最后活跃</th></tr></thead><tbody>{trs}</tbody></table></div></section>"""
+    body = f"""<h1>对话</h1><p class="lede">按渠道浏览最近活跃的客户对话。</p>{channel_tabs}
+<section class="card">{filters}</section>
+<section class="card"><div class="tablewrap"><table><thead><tr><th>渠道</th><th>联系人</th><th>账号</th><th>最后活跃</th></tr></thead><tbody>{trs}</tbody></table></div></section>"""
     return HTMLResponse(
         _page("对话", body, active="conversations", show_users=principal.is_superadmin)
     )
@@ -1148,6 +1449,7 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         or "匿名用户"
     )
     reply_candidates = [message for message in msgs if message.direction == "inbound"]
+    reply_heading = "公开评论回复" if conv.channel_type in {"comment", "mention"} else "私信回复"
     text_limit = capability_text_limit(account.platform, dict(account.capability or {})) or 2000
     destination_label = "—"
     window_label = "无平台时限"
@@ -1217,13 +1519,13 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         or work_item.assigned_actor == principal.actor
     )
     composer = (
-        f"""<section class="card composer"><h2>人工回复</h2>
+        f"""<section class="card composer"><h2>{reply_heading}</h2>
 <dl class="channel-meta"><dt>回复渠道</dt><dd>{html.escape(destination_label)}</dd><dt>平台发送窗口</dt><dd>{html.escape(window_label)}</dd><dt>文本限制</dt><dd>{text_limit} 字符</dd></dl>
 <form method="post" action="/admin/conversations/{conversation_id}/reply"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="idempotency_key" value="{uuid.uuid4()}">{work_fields}
 <label>回复目标</label>{target_choices}<label for="manual-reply">回复内容</label><textarea id="manual-reply" name="text" required maxlength="{text_limit}"></textarea>
 <div class="composer-meta"><span>由当前管理员发送</span><span>最多 {text_limit} 字符</span></div><button>发送回复</button></form></section>"""
         if reply_candidates and can_handle
-        else "<section class='card'><h2>人工回复</h2><div class='banner err'>"
+        else f"<section class='card'><h2>{reply_heading}</h2><div class='banner err'>"
         + (
             "此工作项已由其他客服认领。"
             if reply_candidates
@@ -1284,8 +1586,8 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
 </tbody></table><div style="margin-top:14px">{work_actions}{buttons}</div></section>
 <section class="card"><h2>审计时间线</h2><ul class="audit-list">{audit_items}</ul></section>"""
     body = f"""<a class="back" href="/admin/inbox">← 返回收件箱</a>
-<section class="card"><h1 style="font-size:24px">{who}<span style="margin-left:12px">{_pill(cur_state)}</span></h1>
-<p class="hint">{html.escape(conv.platform)} · {html.escape(account.name)} · {html.escape(conv.channel_type)} · 会话键 <code>{html.escape(conv.conversation_key)}</code></p></section>
+<section class="card"><h1 style="font-size:24px">{who}</h1>
+<p class="hint">{html.escape(conv.platform)} · {html.escape(_channel_label(conv.channel_type))} · {html.escape(account.name)}</p></section>
 <div class="detail-grid"><div class="detail-stack"><section class="card"><h2>消息线程</h2><div class="thread">{bubbles}</div></section>{composer}</div><aside>{sidebar}</aside></div>
 <section class="card"><h2>发送状态</h2><div class="tablewrap"><table><thead><tr><th>时间</th><th>状态</th><th>来源</th><th>内容</th><th>平台错误</th></tr></thead><tbody>{outbox_rows}</tbody></table></div></section>
 <section class="card"><h2>本会话决策</h2><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复</th><th>原因</th><th>置信度</th></tr></thead><tbody>{decision_rows}</tbody></table></div></section>"""
@@ -1478,87 +1780,12 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
 # ---------- 决策与草稿审核 ----------
 
 
-@router.get("/decisions", response_class=HTMLResponse)
-async def decisions_page(request: Request, action: str = "") -> Response:
+@router.get("/decisions")
+async def decisions_page(request: Request) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
-    csrf = _csrf(request)
-    tenants = principal.allowed_tenants
-    valid_actions = ("auto_reply", "draft", "handoff", "ignore")
-    action = action if action in valid_actions else ""
-    async with get_session_factory()() as session:
-        pending_drafts = (
-            (
-                await session.execute(
-                    select(models.ReplyDecision)
-                    .where(
-                        models.ReplyDecision.tenant_id.in_(tenants),
-                        models.ReplyDecision.action == "draft",
-                        models.ReplyDecision.outbox_id.is_(None),
-                        models.ReplyDecision.reply_text.isnot(None),
-                        func.coalesce(models.ReplyDecision.review_action, "PENDING") == "PENDING",
-                    )
-                    .order_by(desc(models.ReplyDecision.created_at))
-                    .limit(20)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        stmt = (
-            select(models.ReplyDecision)
-            .where(models.ReplyDecision.tenant_id.in_(tenants))
-            .order_by(desc(models.ReplyDecision.created_at))
-            .limit(100)
-        )
-        if action:
-            stmt = stmt.where(models.ReplyDecision.action == action)
-        decisions = (await session.execute(stmt)).scalars().all()
-
-    draft_cards = (
-        "".join(
-            f"""<div class="card" style="margin-bottom:14px"><p style="margin:0 0 4px">{html.escape(d.original_reply_text or d.reply_text or "")}</p>
-<p class="muted" style="margin:0 0 10px">意图 {html.escape(d.intent or "—")} · {_fmt(d.created_at)} · <a href="/admin/conversations/{d.conversation_id}">查看对话</a></p>
-<form method="post" action="/admin/decisions/{d.id}/approve"><input type="hidden" name="csrf_token" value="{csrf}"><label for="decision-draft-{d.id}">审核后回复</label><textarea id="decision-draft-{d.id}" name="final_reply_text" required maxlength="10000">{html.escape(d.original_reply_text or d.reply_text or "")}</textarea><button class="btn-sm">发送</button></form>
-<form method="post" action="/admin/decisions/{d.id}/discard"><input type="hidden" name="csrf_token" value="{csrf}"><label for="decision-reason-{d.id}">拒绝原因</label><input id="decision-reason-{d.id}" name="review_reason" required maxlength="500"><button class="btn-sm btn-ghost">拒绝</button></form>
-</div>"""
-            for d in pending_drafts
-        )
-        or "<p class='muted'>没有待审核的草稿。</p>"
-    )
-    chips = (
-        '<div class="chips">'
-        + "".join(
-            f'<a class="chip{" active" if action == a else ""}" href="/admin/decisions{("?action=" + a) if a else ""}">{label}</a>'
-            for a, label in (
-                ("", "全部"),
-                ("auto_reply", "自动回复"),
-                ("draft", "草稿"),
-                ("handoff", "转人工"),
-                ("ignore", "忽略"),
-            )
-        )
-        + "</div>"
-    )
-    rows = (
-        "".join(
-            f"<tr><td class='muted'>{_fmt(d.created_at)}</td><td>{_pill(d.action)}</td>"
-            f"<td class='muted'>{html.escape(d.intent or '—')}</td>"
-            f"<td>{html.escape((d.reply_text or '—')[:56])}</td>"
-            f"<td class='muted'>{html.escape(d.source or '—')}</td>"
-            f"<td><a href='/admin/conversations/{d.conversation_id}'>对话</a></td></tr>"
-            for d in decisions
-        )
-        or "<tr><td colspan='6' class='muted'>暂无决策</td></tr>"
-    )
-    body = f"""<h1>决策</h1><p class="lede">AI 决策日志与草稿人工审核。</p>
-<section class="card"><h2>待审核草稿</h2><p class="hint">草稿模式下生成的回复；采纳后按原文投递给客户。</p>{draft_cards}</section>
-<section class="card"><h2>决策日志</h2>{chips}<div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复预览</th><th>来源</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
-    response = HTMLResponse(
-        _page("决策", body, active="decisions", show_users=principal.is_superadmin)
-    )
-    return _ensure_csrf(response, request, csrf)
+    return RedirectResponse("/admin/inbox?queue=drafts", status_code=status.HTTP_303_SEE_OTHER)
 
 
 async def _load_draft(
@@ -2150,18 +2377,19 @@ async def prompt_trial(request: Request) -> Response:
     return RedirectResponse(f"/admin/prompt?{params}", status_code=status.HTTP_303_SEE_OTHER)
 
 
-# ---------- 投递监控 ----------
+# ---------- System health ----------
 
 
-@router.get("/delivery", response_class=HTMLResponse)
-async def delivery_page(request: Request) -> Response:
+@router.get("/health", response_class=HTMLResponse)
+async def health_page(request: Request) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
-    csrf = _csrf(request)
     tenants = principal.allowed_tenants
-    day_ago = datetime.now(UTC) - timedelta(hours=24)
+    now = datetime.now(UTC)
+    day_ago = now - timedelta(hours=24)
     async with get_session_factory()() as session:
+        health_metrics = await _load_health_metrics(session, tenants, now)
         outbox = (
             (
                 await session.execute(
@@ -2203,22 +2431,26 @@ async def delivery_page(request: Request) -> Response:
                 .group_by(models.RawEvent.source, models.RawEvent.processing_status)
             )
         ).all()
+    metric_rows = "".join(
+        f'<tr id="{metric.key}"><td><strong>{metric.label}</strong></td>'
+        f"<td>{_pill(metric.level)}</td>"
+        f"<td>{metric.action_count} 需处理 · {metric.warning_count} 恢复中</td>"
+        f"<td class='muted'>{_health_age(now, metric.oldest_at)}</td>"
+        f"<td><a href='{metric.href}'>查看</a></td></tr>"
+        for metric in health_metrics
+    )
     rows = (
         "".join(
             f"<tr><td class='muted'>{_fmt(o.created_at)}</td><td>{_pill(o.status)}</td>"
             f"<td class='muted'>{html.escape(o.destination_type)}</td>"
             f"<td>{html.escape((o.payload or {}).get('text', '')[:42])}</td>"
             f"<td class='muted'>{o.attempt_count}</td>"
-            f"<td class='muted'>{html.escape(o.last_error_code or '—')}</td>"
-            + (
-                f"""<td><form class="inline" method="post" action="/admin/delivery/{o.id}/retry"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">重试</button></form></td>"""
-                if o.status == "FAILED"
-                else "<td></td>"
-            )
-            + "</tr>"
+            f"<td class='muted'>{html.escape(o.last_error_code or '—')}"
+            + (f"<br>{html.escape(o.last_error_message)}" if o.last_error_message else "")
+            + "</td></tr>"
             for o in outbox
         )
-        or "<tr><td colspan='7' class='muted'>暂无投递记录</td></tr>"
+        or "<tr><td colspan='6' class='muted'>暂无投递记录</td></tr>"
     )
     ingress_rows = (
         "".join(
@@ -2228,13 +2460,21 @@ async def delivery_page(request: Request) -> Response:
         )
         or "<tr><td colspan='4' class='muted'>24 小时内无入站事件</td></tr>"
     )
-    body = f"""<h1>投递</h1><p class="lede">出站消息投递状态与入站事件健康度。</p>
-<section class="card"><h2>Outbox</h2><p class="hint">最近 50 条出站消息；失败可手动重试（由补扫循环拾取）。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>状态</th><th>目的地</th><th>内容</th><th>尝试</th><th>错误</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>
-<section class="card"><h2>入站健康（24h）</h2><div class="tablewrap"><table><thead><tr><th>来源</th><th>处理状态</th><th>事件数</th><th>最后接收</th></tr></thead><tbody>{ingress_rows}</tbody></table></div></section>"""
-    response = HTMLResponse(
-        _page("投递", body, active="delivery", show_users=principal.is_superadmin)
+    body = f"""<h1>系统健康</h1><p class="lede">只读查看核心处理链路、投递与入站事件状态。</p>
+<section class="card"><h2>核心链路</h2><div class="tablewrap"><table><thead><tr><th>环节</th><th>状态</th><th>积压</th><th>最老等待</th><th></th></tr></thead><tbody>{metric_rows}</tbody></table></div></section>
+<section class="card"><h2>Outbox</h2><p class="hint">最近 50 条出站消息；需要处理的失败项统一进入收件箱。</p><div class="tablewrap"><table><thead><tr><th>时间</th><th>状态</th><th>目的地</th><th>内容</th><th>尝试</th><th>错误</th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<section class="card" id="ingress"><h2>入站健康（24h）</h2><div class="tablewrap"><table><thead><tr><th>来源</th><th>处理状态</th><th>事件数</th><th>最后接收</th></tr></thead><tbody>{ingress_rows}</tbody></table></div></section>"""
+    return HTMLResponse(
+        _page("系统健康", body, active="health", show_users=principal.is_superadmin)
     )
-    return _ensure_csrf(response, request, csrf)
+
+
+@router.get("/delivery")
+async def delivery_page(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    return RedirectResponse("/admin/health", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/delivery/{outbox_id}/retry")
@@ -2267,7 +2507,7 @@ async def delivery_retry(request: Request, outbox_id: uuid.UUID) -> Response:
             )
         )
         await session.commit()
-    return RedirectResponse("/admin/delivery", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/inbox?queue=delivery", status_code=status.HTTP_303_SEE_OTHER)
 
 
 # ---------- 账号 / 急停 / 接入 ----------

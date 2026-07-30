@@ -267,6 +267,6 @@ async def test_tenant_user_does_not_see_unscoped_raw_event_health(session, migra
 
     async with _client() as client:
         await _login(client)
-        response = await client.get("/admin/delivery")
+        response = await client.get("/admin/health")
     assert response.status_code == 200
     assert "secret-unscoped-source" not in response.text

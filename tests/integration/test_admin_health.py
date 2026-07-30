@@ -349,7 +349,7 @@ async def test_health_center_surfaces_actionable_postgres_state(session):
     async with _client() as client:
         await _login(client)
         response = await client.get("/admin")
-        delivery = await client.get("/admin/delivery")
+        health = await client.get("/admin/health")
 
     for key in (
         "ingestion",
@@ -363,10 +363,11 @@ async def test_health_center_surfaces_actionable_postgres_state(session):
         assert "ACTION" in row
         assert "1 需处理" in row
         assert "3 小时" in row
-    assert "/admin/delivery" in _health_row(response.text, "ingestion")
-    assert "/admin/decisions" in _health_row(response.text, "decisions")
+    assert "/admin/health#ingress" in _health_row(response.text, "ingestion")
+    assert "/admin/health#decisions" in _health_row(response.text, "decisions")
+    assert "/admin/inbox?queue=delivery" in _health_row(response.text, "delivery")
     assert "/admin/accounts" in _health_row(response.text, "sync")
-    assert "INITIAL_DISPATCH_DEAD" in delivery.text
+    assert "INITIAL_DISPATCH_DEAD" in health.text
 
 
 async def test_health_center_flags_permanent_xchat_public_key_failure(session):

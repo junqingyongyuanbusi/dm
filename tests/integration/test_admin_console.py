@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from apps.api.main import create_app
 from social_reply.domain.automation.state_machine import ensure_state
@@ -39,20 +39,33 @@ async def _seed_inbox_conversation(
     suffix: str,
     display_name: str,
     work_created_at: datetime,
+    platform: str = "telegram",
+    channel_type: str = "dm",
+    reply_target: dict | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
     account_id, contact_id, conversation_id, message_id, work_item_id = (
         uuid.uuid4() for _ in range(5)
     )
+    capability = {"dm": True, "max_text_length": 4096}
+    if platform in {"facebook", "instagram"}:
+        capability = {"dm": True, "comments": True, "max_text_length": 2000}
+    elif platform == "x":
+        capability = {
+            "dm": True,
+            "x_chat": False,
+            "mentions": True,
+            "max_text_length": 280,
+        }
     await session.execute(
         insert(models.PlatformAccount).values(
             id=account_id,
             brand_id="b1",
-            platform="telegram",
+            platform=platform,
             name=f"Inbox account {suffix}",
             public_id=f"inbox-{suffix}",
             credential_bundle=encrypt_secret_bundle({"bot_token": "token"}),
             config={"delivery_mode": "direct"},
-            capability={"dm": True, "max_text_length": 4096},
+            capability=capability,
             automation_default="BOT_DRAFT_ONLY",
             status="active",
         )
@@ -60,7 +73,7 @@ async def _seed_inbox_conversation(
     await session.execute(
         insert(models.Contact).values(
             id=contact_id,
-            platform="telegram",
+            platform=platform,
             platform_account_id=account_id,
             external_user_id=f"user-{suffix}",
             display_name=display_name,
@@ -70,11 +83,11 @@ async def _seed_inbox_conversation(
         insert(models.Conversation).values(
             id=conversation_id,
             brand_id="b1",
-            platform="telegram",
+            platform=platform,
             platform_account_id=account_id,
             contact_id=contact_id,
-            conversation_key=f"telegram:{suffix}:user",
-            channel_type="dm",
+            conversation_key=f"{platform}:{suffix}:user",
+            channel_type=channel_type,
         )
     )
     await session.execute(
@@ -92,7 +105,7 @@ async def _seed_inbox_conversation(
             direction="inbound",
             sender_type="contact",
             text=f"Message {suffix}",
-            reply_target={"chat_id": suffix},
+            reply_target=reply_target or {"chat_id": suffix},
             occurred_at=work_created_at,
         )
     )
@@ -120,6 +133,7 @@ async def test_console_pages_require_login():
             "/admin/knowledge",
             "/admin/delivery",
             "/admin/accounts",
+            "/admin/health",
         ):
             resp = await client.get(path)
             assert resp.status_code == 303
@@ -133,14 +147,55 @@ async def test_console_pages_render_after_login(migrated_db):
             ("/admin", "总览"),
             ("/admin/inbox", "收件箱"),
             ("/admin/conversations", "对话"),
-            ("/admin/decisions", "决策"),
             ("/admin/knowledge", "知识库"),
-            ("/admin/delivery", "投递"),
             ("/admin/accounts", "账号"),
+            ("/admin/health", "系统健康"),
         ):
             resp = await client.get(path)
             assert resp.status_code == 200, path
             assert marker in resp.text
+
+
+async def test_navigation_does_not_poll_inbox_counts(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get("/admin/inbox")
+        counts = await client.get("/admin/inbox/counts")
+
+    assert page.status_code == 200
+    assert "data-inbox-count" not in page.text
+    assert "nav-queues" not in page.text
+    assert "/admin/inbox/counts" not in page.text
+    assert "refreshInboxCounts" not in page.text
+    assert "setInterval(" not in page.text
+    assert counts.status_code == 200
+    assert counts.json() == {"human": 0, "drafts": 0, "delivery": 0}
+
+
+async def test_legacy_decisions_and_delivery_pages_redirect_after_login(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        decisions = await client.get("/admin/decisions")
+        delivery = await client.get("/admin/delivery")
+
+    assert decisions.status_code == 303
+    assert decisions.headers["location"] == "/admin/inbox?queue=drafts"
+    assert delivery.status_code == 303
+    assert delivery.headers["location"] == "/admin/health"
+
+
+async def test_health_page_is_read_only(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/health")
+
+    assert response.status_code == 200
+    main = re.search(r"<main>(.*)</main>", response.text, re.DOTALL)
+    assert main is not None
+    assert "系统健康" in main.group(1)
+    assert "<form" not in main.group(1)
+    assert 'method="post"' not in main.group(1)
+    assert "csrf_token" not in main.group(1)
 
 
 async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, migrated_db):
@@ -206,6 +261,7 @@ async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, mig
 
     assert human.status_code == 200
     assert '<meta http-equiv="refresh" content="20">' in human.text
+    assert '<meta http-equiv="refresh" content="20">' not in drafts.text
     assert "<strong>2</strong><span>待人工" in human.text
     assert "待人工 · 最老 3 小时" in human.text
     assert "待审核 · 最老" in human.text
@@ -215,6 +271,284 @@ async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, mig
     assert f'action="/admin/decisions/{decision_id}/approve"' in drafts.text
     assert "发送结果不确定" in delivery.text
     assert "Old customer" in filtered.text and "New customer" not in filtered.text
+
+
+async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(session, migrated_db):
+    now = datetime.now(UTC)
+    specs = (
+        {
+            "suffix": "channel-dm",
+            "display_name": "Channel DM customer",
+            "platform": "telegram",
+            "channel_type": "dm",
+            "reply_target": {"chat_id": "dm-user"},
+            "destination_type": "telegram_dm",
+        },
+        {
+            "suffix": "channel-comment",
+            "display_name": "Channel comment customer",
+            "platform": "facebook",
+            "channel_type": "comment",
+            "reply_target": {"kind": "comment", "comment_id": "comment-1"},
+            "destination_type": "meta_public_comment",
+        },
+        {
+            "suffix": "channel-mention",
+            "display_name": "Channel mention customer",
+            "platform": "x",
+            "channel_type": "mention",
+            "reply_target": {"kind": "reply", "in_reply_to_post_id": "post-1"},
+            "destination_type": "x_post_reply",
+        },
+    )
+    seeded: dict[str, tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = {}
+    for offset, spec in enumerate(specs):
+        account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+            session,
+            suffix=spec["suffix"],
+            display_name=spec["display_name"],
+            work_created_at=now - timedelta(minutes=offset + 1),
+            platform=spec["platform"],
+            channel_type=spec["channel_type"],
+            reply_target=spec["reply_target"],
+        )
+        decision_id, outbox_id = uuid.uuid4(), uuid.uuid4()
+        await session.execute(
+            insert(models.ReplyDecision).values(
+                id=decision_id,
+                tenant_id="default",
+                conversation_id=conversation_id,
+                message_id=message_id,
+                action="draft",
+                reply_text=f"Draft for {spec['suffix']}",
+                original_reply_text=f"Draft for {spec['suffix']}",
+                review_action="PENDING",
+                reason_codes=["INSUFFICIENT_KNOWLEDGE"],
+                source="rule",
+            )
+        )
+        await session.execute(
+            insert(models.OutboxMessage).values(
+                id=outbox_id,
+                tenant_id="default",
+                conversation_id=conversation_id,
+                platform_account_id=account_id,
+                destination_type=spec["destination_type"],
+                destination_id=f"destination:{spec['suffix']}",
+                message_type="text",
+                payload={"text": "retry", "target": spec["reply_target"]},
+                reply_to_message_id=message_id,
+                origin_kind="MANUAL_REPLY",
+                actor_kind="ADMIN_HUMAN",
+                actor_id="user:admin",
+                idempotency_key=f"channel-filter-{outbox_id}",
+                status="FAILED",
+                last_error_code="SEND_ERROR",
+            )
+        )
+        seeded[spec["channel_type"]] = (account_id, conversation_id, message_id)
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        inbox_pages = {
+            (queue, channel): await client.get(
+                "/admin/inbox", params={"queue": queue, "channel": channel}
+            )
+            for queue in ("human", "drafts", "delivery")
+            for channel in ("all", "dm", "comment")
+        }
+        conversation_pages = {
+            channel: await client.get("/admin/conversations", params={"channel": channel})
+            for channel in ("all", "dm", "comment")
+        }
+        count_responses = {
+            channel: await client.get("/admin/inbox/counts", params={"channel": channel})
+            for channel in ("all", "dm", "comment")
+        }
+        facebook_conversations = await client.get(
+            "/admin/conversations", params={"platform": "facebook"}
+        )
+        mention_detail = await client.get(f"/admin/conversations/{seeded['mention'][1]}")
+
+    all_names = {spec["display_name"] for spec in specs}
+    dm_names = {"Channel DM customer"}
+    comment_names = {"Channel comment customer", "Channel mention customer"}
+    for queue in ("human", "drafts", "delivery"):
+        for channel, expected_names in (
+            ("all", all_names),
+            ("dm", dm_names),
+            ("comment", comment_names),
+        ):
+            page = inbox_pages[(queue, channel)]
+            assert page.status_code == 200
+            for name in expected_names:
+                assert name in page.text
+            for name in all_names - expected_names:
+                assert name not in page.text
+
+    for channel, expected_names in (
+        ("all", all_names),
+        ("dm", dm_names),
+        ("comment", comment_names),
+    ):
+        page = conversation_pages[channel]
+        assert page.status_code == 200
+        for name in expected_names:
+            assert name in page.text
+        for name in all_names - expected_names:
+            assert name not in page.text
+
+    assert "自动化状态" not in conversation_pages["all"].text
+    assert count_responses["all"].json() == {"human": 3, "drafts": 3, "delivery": 3}
+    assert count_responses["dm"].json() == {"human": 1, "drafts": 1, "delivery": 1}
+    assert count_responses["comment"].json() == {"human": 2, "drafts": 2, "delivery": 2}
+    assert "Channel comment customer" in facebook_conversations.text
+    assert "Channel DM customer" not in facebook_conversations.text
+    assert "Channel mention customer" not in facebook_conversations.text
+
+    assert mention_detail.status_code == 200
+    assert "公开评论回复" in mention_detail.text
+    assert 'name="reply_to_message_id"' in mention_detail.text
+    assert f'value="{seeded["mention"][2]}"' in mention_detail.text
+    assert "in_reply_to_post_id" in mention_detail.text
+    assert "post-1" in mention_detail.text
+
+
+async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db):
+    now = datetime.now(UTC)
+    account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="reviewable-draft",
+        display_name="Reviewable customer",
+        work_created_at=now,
+    )
+    outbox_id = uuid.uuid4()
+    queued_message_id, empty_message_id = uuid.uuid4(), uuid.uuid4()
+    for candidate_id, text in (
+        (queued_message_id, "Already queued inbound"),
+        (empty_message_id, "Empty draft inbound"),
+    ):
+        await session.execute(
+            insert(models.Message).values(
+                id=candidate_id,
+                conversation_id=conversation_id,
+                direction="inbound",
+                sender_type="contact",
+                text=text,
+                reply_target={"chat_id": "reviewable-draft"},
+                occurred_at=now,
+            )
+        )
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=outbox_id,
+            tenant_id="default",
+            conversation_id=conversation_id,
+            platform_account_id=account_id,
+            destination_type="telegram_dm",
+            destination_id="telegram:reviewable-draft:user",
+            message_type="text",
+            payload={"text": "Already queued", "target": {"chat_id": "reviewable-draft"}},
+            reply_to_message_id=queued_message_id,
+            origin_kind="DRAFT_APPROVAL",
+            actor_kind="ADMIN_HUMAN",
+            actor_id="user:admin",
+            idempotency_key=f"reviewable-draft-{outbox_id}",
+            status="SENT",
+        )
+    )
+    for decision_message_id, reply_text, linked_outbox in (
+        (message_id, "Ready for review", None),
+        (queued_message_id, "Already queued", outbox_id),
+        (empty_message_id, "   ", None),
+    ):
+        await session.execute(
+            insert(models.ReplyDecision).values(
+                id=uuid.uuid4(),
+                tenant_id="default",
+                conversation_id=conversation_id,
+                message_id=decision_message_id,
+                action="draft",
+                reply_text=reply_text,
+                original_reply_text=reply_text,
+                review_action="PENDING",
+                reason_codes=["INSUFFICIENT_KNOWLEDGE"],
+                source="rule",
+                outbox_id=linked_outbox,
+            )
+        )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get("/admin/inbox", params={"queue": "drafts"})
+        counts = await client.get("/admin/inbox/counts")
+
+    assert page.status_code == 200
+    assert "Ready for review" in page.text
+    assert "Already queued" not in page.text
+    assert counts.json()["drafts"] == 1
+
+
+async def test_inbox_rejects_cross_tenant_join_mismatches(session, migrated_db):
+    now = datetime.now(UTC)
+    account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="tenant-mismatch",
+        display_name="Leaked customer",
+        work_created_at=now,
+    )
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            id=uuid.uuid4(),
+            tenant_id="default",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            action="draft",
+            reply_text="Leaked draft",
+            original_reply_text="Leaked draft",
+            review_action="PENDING",
+            reason_codes=["INSUFFICIENT_KNOWLEDGE"],
+            source="rule",
+        )
+    )
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=uuid.uuid4(),
+            tenant_id="default",
+            conversation_id=conversation_id,
+            platform_account_id=account_id,
+            destination_type="telegram_dm",
+            destination_id="telegram:tenant-mismatch:user",
+            message_type="text",
+            payload={"text": "Leaked delivery", "target": {"chat_id": "tenant-mismatch"}},
+            reply_to_message_id=message_id,
+            origin_kind="MANUAL_REPLY",
+            actor_kind="ADMIN_HUMAN",
+            actor_id="user:admin",
+            idempotency_key=f"tenant-mismatch-{uuid.uuid4()}",
+            status="FAILED",
+            last_error_code="SEND_ERROR",
+        )
+    )
+    await session.execute(
+        update(models.Conversation)
+        .where(models.Conversation.id == conversation_id)
+        .values(tenant_id="other")
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        pages = [
+            await client.get("/admin/inbox", params={"queue": queue})
+            for queue in ("human", "drafts", "delivery")
+        ]
+        counts = await client.get("/admin/inbox/counts")
+
+    assert all("Leaked customer" not in page.text for page in pages)
+    assert counts.json() == {"human": 0, "drafts": 0, "delivery": 0}
 
 
 async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
@@ -255,7 +589,7 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
         )
 
     assert detail.status_code == 200
-    assert "人工回复" in detail.text
+    assert "私信回复" in detail.text
     assert "telegram_dm" in detail.text
     assert "4096 字符" in detail.text
     assert f'value="{message_id}"' in detail.text

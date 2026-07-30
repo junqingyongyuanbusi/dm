@@ -108,11 +108,10 @@ _NAV_ITEMS = (
     ("overview", "/admin", "总览"),
     ("inbox", "/admin/inbox", "收件箱"),
     ("conversations", "/admin/conversations", "对话"),
-    ("decisions", "/admin/decisions", "决策"),
     ("knowledge", "/admin/knowledge", "知识库"),
     ("prompt", "/admin/prompt", "提示词"),
-    ("delivery", "/admin/delivery", "投递"),
     ("accounts", "/admin/accounts", "账号"),
+    ("health", "/admin/health", "系统健康"),
 )
 
 
@@ -129,32 +128,15 @@ def _page(
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     logout = '<a class="nav-link" href="/admin/logout">退出</a>' if show_logout else ""
     nav_items = _NAV_ITEMS + (("users", "/admin/users", "用户"),) if show_users else _NAV_ITEMS
-    inbox_badges = (
-        '<span class="nav-queues">'
-        '<span>人工 <b data-inbox-count="human">-</b></span>'
-        '<span>审核 <b data-inbox-count="drafts">-</b></span>'
-        '<span>异常 <b data-inbox-count="delivery">-</b></span>'
-        "</span>"
-    )
     tabs = (
         "".join(
-            f'<a class="tab{" active" if key == active else ""}" href="{href}">{label}'
-            f"{inbox_badges if key == 'inbox' else ''}"
-            "</a>"
+            f'<a class="tab{" active" if key == active else ""}" href="{href}">{label}</a>'
             for key, href, label in nav_items
         )
         if show_logout
         else ""
     )
     nav_bar = f'<nav class="tabs" aria-label="主导航">{tabs}</nav>' if tabs else ""
-    inbox_script = (
-        """<script>
-const refreshInboxCounts=async()=>{try{const response=await fetch('/admin/inbox/counts',{credentials:'same-origin'});if(!response.ok)return;const counts=await response.json();document.querySelectorAll('[data-inbox-count]').forEach((node)=>{node.textContent=counts[node.dataset.inboxCount]??0;});}catch(_error){}};
-refreshInboxCounts();setInterval(refreshInboxCounts,20000);
-</script>"""
-        if show_logout
-        else ""
-    )
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">{refresh}
@@ -182,9 +164,6 @@ header{{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px 
 .tab{{color:var(--muted);text-decoration:none;font-size:14px;padding:8px 14px;border-radius:8px;transition:color .18s,background .18s}}
 .tab:hover{{color:var(--text);background:var(--surface-2)}}
 .tab.active{{color:var(--accent);background:var(--accent-tint);font-weight:500}}
-.nav-queues{{display:inline-flex;gap:5px;margin-left:7px}}
-.nav-queues span{{padding:1px 5px;border-radius:6px;background:var(--neutral-bg);font-size:10.5px;white-space:nowrap}}
-.nav-queues b{{font-variant-numeric:tabular-nums;color:var(--err-fg)}}
 .nav-link{{color:var(--muted);text-decoration:none;font-size:14px;padding:8px 12px;border-radius:8px;transition:color .18s,background .18s}}
 .nav-link:hover{{color:var(--text);background:var(--surface-2)}}
 main{{max-width:1100px;margin:0 auto;padding:36px 24px 72px}}
@@ -231,7 +210,7 @@ tbody tr:hover{{background:#F7F5EF}}
 .queue-tab.active{{border-color:var(--accent);background:var(--accent-tint)}}
 .queue-tab strong{{display:block;font-size:22px;line-height:1.2;font-variant-numeric:tabular-nums}}
 .queue-tab span{{display:block;color:var(--muted);font-size:12.5px;margin-top:2px}}
-.filters{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px;align-items:end;margin-bottom:18px}}
+.filters{{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px;align-items:end;margin-bottom:18px}}
 .filters label{{margin-top:0}}
 .filters button{{width:100%}}
 .detail-grid{{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.75fr);gap:20px;align-items:start}}
@@ -318,7 +297,7 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 @media (max-width:520px){{.channel-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}} .channel-tile{{min-height:104px}} .channel-heading{{align-items:flex-start;flex-direction:column;gap:2px}} .channel-meta{{grid-template-columns:1fr;gap:1px}} .channel-meta dd{{margin-bottom:7px}}}}
 </style></head><body>
 <header><span class="brand">Reply Core<small>Control Plane</small></span>{nav_bar}<nav>{logout}</nav></header>
-<main>{body}</main>{inbox_script}</body></html>"""
+<main>{body}</main></body></html>"""
 
 
 @router.get("/login", response_class=HTMLResponse)

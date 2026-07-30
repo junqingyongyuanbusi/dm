@@ -268,7 +268,7 @@ XAA 的完整事件枚举里没有任何回复/评论专用事件（只有 `post
 | **AI 生成并发布回复** | **需 X 事先批准** | 未获批部署即属违规 |
 
 评论与私信一致，是否自动外发由账号的 `automation_default` 决定：`BOT_ACTIVE` 直接回复，
-`BOT_DRAFT_ONLY` 进 `/admin/decisions` 待审。要改行为就改账号配置，代码不按频道写死。
+`BOT_DRAFT_ONLY` 进 `/admin/inbox?queue=drafts` 待审。要改行为就改账号配置，代码不按频道写死。
 
 **开 `BOT_ACTIVE` 前请确认**：已取得 X 对 AI 生成回复的批准、账号资料已标注为自动账号。
 另外建议同时打开 `REQUIRE_KNOWLEDGE`——知识库未命中时模型的自由发挥会直接成为公开推文。

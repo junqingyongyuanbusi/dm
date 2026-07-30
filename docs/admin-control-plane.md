@@ -79,6 +79,9 @@ The built-in administration surface provides:
 - tenant-user self-service account authorization for the user's assigned tenant, including OAuth starts and tenant-scoped provisioning jobs;
 - superadmin-only tenant-wide automation kill switch; tenant users retain account-level controls for their own accounts;
 - PostgreSQL-backed runtime health summary on `/admin`, covering ingestion recovery, decision jobs, Outbox, provisioning, active X sync gaps, and disabled accounts with oldest backlog age;
+- an operations inbox at `/admin/inbox` for human handoff, draft review, and delivery exceptions, with direct-message versus public-interaction filtering and oldest-wait ordering;
+- a conversation archive at `/admin/conversations`, where direct messages and public comments/mentions are separated while every reply remains bound to an explicit inbound message target;
+- read-only runtime diagnostics at `/admin/health`; draft approval and delivery retry remain inbox workflows instead of being duplicated across diagnostic pages;
 - platform account and provisioning-job overview;
 - Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
 - asynchronous job status and retry;
