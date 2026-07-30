@@ -252,6 +252,7 @@ async def ingest_canonical_event(
                 text=event.text,
                 platform_message_id=event.external_event_id,
                 reply_target=event.reply_target,
+                attachments=event.attachments,
                 occurred_at=event.occurred_at,
             )
         )
@@ -277,6 +278,7 @@ async def ingest_canonical_event(
             automation_state=state.state,
             state_version=state.state_version,
             channel_type=event.channel_type,
+            has_unsupported_attachment=bool(event.attachments),
         )
         job_id = (
             await session.execute(

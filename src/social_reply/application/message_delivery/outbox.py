@@ -125,6 +125,7 @@ async def _record_outcome(
                 models.OutboxMessage.conversation_id,
                 models.OutboxMessage.message_type,
                 models.OutboxMessage.payload,
+                models.OutboxMessage.actor_kind,
                 models.OutboxMessage.sent_at,
                 models.OutboxMessage.chatwoot_message_id,
                 models.OutboxMessage.platform_message_id,
@@ -157,7 +158,7 @@ async def _record_outcome(
                     id=uuid.uuid4(),
                     conversation_id=finalized.conversation_id,
                     direction="outbound",
-                    sender_type="agent" if payload.get("approval") == "admin" else "bot",
+                    sender_type=("agent" if finalized.actor_kind == "ADMIN_HUMAN" else "bot"),
                     text=text,
                     chatwoot_message_id=finalized.chatwoot_message_id,
                     platform_message_id=finalized.platform_message_id,
@@ -167,6 +168,16 @@ async def _record_outcome(
                     occurred_at=finalized.sent_at,
                 )
                 .on_conflict_do_nothing(index_elements=["source_outbox_id"])
+            )
+            sent_column = (
+                "last_human_message_at"
+                if finalized.actor_kind == "ADMIN_HUMAN"
+                else "last_bot_message_at"
+            )
+            await session.execute(
+                update(models.AutomationState)
+                .where(models.AutomationState.conversation_id == finalized.conversation_id)
+                .values({sent_column: finalized.sent_at})
             )
     if count_attempt:
         await session.execute(
@@ -289,19 +300,31 @@ async def _validate_direct_send(
         return await _reject_direct_send(session, row, attempt_no, "CAPABILITY_NOT_ALLOWED")
     if row.valid_until is not None and row.valid_until <= datetime.now(UTC):
         return await _reject_direct_send(session, row, attempt_no, "DELIVERY_WINDOW_EXPIRED")
-    source_message = (
-        await session.execute(
-            select(models.Message.reply_target)
-            .join(
-                models.ReplyDecision,
-                models.ReplyDecision.message_id == models.Message.id,
+    if row.reply_to_message_id is not None:
+        source_message = (
+            await session.execute(
+                select(models.Message.reply_target).where(
+                    models.Message.id == row.reply_to_message_id,
+                    models.Message.conversation_id == row.conversation_id,
+                    models.Message.direction == "inbound",
+                )
             )
-            .where(
-                models.ReplyDecision.outbox_id == row.id,
-                models.Message.conversation_id == row.conversation_id,
+        ).first()
+    else:
+        # Compatibility for intents created before reply_to_message_id was introduced.
+        source_message = (
+            await session.execute(
+                select(models.Message.reply_target)
+                .join(
+                    models.ReplyDecision,
+                    models.ReplyDecision.message_id == models.Message.id,
+                )
+                .where(
+                    models.ReplyDecision.outbox_id == row.id,
+                    models.Message.conversation_id == row.conversation_id,
+                )
             )
-        )
-    ).first()
+        ).first()
     conversation_external_user_id = await session.scalar(
         select(models.Contact.external_user_id).where(
             models.Contact.id == conversation.contact_id,
@@ -427,8 +450,15 @@ async def _deliver_outbox_locked(
             )
         )
     ).scalar_one_or_none()
-    admin_approved_draft = payload.get("approval") == "admin" and state == "BOT_DRAFT_ONLY"
-    if is_public and state != "BOT_ACTIVE" and not admin_approved_draft:
+    legacy_approval = payload.get("approval") == "admin"
+    origin_kind = "DRAFT_APPROVAL" if legacy_approval else row.origin_kind
+    send_state_allowed = (
+        (origin_kind == "DECISION" and state == "BOT_ACTIVE")
+        or (origin_kind == "DRAFT_APPROVAL" and state == "BOT_DRAFT_ONLY")
+        or (origin_kind == "MANUAL_REPLY" and state == "HUMAN_ACTIVE")
+        or (origin_kind == "SYSTEM_NOTICE" and state in {"HANDOFF_PENDING", "HUMAN_ACTIVE"})
+    )
+    if is_public and not send_state_allowed:
         return await _stop_before_send(session, oid, "CANCELLED", "TAKEOVER_AT_SEND", attempt_no)
     direct_command: TextSendCommand | None = None
     if is_direct:

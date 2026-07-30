@@ -252,7 +252,7 @@ async def test_instagram_login_defaults_to_active_comments_when_enabled(
 
     assert callback.status_code == 303
     assert instagram_env["submitted"]["request"]["enable_comments"] is True
-    assert instagram_env["submitted"]["request"]["automation_default"] == "BOT_ACTIVE"
+    assert instagram_env["submitted"]["request"]["automation_default"] == "BOT_DRAFT_ONLY"
 
 
 async def test_instagram_callback_state_is_one_time(instagram_env, migrated_db):

@@ -166,9 +166,7 @@ async def test_instagram_comment_provisioning_validates_permissions_and_subscrip
             granular_scopes = []
             if login_mode == "facebook_login":
                 scopes.append("pages_read_engagement")
-                granular_scopes = [
-                    {"scope": scope, "target_ids": ["page-1"]} for scope in scopes
-                ]
+                granular_scopes = [{"scope": scope, "target_ids": ["page-1"]} for scope in scopes]
             return httpx.Response(
                 200,
                 json={
@@ -201,7 +199,7 @@ async def test_instagram_comment_provisioning_validates_permissions_and_subscrip
         tenant_id="tenant-a",
         brand_id="brand-a",
         enable_comments=True,
-        automation_default="BOT_ACTIVE",
+        automation_default="BOT_DRAFT_ONLY",
         secrets_root=tmp_path,
         transport=httpx.MockTransport(handler),
     )
@@ -209,12 +207,10 @@ async def test_instagram_comment_provisioning_validates_permissions_and_subscrip
     session.expire_all()
     account = await session.get(models.PlatformAccount, result.account_id)
     expected_account_fields = (
-        ["messages"]
-        if login_mode == "facebook_login"
-        else ["messages", "comments"]
+        ["messages"] if login_mode == "facebook_login" else ["messages", "comments"]
     )
     assert account.capability == {"dm": True, "comments": True, "max_text_length": 1000}
-    assert account.automation_default == "BOT_ACTIVE"
+    assert account.automation_default == "BOT_DRAFT_ONLY"
     assert account.config["meta_desired_subscribed_fields"] == expected_account_fields
     assert account.config["meta_desired_app_subscribed_fields"] == ["messages", "comments"]
     assert account.config["meta_subscribed_fields"] == expected_account_fields
@@ -228,6 +224,4 @@ async def test_instagram_comment_provisioning_validates_permissions_and_subscrip
     account_subscription = next(
         request for request in requests if request.url.path.endswith("/subscribed_apps")
     )
-    assert account_subscription.url.params["subscribed_fields"] == ",".join(
-        expected_account_fields
-    )
+    assert account_subscription.url.params["subscribed_fields"] == ",".join(expected_account_fields)

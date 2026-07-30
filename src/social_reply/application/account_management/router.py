@@ -72,14 +72,8 @@ class MetaAccountRequest(_BaseAccountRequest):
             self.enable_comments = settings.meta_comment_reply_enabled
         if self.enable_comments and not settings.meta_comment_reply_enabled:
             raise ValueError("Meta 评论回复未启用")
-        if (
-            self.enable_comments
-            and "automation_default" not in self.model_fields_set
-            and settings.meta_auto_reply_enabled
-        ):
-            self.automation_default = "BOT_ACTIVE"
-        if not settings.meta_automation_default_allowed(self.platform, self.automation_default):
-            raise ValueError("Meta 接入必须使用 BOT_DRAFT_ONLY（未开启 META_AUTO_REPLY_ENABLED）")
+        if self.automation_default != "BOT_DRAFT_ONLY":
+            raise ValueError("新接入的 Meta 账号必须使用 BOT_DRAFT_ONLY")
         if self.platform == "facebook" and self.instagram_login_mode != "facebook_login":
             raise ValueError("Facebook 账号必须使用 facebook_login")
         if (

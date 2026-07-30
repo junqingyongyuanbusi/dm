@@ -86,7 +86,7 @@ async def test_messenger_account_api_defaults_to_dm_only_draft_mode(monkeypatch)
     assert captured["request"]["automation_default"] == "BOT_DRAFT_ONLY"
 
 
-async def test_messenger_account_api_defaults_to_active_comments_when_enabled(monkeypatch):
+async def test_messenger_account_api_keeps_draft_mode_when_comments_enabled(monkeypatch):
     captured = {}
     settings = account_router.get_settings().model_copy(
         update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
@@ -117,7 +117,7 @@ async def test_messenger_account_api_defaults_to_active_comments_when_enabled(mo
         )
     assert response.status_code == 202
     assert captured["request"]["enable_comments"] is True
-    assert captured["request"]["automation_default"] == "BOT_ACTIVE"
+    assert captured["request"]["automation_default"] == "BOT_DRAFT_ONLY"
 
 
 async def test_meta_account_api_rejects_missing_app_identity():
@@ -205,7 +205,7 @@ async def test_meta_account_api_rejects_out_of_scope_launch_policy(overrides):
     assert response.status_code == 422
 
 
-async def test_instagram_account_api_defaults_to_active_comments_when_enabled(monkeypatch):
+async def test_instagram_account_api_keeps_draft_mode_when_comments_enabled(monkeypatch):
     captured = {}
     settings = account_router.get_settings().model_copy(
         update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
@@ -237,7 +237,7 @@ async def test_instagram_account_api_defaults_to_active_comments_when_enabled(mo
         )
     assert response.status_code == 202
     assert captured["request"]["enable_comments"] is True
-    assert captured["request"]["automation_default"] == "BOT_ACTIVE"
+    assert captured["request"]["automation_default"] == "BOT_DRAFT_ONLY"
 
 
 async def test_x_account_api_rejects_disabled_features(monkeypatch):
@@ -405,23 +405,12 @@ async def test_meta_account_api_rejects_bot_active_while_switch_is_off():
             },
         )
     assert response.status_code == 422
-    assert "META_AUTO_REPLY_ENABLED" in response.text
+    assert "BOT_DRAFT_ONLY" in response.text
 
 
-async def test_meta_account_api_accepts_bot_active_once_deployment_opts_in(monkeypatch):
-    captured = {}
-
-    async def fake_submit(**kwargs):
-        captured.update(kwargs)
-        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-
-    async def fake_enqueue(_job_id):
-        return None
-
+async def test_meta_account_api_still_rejects_bot_active_once_deployment_opts_in(monkeypatch):
     settings = account_router.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
     monkeypatch.setattr(account_router, "get_settings", lambda: settings)
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
-    monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
             "/api/v1/platform-accounts/meta",
@@ -436,5 +425,5 @@ async def test_meta_account_api_accepts_bot_active_once_deployment_opts_in(monke
                 "automation_default": "BOT_ACTIVE",
             },
         )
-    assert response.status_code == 202
-    assert captured["request"]["automation_default"] == "BOT_ACTIVE"
+    assert response.status_code == 422
+    assert "BOT_DRAFT_ONLY" in response.text

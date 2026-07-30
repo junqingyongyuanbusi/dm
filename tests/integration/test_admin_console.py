@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -32,10 +33,88 @@ def _app_client() -> httpx.AsyncClient:
     )
 
 
+async def _seed_inbox_conversation(
+    session,
+    *,
+    suffix: str,
+    display_name: str,
+    work_created_at: datetime,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+    account_id, contact_id, conversation_id, message_id, work_item_id = (
+        uuid.uuid4() for _ in range(5)
+    )
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            brand_id="b1",
+            platform="telegram",
+            name=f"Inbox account {suffix}",
+            public_id=f"inbox-{suffix}",
+            credential_bundle=encrypt_secret_bundle({"bot_token": "token"}),
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "max_text_length": 4096},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            platform="telegram",
+            platform_account_id=account_id,
+            external_user_id=f"user-{suffix}",
+            display_name=display_name,
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            brand_id="b1",
+            platform="telegram",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"telegram:{suffix}:user",
+            channel_type="dm",
+        )
+    )
+    await session.execute(
+        insert(models.AutomationState).values(
+            conversation_id=conversation_id,
+            state="HANDOFF_PENDING",
+            state_version=1,
+            state_changed_reason="LLM_UNAVAILABLE",
+        )
+    )
+    await session.execute(
+        insert(models.Message).values(
+            id=message_id,
+            conversation_id=conversation_id,
+            direction="inbound",
+            sender_type="contact",
+            text=f"Message {suffix}",
+            reply_target={"chat_id": suffix},
+            occurred_at=work_created_at,
+        )
+    )
+    await session.execute(
+        insert(models.HumanWorkItem).values(
+            id=work_item_id,
+            tenant_id="default",
+            conversation_id=conversation_id,
+            status="WAITING",
+            reason_code="LLM_UNAVAILABLE",
+            created_at=work_created_at,
+            version=1,
+        )
+    )
+    return account_id, conversation_id, message_id, work_item_id
+
+
 async def test_console_pages_require_login():
     async with _app_client() as client:
         for path in (
             "/admin",
+            "/admin/inbox",
             "/admin/conversations",
             "/admin/decisions",
             "/admin/knowledge",
@@ -52,6 +131,7 @@ async def test_console_pages_render_after_login(migrated_db):
         await _login(client)
         for path, marker in (
             ("/admin", "总览"),
+            ("/admin/inbox", "收件箱"),
             ("/admin/conversations", "对话"),
             ("/admin/decisions", "决策"),
             ("/admin/knowledge", "知识库"),
@@ -61,6 +141,235 @@ async def test_console_pages_render_after_login(migrated_db):
             resp = await client.get(path)
             assert resp.status_code == 200, path
             assert marker in resp.text
+
+
+async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, migrated_db):
+    now = datetime.now(UTC)
+    old_account, old_conversation, old_message, _old_work = await _seed_inbox_conversation(
+        session,
+        suffix="old",
+        display_name="Old customer",
+        work_created_at=now - timedelta(hours=3),
+    )
+    _new_account, _new_conversation, _new_message, new_work = await _seed_inbox_conversation(
+        session,
+        suffix="new",
+        display_name="New customer",
+        work_created_at=now - timedelta(minutes=5),
+    )
+    newest_work = await session.get(models.HumanWorkItem, new_work)
+    newest_work.reason_code = "RISK_WORD"
+    newest_work.status = "CLAIMED"
+    newest_work.assigned_actor = "user:another-agent"
+    decision_id, outbox_id = uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            id=decision_id,
+            tenant_id="default",
+            conversation_id=old_conversation,
+            message_id=old_message,
+            action="draft",
+            reply_text="Original draft",
+            original_reply_text="Original draft",
+            review_action="PENDING",
+            reason_codes=["INSUFFICIENT_KNOWLEDGE"],
+            source="rule",
+        )
+    )
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=outbox_id,
+            tenant_id="default",
+            conversation_id=old_conversation,
+            platform_account_id=old_account,
+            destination_type="telegram_dm",
+            destination_id="telegram:old:user",
+            message_type="text",
+            payload={"text": "uncertain", "target": {"chat_id": "old"}},
+            reply_to_message_id=old_message,
+            origin_kind="MANUAL_REPLY",
+            actor_kind="ADMIN_HUMAN",
+            actor_id="user:admin",
+            idempotency_key=f"inbox-{outbox_id}",
+            status="NEEDS_REVIEW",
+            last_error_code="AMBIGUOUS_SEND",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        human = await client.get("/admin/inbox")
+        drafts = await client.get("/admin/inbox?queue=drafts")
+        delivery = await client.get("/admin/inbox?queue=delivery")
+        filtered = await client.get("/admin/inbox?queue=human&reason=LLM_UNAVAILABLE")
+
+    assert human.status_code == 200
+    assert '<meta http-equiv="refresh" content="20">' in human.text
+    assert "<strong>2</strong><span>待人工" in human.text
+    assert "待人工 · 最老 3 小时" in human.text
+    assert "待审核 · 最老" in human.text
+    assert "投递异常 · 最老" in human.text
+    assert human.text.index("Old customer") < human.text.index("New customer")
+    assert "Original draft" in drafts.text
+    assert f'action="/admin/decisions/{decision_id}/approve"' in drafts.text
+    assert "发送结果不确定" in delivery.text
+    assert "Old customer" in filtered.text and "New customer" not in filtered.text
+
+
+async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
+    session, migrated_db, monkeypatch
+):
+    now = datetime.now(UTC)
+    _account_id, conversation_id, message_id, work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="manual",
+        display_name="Manual customer",
+        work_created_at=now - timedelta(minutes=20),
+    )
+    await session.commit()
+    captured: dict = {}
+
+    async def fake_send_human_reply(**kwargs):
+        captured.update(kwargs)
+        return uuid.uuid4()
+
+    from social_reply.application.account_management import admin_console
+
+    monkeypatch.setattr(admin_console, "send_human_reply", fake_send_human_reply)
+    async with _app_client() as client:
+        csrf = await _login(client)
+        detail = await client.get(f"/admin/conversations/{conversation_id}")
+        key_match = re.search(r'name="idempotency_key" value="([^"]+)"', detail.text)
+        assert key_match is not None
+        response = await client.post(
+            f"/admin/conversations/{conversation_id}/reply",
+            data={
+                "csrf_token": csrf,
+                "reply_to_message_id": str(message_id),
+                "idempotency_key": key_match.group(1),
+                "work_item_id": str(work_item_id),
+                "version": "1",
+                "text": "Human response",
+            },
+        )
+
+    assert detail.status_code == 200
+    assert "人工回复" in detail.text
+    assert "telegram_dm" in detail.text
+    assert "4096 字符" in detail.text
+    assert f'value="{message_id}"' in detail.text
+    assert response.status_code == 303
+    assert captured["conversation_id"] == conversation_id
+    assert captured["reply_to_message_id"] == message_id
+    assert captured["work_item_id"] == work_item_id
+    assert captured["expected_version"] == 1
+    assert captured["idempotency_key"] == key_match.group(1)
+
+
+async def test_draft_rejection_records_structured_review(session, migrated_db):
+    now = datetime.now(UTC)
+    _account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="reject",
+        display_name="Reject customer",
+        work_created_at=now,
+    )
+    decision_id = uuid.uuid4()
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            id=decision_id,
+            tenant_id="default",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            action="draft",
+            reply_text="Unsafe draft",
+            original_reply_text="Unsafe draft",
+            review_action="PENDING",
+            reason_codes=[],
+            source="llm",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        response = await client.post(
+            f"/admin/decisions/{decision_id}/discard",
+            data={"csrf_token": csrf, "review_reason": "Tone is not suitable"},
+        )
+        reviewed = await client.get("/admin/inbox?queue=drafts&status=REJECTED")
+        detail = await client.get(f"/admin/conversations/{conversation_id}")
+
+    assert response.status_code == 303
+    assert reviewed.status_code == 200
+    assert "REJECTED" in reviewed.text
+    assert "Unsafe draft" in reviewed.text
+    assert "Tone is not suitable" in reviewed.text
+    assert "user:admin" in reviewed.text
+    assert f'action="/admin/decisions/{decision_id}/approve"' not in reviewed.text
+    assert "REJECT_DRAFT" in detail.text
+    session.expire_all()
+    decision = await session.get(models.ReplyDecision, decision_id)
+    assert decision.review_action == "REJECTED"
+    assert decision.review_reason == "Tone is not suitable"
+    assert decision.reviewed_by == "user:admin"
+    assert decision.reviewed_at is not None
+    assert "ADMIN_DISCARDED" in decision.reason_codes
+
+
+async def test_draft_edit_records_final_text_and_outbox_provenance(
+    session, migrated_db, monkeypatch
+):
+    now = datetime.now(UTC)
+    _account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="edit",
+        display_name="Edit customer",
+        work_created_at=now,
+    )
+    decision_id = uuid.uuid4()
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            id=decision_id,
+            tenant_id="default",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            action="draft",
+            reply_text="Original reply",
+            original_reply_text="Original reply",
+            review_action="PENDING",
+            reason_codes=[],
+            source="llm",
+        )
+    )
+    await session.commit()
+
+    async def fake_dispatch(*_args, **_kwargs):
+        return None
+
+    from social_reply.application.account_management import admin_console
+
+    monkeypatch.setattr(admin_console, "dispatch_actor", fake_dispatch)
+    async with _app_client() as client:
+        csrf = await _login(client)
+        response = await client.post(
+            f"/admin/decisions/{decision_id}/approve",
+            data={"csrf_token": csrf, "final_reply_text": "Edited human reply"},
+        )
+
+    assert response.status_code == 303
+    session.expire_all()
+    decision = await session.get(models.ReplyDecision, decision_id)
+    outbox = await session.get(models.OutboxMessage, decision.outbox_id)
+    assert decision.original_reply_text == "Original reply"
+    assert decision.final_reply_text == "Edited human reply"
+    assert decision.review_action == "EDITED"
+    assert decision.reviewed_by == "user:admin"
+    assert outbox.payload["text"] == "Edited human reply"
+    assert outbox.reply_to_message_id == message_id
+    assert outbox.origin_kind == "DRAFT_APPROVAL"
+    assert outbox.actor_kind == "ADMIN_HUMAN"
 
 
 async def test_accounts_page_renders_five_channel_tiles(migrated_db, monkeypatch):
@@ -128,7 +437,7 @@ async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypat
     assert "pages_messaging" in facebook_page.text
     assert "pages_read_user_content" in facebook_page.text
     assert 'name="enable_comments" value="true"' in facebook_page.text
-    assert 'name="automation_default" value="BOT_ACTIVE"' in facebook_page.text
+    assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in facebook_page.text
     assert 'action="/admin/connect/meta"' in facebook_page.text
 
     assert 'action="/admin/oauth/instagram/start"' in instagram_page.text
@@ -140,7 +449,7 @@ async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypat
     assert "instagram_business_manage_comments" in instagram_page.text
     assert "instagram_manage_comments" in instagram_page.text
     assert 'name="enable_comments" value="true"' in instagram_page.text
-    assert 'name="automation_default" value="BOT_ACTIVE"' in instagram_page.text
+    assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in instagram_page.text
 
 
 async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypatch):

@@ -248,6 +248,7 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:
         conversation_key=conversation.conversation_key,
         automation_state=state_row.state,
         state_version=state_row.state_version,
+        has_unsupported_attachment=bool(msg.attachments),
     )
     return _Outcome("PROCESSED", snapshot, conversation.id, message_id, account.id)
 
@@ -378,6 +379,7 @@ async def _store_message(
             sender_type="contact" if inbound else "agent",
             text=msg.content,
             chatwoot_message_id=msg.chatwoot_message_id,
+            attachments=list(msg.attachments),
             private=msg.private,
             occurred_at=_parse_ts(msg.occurred_at_iso),
         )

@@ -1,7 +1,7 @@
 import uuid
 from enum import StrEnum
 
-from sqlalchemy import insert, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ _ALLOWED: dict[AutomationStateEnum, set[AutomationStateEnum]] = {
         AutomationStateEnum.CLOSED,
     },
     AutomationStateEnum.BOT_DRAFT_ONLY: {
+        AutomationStateEnum.HANDOFF_PENDING,
         AutomationStateEnum.HUMAN_ACTIVE,
         AutomationStateEnum.BOT_ACTIVE,
         AutomationStateEnum.CLOSED,
@@ -95,8 +96,12 @@ async def flip_to_human_active(
     result = await session.execute(stmt)
     flipped = result.rowcount > 0
     if flipped:
+        tenant_id = await session.scalar(
+            select(models.Conversation.tenant_id).where(models.Conversation.id == conversation_id)
+        )
         await session.execute(
             insert(models.AuditLog).values(
+                tenant_id=tenant_id or "default",
                 category="state_transition",
                 actor=f"agent:{agent_id}" if agent_id else "system",
                 action="HUMAN_ACTIVE",
@@ -111,6 +116,7 @@ async def flip_to_human_active(
             .where(
                 models.OutboxMessage.conversation_id == conversation_id,
                 models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
+                models.OutboxMessage.actor_kind == "BOT",
             )
             .values(status="CANCELLED", last_error_code="TAKEOVER")
         )

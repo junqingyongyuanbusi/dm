@@ -23,6 +23,7 @@ class ChatwootMessage:
     chatwoot_inbox_id: int
     chatwoot_account_id: int
     occurred_at_iso: str | None
+    attachments: tuple[dict, ...] = ()
 
 
 def parse_message_created(payload: dict) -> ChatwootMessage:
@@ -42,6 +43,9 @@ def parse_message_created(payload: dict) -> ChatwootMessage:
         chatwoot_inbox_id=int(conversation["inbox_id"]),
         chatwoot_account_id=int((payload.get("account") or {}).get("id", 0)),
         occurred_at_iso=payload.get("created_at"),
+        attachments=tuple(
+            item for item in payload.get("attachments", []) if isinstance(item, dict)
+        ),
     )
 
 
@@ -50,7 +54,11 @@ def classify(msg: ChatwootMessage) -> EventClass:
     if msg.private:
         return EventClass.IGNORE
     if msg.message_type == "incoming":
-        return EventClass.INBOUND_USER if isinstance(msg.content, str) else EventClass.IGNORE
+        return (
+            EventClass.INBOUND_USER
+            if isinstance(msg.content, str) or msg.attachments
+            else EventClass.IGNORE
+        )
     if msg.message_type == "outgoing":
         if msg.sender_type == "agent_bot":
             return EventClass.BOT_ECHO

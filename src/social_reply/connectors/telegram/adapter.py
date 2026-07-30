@@ -24,7 +24,28 @@ class TelegramWebhookAdapter:
         message_id = message.get("message_id")
         user_id = sender.get("id")
         text = message.get("text") or message.get("caption")
-        if chat_id is None or message_id is None or user_id is None or not isinstance(text, str):
+        attachments = []
+        for kind in ("photo", "document", "audio", "voice", "video", "animation", "sticker"):
+            raw = message.get(kind)
+            values = raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else []
+            for item in values[-1:]:
+                attachments.append(
+                    {
+                        "type": kind,
+                        "platform_id": item.get("file_id"),
+                        "metadata": {
+                            key: item.get(key)
+                            for key in ("file_unique_id", "file_name", "mime_type", "file_size")
+                            if item.get(key) is not None
+                        },
+                    }
+                )
+        if (
+            chat_id is None
+            or message_id is None
+            or user_id is None
+            or (not isinstance(text, str) and not attachments)
+        ):
             return []
         occurred_at = None
         if message.get("date") is not None:
@@ -40,6 +61,7 @@ class TelegramWebhookAdapter:
                 occurred_at=occurred_at,
                 external_conversation_id=str(chat_id),
                 reply_target={"chat_id": chat_id},
+                attachments=attachments,
                 raw_payload=payload,
             )
         ]

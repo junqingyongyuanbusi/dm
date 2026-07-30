@@ -152,7 +152,7 @@ def test_whatsapp_normalization():
     }
 
 
-def test_text_only_adapters_ignore_unsupported_message_occurrences():
+def test_adapters_preserve_unsupported_attachments_for_handoff():
     meta_events = MetaWebhookAdapter().normalize(
         {
             "object": "page",
@@ -207,8 +207,11 @@ def test_text_only_adapters_ignore_unsupported_message_occurrences():
             ]
         }
     )
-    assert meta_events == []
-    assert whatsapp_events == []
+    assert meta_events[0].text is None
+    assert meta_events[0].attachments[0]["type"] == "attachment"
+    assert whatsapp_events[0].text is None
+    assert whatsapp_events[0].attachments[0]["type"] == "image"
+    assert whatsapp_events[0].attachments[0]["platform_id"] == "image-1"
     assert x_events == []
 
 

@@ -203,6 +203,7 @@ class Message(Base):
     platform_message_id: Mapped[str | None] = mapped_column(Text, index=True)
     source_outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
     reply_target: Mapped[dict] = mapped_column(JSONB, default=dict)
+    attachments: Mapped[list] = mapped_column(JSONB, default=list)
     private: Mapped[bool] = mapped_column(Boolean, default=False)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -421,6 +422,47 @@ class AutomationState(Base):
     )
 
 
+class HumanWorkItem(Base):
+    __tablename__ = "human_work_items"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('WAITING', 'CLAIMED', 'RESOLVED', 'CANCELLED')",
+            name="ck_human_work_items_status",
+        ),
+        CheckConstraint("version >= 1", name="ck_human_work_items_version"),
+        Index(
+            "uq_human_work_items_open_conversation",
+            "conversation_id",
+            unique=True,
+            postgresql_where=text("status IN ('WAITING', 'CLAIMED')"),
+        ),
+        Index(
+            "ix_human_work_items_tenant_status_created",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
+        Index("ix_human_work_items_assigned_status", "assigned_user_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    status: Mapped[str] = mapped_column(Text, default="WAITING")
+    reason_code: Mapped[str] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="SET NULL")
+    )
+    assigned_actor: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class OutboxMessage(Base):
     __tablename__ = "outbox_messages"
     __table_args__ = (
@@ -432,6 +474,14 @@ class OutboxMessage(Base):
             "status",
             "created_at",
         ),
+        CheckConstraint(
+            "origin_kind IN ('DECISION', 'DRAFT_APPROVAL', 'MANUAL_REPLY', 'SYSTEM_NOTICE')",
+            name="ck_outbox_origin_kind",
+        ),
+        CheckConstraint(
+            "actor_kind IN ('BOT', 'ADMIN_HUMAN', 'SYSTEM')",
+            name="ck_outbox_actor_kind",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
@@ -441,6 +491,16 @@ class OutboxMessage(Base):
     destination_id: Mapped[str] = mapped_column(Text)
     message_type: Mapped[str] = mapped_column(Text)
     payload: Mapped[dict] = mapped_column(JSONB)
+    reply_to_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "messages.id",
+            name="fk_outbox_messages_reply_to_message_id",
+            use_alter=True,
+        )
+    )
+    origin_kind: Mapped[str] = mapped_column(Text, default="DECISION")
+    actor_kind: Mapped[str] = mapped_column(Text, default="BOT")
+    actor_id: Mapped[str | None] = mapped_column(Text)
     idempotency_key: Mapped[str] = mapped_column(Text, unique=True)
     status: Mapped[str] = mapped_column(Text, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -534,6 +594,12 @@ class ReplyDecision(Base):
     risk_level: Mapped[str] = mapped_column(Text, default="low")
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     reply_text: Mapped[str | None] = mapped_column(Text)
+    original_reply_text: Mapped[str | None] = mapped_column(Text)
+    final_reply_text: Mapped[str | None] = mapped_column(Text)
+    review_action: Mapped[str | None] = mapped_column(Text)
+    reviewed_by: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_reason: Mapped[str | None] = mapped_column(Text)
     reply_visibility: Mapped[str] = mapped_column(Text, default="public")
     reason_codes: Mapped[list] = mapped_column(JSONB, default=list)
     source: Mapped[str] = mapped_column(Text)  # rule / llm / guard

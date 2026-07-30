@@ -137,14 +137,14 @@ async def test_messenger_comment_provisioning_checks_permissions_and_enables_fee
         tenant_id="tenant-a",
         brand_id="brand-a",
         enable_comments=True,
-        automation_default="BOT_ACTIVE",
+        automation_default="BOT_DRAFT_ONLY",
         secrets_root=tmp_path,
         transport=httpx.MockTransport(handler),
     )
 
     session.expire_all()
     account = await session.get(models.PlatformAccount, result.account_id)
-    assert account.automation_default == "BOT_ACTIVE"
+    assert account.automation_default == "BOT_DRAFT_ONLY"
     assert account.capability == {"dm": True, "comments": True, "max_text_length": 2000}
     assert account.config["meta_desired_subscribed_fields"] == ["messages", "feed"]
     assert account.config["meta_subscribed_fields"] == ["messages", "feed"]

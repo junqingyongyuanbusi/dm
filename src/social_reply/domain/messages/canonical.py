@@ -31,6 +31,7 @@ class CanonicalEvent:
     external_conversation_id: str | None = None
     event_metadata: dict[str, Any] = field(default_factory=dict)
     reply_target: dict[str, Any] = field(default_factory=dict)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
     raw_payload: dict[str, Any] = field(default_factory=dict)
 
 
@@ -58,5 +59,6 @@ def canonical_event_from_dict(value: dict[str, Any]) -> CanonicalEvent:
         external_conversation_id=value.get("external_conversation_id"),
         event_metadata=dict(value.get("event_metadata") or {}),
         reply_target=dict(value.get("reply_target") or {}),
+        attachments=list(value.get("attachments") or []),
         raw_payload=dict(value.get("raw_payload") or {}),
     )

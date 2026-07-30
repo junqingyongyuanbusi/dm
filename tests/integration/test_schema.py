@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "sync_runs",
     "sync_gaps",
     "automation_states",
+    "human_work_items",
     "outbox_messages",
     "audit_logs",
     "provisioning_jobs",

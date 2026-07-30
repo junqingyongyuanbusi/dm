@@ -25,7 +25,23 @@ class WhatsAppWebhookAdapter:
                     if not phone_number_id or not sender_id or not event_id:
                         continue
                     text = (message.get("text") or {}).get("body")
-                    if not isinstance(text, str):
+                    message_type = str(message.get("type") or "")
+                    media = message.get(message_type) if message_type != "text" else None
+                    attachments = []
+                    if isinstance(media, dict):
+                        attachments.append(
+                            {
+                                "type": message_type or "attachment",
+                                "platform_id": media.get("id"),
+                                "url": media.get("link"),
+                                "metadata": {
+                                    key: media.get(key)
+                                    for key in ("mime_type", "filename", "sha256", "caption")
+                                    if media.get(key) is not None
+                                },
+                            }
+                        )
+                    if not isinstance(text, str) and not attachments:
                         continue
                     occurred_at = None
                     if message.get("timestamp"):
@@ -45,6 +61,7 @@ class WhatsAppWebhookAdapter:
                                 "phone_number_id": phone_number_id,
                                 "to": sender_id,
                             },
+                            attachments=attachments,
                             raw_payload=message,
                         )
                     )

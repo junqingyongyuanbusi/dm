@@ -29,22 +29,21 @@ def test_telegram_adapter_verifies_and_normalizes_message():
     assert event.text == "Hello"
 
 
-def test_telegram_adapter_ignores_non_text_messages():
+def test_telegram_adapter_preserves_non_text_messages_for_handoff():
     adapter = TelegramWebhookAdapter(account_id="account-1", secret="secret-1")
-    assert (
-        adapter.normalize(
-            {
-                "update_id": 101,
-                "message": {
-                    "message_id": 56,
-                    "from": {"id": 9},
-                    "chat": {"id": 77, "type": "private"},
-                    "photo": [{"file_id": "photo-1"}],
-                },
-            }
-        )
-        == []
+    events = adapter.normalize(
+        {
+            "update_id": 101,
+            "message": {
+                "message_id": 56,
+                "from": {"id": 9},
+                "chat": {"id": 77, "type": "private"},
+                "photo": [{"file_id": "photo-1"}],
+            },
+        }
     )
+    assert events[0].text is None
+    assert events[0].attachments == [{"type": "photo", "platform_id": "photo-1", "metadata": {}}]
 
 
 async def test_telegram_client_send_message_and_set_webhook():

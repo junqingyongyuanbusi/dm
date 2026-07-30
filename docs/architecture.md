@@ -127,8 +127,8 @@ resumable backfill.
 
 Facebook Messenger, Instagram Messaging, and WhatsApp use independent Settings gates even though
 they share the signed Meta webhook route. Both Facebook and Instagram remain draft-first and
-DM-only by default, but enabling both Meta release switches makes newly authorized accounts
-comment-capable and `BOT_ACTIVE`. OAuth validates target-specific comment permissions;
+DM-only by default; enabling both Meta release switches makes newly authorized accounts
+comment-capable while they remain `BOT_DRAFT_ONLY`. OAuth validates target-specific comment permissions;
 provisioning installs Facebook `feed` or Instagram `comments`; and comment decisions are forced to
 public visibility before Final Guard. Delivery therefore creates only `meta_public_comment` child
 replies, never `meta_private_reply`; account-level automation state also applies to DMs. A verified

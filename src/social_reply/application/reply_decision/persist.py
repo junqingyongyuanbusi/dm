@@ -1,18 +1,25 @@
-import hashlib
 import uuid
-from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from social_reply.application.message_delivery.contracts import (
-    build_direct_reply_destination,
+from social_reply.application.account_management.human_workflow import (
+    ensure_open_human_work_item,
+)
+from social_reply.application.message_delivery.intents import (
+    OutboxActor,
+    OutboxOrigin,
+    create_or_get_outbox_intent,
+    decision_idempotency_key,
 )
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import AutomationStateEnum
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.advisory_locks import (
+    acquire_conversation_delivery_xact_lock,
+)
 from social_reply.shared.config import get_settings
 
 
@@ -43,9 +50,7 @@ def ensure_decision_delivery_available(
 def _idempotency_key(
     account_id: uuid.UUID, conversation_id: uuid.UUID, message_id: uuid.UUID, action: str
 ) -> str:
-    # 不含 prompt_version（换版重投不得产生重复发送）
-    raw = f"{account_id}:{conversation_id}:{message_id}:{action}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return decision_idempotency_key(account_id, conversation_id, message_id, action)
 
 
 async def persist_decision(
@@ -107,98 +112,62 @@ async def persist_decision(
     elif decision.action is ReplyAction.DRAFT:
         # Direct platforms have no private-note channel. Retain the ReplyDecision as a
         # draft for the admin inbox; never send it to the customer before approval.
-        if not direct_delivery:
+        if not direct_delivery and decision.reply_text:
             message_type = "private_note"
     elif decision.action is ReplyAction.HANDOFF:
-        # 转人工：置 HANDOFF_PENDING（仅当当前非终态）
-        await session.execute(
-            update(models.AutomationState)
-            .where(
-                models.AutomationState.conversation_id == conversation_id,
-                models.AutomationState.state.notin_(
-                    [AutomationStateEnum.HUMAN_ACTIVE, AutomationStateEnum.CLOSED]
-                ),
+        await acquire_conversation_delivery_xact_lock(session, conversation_id)
+        current = (
+            await session.execute(
+                select(models.AutomationState)
+                .where(models.AutomationState.conversation_id == conversation_id)
+                .with_for_update()
             )
-            .values(
-                state=AutomationStateEnum.HANDOFF_PENDING,
-                state_version=models.AutomationState.state_version + 1,
-                state_changed_reason="rule_or_guard_handoff",
+        ).scalar_one_or_none()
+        may_create_work = current is not None and (
+            current.state == AutomationStateEnum.HANDOFF_PENDING
+            or (
+                current.state_version == snapshot.state_version
+                and current.state
+                not in [AutomationStateEnum.HUMAN_ACTIVE, AutomationStateEnum.CLOSED]
             )
         )
+        if may_create_work:
+            reason_code = decision.reason_codes[-1] if decision.reason_codes else "HANDOFF"
+            if current.state != AutomationStateEnum.HANDOFF_PENDING:
+                current.state = AutomationStateEnum.HANDOFF_PENDING
+                current.state_version += 1
+                current.state_changed_reason = reason_code
+            await ensure_open_human_work_item(
+                session,
+                tenant_id=account.tenant_id,
+                conversation_id=conversation_id,
+                reason_code=reason_code,
+            )
 
     if message_type is not None:
         if direct_delivery and message_id is None:
             raise DecisionDeliveryConfigurationError("direct_delivery_message_id_missing")
-        reply_target = {}
-        destination_type = "chatwoot_conversation"
-        valid_until = None
-        if direct_delivery:
-            message = (
-                await session.execute(
-                    select(
-                        models.Message.reply_target,
-                        models.Message.occurred_at,
-                    ).where(models.Message.id == message_id)
-                )
-            ).one_or_none()
-            if message is None:
-                raise DecisionDeliveryConfigurationError("direct_delivery_message_missing")
-            try:
-                destination = build_direct_reply_destination(
-                    platform=account.platform,
-                    reply_target=dict(message.reply_target or {}),
-                    visibility=decision.reply_visibility,
-                    occurred_at=message.occurred_at,
-                    now=datetime.now(UTC),
-                )
-            except ValueError as exc:
-                raise DecisionDeliveryConfigurationError(str(exc)) from exc
-            destination_type = destination.destination_type
-            reply_target = destination.target
-            valid_until = destination.valid_until
-        candidate_outbox_id = uuid.uuid4()
-        inserted_outbox = (
-            await session.execute(
-                pg_insert(models.OutboxMessage)
-                .values(
-                    id=candidate_outbox_id,
-                    tenant_id=account.tenant_id,
-                    conversation_id=conversation_id,
-                    platform_account_id=account_id,
-                    destination_type=destination_type,
-                    destination_id=snapshot.conversation_key,
-                    message_type=message_type,
-                    payload={
-                        "text": decision.reply_text or "",
-                        "visibility": decision.reply_visibility,
-                        "target": reply_target,
-                    },
-                    idempotency_key=_idempotency_key(
-                        account_id, conversation_id, message_id or conversation_id, decision.action
-                    ),
-                    status="PENDING",
-                    valid_until=valid_until,
-                )
-                .on_conflict_do_nothing(index_elements=["idempotency_key"])
-                .returning(models.OutboxMessage.id)
+        try:
+            outbox_id = await create_or_get_outbox_intent(
+                session,
+                conversation_id=conversation_id,
+                platform_account_id=account_id,
+                reply_to_message_id=message_id,
+                text=decision.reply_text or "",
+                origin_kind=OutboxOrigin.DECISION,
+                actor_kind=OutboxActor.BOT,
+                actor_id=None,
+                idempotency_key=_idempotency_key(
+                    account_id,
+                    conversation_id,
+                    message_id or conversation_id,
+                    decision.action,
+                ),
+                visibility=decision.reply_visibility,
+                message_type=message_type,
             )
-        ).scalar_one_or_none()
-        if inserted_outbox is not None:
-            outbox_id = inserted_outbox
-        else:
-            outbox_id = (
-                await session.execute(
-                    select(models.OutboxMessage.id).where(
-                        models.OutboxMessage.idempotency_key
-                        == _idempotency_key(
-                            account_id,
-                            conversation_id,
-                            message_id or conversation_id,
-                            decision.action,
-                        )
-                    )
-                )
-            ).scalar_one()
+        except ValueError as exc:
+            raise DecisionDeliveryConfigurationError(str(exc)) from exc
 
     inserted_decision = (
         await session.execute(
@@ -213,6 +182,8 @@ async def persist_decision(
                 risk_level=decision.risk_level,
                 confidence=decision.confidence,
                 reply_text=decision.reply_text,
+                original_reply_text=decision.reply_text,
+                review_action="PENDING" if decision.action is ReplyAction.DRAFT else None,
                 reply_visibility=decision.reply_visibility,
                 reason_codes=list(decision.reason_codes),
                 source=decision.source,

@@ -6,9 +6,6 @@ from social_reply.domain.reply.guard import redact_pii, run_final_guard
 from social_reply.domain.reply.llm import LLMClient, LLMContext
 from social_reply.domain.reply.rules import apply_rules
 
-# 低置信度的 LLM handoff 不应让会话静默，也不应永久锁死等待人工。
-LLM_HANDOFF_FALLBACK_TEXT = "抱歉，我暂时无法准确回答这个问题。请换一种说法或提供更多信息。"
-
 
 @dataclass(frozen=True)
 class DecisionSnapshot:
@@ -24,6 +21,7 @@ class DecisionSnapshot:
     automation_state: str
     state_version: int
     channel_type: ChannelType = ChannelType.DM
+    has_unsupported_attachment: bool = False
 
 
 async def run_decision_pipeline(
@@ -40,10 +38,12 @@ async def run_decision_pipeline(
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
     verbatim_reply 非空时（知识库命中且开模板直答）原文返回模板回复，不调 LLM。"""
-    # Human takeover suppresses all automated decisions.
-    if snapshot.automation_state == "HUMAN_ACTIVE":
+    # Only active automation modes are allowed to spend model capacity or create decisions.
+    if snapshot.automation_state not in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}:
         return ReplyDecision(
-            action=ReplyAction.IGNORE, reason_codes=("HUMAN_ACTIVE",), source="rule"
+            action=ReplyAction.IGNORE,
+            reason_codes=(snapshot.automation_state,),
+            source="rule",
         )
 
     # 全局/品牌/账号急停：降级为草稿（仍生成供人工参考，但不外发）。
@@ -61,7 +61,13 @@ async def run_decision_pipeline(
 
     # 确定性安全规则（空消息/风险词）优先于一切
     ruled = apply_rules(snapshot.text)
-    if ruled is not None:
+    if snapshot.has_unsupported_attachment:
+        decision = ReplyDecision(
+            action=ReplyAction.HANDOFF,
+            reason_codes=("UNSUPPORTED_ATTACHMENT",),
+            source="rule",
+        )
+    elif ruled is not None:
         decision = ruled
     elif verbatim_reply is not None:
         # Exact templates bypass the LLM so approved wording is preserved.
@@ -96,16 +102,6 @@ async def run_decision_pipeline(
         if knowledge:
             # Preserve whether retrieved knowledge influenced the model decision.
             decision = replace(decision, reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
-
-    # 仅把 LLM 自身给出的 handoff 转为公开兜底；风险词与知识不足是确定性规则（source=rule），
-    # 必须保持 handoff。Guard 失败发生在下一步，其 source=guard，因此不会被这里回滚。
-    if decision.action is ReplyAction.HANDOFF and decision.source == "llm":
-        decision = ReplyDecision(
-            action=ReplyAction.AUTO_REPLY,
-            reply_text=LLM_HANDOFF_FALLBACK_TEXT,
-            reason_codes=decision.reason_codes + ("LLM_HANDOFF_FALLBACK",),
-            source="rule",
-        )
 
     # Meta 评论只能在原评论下公开回复。先固定 visibility 再执行 Final Guard，
     # 否则模型给出的 private 会绕过公开回复的 PII 检查，随后再被改成公开发送。

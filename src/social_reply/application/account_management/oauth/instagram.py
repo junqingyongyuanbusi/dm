@@ -210,11 +210,7 @@ async def instagram_oauth_callback(request: Request) -> Response:
         "instagram_login_mode": "instagram_login",
         "enable_dm": True,
         "enable_comments": enable_comments,
-        "automation_default": (
-            "BOT_ACTIVE"
-            if enable_comments and settings.meta_auto_reply_enabled
-            else "BOT_DRAFT_ONLY"
-        ),
+        "automation_default": "BOT_DRAFT_ONLY",
         "access_token": long_token,
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,

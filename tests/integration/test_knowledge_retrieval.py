@@ -238,12 +238,15 @@ async def test_llm_handoff_转为公开兜底且不锁会话(session, knowledge_
     outbox_id = await runner.run_and_persist_decision(
         _snapshot(account_id), conv_id, msg_id, account_id
     )
-    assert outbox_id is not None
+    assert outbox_id is None
     dec = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert dec.action == "auto_reply"
-    assert "LLM_HANDOFF_FALLBACK" in dec.reason_codes
+    assert dec.action == "handoff"
+    assert dec.reason_codes == ["OPENAI"]
     state = (await session.execute(select(models.AutomationState))).scalar_one()
-    assert state.state == "BOT_ACTIVE"
+    assert state.state == "HANDOFF_PENDING"
+    work = (await session.execute(select(models.HumanWorkItem))).scalar_one()
+    assert work.status == "WAITING"
+    assert work.reason_code == "OPENAI"
 
 
 async def test_命中时决策附_knowledge_hit(session, knowledge_enabled):

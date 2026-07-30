@@ -104,8 +104,8 @@ subscriptions and records sanitized provider health in `PlatformAccount.config`.
 
 Meta comment auto-replies require the platform gate plus `META_COMMENT_REPLY_ENABLED=true` and
 `META_AUTO_REPLY_ENABLED=true` on API, Worker, and Scheduler. New Facebook and Instagram
-authorizations then default to `comments=true` and `BOT_ACTIVE`; DMs on the same account are also
-automatic because automation mode is account-scoped. Facebook OAuth requests
+authorizations default to `comments=true` and `BOT_DRAFT_ONLY`; the latter switch only permits an
+administrator to promote a tested account explicitly. Facebook OAuth requests
 `pages_read_engagement`, `pages_read_user_content`, and `pages_manage_engagement`, validates that
 all three permissions target the selected Page, and subscribes the Page to `feed`. Existing Page
 tokens must be reauthorized from `/admin/accounts`; missing or wrong-Page permissions produce

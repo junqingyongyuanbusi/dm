@@ -95,8 +95,9 @@ API 立即返回 `job_id`；Worker 验证 `getMe`、幂等创建或更新账号�
 需要停用时在 API、Worker、Scheduler 同时设为 `false`。Facebook Page 与 Instagram 专业账号均可
 开启文本私信和公开评论回复；附件、模板和营销消息不进入自动回复。
 
-Meta 自动外发默认关闭。要允许某个 Meta 账号使用 `BOT_ACTIVE`，API、Worker、Scheduler 必须同时
-设置 `META_AUTO_REPLY_ENABLED=true`。默认 `false`：
+Meta 自动外发默认关闭。所有新接入的 Meta 账号始终从 `BOT_DRAFT_ONLY` 开始，评论 capability
+不会改变自动化模式。要允许管理员之后把某个 Meta 账号切到 `BOT_ACTIVE`，API、Worker、
+Scheduler 必须同时设置 `META_AUTO_REPLY_ENABLED=true`。默认 `false`：
 
 - 关闭时：Control API 传 `automation_default=BOT_ACTIVE` 返回 422，后台「切为自动」按钮不渲染，
   直接 POST 也返回 422 `meta_requires_bot_draft_only`。已是 `BOT_ACTIVE` 的历史账号仍可改回草稿。
@@ -106,7 +107,7 @@ Meta 自动外发默认关闭。要允许某个 Meta 账号使用 `BOT_ACTIVE`�
 
 Facebook 与 Instagram 评论自动回复还要求三个角色同时设置
 `META_COMMENT_REPLY_ENABLED=true`。两个 Meta 开关都开启时，新授权账号默认
-`enable_comments=true`、`BOT_ACTIVE`；评论只会在原评论下发送公开子评论，不生成私信回复。
+`enable_comments=true`、`BOT_DRAFT_ONLY`；评论只会在原评论下发送公开子评论，不生成私信回复。
 由于自动化模式属于账号级，同一账号的 Messenger/Instagram 私信也会自动回复。
 
 这个开关不改变单会话控制：`/admin/conversations/{id}` 的状态翻转任何时候都可用。

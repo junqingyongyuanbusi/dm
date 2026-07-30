@@ -74,9 +74,10 @@ HAVING count(*) > 1;
 ## Event and send contracts
 
 `CanonicalEvent` now persists an additive `event_kind=message` field. New readers default historical
-serialized events without the field to `message`; old readers ignore the additional key. Current
-Telegram, Meta, WhatsApp, X and Chatwoot normalization is text-message-only, so unsupported media,
-receipts and reactions remain in RawEvent evidence without creating DecisionJobs.
+serialized events without the field to `message`; old readers ignore the additional key. Telegram,
+Meta, WhatsApp and Chatwoot normalization now preserves unsupported media metadata on the Message
+and creates an `UNSUPPORTED_ATTACHMENT` human work item. Receipts and reactions remain in RawEvent
+evidence without creating DecisionJobs.
 
 Direct Outbox delivery now validates nonblank text and binds the destination target to the source
 `ReplyDecision.message_id`, `Message.reply_target`, Conversation contact and account identity before
@@ -85,6 +86,26 @@ links, malformed targets, wrong recipients, or private X post replies move to op
 `NEEDS_REVIEW` without consuming a network attempt; the application does not infer recipients from
 arbitrary strings. Telegram retains only its prior empty-target fallback from the persisted
 conversation destination.
+
+## Human operations inbox rollout
+
+Revision `f6c2a9d81b40` adds `human_work_items`, explicit Outbox provenance and reply targets,
+structured draft review fields, and attachment metadata. It backfills open work for existing
+`HANDOFF_PENDING` and `HUMAN_ACTIVE` conversations and derives legacy Outbox targets from their
+ReplyDecision where available.
+
+The previous Worker cannot deliver `MANUAL_REPLY` rows because it resolves direct targets only
+through a ReplyDecision. During the API-first Railway rollout, operators must not submit manual
+replies or draft approvals from the new inbox until API, Worker, and Scheduler all report `SUCCESS`
+at the new identical digest. Read-only inbox use, claims, and resolves are safe. Run the standard
+`scripts/publish_railway_release.sh`, keep the coordinated pause through its final digest
+verification, then perform one manual-reply smoke test with a dedicated platform account. A row
+accepted during an accidental mixed-version window may move to `NEEDS_REVIEW`; inspect its delivery
+attempts and retry only after every Worker is on the new digest.
+
+The migration is expand-only for the running application. Database rollback still requires the
+normal verified pre-release backup because removing work items and provenance loses operator audit
+context even though an Alembic downgrade is mechanically available.
 
 ## Polling RawEvent journal
 

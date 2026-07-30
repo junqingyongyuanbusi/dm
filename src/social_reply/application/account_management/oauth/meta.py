@@ -180,11 +180,7 @@ async def meta_oauth_start(request: Request) -> Response:
                 "state": state_token,
                 "response_type": "code",
                 "scope": _oauth_scopes(platform),
-                **(
-                    {"auth_type": "rerequest"}
-                    if get_settings().meta_comment_reply_enabled
-                    else {}
-                ),
+                **({"auth_type": "rerequest"} if get_settings().meta_comment_reply_enabled else {}),
             },
             quote_via=quote,
         )
@@ -399,11 +395,6 @@ async def _finalize(
         external_account_id = candidate["id"]
         display_name = candidate["name"]
     enable_comments = settings.meta_comment_reply_enabled
-    automation_default = (
-        "BOT_ACTIVE"
-        if enable_comments and settings.meta_auto_reply_enabled
-        else "BOT_DRAFT_ONLY"
-    )
     submission = {
         "name": display_name,
         "external_account_id": external_account_id,
@@ -414,7 +405,7 @@ async def _finalize(
         "page_id": candidate["id"],
         "enable_dm": True,
         "enable_comments": enable_comments,
-        "automation_default": automation_default,
+        "automation_default": "BOT_DRAFT_ONLY",
         "access_token": candidate["access_token"],
         "app_secret": app.app_secret,
         "verify_token": app.verify_token,

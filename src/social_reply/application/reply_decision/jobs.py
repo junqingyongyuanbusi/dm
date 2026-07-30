@@ -31,7 +31,7 @@ _INITIAL_DISPATCH_ACTIVE_STATUSES = (
 )
 
 
-def snapshot_to_dict(snapshot: DecisionSnapshot) -> dict[str, str | int | None]:
+def snapshot_to_dict(snapshot: DecisionSnapshot) -> dict[str, str | int | bool | None]:
     return {
         "text": snapshot.text,
         "platform": snapshot.platform,
@@ -42,6 +42,7 @@ def snapshot_to_dict(snapshot: DecisionSnapshot) -> dict[str, str | int | None]:
         "automation_state": snapshot.automation_state,
         "state_version": snapshot.state_version,
         "channel_type": snapshot.channel_type.value,
+        "has_unsupported_attachment": snapshot.has_unsupported_attachment,
     }
 
 
@@ -56,6 +57,7 @@ def snapshot_from_dict(value: dict) -> DecisionSnapshot:
         automation_state=value["automation_state"],
         state_version=int(value["state_version"]),
         channel_type=ChannelType(value.get("channel_type", ChannelType.DM)),
+        has_unsupported_attachment=bool(value.get("has_unsupported_attachment", False)),
     )
 
 

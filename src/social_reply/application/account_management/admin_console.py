@@ -4,6 +4,7 @@
 """
 
 import hashlib
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -12,9 +13,8 @@ from urllib.parse import urlencode
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import and_, desc, func, or_, select, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.application.account_management.admin import (
     _CSRF_COOKIE,
@@ -29,6 +29,15 @@ from social_reply.application.account_management.admin import (
     html,
 )
 from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.human_workflow import (
+    HumanWorkflowConflict,
+    HumanWorkflowError,
+    claim_human_work_item,
+    ensure_open_human_work_item,
+    resolve_human_work_item,
+    resume_bot,
+    send_human_reply,
+)
 from social_reply.application.account_management.jobs import provisioning_job_is_in_flight
 from social_reply.application.account_management.oauth.common import notice
 from social_reply.application.account_management.service import enable_xchat_for_account
@@ -36,7 +45,13 @@ from social_reply.application.account_management.xchat_activation import XChatAc
 from social_reply.application.message_delivery.contracts import (
     build_direct_reply_destination,
 )
-from social_reply.application.reply_decision.persist import _idempotency_key
+from social_reply.application.message_delivery.intents import (
+    OutboxActor,
+    OutboxIdempotencyConflict,
+    OutboxIntentError,
+    OutboxOrigin,
+    create_or_get_outbox_intent,
+)
 from social_reply.application.reply_decision.persona import (
     PERSONA_MAX_CHARS,
     load_persona,
@@ -47,6 +62,7 @@ from social_reply.domain.automation.state_machine import (
     can_transition,
     flip_to_human_active,
 )
+from social_reply.domain.platform_accounts import capability_text_limit
 from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
@@ -88,6 +104,157 @@ def _tenant_input(principal: Principal) -> str:
         f'<label for="{field_id}">Tenant</label>'
         f'<select id="{field_id}" name="tenant_id" required>{options}</select>'
     )
+
+
+_REASON_LABELS = {
+    "RISK_WORD": "高风险内容",
+    "OPENAI": "模型主动转人工",
+    "EMPTY_OR_NON_TEXT": "消息缺少文本",
+    "INSUFFICIENT_KNOWLEDGE": "知识不足",
+    "LLM_REFUSAL": "模型拒答",
+    "LLM_SCHEMA_FAIL": "模型返回异常",
+    "LLM_UNAVAILABLE": "模型故障",
+    "GUARD_PII_LEAK": "PII Guard",
+    "GUARD_TOO_LONG": "长度 Guard",
+    "CAPABILITY_NOT_ALLOWED": "平台能力限制",
+    "CAPABILITY_TEXT_TOO_LONG": "平台长度限制",
+    "DELIVERY_WINDOW_EXPIRED": "发送窗口已关闭",
+    "UNSUPPORTED_ATTACHMENT": "暂不支持的附件",
+    "AMBIGUOUS_SEND": "发送结果不确定",
+}
+
+
+def _reason_label(code: str | None) -> str:
+    if not code:
+        return "—"
+    return _REASON_LABELS.get(code, code)
+
+
+def _target_label(target: dict | None) -> str:
+    value = dict(target or {})
+    kind = str(value.get("kind") or "dm")
+    labels = {
+        "dm": "私信会话",
+        "x_chat": "X Chat 会话",
+        "comment": "公开评论",
+        "reply": "公开帖子回复",
+        "session_message": "WhatsApp 会话",
+    }
+    return f"{labels.get(kind, kind)} · {json.dumps(value, ensure_ascii=False, sort_keys=True)}"
+
+
+def _attachment_text(attachment: object) -> str:
+    if not isinstance(attachment, dict):
+        return "附件"
+    media_type = str(
+        attachment.get("type")
+        or attachment.get("media_type")
+        or attachment.get("mime_type")
+        or "附件"
+    )
+    reference = str(attachment.get("url") or attachment.get("href") or attachment.get("id") or "")
+    return f"{media_type}{f' · {reference}' if reference else ''}"
+
+
+def _workflow_error(exc: HumanWorkflowError) -> HTTPException:
+    detail = str(exc)
+    if detail in {"human_work_item_not_found", "conversation_not_found"}:
+        return HTTPException(status_code=404, detail=detail)
+    if isinstance(exc, HumanWorkflowConflict):
+        return HTTPException(status_code=409, detail=detail)
+    return HTTPException(status_code=422, detail=detail)
+
+
+def _expected_version(form: dict[str, str]) -> int:
+    try:
+        value = int(form.get("version", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_work_item_version") from exc
+    if value < 1:
+        raise HTTPException(status_code=422, detail="invalid_work_item_version")
+    return value
+
+
+def _selected(value: str, expected: str) -> str:
+    return " selected" if value == expected else ""
+
+
+async def _load_inbox_summary(
+    session, tenants: frozenset[str]
+) -> dict[str, tuple[int, datetime | None]]:
+    human = (
+        await session.execute(
+            select(func.count(), func.min(models.HumanWorkItem.created_at)).where(
+                models.HumanWorkItem.tenant_id.in_(tenants),
+                models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
+            )
+        )
+    ).one()
+    drafts = (
+        await session.execute(
+            select(func.count(), func.min(models.ReplyDecision.created_at)).where(
+                models.ReplyDecision.tenant_id.in_(tenants),
+                models.ReplyDecision.action == "draft",
+                func.coalesce(models.ReplyDecision.review_action, "PENDING") == "PENDING",
+            )
+        )
+    ).one()
+    delivery = (
+        await session.execute(
+            select(func.count(), func.min(models.OutboxMessage.created_at)).where(
+                models.OutboxMessage.tenant_id.in_(tenants),
+                models.OutboxMessage.status.in_(("FAILED", "NEEDS_REVIEW")),
+            )
+        )
+    ).one()
+    return {
+        "human": (int(human[0]), human[1]),
+        "drafts": (int(drafts[0]), drafts[1]),
+        "delivery": (int(delivery[0]), delivery[1]),
+    }
+
+
+def _inbox_filter_form(
+    *,
+    queue: str,
+    principal: Principal,
+    accounts: list[models.PlatformAccount],
+    tenant_id: str,
+    account_id: str,
+    platform: str,
+    queue_status: str,
+    reason: str,
+) -> str:
+    tenant_options = '<option value="">全部 Tenant</option>' + "".join(
+        f'<option value="{html.escape(value)}"{_selected(tenant_id, value)}>{html.escape(value)}</option>'
+        for value in sorted(principal.allowed_tenants)
+    )
+    account_options = '<option value="">全部账号</option>' + "".join(
+        f'<option value="{account.id}"{_selected(account_id, str(account.id))}>{html.escape(account.name)}</option>'
+        for account in accounts
+        if not tenant_id or account.tenant_id == tenant_id
+    )
+    platform_options = '<option value="">全部平台</option>' + "".join(
+        f'<option value="{value}"{_selected(platform, value)}>{html.escape(value)}</option>'
+        for value in ("telegram", "facebook", "instagram", "whatsapp", "x")
+    )
+    status_values = {
+        "human": ("WAITING", "CLAIMED", "RESOLVED", "CANCELLED"),
+        "drafts": ("PENDING", "ACCEPTED", "EDITED", "REJECTED"),
+        "delivery": ("FAILED", "NEEDS_REVIEW"),
+    }[queue]
+    status_options = '<option value="">全部状态</option>' + "".join(
+        f'<option value="{value}"{_selected(queue_status, value)}>{value}</option>'
+        for value in status_values
+    )
+    return f"""<form class="filters" method="get" action="/admin/inbox">
+<input type="hidden" name="queue" value="{queue}">
+<div><label for="inbox-tenant">Tenant</label><select id="inbox-tenant" name="tenant_id">{tenant_options}</select></div>
+<div><label for="inbox-account">账号</label><select id="inbox-account" name="account_id">{account_options}</select></div>
+<div><label for="inbox-platform">平台</label><select id="inbox-platform" name="platform">{platform_options}</select></div>
+<div><label for="inbox-status">状态</label><select id="inbox-status" name="status">{status_options}</select></div>
+<div><label for="inbox-reason">原因代码</label><input id="inbox-reason" name="reason" value="{html.escape(reason, quote=True)}" maxlength="128" placeholder="全部原因"></div>
+<button>筛选</button></form>"""
 
 
 # ---------- 总览 ----------
@@ -166,6 +333,23 @@ def _health_age(now: datetime, oldest_at: datetime | None) -> str:
     if hours < 48:
         return f"{hours} 小时"
     return f"{hours // 24} 天"
+
+
+def _elapsed(started_at: datetime, finished_at: datetime | None) -> str:
+    if finished_at is None:
+        return "—"
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=UTC)
+    if finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=UTC)
+    seconds = max(int((finished_at - started_at).total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours = minutes // 60
+    return f"{hours} 小时 {minutes % 60} 分钟"
 
 
 async def _load_health_metrics(
@@ -440,7 +624,331 @@ async def overview(request: Request) -> Response:
     return HTMLResponse(_page("总览", body, active="overview", show_users=principal.is_superadmin))
 
 
-# ---------- 对话收件箱 ----------
+# ---------- Unified inbox ----------
+
+
+def _draft_review_card(
+    *,
+    decision: models.ReplyDecision,
+    conversation: models.Conversation,
+    display_name: str,
+    platform: str,
+    account_name: str,
+    csrf: str,
+    now: datetime,
+) -> str:
+    review_action = decision.review_action or "PENDING"
+    original_text = decision.original_reply_text or decision.reply_text or ""
+    heading = (
+        f'<section class="card"><h3>{html.escape(display_name)} · '
+        f"{html.escape(platform)}</h3>"
+        f'<p class="hint">{html.escape(account_name)} · {_pill(review_action)} · '
+        f"等待 {_health_age(now, decision.created_at)} · "
+        f'<a href="/admin/conversations/{conversation.id}">查看上下文</a></p>'
+    )
+    if review_action == "PENDING":
+        controls = f"""<form method="post" action="/admin/decisions/{decision.id}/approve"><input type="hidden" name="csrf_token" value="{csrf}"><label for="draft-{decision.id}">回复内容</label><textarea id="draft-{decision.id}" name="final_reply_text" required maxlength="10000">{html.escape(original_text)}</textarea><button class="btn-sm">发送</button></form>
+<form method="post" action="/admin/decisions/{decision.id}/discard"><input type="hidden" name="csrf_token" value="{csrf}"><label for="reject-{decision.id}">拒绝原因</label><input id="reject-{decision.id}" name="review_reason" maxlength="500" required><button class="btn-sm btn-ghost">拒绝</button></form>"""
+        return f"{heading}{controls}</section>"
+
+    final_text = decision.final_reply_text or "—"
+    review_reason = decision.review_reason or "—"
+    reviewed_by = decision.reviewed_by or "—"
+    return f"""{heading}<dl class="channel-meta"><dt>AI 原始草稿</dt><dd>{html.escape(original_text or "—")}</dd>
+<dt>最终回复</dt><dd>{html.escape(final_text)}</dd><dt>审核人</dt><dd>{html.escape(reviewed_by)}</dd>
+<dt>审核时间</dt><dd>{_fmt(decision.reviewed_at)}</dd><dt>审核耗时</dt><dd>{_elapsed(decision.created_at, decision.reviewed_at)}</dd>
+<dt>审核原因</dt><dd>{html.escape(review_reason)}</dd></dl></section>"""
+
+
+@router.get("/inbox/counts", response_class=JSONResponse)
+async def inbox_counts(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as session:
+        summary = await _load_inbox_summary(session, principal.allowed_tenants)
+    return JSONResponse({key: value[0] for key, value in summary.items()})
+
+
+@router.get("/inbox", response_class=HTMLResponse)
+async def inbox_page(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    csrf = _csrf(request)
+    tenants = principal.allowed_tenants
+    queue = request.query_params.get("queue", "human")
+    if queue not in {"human", "drafts", "delivery"}:
+        queue = "human"
+    tenant_id = request.query_params.get("tenant_id", "").strip()
+    if tenant_id:
+        principal.require_tenant(tenant_id)
+    account_id = request.query_params.get("account_id", "").strip()
+    account_uuid: uuid.UUID | None = None
+    if account_id:
+        try:
+            account_uuid = uuid.UUID(account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
+    platform = request.query_params.get("platform", "").strip()
+    if platform and platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+        raise HTTPException(status_code=422, detail="invalid_platform_filter")
+    queue_status = request.query_params.get("status", "").strip()
+    valid_statuses = {
+        "human": {"WAITING", "CLAIMED", "RESOLVED", "CANCELLED"},
+        "drafts": {"PENDING", "ACCEPTED", "EDITED", "REJECTED"},
+        "delivery": {"FAILED", "NEEDS_REVIEW"},
+    }[queue]
+    if queue_status and queue_status not in valid_statuses:
+        raise HTTPException(status_code=422, detail="invalid_inbox_status_filter")
+    reason = request.query_params.get("reason", "").strip()
+    if len(reason) > 128:
+        raise HTTPException(status_code=422, detail="invalid_reason_filter")
+
+    async with get_session_factory()() as session:
+        accounts = list(
+            (
+                await session.execute(
+                    select(models.PlatformAccount)
+                    .where(models.PlatformAccount.tenant_id.in_(tenants))
+                    .order_by(models.PlatformAccount.name)
+                )
+            ).scalars()
+        )
+        if account_uuid is not None and all(account.id != account_uuid for account in accounts):
+            raise HTTPException(status_code=404, detail="account_not_found")
+        summary = await _load_inbox_summary(session, tenants)
+        now = datetime.now(UTC)
+
+        if queue == "human":
+            statement = (
+                select(
+                    models.HumanWorkItem,
+                    models.Conversation,
+                    models.Contact.display_name,
+                    models.Contact.external_user_id,
+                    models.PlatformAccount.name.label("account_name"),
+                    models.PlatformAccount.platform,
+                    models.AutomationState.state,
+                )
+                .join(
+                    models.Conversation,
+                    models.Conversation.id == models.HumanWorkItem.conversation_id,
+                )
+                .join(models.Contact, models.Contact.id == models.Conversation.contact_id)
+                .join(
+                    models.PlatformAccount,
+                    models.PlatformAccount.id == models.Conversation.platform_account_id,
+                )
+                .join(
+                    models.AutomationState,
+                    models.AutomationState.conversation_id == models.Conversation.id,
+                    isouter=True,
+                )
+                .where(models.HumanWorkItem.tenant_id.in_(tenants))
+            )
+            if queue_status:
+                statement = statement.where(models.HumanWorkItem.status == queue_status)
+            else:
+                statement = statement.where(models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")))
+            if reason:
+                statement = statement.where(models.HumanWorkItem.reason_code == reason)
+            if tenant_id:
+                statement = statement.where(models.HumanWorkItem.tenant_id == tenant_id)
+            if account_uuid:
+                statement = statement.where(models.Conversation.platform_account_id == account_uuid)
+            if platform:
+                statement = statement.where(models.PlatformAccount.platform == platform)
+            items = (
+                await session.execute(
+                    statement.order_by(models.HumanWorkItem.created_at).limit(100)
+                )
+            ).all()
+        elif queue == "drafts":
+            statement = (
+                select(
+                    models.ReplyDecision,
+                    models.Conversation,
+                    models.Contact.display_name,
+                    models.Contact.external_user_id,
+                    models.PlatformAccount.name.label("account_name"),
+                    models.PlatformAccount.platform,
+                )
+                .join(
+                    models.Conversation,
+                    models.Conversation.id == models.ReplyDecision.conversation_id,
+                )
+                .join(models.Contact, models.Contact.id == models.Conversation.contact_id)
+                .join(
+                    models.PlatformAccount,
+                    models.PlatformAccount.id == models.Conversation.platform_account_id,
+                )
+                .where(
+                    models.ReplyDecision.tenant_id.in_(tenants),
+                    models.ReplyDecision.action == "draft",
+                )
+            )
+            statement = statement.where(
+                func.coalesce(models.ReplyDecision.review_action, "PENDING")
+                == (queue_status or "PENDING")
+            )
+            if reason:
+                statement = statement.where(models.ReplyDecision.reason_codes.contains([reason]))
+            if tenant_id:
+                statement = statement.where(models.ReplyDecision.tenant_id == tenant_id)
+            if account_uuid:
+                statement = statement.where(models.Conversation.platform_account_id == account_uuid)
+            if platform:
+                statement = statement.where(models.PlatformAccount.platform == platform)
+            items = (
+                await session.execute(
+                    statement.order_by(models.ReplyDecision.created_at).limit(100)
+                )
+            ).all()
+        else:
+            statement = (
+                select(
+                    models.OutboxMessage,
+                    models.Conversation,
+                    models.Contact.display_name,
+                    models.Contact.external_user_id,
+                    models.PlatformAccount.name.label("account_name"),
+                    models.PlatformAccount.platform,
+                )
+                .join(
+                    models.Conversation,
+                    models.Conversation.id == models.OutboxMessage.conversation_id,
+                )
+                .join(models.Contact, models.Contact.id == models.Conversation.contact_id)
+                .join(
+                    models.PlatformAccount,
+                    models.PlatformAccount.id == models.Conversation.platform_account_id,
+                )
+                .where(
+                    models.OutboxMessage.tenant_id.in_(tenants),
+                    models.OutboxMessage.status.in_(
+                        (queue_status,) if queue_status else ("FAILED", "NEEDS_REVIEW")
+                    ),
+                )
+            )
+            if reason:
+                statement = statement.where(models.OutboxMessage.last_error_code == reason)
+            if tenant_id:
+                statement = statement.where(models.OutboxMessage.tenant_id == tenant_id)
+            if account_uuid:
+                statement = statement.where(
+                    models.OutboxMessage.platform_account_id == account_uuid
+                )
+            if platform:
+                statement = statement.where(models.PlatformAccount.platform == platform)
+            items = (
+                await session.execute(
+                    statement.order_by(models.OutboxMessage.created_at).limit(100)
+                )
+            ).all()
+
+    queue_tabs = (
+        '<div class="queue-tabs">'
+        + "".join(
+            f'<a class="queue-tab{" active" if queue == key else ""}" href="/admin/inbox?queue={key}">'
+            f"<strong>{summary[key][0]}</strong><span>{label} · 最老 {_health_age(now, summary[key][1])}</span></a>"
+            for key, label in (
+                ("human", "待人工"),
+                ("drafts", "待审核"),
+                ("delivery", "投递异常"),
+            )
+        )
+        + "</div>"
+    )
+    filters = _inbox_filter_form(
+        queue=queue,
+        principal=principal,
+        accounts=accounts,
+        tenant_id=tenant_id,
+        account_id=account_id,
+        platform=platform,
+        queue_status=queue_status,
+        reason=reason,
+    )
+
+    if queue == "human":
+        rows = (
+            "".join(
+                f"<tr><td class='muted'>{_health_age(now, work.created_at)}</td>"
+                f"<td><a href='/admin/conversations/{conv.id}'>{html.escape(display or external or '匿名用户')}</a></td>"
+                f"<td>{html.escape(platform_name)} · {html.escape(account_name)}</td>"
+                f"<td>{_pill(work.status)}</td><td>{html.escape(_reason_label(work.reason_code))}</td>"
+                f"<td class='muted'>{html.escape(work.assigned_actor or str(work.assigned_user_id or '未认领'))}</td>"
+                "<td>"
+                + (
+                    f'<form class="inline" method="post" action="/admin/work-items/{work.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work.version}"><button class="btn-sm">认领</button></form>'
+                    if work.status == "WAITING"
+                    else ""
+                )
+                + (
+                    f'<form class="inline" method="post" action="/admin/work-items/{work.id}/resolve"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work.version}"><button class="btn-sm btn-ghost">解决</button></form>'
+                    if work.status == "CLAIMED"
+                    and (principal.is_superadmin or work.assigned_actor == principal.actor)
+                    else ""
+                )
+                + "</td></tr>"
+                for work, conv, display, external, account_name, platform_name, _automation in items
+            )
+            or "<tr><td colspan='7' class='muted'>当前没有匹配的人工工作项</td></tr>"
+        )
+        content = f"<section class='card'><div class='tablewrap'><table><thead><tr><th>等待</th><th>联系人</th><th>渠道</th><th>状态</th><th>原因</th><th>负责人</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>"
+    elif queue == "drafts":
+        cards = (
+            "".join(
+                _draft_review_card(
+                    decision=decision,
+                    conversation=conv,
+                    display_name=display or external or "匿名用户",
+                    platform=platform_name,
+                    account_name=account_name,
+                    csrf=csrf,
+                    now=now,
+                )
+                for decision, conv, display, external, account_name, platform_name in items
+            )
+            or "<section class='card'><p class='muted'>当前没有匹配的待审核草稿</p></section>"
+        )
+        content = cards
+    else:
+        rows = (
+            "".join(
+                f"<tr><td class='muted'>{_health_age(now, outbox.created_at)}</td>"
+                f"<td><a href='/admin/conversations/{conv.id}'>{html.escape(display or external or '匿名用户')}</a></td>"
+                f"<td>{html.escape(platform_name)} · {html.escape(account_name)}</td>"
+                f"<td>{_pill(outbox.status)}</td><td>{html.escape(_reason_label(outbox.last_error_code))}</td>"
+                f"<td class='muted'>{html.escape(outbox.last_error_message or '—')}</td>"
+                + (
+                    f'<td><form class="inline" method="post" action="/admin/delivery/{outbox.id}/retry"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">重试</button></form></td>'
+                    if outbox.status == "FAILED"
+                    else "<td><span class='muted'>需核实平台结果</span></td>"
+                )
+                + "</tr>"
+                for outbox, conv, display, external, account_name, platform_name in items
+            )
+            or "<tr><td colspan='7' class='muted'>当前没有匹配的投递异常</td></tr>"
+        )
+        content = f"<section class='card'><div class='tablewrap'><table><thead><tr><th>等待</th><th>联系人</th><th>渠道</th><th>状态</th><th>错误</th><th>详情</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>"
+
+    body = f"""<h1>收件箱</h1><p class="lede">人工处理、草稿审核与投递异常的统一工作队列。</p>{queue_tabs}
+<section class="card">{filters}</section>{content}"""
+    response = HTMLResponse(
+        _page(
+            "收件箱",
+            body,
+            active="inbox",
+            refresh_seconds=20,
+            show_users=principal.is_superadmin,
+        )
+    )
+    return _ensure_csrf(response, request, csrf)
+
+
+# ---------- Conversations ----------
 
 
 @router.get("/conversations", response_class=HTMLResponse)
@@ -489,7 +997,7 @@ async def conversations_page(request: Request) -> Response:
             f"<tr><td>{html.escape(conv.platform)}</td>"
             f"<td><a href='/admin/conversations/{conv.id}'>{html.escape(display or external or '匿名用户')}</a></td>"
             f"<td class='muted'>{html.escape(account_name)}</td>"
-            f"<td>{_pill(state or 'BOT_ACTIVE')}</td>"
+            f"<td>{_pill(state or 'BOT_DRAFT_ONLY')}</td>"
             f"<td class='muted'>{_fmt(last_at or conv.created_at)}</td></tr>"
             for conv, display, external, state, account_name, last_at in rows
         )
@@ -521,6 +1029,9 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         if conv is None or conv.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="conversation_not_found")
         contact = await session.get(models.Contact, conv.contact_id)
+        account = await session.get(models.PlatformAccount, conv.platform_account_id)
+        if account is None or account.tenant_id != conv.tenant_id:
+            raise HTTPException(status_code=409, detail="conversation_account_scope_mismatch")
         state_row = (
             await session.execute(
                 select(models.AutomationState).where(
@@ -533,7 +1044,7 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
                 await session.execute(
                     select(models.Message)
                     .where(models.Message.conversation_id == conversation_id)
-                    .order_by(models.Message.created_at)
+                    .order_by(models.Message.history_seq)
                     .limit(200)
                 )
             )
@@ -552,12 +1063,60 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
             .scalars()
             .all()
         )
-    cur_state = state_row.state if state_row else "BOT_ACTIVE"
+        work_item = (
+            (
+                await session.execute(
+                    select(models.HumanWorkItem)
+                    .where(models.HumanWorkItem.conversation_id == conversation_id)
+                    .order_by(desc(models.HumanWorkItem.created_at))
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        outboxes = (
+            (
+                await session.execute(
+                    select(models.OutboxMessage)
+                    .where(models.OutboxMessage.conversation_id == conversation_id)
+                    .order_by(desc(models.OutboxMessage.created_at))
+                    .limit(20)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        subject_ids = [str(conversation_id)]
+        if work_item is not None:
+            subject_ids.append(str(work_item.id))
+        subject_ids.extend(str(decision.id) for decision in decisions)
+        subject_ids.extend(str(outbox.id) for outbox in outboxes)
+        audit_logs = (
+            (
+                await session.execute(
+                    select(models.AuditLog)
+                    .where(
+                        models.AuditLog.tenant_id == conv.tenant_id,
+                        models.AuditLog.subject_id.in_(subject_ids),
+                    )
+                    .order_by(desc(models.AuditLog.created_at))
+                    .limit(30)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    cur_state = state_row.state if state_row else "BOT_DRAFT_ONLY"
     bubbles = (
         "".join(
             f"<div class='msg {'in' if m.direction == 'inbound' else 'out'}'>"
             f"{html.escape(m.text or '（非文本消息）')}"
-            f"<div class='meta'>{'客户' if m.direction == 'inbound' else '机器人/客服'} · {_fmt(m.created_at)}</div></div>"
+            + "".join(
+                f"<div class='target-choice'>{html.escape(_attachment_text(attachment))}</div>"
+                for attachment in (m.attachments or [])
+            )
+            + f"<div class='meta'>{'客户' if m.sender_type == 'contact' else '人工客服' if m.sender_type == 'agent' else '机器人'} · {_fmt(m.occurred_at or m.created_at)}</div></div>"
             for m in msgs
         )
         or "<p class='muted'>暂无消息</p>"
@@ -568,29 +1127,168 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{dst}">
 <input type="hidden" name="expect" value="{cur_state}"><button class="btn-sm {cls}">{label}</button></form>"""
         for dst, (label, cls) in _TRANSITION_LABELS.items()
-        if cur is not None and can_transition(cur, AutomationStateEnum(dst))
+        if cur is not None
+        and can_transition(cur, AutomationStateEnum(dst))
+        and (dst == "HUMAN_ACTIVE" or work_item is None)
     )
     decision_rows = (
         "".join(
             f"<tr><td class='muted'>{_fmt(d.created_at)}</td><td>{_pill(d.action)}</td>"
             f"<td class='muted'>{html.escape(d.intent or '—')}</td>"
-            f"<td>{html.escape((d.reply_text or '—')[:60])}</td>"
+            f"<td>{html.escape((d.final_reply_text or d.original_reply_text or d.reply_text or '—')[:60])}</td>"
+            f"<td>{html.escape('、'.join(_reason_label(str(code)) for code in (d.reason_codes or [])) or '—')}</td>"
             f"<td class='muted'>{d.confidence if d.confidence is not None else '—'}</td></tr>"
             for d in decisions
         )
-        or "<tr><td colspan='5' class='muted'>暂无决策</td></tr>"
+        or "<tr><td colspan='6' class='muted'>暂无决策</td></tr>"
     )
     who = html.escape(
         (contact.display_name if contact else None)
         or (contact.external_user_id if contact else "")
         or "匿名用户"
     )
-    body = f"""<a class="back" href="/admin/conversations">← 返回对话列表</a>
+    reply_candidates = [message for message in msgs if message.direction == "inbound"]
+    text_limit = capability_text_limit(account.platform, dict(account.capability or {})) or 2000
+    destination_label = "—"
+    window_label = "无平台时限"
+    if reply_candidates:
+        latest_inbound = reply_candidates[-1]
+        try:
+            destination = build_direct_reply_destination(
+                platform=account.platform,
+                reply_target=dict(latest_inbound.reply_target or {}),
+                visibility="public",
+                occurred_at=latest_inbound.occurred_at,
+                now=datetime.now(UTC),
+            )
+            destination_label = destination.destination_type
+            if destination.valid_until is not None:
+                window_label = (
+                    f"截止 {_fmt(destination.valid_until)}"
+                    if destination.valid_until > datetime.now(UTC)
+                    else "发送窗口已关闭"
+                )
+        except ValueError:
+            destination_label = "当前渠道不支持直接回复"
+
+    target_choices = "".join(
+        f"""<label class="target-choice"><input type="radio" name="reply_to_message_id" value="{message.id}" {"checked" if message is reply_candidates[-1] else ""} required>
+{html.escape(_target_label(message.reply_target))}<br><span class="muted">{html.escape((message.text or "非文本消息")[:90])} · {_fmt(message.occurred_at or message.created_at)}</span></label>"""
+        for message in reply_candidates
+    )
+    work_status = work_item.status if work_item is not None else "NONE"
+    assigned = (
+        work_item.assigned_actor or str(work_item.assigned_user_id or "未认领")
+        if work_item is not None
+        else "—"
+    )
+    work_actions = ""
+    if work_item is not None and work_item.status == "WAITING":
+        work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm">认领</button></form>"""
+    if (
+        work_item is not None
+        and work_item.status == "CLAIMED"
+        and (principal.is_superadmin or work_item.assigned_actor == principal.actor)
+    ):
+        work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/resolve"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm btn-ghost">解决</button></form>"""
+    if (
+        work_item is not None
+        and work_item.status == "RESOLVED"
+        and cur_state
+        in {
+            "HUMAN_ACTIVE",
+            "BOT_COOLDOWN",
+        }
+    ):
+        resume_auto = (
+            '<button class="btn-sm btn-ghost" name="target" value="BOT_ACTIVE">恢复自动</button>'
+            if get_settings().meta_automation_default_allowed(account.platform, "BOT_ACTIVE")
+            else ""
+        )
+        work_actions += f"""<form class="inline" method="post" action="/admin/conversations/{conversation_id}/resume"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm" name="target" value="BOT_DRAFT_ONLY">恢复为草稿</button>{resume_auto}</form>"""
+
+    work_fields = ""
+    if work_item is not None and work_item.status in {"WAITING", "CLAIMED"}:
+        work_fields = f'<input type="hidden" name="work_item_id" value="{work_item.id}"><input type="hidden" name="version" value="{work_item.version}">'
+    can_handle = (
+        work_item is None
+        or work_item.status != "CLAIMED"
+        or principal.is_superadmin
+        or work_item.assigned_actor == principal.actor
+    )
+    composer = (
+        f"""<section class="card composer"><h2>人工回复</h2>
+<dl class="channel-meta"><dt>回复渠道</dt><dd>{html.escape(destination_label)}</dd><dt>平台发送窗口</dt><dd>{html.escape(window_label)}</dd><dt>文本限制</dt><dd>{text_limit} 字符</dd></dl>
+<form method="post" action="/admin/conversations/{conversation_id}/reply"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="idempotency_key" value="{uuid.uuid4()}">{work_fields}
+<label>回复目标</label>{target_choices}<label for="manual-reply">回复内容</label><textarea id="manual-reply" name="text" required maxlength="{text_limit}"></textarea>
+<div class="composer-meta"><span>由当前管理员发送</span><span>最多 {text_limit} 字符</span></div><button>发送回复</button></form></section>"""
+        if reply_candidates and can_handle
+        else "<section class='card'><h2>人工回复</h2><div class='banner err'>"
+        + (
+            "此工作项已由其他客服认领。"
+            if reply_candidates
+            else "当前会话没有可绑定的入站消息，无法安全发送。"
+        )
+        + "</div></section>"
+    )
+    outbox_rows = (
+        "".join(
+            f"<tr><td class='muted'>{_fmt(row.created_at)}</td><td>{_pill(row.status)}</td>"
+            f"<td>{html.escape(row.origin_kind)}</td><td>{html.escape((row.payload or {}).get('text', '')[:52])}</td>"
+            f"<td class='muted'>{html.escape(_reason_label(row.last_error_code))}"
+            + (f"<br>{html.escape(row.last_error_message)}" if row.last_error_message else "")
+            + "</td></tr>"
+            for row in outboxes
+        )
+        or "<tr><td colspan='5' class='muted'>暂无发送记录</td></tr>"
+    )
+    audit_items = (
+        "".join(
+            f"<li><strong>{html.escape(entry.action)}</strong> · {html.escape(entry.actor)}"
+            f"<div class='muted'>{_fmt(entry.created_at)} · {html.escape(json.dumps(entry.detail or {}, ensure_ascii=False, sort_keys=True))}</div></li>"
+            for entry in audit_logs
+        )
+        or "<li class='muted'>暂无审计记录</li>"
+    )
+    human_times = [
+        message.occurred_at or message.created_at
+        for message in msgs
+        if message.direction == "outbound" and message.sender_type == "agent"
+    ]
+    bot_times = [
+        message.occurred_at or message.created_at
+        for message in msgs
+        if message.direction == "outbound" and message.sender_type == "bot"
+    ]
+    if state_row is not None and state_row.last_human_message_at is not None:
+        human_times.append(state_row.last_human_message_at)
+    if state_row is not None and state_row.last_bot_message_at is not None:
+        bot_times.append(state_row.last_bot_message_at)
+    handoff_reason = work_item.reason_code if work_item is not None else None
+    if handoff_reason is None:
+        handoff_reason = next(
+            (
+                str(code)
+                for decision in decisions
+                if decision.action == "handoff"
+                for code in (decision.reason_codes or [])
+            ),
+            None,
+        )
+    sidebar = f"""<section class="card"><h2>处理状态</h2><table class="kv"><tbody>
+<tr><th>Automation</th><td>{_pill(cur_state)}</td></tr><tr><th>人工工作项</th><td>{_pill(work_status)}</td></tr>
+<tr><th>转人工原因</th><td>{html.escape(_reason_label(handoff_reason))}</td></tr><tr><th>负责人</th><td>{html.escape(assigned)}</td></tr>
+<tr><th>等待时间</th><td>{_health_age(datetime.now(UTC), work_item.created_at) if work_item is not None else "—"}</td></tr>
+<tr><th>最近人工发送</th><td>{_fmt(max(human_times, default=None))}</td></tr>
+<tr><th>最近机器人发送</th><td>{_fmt(max(bot_times, default=None))}</td></tr>
+</tbody></table><div style="margin-top:14px">{work_actions}{buttons}</div></section>
+<section class="card"><h2>审计时间线</h2><ul class="audit-list">{audit_items}</ul></section>"""
+    body = f"""<a class="back" href="/admin/inbox">← 返回收件箱</a>
 <section class="card"><h1 style="font-size:24px">{who}<span style="margin-left:12px">{_pill(cur_state)}</span></h1>
-<p class="hint">{html.escape(conv.platform)} · 会话键 <code>{html.escape(conv.conversation_key)}</code></p>
-<div style="margin:6px 0 4px">{buttons}</div>
-<div class="thread">{bubbles}</div></section>
-<section class="card"><h2>本会话决策</h2><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复</th><th>置信度</th></tr></thead><tbody>{decision_rows}</tbody></table></div></section>"""
+<p class="hint">{html.escape(conv.platform)} · {html.escape(account.name)} · {html.escape(conv.channel_type)} · 会话键 <code>{html.escape(conv.conversation_key)}</code></p></section>
+<div class="detail-grid"><div class="detail-stack"><section class="card"><h2>消息线程</h2><div class="thread">{bubbles}</div></section>{composer}</div><aside>{sidebar}</aside></div>
+<section class="card"><h2>发送状态</h2><div class="tablewrap"><table><thead><tr><th>时间</th><th>状态</th><th>来源</th><th>内容</th><th>平台错误</th></tr></thead><tbody>{outbox_rows}</tbody></table></div></section>
+<section class="card"><h2>本会话决策</h2><div class="tablewrap"><table><thead><tr><th>时间</th><th>动作</th><th>意图</th><th>回复</th><th>原因</th><th>置信度</th></tr></thead><tbody>{decision_rows}</tbody></table></div></section>"""
     response = HTMLResponse(
         _page(
             "对话详情",
@@ -600,6 +1298,117 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         )
     )
     return _ensure_csrf(response, request, csrf)
+
+
+@router.post("/work-items/{work_item_id}/claim")
+async def claim_work_item(request: Request, work_item_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await claim_human_work_item(
+            work_item_id=work_item_id,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            user_id=principal.user_id,
+            expected_version=_expected_version(form),
+        )
+    except HumanWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    return RedirectResponse("/admin/inbox?queue=human", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/work-items/{work_item_id}/resolve")
+async def resolve_work_item(request: Request, work_item_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await resolve_human_work_item(
+            work_item_id=work_item_id,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            expected_version=_expected_version(form),
+            allow_override=principal.is_superadmin,
+        )
+    except HumanWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    return RedirectResponse("/admin/inbox?queue=human", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/conversations/{conversation_id}/resume")
+async def resume_conversation(request: Request, conversation_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    target = form.get("target", "")
+    if target not in {"BOT_DRAFT_ONLY", "BOT_ACTIVE"}:
+        raise HTTPException(status_code=422, detail="resume_target_invalid")
+    try:
+        await resume_bot(
+            conversation_id=conversation_id,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            target=target,
+        )
+    except HumanWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    return RedirectResponse(
+        f"/admin/conversations/{conversation_id}", status_code=status.HTTP_303_SEE_OTHER
+    )
+
+
+@router.post("/conversations/{conversation_id}/reply")
+async def send_manual_reply(request: Request, conversation_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    text = form.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="reply_text_required")
+    try:
+        reply_to_message_id = uuid.UUID(form.get("reply_to_message_id", ""))
+        browser_key = str(uuid.UUID(form.get("idempotency_key", "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_manual_reply_form") from exc
+    work_item_id: uuid.UUID | None = None
+    expected_version: int | None = None
+    if form.get("work_item_id"):
+        try:
+            work_item_id = uuid.UUID(form["work_item_id"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid_work_item_id") from exc
+        expected_version = _expected_version(form)
+    try:
+        await send_human_reply(
+            conversation_id=conversation_id,
+            reply_to_message_id=reply_to_message_id,
+            text=text,
+            idempotency_key=browser_key,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            user_id=principal.user_id,
+            allow_override=principal.is_superadmin,
+            work_item_id=work_item_id,
+            expected_version=expected_version,
+        )
+    except HumanWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    except OutboxIdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OutboxIntentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return RedirectResponse(
+        f"/admin/conversations/{conversation_id}", status_code=status.HTTP_303_SEE_OTHER
+    )
 
 
 @router.post("/conversations/{conversation_id}/state")
@@ -620,15 +1429,33 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
             raise HTTPException(status_code=404, detail="conversation_not_found")
         # CAS：仅当仍处于提交时看到的状态才翻转（防并发接管竞态）
         if target == AutomationStateEnum.HUMAN_ACTIVE:
-            await flip_to_human_active(
+            flipped = await flip_to_human_active(
                 session,
                 conversation_id,
                 principal.actor,
                 "admin_manual",
                 expected_state=AutomationStateEnum(expect),
             )
+            if not flipped:
+                raise HTTPException(status_code=409, detail="automation_state_version_conflict")
+            await ensure_open_human_work_item(
+                session,
+                tenant_id=conv.tenant_id,
+                conversation_id=conversation_id,
+                reason_code="ADMIN_MANUAL",
+            )
         else:
-            await session.execute(
+            open_work = await session.scalar(
+                select(func.count())
+                .select_from(models.HumanWorkItem)
+                .where(
+                    models.HumanWorkItem.conversation_id == conversation_id,
+                    models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
+                )
+            )
+            if open_work:
+                raise HTTPException(status_code=409, detail="human_work_item_still_open")
+            changed = await session.execute(
                 update(models.AutomationState)
                 .where(
                     models.AutomationState.conversation_id == conversation_id,
@@ -640,6 +1467,8 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
                     state_changed_reason="admin_manual",
                 )
             )
+            if changed.rowcount != 1:
+                raise HTTPException(status_code=409, detail="automation_state_version_conflict")
         await session.commit()
     return RedirectResponse(
         f"/admin/conversations/{conversation_id}", status_code=status.HTTP_303_SEE_OTHER
@@ -668,7 +1497,7 @@ async def decisions_page(request: Request, action: str = "") -> Response:
                         models.ReplyDecision.action == "draft",
                         models.ReplyDecision.outbox_id.is_(None),
                         models.ReplyDecision.reply_text.isnot(None),
-                        ~models.ReplyDecision.reason_codes.contains(["ADMIN_DISCARDED"]),
+                        func.coalesce(models.ReplyDecision.review_action, "PENDING") == "PENDING",
                     )
                     .order_by(desc(models.ReplyDecision.created_at))
                     .limit(20)
@@ -689,10 +1518,10 @@ async def decisions_page(request: Request, action: str = "") -> Response:
 
     draft_cards = (
         "".join(
-            f"""<div class="card" style="margin-bottom:14px"><p style="margin:0 0 4px">{html.escape(d.reply_text or "")}</p>
+            f"""<div class="card" style="margin-bottom:14px"><p style="margin:0 0 4px">{html.escape(d.original_reply_text or d.reply_text or "")}</p>
 <p class="muted" style="margin:0 0 10px">意图 {html.escape(d.intent or "—")} · {_fmt(d.created_at)} · <a href="/admin/conversations/{d.conversation_id}">查看对话</a></p>
-<form class="inline" method="post" action="/admin/decisions/{d.id}/approve"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm">采纳并发送</button></form>
-<form class="inline" method="post" action="/admin/decisions/{d.id}/discard"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">忽略</button></form>
+<form method="post" action="/admin/decisions/{d.id}/approve"><input type="hidden" name="csrf_token" value="{csrf}"><label for="decision-draft-{d.id}">审核后回复</label><textarea id="decision-draft-{d.id}" name="final_reply_text" required maxlength="10000">{html.escape(d.original_reply_text or d.reply_text or "")}</textarea><button class="btn-sm">发送</button></form>
+<form method="post" action="/admin/decisions/{d.id}/discard"><input type="hidden" name="csrf_token" value="{csrf}"><label for="decision-reason-{d.id}">拒绝原因</label><input id="decision-reason-{d.id}" name="review_reason" required maxlength="500"><button class="btn-sm btn-ghost">拒绝</button></form>
 </div>"""
             for d in pending_drafts
         )
@@ -735,10 +1564,20 @@ async def decisions_page(request: Request, action: str = "") -> Response:
 async def _load_draft(
     session, decision_id: uuid.UUID, principal: Principal
 ) -> models.ReplyDecision:
-    decision = await session.get(models.ReplyDecision, decision_id)
+    decision = (
+        await session.execute(
+            select(models.ReplyDecision)
+            .where(models.ReplyDecision.id == decision_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
     if decision is None or decision.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="decision_not_found")
-    if decision.action != "draft" or decision.outbox_id is not None:
+    if (
+        decision.action != "draft"
+        or decision.outbox_id is not None
+        or (decision.review_action or "PENDING") != "PENDING"
+    ):
         raise HTTPException(status_code=409, detail="decision_not_pending_draft")
     return decision
 
@@ -752,95 +1591,74 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
     _require_csrf(request, form)
     async with get_session_factory()() as session:
         decision = await _load_draft(session, decision_id, principal)
+        original_text = (decision.original_reply_text or decision.reply_text or "").strip()
+        final_text = form.get("final_reply_text", original_text).strip()
+        if not final_text:
+            raise HTTPException(status_code=422, detail="draft_reply_text_required")
+        if len(final_text) > 10000:
+            raise HTTPException(status_code=422, detail="draft_reply_text_too_long")
         conv = await session.get(models.Conversation, decision.conversation_id)
         if conv is None or conv.tenant_id != decision.tenant_id:
             raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
         account = await session.get(models.PlatformAccount, conv.platform_account_id)
         if account is None or account.tenant_id != decision.tenant_id:
             raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
-        if (account.config or {}).get("delivery_mode") != "direct":
-            raise HTTPException(status_code=409, detail="approve_only_supports_direct_platforms")
-        reply_target: dict = {}
-        occurred_at = None
-        if decision.message_id is not None:
-            msg = await session.get(models.Message, decision.message_id)
-            if msg is None or msg.conversation_id != decision.conversation_id:
-                raise HTTPException(status_code=409, detail="decision_message_scope_mismatch")
-            reply_target = dict(msg.reply_target or {})
-            occurred_at = msg.occurred_at
-        visibility = decision.reply_visibility or "public"
         try:
-            destination = build_direct_reply_destination(
-                platform=account.platform,
-                reply_target=reply_target,
-                visibility=visibility,
-                occurred_at=occurred_at,
-                now=datetime.now(UTC),
+            outbox_id = await create_or_get_outbox_intent(
+                session,
+                conversation_id=conv.id,
+                platform_account_id=account.id,
+                reply_to_message_id=decision.message_id,
+                text=final_text,
+                origin_kind=OutboxOrigin.DRAFT_APPROVAL,
+                actor_kind=OutboxActor.ADMIN_HUMAN,
+                actor_id=principal.actor,
+                idempotency_key=f"draft-approval:{decision.id}",
+                visibility=decision.reply_visibility or "public",
+                payload_metadata={"approval": "admin", "approved_by": principal.actor},
             )
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail="unsupported_platform_for_approve",
-            ) from exc
-        destination_type = destination.destination_type
-        reply_target = destination.target
-        valid_until = destination.valid_until
-        outbox_id = (
-            await session.execute(
-                pg_insert(models.OutboxMessage)
-                .values(
-                    id=uuid.uuid4(),
-                    tenant_id=account.tenant_id,
-                    conversation_id=conv.id,
-                    platform_account_id=account.id,
-                    destination_type=destination_type,
-                    destination_id=conv.conversation_key,
-                    message_type="text",
-                    payload={
-                        "text": decision.reply_text or "",
-                        "visibility": visibility,
-                        "target": reply_target,
-                        "approval": "admin",
-                        "approved_by": principal.actor,
-                    },
-                    idempotency_key=_idempotency_key(
-                        account.id, conv.id, decision.message_id or conv.id, "draft_approved"
-                    ),
-                    status="PENDING",
-                    valid_until=valid_until,
-                )
-                .on_conflict_do_nothing(index_elements=["idempotency_key"])
-                .returning(models.OutboxMessage.id)
+        except OutboxIdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OutboxIntentError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        review_action = "ACCEPTED" if final_text == original_text else "EDITED"
+        await session.execute(
+            update(models.ReplyDecision)
+            .where(
+                models.ReplyDecision.id == decision_id,
+                models.ReplyDecision.outbox_id.is_(None),
             )
-        ).scalar_one_or_none()
-        if outbox_id is not None:
-            await session.execute(
-                update(models.ReplyDecision)
-                .where(models.ReplyDecision.id == decision_id)
-                .values(outbox_id=outbox_id)
+            .values(
+                original_reply_text=original_text,
+                final_reply_text=final_text,
+                review_action=review_action,
+                reviewed_by=principal.actor,
+                reviewed_at=datetime.now(UTC),
+                review_reason=None,
+                outbox_id=outbox_id,
             )
-            await session.execute(
-                models.AuditLog.__table__.insert().values(
-                    tenant_id=account.tenant_id,
-                    category="admin_action",
-                    actor=principal.actor,
-                    action="APPROVE_DRAFT",
-                    subject_type="reply_decision",
-                    subject_id=str(decision_id),
-                    detail={"outbox_id": str(outbox_id)},
-                )
-            )
-        await session.commit()
-    if outbox_id is not None:
-        from social_reply.application.message_delivery.actors import deliver_outbox_message
-        from social_reply.application.message_delivery.outbox import deliver_outbox
-
-        await dispatch_actor(
-            deliver_outbox_message,
-            str(outbox_id),
-            inline=lambda: deliver_outbox(str(outbox_id)),
         )
-    return RedirectResponse("/admin/decisions", status_code=status.HTTP_303_SEE_OTHER)
+        await session.execute(
+            models.AuditLog.__table__.insert().values(
+                tenant_id=account.tenant_id,
+                category="admin_action",
+                actor=principal.actor,
+                action="APPROVE_DRAFT",
+                subject_type="reply_decision",
+                subject_id=str(decision_id),
+                detail={"outbox_id": str(outbox_id), "review_action": review_action},
+            )
+        )
+        await session.commit()
+    from social_reply.application.message_delivery.actors import deliver_outbox_message
+    from social_reply.application.message_delivery.outbox import deliver_outbox
+
+    await dispatch_actor(
+        deliver_outbox_message,
+        str(outbox_id),
+        inline=lambda: deliver_outbox(str(outbox_id)),
+    )
+    return RedirectResponse("/admin/inbox?queue=drafts", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/decisions/{decision_id}/discard")
@@ -850,15 +1668,42 @@ async def discard_draft(request: Request, decision_id: uuid.UUID) -> Response:
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    review_reason = form.get("review_reason", "").strip()
+    if not review_reason:
+        raise HTTPException(status_code=422, detail="draft_review_reason_required")
+    if len(review_reason) > 500:
+        raise HTTPException(status_code=422, detail="draft_review_reason_too_long")
     async with get_session_factory()() as session:
         decision = await _load_draft(session, decision_id, principal)
+        reason_codes = list(decision.reason_codes or [])
+        if "ADMIN_DISCARDED" not in reason_codes:
+            reason_codes.append("ADMIN_DISCARDED")
         await session.execute(
             update(models.ReplyDecision)
             .where(models.ReplyDecision.id == decision_id)
-            .values(reason_codes=list(decision.reason_codes or []) + ["ADMIN_DISCARDED"])
+            .values(
+                original_reply_text=decision.original_reply_text or decision.reply_text,
+                final_reply_text=None,
+                review_action="REJECTED",
+                reviewed_by=principal.actor,
+                reviewed_at=datetime.now(UTC),
+                review_reason=review_reason,
+                reason_codes=reason_codes,
+            )
+        )
+        await session.execute(
+            models.AuditLog.__table__.insert().values(
+                tenant_id=decision.tenant_id,
+                category="admin_action",
+                actor=principal.actor,
+                action="REJECT_DRAFT",
+                subject_type="reply_decision",
+                subject_id=str(decision_id),
+                detail={"reason": review_reason},
+            )
         )
         await session.commit()
-    return RedirectResponse("/admin/decisions", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/inbox?queue=drafts", status_code=status.HTTP_303_SEE_OTHER)
 
 
 # ---------- 知识库 ----------
@@ -1708,20 +2553,18 @@ async def accounts_page(request: Request) -> Response:
 <div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">5 个平台</span></div>
 <div class="channel-grid" role="list">{channel_tiles}</div></section>{channel_notice}"""
     facebook_comments = settings.meta_comment_reply_enabled
-    facebook_auto = facebook_comments and settings.meta_auto_reply_enabled
     facebook_policy_fields = (
         '<input type="hidden" name="instagram_login_mode" value="facebook_login">'
         '<input type="hidden" name="enable_dm" value="true">'
         f'<input type="hidden" name="enable_comments" value="{str(facebook_comments).lower()}">'
-        f'<input type="hidden" name="automation_default" value="{"BOT_ACTIVE" if facebook_auto else "BOT_DRAFT_ONLY"}">'
+        '<input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">'
     )
     instagram_comments = settings.meta_comment_reply_enabled
-    instagram_auto = instagram_comments and settings.meta_auto_reply_enabled
     instagram_policy_fields = (
         '<input type="hidden" name="instagram_login_mode" value="facebook_login">'
         '<input type="hidden" name="enable_dm" value="true">'
         f'<input type="hidden" name="enable_comments" value="{str(instagram_comments).lower()}">'
-        f'<input type="hidden" name="automation_default" value="{"BOT_ACTIVE" if instagram_auto else "BOT_DRAFT_ONLY"}">'
+        '<input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">'
     )
     selected_panel = ""
     if selected_channel == "x":

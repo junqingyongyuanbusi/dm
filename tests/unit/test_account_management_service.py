@@ -176,20 +176,11 @@ async def test_connect_meta_rejects_out_of_scope_launch_policy_before_graph_call
         )
 
 
-async def test_connect_meta_accepts_bot_active_once_deployment_opts_in(monkeypatch, tmp_path):
-    # 开关只解锁发布范围校验：能走到构造 Graph client，就证明闸门已放行。
+async def test_connect_meta_rejects_bot_active_even_when_deployment_opts_in(monkeypatch, tmp_path):
     settings = service.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
     monkeypatch.setattr(service, "get_settings", lambda: settings)
 
-    class ReachedGraphCall(Exception):
-        pass
-
-    class SentinelClient:
-        def __init__(self, **_kwargs):
-            raise ReachedGraphCall
-
-    monkeypatch.setattr(service, "MetaGraphClient", SentinelClient)
-    with pytest.raises(ReachedGraphCall):
+    with pytest.raises(ValueError, match="meta_requires_bot_draft_only"):
         await service.connect_meta_account(
             platform="facebook",
             external_account_id="page-1",
@@ -228,7 +219,7 @@ async def test_connect_meta_allows_instagram_comments_when_switch_is_on(monkeypa
             app_id="app-1",
             page_id="page-1",
             enable_comments=True,
-            automation_default="BOT_ACTIVE",
+            automation_default="BOT_DRAFT_ONLY",
             secrets_root=tmp_path,
         )
 

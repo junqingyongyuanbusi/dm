@@ -139,24 +139,21 @@ class _HandoffLLM:
         return ReplyDecision(action=ReplyAction.HANDOFF, reason_codes=("OPENAI",), source="llm")
 
 
-async def test_llm_handoff_falls_back_to_auto_reply_when_bot_active():
+async def test_llm_handoff_remains_handoff_when_bot_active():
     d = await run_decision_pipeline(_snap(), llm=_HandoffLLM(), killswitch=_OpenSwitch())
-    assert d.action is ReplyAction.AUTO_REPLY
-    assert "LLM_HANDOFF_FALLBACK" in d.reason_codes
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reason_codes == ("OPENAI",)
 
 
-async def test_llm_handoff_fallback_still_downgrades_under_draft_only():
-    # 兜底把 handoff 改回 auto_reply，若排在草稿降级之后，决策会以 auto_reply 落库：
-    # BOT_DRAFT_ONLY 下既不外发，也进不了只查 action=draft 的 admin 待审队列。
+async def test_llm_handoff_remains_handoff_under_draft_only():
     d = await run_decision_pipeline(
         _snap(state="BOT_DRAFT_ONLY"), llm=_HandoffLLM(), killswitch=_OpenSwitch()
     )
-    assert d.action is ReplyAction.DRAFT
-    assert "LLM_HANDOFF_FALLBACK" in d.reason_codes
-    assert d.reply_text
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reason_codes == ("OPENAI",)
 
 
-async def test_guard_downgrade_is_not_reverted_by_the_handoff_fallback():
+async def test_guard_downgrade_remains_handoff():
     class _PiiLLM:
         async def decide(self, context):
             return ReplyDecision(
@@ -177,6 +174,33 @@ async def test_rule_handoff_is_not_converted_to_auto_reply():
     )
     assert d.action is ReplyAction.HANDOFF
     assert "LLM_HANDOFF_FALLBACK" not in d.reason_codes
+
+
+async def test_unsupported_attachment_hands_off_without_calling_llm():
+    class _UnexpectedLLM:
+        async def decide(self, context):
+            raise AssertionError("LLM must not be called for unsupported attachments")
+
+    d = await run_decision_pipeline(
+        _snap(text=None, has_unsupported_attachment=True),
+        llm=_UnexpectedLLM(),
+        killswitch=_OpenSwitch(),
+    )
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reason_codes == ("UNSUPPORTED_ATTACHMENT",)
+
+
+@pytest.mark.parametrize("state", ["HANDOFF_PENDING", "HUMAN_ACTIVE", "BOT_COOLDOWN", "CLOSED"])
+async def test_non_automation_states_do_not_call_llm(state):
+    class _UnexpectedLLM:
+        async def decide(self, context):
+            raise AssertionError("LLM must not be called while automation is paused")
+
+    d = await run_decision_pipeline(
+        _snap(state=state), llm=_UnexpectedLLM(), killswitch=_OpenSwitch()
+    )
+    assert d.action is ReplyAction.IGNORE
+    assert d.reason_codes == (state,)
 
 
 @pytest.mark.parametrize(
@@ -237,3 +261,8 @@ def test_decision_snapshot_channel_type_round_trips_and_old_jobs_default_to_dm()
     assert snapshot_from_dict(serialized).channel_type is ChannelType.COMMENT
     serialized.pop("channel_type")
     assert snapshot_from_dict(serialized).channel_type is ChannelType.DM
+
+
+def test_decision_snapshot_attachment_flag_round_trips():
+    snapshot = _snap(has_unsupported_attachment=True)
+    assert snapshot_from_dict(snapshot_to_dict(snapshot)).has_unsupported_attachment is True
