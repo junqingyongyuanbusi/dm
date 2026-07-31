@@ -301,7 +301,15 @@ async def test_cross_tenant_direct_metadata_fails_closed(session):
     ).first() is None
 
 
-async def test_decision_completion_does_not_overwrite_initial_retry(session, monkeypatch):
+@pytest.mark.parametrize(
+    "initial_status",
+    ["PENDING", "INITIAL_DISPATCH_RETRY", "INITIAL_DISPATCHING"],
+)
+async def test_decision_completion_does_not_overwrite_initial_dispatch(
+    session,
+    monkeypatch,
+    initial_status,
+):
     account_id, contact_id, conversation_id, message_id, job_id = (
         uuid.uuid4(),
         uuid.uuid4(),
@@ -311,7 +319,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
     )
     raw_event_id = await _seed_raw(
         session,
-        status="INITIAL_DISPATCH_RETRY",
+        status=initial_status,
         context=raw_recovery.direct_dispatch_context([_event(account_id)]),
     )
     await session.execute(
@@ -392,7 +400,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
     assert await decision_jobs.process_decision_job(str(job_id)) is True
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
-    assert raw.processing_status == "INITIAL_DISPATCH_RETRY"
+    assert raw.processing_status == initial_status
     assert (await session.get(models.DecisionJob, job_id)).status == "COMPLETED"
 
 

@@ -196,34 +196,43 @@ def raw_event_decision_status(statuses: set[str]) -> str:
     return "DECISION_PENDING"
 
 
-async def aggregate_raw_event_decisions(session: AsyncSession, raw_event_id: uuid.UUID) -> None:
-    """Aggregate all decision jobs into the RawEvent processing state."""
-    statuses = set(
+async def load_raw_event_decision_statuses(
+    session: AsyncSession,
+    raw_event_id: uuid.UUID,
+) -> set[str]:
+    return set(
         (
             await session.execute(
                 select(models.DecisionJob.status).where(
                     models.DecisionJob.raw_event_id == raw_event_id
                 )
             )
-        ).scalars()
+        )
+        .scalars()
+        .all()
     )
+
+
+async def aggregate_raw_event_decisions(session: AsyncSession, raw_event_id: uuid.UUID) -> None:
+    """Aggregate all decision jobs into the RawEvent processing state."""
+    raw_event = (
+        await session.execute(
+            select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if raw_event is None or raw_event.processing_status in _INITIAL_DISPATCH_ACTIVE_STATUSES:
+        return
+
+    # The RawEvent row serializes aggregate snapshots across concurrent job finalizers.
+    statuses = await load_raw_event_decision_statuses(session, raw_event_id)
     if not statuses:
         return
     processing_status = raw_event_decision_status(statuses)
-    now = datetime.now(UTC)
-    values = {
-        "processing_status": processing_status,
-        "processed_at": (
-            None if processing_status in {"DECISION_PENDING", "DECISION_DEFERRED"} else now
-        ),
-    }
-    await session.execute(
-        update(models.RawEvent)
-        .where(
-            models.RawEvent.id == raw_event_id,
-            models.RawEvent.processing_status.not_in(_INITIAL_DISPATCH_ACTIVE_STATUSES),
-        )
-        .values(**values)
+    raw_event.processing_status = processing_status
+    raw_event.processed_at = (
+        None
+        if processing_status in {"DECISION_PENDING", "DECISION_DEFERRED"}
+        else datetime.now(UTC)
     )
 
 

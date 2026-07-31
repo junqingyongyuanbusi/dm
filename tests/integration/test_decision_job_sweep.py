@@ -115,6 +115,130 @@ async def _seed_job(
     return job_id
 
 
+async def _add_job(session, first_job_id: uuid.UUID, *, status: str) -> uuid.UUID:
+    first_job = await session.get(models.DecisionJob, first_job_id)
+    message_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    await session.execute(
+        insert(models.Message).values(
+            id=message_id,
+            conversation_id=first_job.conversation_id,
+            direction="inbound",
+            sender_type="contact",
+            text=status,
+            decision_generation=first_job.decision_generation,
+        )
+    )
+    await session.execute(
+        insert(models.DecisionJob).values(
+            id=job_id,
+            raw_event_id=first_job.raw_event_id,
+            conversation_id=first_job.conversation_id,
+            message_id=message_id,
+            account_id=first_job.account_id,
+            snapshot=first_job.snapshot,
+            decision_generation=first_job.decision_generation,
+            status=status,
+        )
+    )
+    await session.commit()
+    return job_id
+
+
+async def test_concurrent_job_finalizers_commit_complete_raw_aggregate(session, monkeypatch):
+    first_job_id = await _seed_job(session)
+    second_job_id = await _add_job(session, first_job_id, status="PENDING")
+    real_aggregate = decision_jobs.aggregate_raw_event_decisions
+    aggregate_count = 0
+    both_finalizers_ready = asyncio.Event()
+    count_lock = asyncio.Lock()
+
+    async def synchronize_aggregate(aggregate_session, raw_event_id):
+        nonlocal aggregate_count
+        async with count_lock:
+            aggregate_count += 1
+            if aggregate_count == 2:
+                both_finalizers_ready.set()
+        await asyncio.wait_for(both_finalizers_ready.wait(), timeout=1)
+        await real_aggregate(aggregate_session, raw_event_id)
+
+    async def complete_decision(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(decision_jobs, "aggregate_raw_event_decisions", synchronize_aggregate)
+    monkeypatch.setattr(decision_jobs, "run_and_persist_decision", complete_decision)
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            process_decision_job(str(first_job_id)),
+            process_decision_job(str(second_job_id)),
+        ),
+        timeout=5,
+    )
+
+    assert results == [True, True]
+    session.expire_all()
+    jobs = (
+        (
+            await session.execute(
+                select(models.DecisionJob)
+                .where(models.DecisionJob.id.in_((first_job_id, second_job_id)))
+                .order_by(models.DecisionJob.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [job.status for job in jobs] == ["COMPLETED", "COMPLETED"]
+    raw = await session.get(models.RawEvent, jobs[0].raw_event_id)
+    assert raw.processing_status == "PROCESSED"
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (("COMPLETED", "SUPERSEDED"), "PROCESSED"),
+        (("COMPLETED", "FAILED"), "DECISION_PENDING"),
+        (("FAILED", "DEFERRED_CHATWOOT"), "DECISION_DEFERRED"),
+        (("DEFERRED_CHATWOOT", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
+    ],
+)
+async def test_raw_event_aggregate_status_priority(session, statuses, expected):
+    first_job_id = await _seed_job(session, status=statuses[0])
+    await _add_job(session, first_job_id, status=statuses[1])
+    raw_event_id = await session.scalar(
+        select(models.DecisionJob.raw_event_id).where(models.DecisionJob.id == first_job_id)
+    )
+
+    await decision_jobs.aggregate_raw_event_decisions(session, raw_event_id)
+    await session.commit()
+
+    session.expire_all()
+    assert (await session.get(models.RawEvent, raw_event_id)).processing_status == expected
+
+
+async def test_jobless_raw_event_aggregate_is_noop(session):
+    raw_event_id = uuid.uuid4()
+    await session.execute(
+        insert(models.RawEvent).values(
+            id=raw_event_id,
+            source="chatwoot",
+            payload={},
+            processing_status="DECISION_PENDING",
+        )
+    )
+    await session.commit()
+
+    await decision_jobs.aggregate_raw_event_decisions(session, raw_event_id)
+    await session.commit()
+
+    session.expire_all()
+    assert (await session.get(models.RawEvent, raw_event_id)).processing_status == (
+        "DECISION_PENDING"
+    )
+    assert decision_jobs.raw_event_decision_status(set()) == "PROCESSED"
+
+
 async def test_chatwoot_decision_is_deferred_and_resumed_after_reenable(session, monkeypatch):
     job_id = await _seed_job(session)
 
