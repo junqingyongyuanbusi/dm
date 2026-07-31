@@ -1,5 +1,6 @@
 import asyncio
 import os
+import subprocess
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -26,7 +27,7 @@ _CONVERSATION_ID = uuid.UUID("10000000-0000-0000-0000-000000000003")
 async def _run_alembic(database_url: str, *args: str):
     env = {**os.environ, "DATABASE_URL": database_url, "TESTING": "true"}
     return await asyncio.to_thread(
-        __import__("subprocess").run,
+        subprocess.run,
         [sys.executable, "-m", "alembic", *args],
         cwd=_REPO_ROOT,
         env=env,
