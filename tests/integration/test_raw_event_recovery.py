@@ -343,6 +343,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key=f"telegram:{account_id}:chat-1",
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -352,6 +353,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
             direction="inbound",
             sender_type="contact",
             text="hello",
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -361,6 +363,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
             conversation_id=conversation_id,
             message_id=message_id,
             account_id=account_id,
+            decision_generation=1,
             snapshot={
                 "text": "hello",
                 "platform": "telegram",
@@ -470,6 +473,92 @@ async def test_direct_claim_completion_reaggregates_jobs_under_raw_lock(session)
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
     assert raw.processing_status == "PROCESSED"
+    assert raw.processing_claim_token is None
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (("COMPLETED", "SUPERSEDED"), "PROCESSED"),
+        (("COMPLETED", "FAILED"), "DECISION_PENDING"),
+        (("FAILED", "DEFERRED_CHATWOOT"), "DECISION_DEFERRED"),
+        (("DEFERRED_CHATWOOT", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
+    ],
+)
+async def test_direct_claim_completion_aggregates_job_priorities(session, statuses, expected):
+    raw_event_id = uuid.uuid4()
+    token = uuid.uuid4()
+    account_id, contact_id, conversation_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        insert(models.RawEvent).values(
+            id=raw_event_id,
+            source="telegram",
+            ingress_kind="webhook",
+            payload={},
+            context=raw_recovery.direct_dispatch_context([_event(account_id)]),
+            processing_status="INITIAL_DISPATCHING",
+            processing_claim_token=token,
+            processing_claim_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            processing_attempt_count=1,
+        )
+    )
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="telegram",
+            name="account",
+            status="active",
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="tenant-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            external_user_id="user-1",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"telegram:{account_id}:chat-1",
+        )
+    )
+    for status in statuses:
+        message_id = uuid.uuid4()
+        await session.execute(
+            insert(models.Message).values(
+                id=message_id,
+                conversation_id=conversation_id,
+                direction="inbound",
+                sender_type="contact",
+                text=status,
+            )
+        )
+        await session.execute(
+            insert(models.DecisionJob).values(
+                raw_event_id=raw_event_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                account_id=account_id,
+                snapshot={},
+                status=status,
+            )
+        )
+    await session.commit()
+
+    assert await raw_recovery.complete_initial_direct_claim(raw_event_id, token) is True
+    session.expire_all()
+    raw = await session.get(models.RawEvent, raw_event_id)
+    assert raw.processing_status == expected
     assert raw.processing_claim_token is None
 
 

@@ -178,6 +178,30 @@ Revision `f3a6c1d8e250` adds a database-generated `messages.history_seq`, the `m
 
 History sent to an external LLM is bounded by `CONVERSATION_HISTORY_LIMIT` and `CONVERSATION_HISTORY_MAX_CHARS`; set the limit to `0` to disable multi-turn history. Customer text is retained unchanged in PostgreSQL but email and long-number patterns are redacted in the external LLM request.
 
+## Conversation decision generation fencing
+
+Revision `c2f4a6d8e901` adds a monotonic `conversations.decision_generation`, nullable message and
+job generation provenance, random claim-token fences on `decision_jobs`, and durable job provenance
+on `reply_decisions`. The migration ranks every public inbound contact message by `history_seq`,
+copies that generation through its job and decision, marks nonterminal older jobs `SUPERSEDED`, and
+cancels only their pending or failed bot decision outboxes with `STALE_CONVERSATION_INPUT`.
+
+Deploy the database migration before replacing Worker and Scheduler instances. PostgreSQL triggers
+keep old ingestion writers compatible during the rolling window: an eligible old message insert
+that omits the generation reserves one while holding the conversation delivery lock, and an old job
+insert inherits that message generation without advancing the conversation again. Explicit message
+generations, agent or bot messages, outgoing messages, and private messages do not advance the
+counter. Old decision writers receive provenance and are rejected if their generation is already
+stale. New workers do not hold a transaction or database lock
+while calling the LLM; finalization acquires its locks only after the model returns and atomically
+writes the decision provenance, completes the fenced job, and aggregates the RawEvent state.
+
+The migration briefly takes row and advisory locks for conversations with existing decision jobs or
+pending bot decision outboxes. Before upgrade, allow active sends to drain and take a database
+backup. A database downgrade removes the fencing columns and triggers and is safe only after all new
+Worker and Scheduler instances have been replaced with the prior image; otherwise restore the
+pre-upgrade backup.
+
 ## Railway X OAuth state-key rollout
 
 The X OAuth transaction key changes from `oauth:x:<raw-token>` to

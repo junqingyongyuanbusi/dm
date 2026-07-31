@@ -1,9 +1,10 @@
 import logging
 import time
 import uuid
+from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from social_reply.application.knowledge.retrieval import (
     KnowledgeHit,
@@ -27,6 +28,9 @@ from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.openai_client import DEFAULT_PERSONA, OpenAILLMClient
 from social_reply.domain.reply.rules import apply_rules
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.advisory_locks import (
+    acquire_conversation_delivery_xact_lock,
+)
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.killswitch import KillSwitchChecker
 from social_reply.shared.config import get_settings
@@ -142,6 +146,10 @@ async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[KnowledgeHit, ..
 
 
 class DecisionContextScopeError(RuntimeError):
+    pass
+
+
+class DecisionSuperseded(RuntimeError):
     pass
 
 
@@ -262,9 +270,17 @@ async def run_and_persist_decision(
     conversation_id: uuid.UUID,
     message_id: uuid.UUID,
     account_id: uuid.UUID,
+    *,
+    decision_job_id: uuid.UUID | None = None,
+    decision_generation: int | None = None,
+    claim_token: uuid.UUID | None = None,
+    raw_event_id: uuid.UUID | None = None,
 ) -> uuid.UUID | None:
-    """tx1 提交后调用：跑纯管线（不持事务），再在 tx2 写决策+outbox。
-    返回 outbox_id（供后续投递入队）。"""
+    """Run the pipeline without a database transaction, then persist atomically.
+
+    The optional job arguments fence durable workers. Omitting them preserves the direct-call
+    behavior used by tests and administrative callers.
+    """
     started = time.perf_counter()
     settings = get_settings()
     cutoff_seq = await _validate_decision_scope(snapshot, conversation_id, message_id, account_id)
@@ -310,6 +326,48 @@ async def run_and_persist_decision(
             persona=persona.text,
         )
     async with get_session_factory()() as session:
+        if decision_job_id is not None:
+            if decision_generation is None or claim_token is None:
+                raise ValueError("decision_job_fence_required")
+            await acquire_conversation_delivery_xact_lock(session, conversation_id)
+            current_generation = await session.scalar(
+                select(models.Conversation.decision_generation)
+                .where(models.Conversation.id == conversation_id)
+                .with_for_update()
+            )
+            job = (
+                await session.execute(
+                    select(models.DecisionJob)
+                    .where(models.DecisionJob.id == decision_job_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                job is None
+                or job.status != "PROCESSING"
+                or job.claim_token != claim_token
+                or job.decision_generation != decision_generation
+                or current_generation != decision_generation
+            ):
+                if (
+                    job is not None
+                    and job.status == "PROCESSING"
+                    and job.claim_token == claim_token
+                ):
+                    job.status = "SUPERSEDED"
+                    job.claim_token = None
+                    job.locked_at = None
+                    job.next_attempt_at = None
+                    job.completed_at = datetime.now(UTC)
+                    job.last_error = "superseded before decision finalization"
+                    if raw_event_id is not None:
+                        from social_reply.application.reply_decision.jobs import (
+                            aggregate_raw_event_decisions,
+                        )
+
+                        await aggregate_raw_event_decisions(session, raw_event_id)
+                await session.commit()
+                raise DecisionSuperseded("decision_generation_superseded")
         outbox_id = await persist_decision(
             session,
             snapshot,
@@ -318,7 +376,37 @@ async def run_and_persist_decision(
             account_id,
             decision,
             prompt_version_label(settings.prompt_version, persona),
+            decision_job_id=decision_job_id,
+            decision_generation=decision_generation,
+            decision_claim_token=claim_token,
         )
+        if decision_job_id is not None:
+            completed = await session.execute(
+                update(models.DecisionJob)
+                .where(
+                    models.DecisionJob.id == decision_job_id,
+                    models.DecisionJob.status == "PROCESSING",
+                    models.DecisionJob.claim_token == claim_token,
+                    models.DecisionJob.decision_generation == decision_generation,
+                )
+                .values(
+                    status="COMPLETED",
+                    completed_at=datetime.now(UTC),
+                    next_attempt_at=None,
+                    locked_at=None,
+                    claim_token=None,
+                    last_error=None,
+                )
+            )
+            if completed.rowcount != 1:
+                await session.rollback()
+                raise DecisionSuperseded("decision_claim_lost")
+            if raw_event_id is not None:
+                from social_reply.application.reply_decision.jobs import (
+                    aggregate_raw_event_decisions,
+                )
+
+                await aggregate_raw_event_decisions(session, raw_event_id)
         await session.commit()
     decision_ms = (time.perf_counter() - started) * 1000
     if outbox_id is not None:

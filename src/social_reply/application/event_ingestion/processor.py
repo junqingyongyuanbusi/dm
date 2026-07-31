@@ -8,7 +8,10 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from social_reply.application.reply_decision.jobs import snapshot_to_dict
+from social_reply.application.reply_decision.jobs import (
+    reserve_conversation_generation,
+    reserve_decision_job,
+)
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.connectors.chatwoot.normalizer import (
     ChatwootMessage,
@@ -19,6 +22,9 @@ from social_reply.connectors.chatwoot.normalizer import (
 from social_reply.domain.automation.state_machine import ensure_state, flip_to_human_active
 from social_reply.domain.messages.events import build_dm_conversation_key
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.advisory_locks import (
+    acquire_conversation_delivery_xact_lock,
+)
 from social_reply.infrastructure.database.engine import get_session_factory
 
 logger = logging.getLogger(__name__)
@@ -33,6 +39,11 @@ class _Outcome:
     conversation_id: uuid.UUID | None = None
     message_id: uuid.UUID | None = None
     account_id: uuid.UUID | None = None
+    decision_generation: int | None = None
+
+
+class _RawEventClaimLost(Exception):
+    pass
 
 
 async def process_raw_event(
@@ -43,10 +54,9 @@ async def process_raw_event(
     started = time.perf_counter()
     event_id = uuid.UUID(raw_event_id)
     async with get_session_factory()() as session:
-        raw_statement = select(models.RawEvent).where(models.RawEvent.id == event_id)
-        if raw_event_claim_token is not None:
-            raw_statement = raw_statement.with_for_update()
-        raw = (await session.execute(raw_statement)).scalar_one()
+        raw = (
+            await session.execute(select(models.RawEvent).where(models.RawEvent.id == event_id))
+        ).scalar_one()
         if raw_event_claim_token is not None:
             database_now = await session.scalar(select(func.clock_timestamp()))
             if (
@@ -58,7 +68,14 @@ async def process_raw_event(
                 await session.rollback()
                 return
         try:
-            outcome = await _process(session, raw)
+            outcome = await _process(
+                session,
+                raw,
+                raw_event_claim_token=raw_event_claim_token,
+            )
+        except _RawEventClaimLost:
+            await session.rollback()
+            return
         except (KeyError, ValueError, TypeError, AttributeError):
             # 畸形 payload 不得卡死在 PENDING / 打死信
             await session.rollback()
@@ -86,23 +103,17 @@ async def process_raw_event(
             return
         decision_job_id = None
         if outcome.snapshot is not None:
-            # 决策任务与入站消息在 tx1 同事务落库。即使进程在 commit 后、入队前崩溃，
-            # scheduler 也能从 decision_jobs 补扫恢复，不再出现静默决策丢失。
-            decision_job_id = (
-                await session.execute(
-                    pg_insert(models.DecisionJob)
-                    .values(
-                        raw_event_id=event_id,
-                        conversation_id=outcome.conversation_id,
-                        message_id=outcome.message_id,
-                        account_id=outcome.account_id,
-                        snapshot=snapshot_to_dict(outcome.snapshot),
-                        status="PENDING",
-                    )
-                    .on_conflict_do_nothing(index_elements=["message_id"])
-                    .returning(models.DecisionJob.id)
-                )
-            ).scalar_one_or_none()
+            # Reserve the conversation generation in the ingestion transaction so a newer
+            # inbound message supersedes stale work before either job can call the LLM.
+            decision_job_id = await reserve_decision_job(
+                session,
+                raw_event_id=event_id,
+                conversation_id=outcome.conversation_id,
+                message_id=outcome.message_id,
+                account_id=outcome.account_id,
+                snapshot=outcome.snapshot,
+                decision_generation=outcome.decision_generation,
+            )
         await session.commit()
 
     if decision_job_id is not None:
@@ -153,7 +164,12 @@ async def process_claimed_raw_event(
         )
 
 
-async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:
+async def _process(
+    session: AsyncSession,
+    raw: models.RawEvent,
+    *,
+    raw_event_claim_token: uuid.UUID | None = None,
+) -> _Outcome:
     msg = parse_message_created(raw.payload)
 
     if msg.chatwoot_account_id == 0:
@@ -195,6 +211,22 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:
             # 乱序坐席消息：不得用坐席 id 建脏联系人/会话
             return _Outcome("SKIPPED_ORPHAN_AGENT_MSG")
 
+    conversation = await _ensure_conversation(session, account, msg)
+    if raw_event_claim_token is not None:
+        claimed_raw = (
+            await session.execute(
+                select(models.RawEvent).where(models.RawEvent.id == raw.id).with_for_update()
+            )
+        ).scalar_one()
+        database_now = await session.scalar(select(func.clock_timestamp()))
+        if (
+            claimed_raw.processing_status != "INITIAL_DISPATCHING"
+            or claimed_raw.processing_claim_token != raw_event_claim_token
+            or claimed_raw.processing_claim_expires_at is None
+            or claimed_raw.processing_claim_expires_at <= database_now
+        ):
+            raise _RawEventClaimLost
+
     # The normalized-event constraint is the durable webhook deduplication boundary.
     dedup = await session.execute(
         pg_insert(models.NormalizedEvent)
@@ -216,10 +248,18 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:
     if normalized_id is None:
         return _Outcome("SKIPPED_DUPLICATE")
 
-    conversation = await _ensure_conversation(session, account, msg)
     await ensure_state(session, conversation.id, account.automation_default)
 
-    message_id = await _store_message(session, conversation.id, msg, event_class)
+    decision_generation = None
+    if event_class is EventClass.INBOUND_USER:
+        decision_generation = await reserve_conversation_generation(session, conversation.id)
+    message_id = await _store_message(
+        session,
+        conversation.id,
+        msg,
+        event_class,
+        decision_generation=decision_generation,
+    )
     await session.execute(
         update(models.NormalizedEvent)
         .where(models.NormalizedEvent.id == normalized_id)
@@ -250,7 +290,14 @@ async def _process(session: AsyncSession, raw: models.RawEvent) -> _Outcome:
         state_version=state_row.state_version,
         has_unsupported_attachment=bool(msg.attachments),
     )
-    return _Outcome("PROCESSED", snapshot, conversation.id, message_id, account.id)
+    return _Outcome(
+        "PROCESSED",
+        snapshot,
+        conversation.id,
+        message_id,
+        account.id,
+        decision_generation,
+    )
 
 
 async def _is_self_echo(session: AsyncSession, msg: ChatwootMessage) -> bool:
@@ -296,6 +343,7 @@ async def _ensure_conversation(
         )
     ).scalar_one_or_none()
     if mapped is not None:
+        await acquire_conversation_delivery_xact_lock(session, mapped.id)
         return mapped
 
     contact = await _ensure_contact(session, account, msg)
@@ -326,6 +374,7 @@ async def _ensure_conversation(
             )
         )
     ).scalar_one()
+    await acquire_conversation_delivery_xact_lock(session, conversation.id)
     await session.execute(
         pg_insert(models.ConversationMapping)
         .values(
@@ -368,6 +417,8 @@ async def _store_message(
     conversation_id: uuid.UUID,
     msg: ChatwootMessage,
     event_class: EventClass,
+    *,
+    decision_generation: int | None,
 ) -> uuid.UUID:
     message_id = uuid.uuid4()
     inbound = event_class is EventClass.INBOUND_USER
@@ -378,6 +429,7 @@ async def _store_message(
             direction="inbound" if inbound else "outbound",
             sender_type="contact" if inbound else "agent",
             text=msg.content,
+            decision_generation=decision_generation,
             chatwoot_message_id=msg.chatwoot_message_id,
             attachments=list(msg.attachments),
             private=msg.private,

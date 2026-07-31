@@ -201,6 +201,7 @@ async def resume_bot(
     if target not in {"BOT_DRAFT_ONLY", "BOT_ACTIVE"}:
         raise HumanWorkflowError("resume_target_invalid")
     async with get_session_factory()() as session:
+        await acquire_conversation_delivery_xact_lock(session, conversation_id)
         conversation = (
             await session.execute(
                 select(models.Conversation)
@@ -231,7 +232,6 @@ async def resume_bot(
                 open_work, conversation_tenant_id=conversation.tenant_id
             )
             raise HumanWorkflowConflict("human_work_item_still_open")
-        await acquire_conversation_delivery_xact_lock(session, conversation_id)
         changed = await session.execute(
             update(models.AutomationState)
             .where(
@@ -275,6 +275,7 @@ async def send_human_reply(
     expected_version: int | None = None,
 ) -> uuid.UUID:
     async with get_session_factory()() as session:
+        await acquire_conversation_delivery_xact_lock(session, conversation_id)
         conversation = (
             await session.execute(
                 select(models.Conversation)
@@ -287,7 +288,6 @@ async def send_human_reply(
         ).scalar_one_or_none()
         if conversation is None:
             raise HumanWorkflowError("conversation_not_found")
-        await acquire_conversation_delivery_xact_lock(session, conversation_id)
 
         existing_intent = await find_outbox_intent(
             session,

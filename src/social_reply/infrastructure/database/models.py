@@ -162,6 +162,10 @@ class Conversation(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "conversation_key"),
         UniqueConstraint("tenant_id", "id", name="uq_conversations_tenant_id_id"),
+        CheckConstraint(
+            "decision_generation >= 0",
+            name="ck_conversations_decision_generation",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
@@ -171,6 +175,7 @@ class Conversation(Base):
     contact_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contacts.id"))
     conversation_key: Mapped[str] = mapped_column(Text)
     channel_type: Mapped[str] = mapped_column(Text, default="dm")
+    decision_generation: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -192,6 +197,11 @@ class Message(Base):
         UniqueConstraint("history_seq", name="uq_messages_history_seq"),
         UniqueConstraint("source_outbox_id", name="uq_messages_source_outbox_id"),
         Index("ix_messages_conversation_history", "conversation_id", "history_seq"),
+        Index(
+            "ix_messages_conversation_decision_generation",
+            "conversation_id",
+            "decision_generation",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     history_seq: Mapped[int] = mapped_column(
@@ -206,6 +216,7 @@ class Message(Base):
     chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     platform_message_id: Mapped[str | None] = mapped_column(Text, index=True)
     source_outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
+    decision_generation: Mapped[int | None] = mapped_column(BigInteger)
     reply_target: Mapped[dict] = mapped_column(JSONB, default=dict)
     attachments: Mapped[list] = mapped_column(JSONB, default=list)
     private: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -578,17 +589,22 @@ class ProvisioningJob(Base):
 
 class DecisionJob(Base):
     __tablename__ = "decision_jobs"
-    __table_args__ = (Index("ix_decision_jobs_status_next_attempt", "status", "next_attempt_at"),)
+    __table_args__ = (
+        Index("ix_decision_jobs_status_next_attempt", "status", "next_attempt_at"),
+        Index("ix_decision_jobs_conversation_generation", "conversation_id", "decision_generation"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     raw_event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("raw_events.id"))
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
     message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), unique=True)
     account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("platform_accounts.id"))
     snapshot: Mapped[dict] = mapped_column(JSONB)
+    decision_generation: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(Text, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -596,7 +612,15 @@ class DecisionJob(Base):
 
 class ReplyDecision(Base):
     __tablename__ = "reply_decisions"
-    __table_args__ = (UniqueConstraint("message_id"),)
+    __table_args__ = (
+        UniqueConstraint("message_id"),
+        Index(
+            "ix_reply_decisions_decision_job_id",
+            "decision_job_id",
+            unique=True,
+            postgresql_where=text("decision_job_id IS NOT NULL"),
+        ),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
@@ -617,6 +641,9 @@ class ReplyDecision(Base):
     source: Mapped[str] = mapped_column(Text)  # rule / llm / guard
     prompt_version: Mapped[str | None] = mapped_column(Text)
     state_version_at_decision: Mapped[int | None] = mapped_column(Integer)
+    decision_job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("decision_jobs.id"))
+    decision_generation: Mapped[int | None] = mapped_column(BigInteger)
+    decision_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

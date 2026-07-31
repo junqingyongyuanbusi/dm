@@ -63,6 +63,7 @@ async def _seed_job(
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key=key,
+            decision_generation=1,
         )
     )
     await ensure_state(session, conversation_id, "BOT_ACTIVE")
@@ -73,6 +74,7 @@ async def _seed_job(
             direction="inbound",
             sender_type="contact",
             text="hi",
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -102,6 +104,7 @@ async def _seed_job(
             message_id=message_id,
             account_id=account_id,
             snapshot=snapshot_to_dict(snapshot),
+            decision_generation=1,
             status=status,
             attempt_count=attempt_count,
             next_attempt_at=next_attempt_at,

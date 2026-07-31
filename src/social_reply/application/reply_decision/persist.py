@@ -61,6 +61,10 @@ async def persist_decision(
     account_id: uuid.UUID,
     decision: ReplyDecision,
     prompt_version: str,
+    *,
+    decision_job_id: uuid.UUID | None = None,
+    decision_generation: int | None = None,
+    decision_claim_token: uuid.UUID | None = None,
 ) -> uuid.UUID | None:
     """在调用方事务内写 reply_decisions（永远写）+ 按 action 落地副作用。
     auto_reply/draft → 写 outbox（auto_reply 受 state_version CAS 守护，defense 1）。
@@ -189,6 +193,9 @@ async def persist_decision(
                 source=decision.source,
                 prompt_version=prompt_version,
                 state_version_at_decision=snapshot.state_version,
+                decision_job_id=decision_job_id,
+                decision_generation=decision_generation,
+                decision_claim_token=decision_claim_token,
                 outbox_id=outbox_id,
             )
             .on_conflict_do_nothing(index_elements=["message_id"])

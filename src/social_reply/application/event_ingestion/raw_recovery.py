@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.reply_decision.jobs import raw_event_decision_status
 from social_reply.domain.messages.canonical import canonical_event_from_dict
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -371,14 +372,7 @@ async def complete_initial_direct_claim(
             .scalars()
             .all()
         )
-        if "NEEDS_REVIEW" in statuses:
-            processing_status = "DECISION_NEEDS_REVIEW"
-        elif "DEFERRED_CHATWOOT" in statuses:
-            processing_status = "DECISION_DEFERRED"
-        elif statuses - {"COMPLETED"}:
-            processing_status = "DECISION_PENDING"
-        else:
-            processing_status = "PROCESSED"
+        processing_status = raw_event_decision_status(statuses)
         row.processing_status = processing_status
         row.processing_claim_token = None
         row.processing_claim_expires_at = None

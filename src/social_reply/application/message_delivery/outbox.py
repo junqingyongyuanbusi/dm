@@ -394,6 +394,29 @@ async def _deliver_outbox_locked(
         await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == oid))
     ).scalar_one()
     attempt_no = row.attempt_count + 1
+    if row.origin_kind == "DECISION" and row.actor_kind == "BOT":
+        generation = (
+            await session.execute(
+                select(
+                    models.ReplyDecision.decision_generation,
+                    models.Conversation.decision_generation,
+                )
+                .join(
+                    models.Conversation,
+                    models.Conversation.id == models.ReplyDecision.conversation_id,
+                )
+                .where(models.ReplyDecision.outbox_id == oid)
+            )
+        ).one_or_none()
+        if generation is not None and generation[0] is not None and generation[0] != generation[1]:
+            return await _stop_before_send(
+                session,
+                oid,
+                "CANCELLED",
+                "STALE_CONVERSATION_INPUT",
+                attempt_no,
+                count_attempt=False,
+            )
     if not isinstance(row.payload, dict):
         return await _stop_before_send(
             session,
