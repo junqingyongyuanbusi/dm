@@ -94,6 +94,69 @@ structured draft review fields, and attachment metadata. It backfills open work 
 `HANDOFF_PENDING` and `HUMAN_ACTIVE` conversations and derives legacy Outbox targets from their
 ReplyDecision where available.
 
+Revision `b8e1d4f7a2c3` makes the Conversation tenant authoritative for each work item before adding
+the composite tenant/Conversation foreign key. After that rewrite, it retains a `CLAIMED` item only
+when `assigned_user_id` resolves to an `admin_users` row in the Conversation tenant,
+`assigned_actor` exactly equals `user:{username}`, and `claimed_at` is present. Every other claimed
+item, including legacy bootstrap or incomplete attribution, is released to `WAITING`; the migration
+clears `assigned_user_id`, `assigned_actor`, and `claimed_at`, then increments `version` once so an
+operator with a stale inbox must reload. The existing missing-attribution and missing-timestamp
+repair remains part of this rule.
+
+Inventory affected rows before upgrade:
+
+```sql
+SELECT
+    w.id,
+    w.tenant_id AS work_tenant_id,
+    c.tenant_id AS conversation_tenant_id,
+    w.assigned_user_id,
+    w.assigned_actor,
+    u.username AS assigned_username,
+    u.tenant_id AS assigned_user_tenant_id,
+    w.claimed_at,
+    w.version
+FROM human_work_items AS w
+JOIN conversations AS c ON c.id = w.conversation_id
+LEFT JOIN admin_users AS u ON u.id = w.assigned_user_id
+WHERE w.tenant_id IS DISTINCT FROM c.tenant_id
+   OR (
+       w.status = 'CLAIMED'
+       AND (
+           w.claimed_at IS NULL
+           OR u.id IS NULL
+           OR u.tenant_id IS DISTINCT FROM c.tenant_id
+           OR w.assigned_actor IS DISTINCT FROM 'user:' || u.username
+       )
+   )
+ORDER BY c.tenant_id, w.created_at, w.id;
+```
+
+Record expected repair counts in the rollout log before applying the migration. The two counts can
+overlap because a row may need both a tenant rewrite and claim release:
+
+```sql
+SELECT
+    count(*) FILTER (
+        WHERE w.tenant_id IS DISTINCT FROM c.tenant_id
+    ) AS tenant_rewrites,
+    count(*) FILTER (
+        WHERE w.status = 'CLAIMED'
+          AND (
+              w.claimed_at IS NULL
+              OR u.id IS NULL
+              OR u.tenant_id IS DISTINCT FROM c.tenant_id
+              OR w.assigned_actor IS DISTINCT FROM 'user:' || u.username
+          )
+    ) AS claims_released
+FROM human_work_items AS w
+JOIN conversations AS c ON c.id = w.conversation_id
+LEFT JOIN admin_users AS u ON u.id = w.assigned_user_id;
+```
+
+Take and verify a database backup before upgrade. Downgrade preserves the repaired rows and cannot
+reconstruct released assignment attribution; restore the backup if that history must be recovered.
+
 The previous Worker cannot deliver `MANUAL_REPLY` rows because it resolves direct targets only
 through a ReplyDecision. During the API-first Railway rollout, operators must not submit manual
 replies or draft approvals from the new inbox until API, Worker, and Scheduler all report `SUCCESS`

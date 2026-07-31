@@ -24,10 +24,16 @@ def upgrade() -> None:
     )
     op.execute(
         sa.text(
-            "UPDATE human_work_items SET status = 'WAITING', claimed_at = NULL, "
-            "version = version + 1 "
-            "WHERE status = 'CLAIMED' "
-            "AND (assigned_actor IS NULL OR claimed_at IS NULL)"
+            "UPDATE human_work_items w SET status = 'WAITING', "
+            "assigned_user_id = NULL, assigned_actor = NULL, claimed_at = NULL, "
+            "version = w.version + 1 "
+            "WHERE w.status = 'CLAIMED' "
+            "AND (w.claimed_at IS NULL OR NOT EXISTS ("
+            "SELECT 1 FROM admin_users u "
+            "WHERE u.id = w.assigned_user_id "
+            "AND u.tenant_id = w.tenant_id "
+            "AND w.assigned_actor = 'user:' || u.username"
+            "))"
         )
     )
     op.create_unique_constraint(

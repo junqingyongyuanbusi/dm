@@ -161,7 +161,16 @@ async def test_human_work_hardening_repairs_legacy_rows():
                     "'00000000-0000-0000-0000-000000000102', 'migration:u1', 'dm'), "
                     "('00000000-0000-0000-0000-000000000104', 'tenant-a', 'b1', "
                     "'telegram', '00000000-0000-0000-0000-000000000101', "
-                    "'00000000-0000-0000-0000-000000000102', 'migration:u2', 'dm')"
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u2', 'dm'), "
+                    "('00000000-0000-0000-0000-000000000105', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u3', 'dm'), "
+                    "('00000000-0000-0000-0000-000000000106', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u4', 'dm'), "
+                    "('00000000-0000-0000-0000-000000000107', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u5', 'dm')"
                 )
             )
             await connection.execute(
@@ -172,7 +181,13 @@ async def test_human_work_hardening_repairs_legacy_rows():
                     "('00000000-0000-0000-0000-000000000103', 'HUMAN_ACTIVE', 1, "
                     "'user:alice', 'MANUAL', 'legacy'), "
                     "('00000000-0000-0000-0000-000000000104', 'HUMAN_ACTIVE', 1, "
-                    "NULL, 'MANUAL', 'legacy')"
+                    "NULL, 'MANUAL', 'legacy'), "
+                    "('00000000-0000-0000-0000-000000000105', 'HUMAN_ACTIVE', 1, "
+                    "'user:bob', 'MANUAL', 'legacy'), "
+                    "('00000000-0000-0000-0000-000000000106', 'HUMAN_ACTIVE', 1, "
+                    "'user:alice', 'MANUAL', 'legacy'), "
+                    "('00000000-0000-0000-0000-000000000107', 'HUMAN_ACTIVE', 1, "
+                    "'user:bob', 'MANUAL', 'legacy')"
                 )
             )
         await engine.dispose()
@@ -182,9 +197,41 @@ async def test_human_work_hardening_repairs_legacy_rows():
         async with engine.begin() as connection:
             await connection.execute(
                 text(
-                    "UPDATE human_work_items SET tenant_id = 'legacy-wrong' "
-                    "WHERE conversation_id = "
-                    "'00000000-0000-0000-0000-000000000103'"
+                    "INSERT INTO admin_users ("
+                    "id, username, password_hash, tenant_id, must_change_password, status) "
+                    "VALUES "
+                    "('00000000-0000-0000-0000-000000000201', 'alice', 'test-hash', "
+                    "'tenant-a', false, 'active'), "
+                    "('00000000-0000-0000-0000-000000000202', 'bob', 'test-hash', "
+                    "'tenant-b', false, 'active')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE human_work_items SET tenant_id = 'legacy-wrong', "
+                    "assigned_user_id = CASE conversation_id "
+                    "WHEN '00000000-0000-0000-0000-000000000103' "
+                    "THEN '00000000-0000-0000-0000-000000000201'::uuid "
+                    "WHEN '00000000-0000-0000-0000-000000000105' "
+                    "THEN '00000000-0000-0000-0000-000000000202'::uuid END "
+                    "WHERE conversation_id IN ("
+                    "'00000000-0000-0000-0000-000000000103', "
+                    "'00000000-0000-0000-0000-000000000105')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE human_work_items SET "
+                    "assigned_user_id = '00000000-0000-0000-0000-000000000201' "
+                    "WHERE conversation_id IN ("
+                    "'00000000-0000-0000-0000-000000000106', "
+                    "'00000000-0000-0000-0000-000000000107')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE human_work_items SET claimed_at = NULL WHERE conversation_id = "
+                    "'00000000-0000-0000-0000-000000000106'"
                 )
             )
         await engine.dispose()
@@ -195,8 +242,8 @@ async def test_human_work_hardening_repairs_legacy_rows():
             rows = (
                 await connection.execute(
                     text(
-                        "SELECT conversation_id, tenant_id, status, assigned_actor, "
-                        "claimed_at, version FROM human_work_items "
+                        "SELECT conversation_id, tenant_id, status, assigned_user_id, "
+                        "assigned_actor, claimed_at, version FROM human_work_items "
                         "ORDER BY conversation_id"
                     )
                 )
@@ -210,15 +257,38 @@ async def test_human_work_hardening_repairs_legacy_rows():
         assert str(rows[0].conversation_id) == "00000000-0000-0000-0000-000000000103"
         assert rows[0].tenant_id == "tenant-a"
         assert rows[0].status == "CLAIMED"
+        assert str(rows[0].assigned_user_id) == "00000000-0000-0000-0000-000000000201"
         assert rows[0].assigned_actor == "user:alice"
         assert rows[0].claimed_at is not None
         assert rows[0].version == 1
         assert str(rows[1].conversation_id) == "00000000-0000-0000-0000-000000000104"
         assert rows[1].tenant_id == "tenant-a"
         assert rows[1].status == "WAITING"
+        assert rows[1].assigned_user_id is None
         assert rows[1].assigned_actor is None
         assert rows[1].claimed_at is None
         assert rows[1].version == 2
+        assert str(rows[2].conversation_id) == "00000000-0000-0000-0000-000000000105"
+        assert rows[2].tenant_id == "tenant-a"
+        assert rows[2].status == "WAITING"
+        assert rows[2].assigned_user_id is None
+        assert rows[2].assigned_actor is None
+        assert rows[2].claimed_at is None
+        assert rows[2].version == 2
+        assert str(rows[3].conversation_id) == "00000000-0000-0000-0000-000000000106"
+        assert rows[3].tenant_id == "tenant-a"
+        assert rows[3].status == "WAITING"
+        assert rows[3].assigned_user_id is None
+        assert rows[3].assigned_actor is None
+        assert rows[3].claimed_at is None
+        assert rows[3].version == 2
+        assert str(rows[4].conversation_id) == "00000000-0000-0000-0000-000000000107"
+        assert rows[4].tenant_id == "tenant-a"
+        assert rows[4].status == "WAITING"
+        assert rows[4].assigned_user_id is None
+        assert rows[4].assigned_actor is None
+        assert rows[4].claimed_at is None
+        assert rows[4].version == 2
     finally:
         async with admin_engine.connect() as connection:
             await connection.execute(
