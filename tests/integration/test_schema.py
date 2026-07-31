@@ -449,6 +449,90 @@ async def test_normalized_events_dedup_constraint(migrated_db, session):
         await session.commit()
 
 
+async def test_human_work_items_enforce_tenant_and_claim_assignment(session, migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        work_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='human_work_items'"
+                )
+            )
+        }
+        conversation_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='conversations'"
+                )
+            )
+        }
+    assert {
+        "ck_human_work_items_claimed_assignment",
+        "fk_human_work_items_tenant_conversation",
+    } <= work_constraints
+    assert "uq_conversations_tenant_id_id" in conversation_constraints
+
+    account_id, contact_id, conversation_id = (uuid.uuid4() for _ in range(3))
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="tenant-a",
+            brand_id="b1",
+            platform="telegram",
+            name="human-work-schema",
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="tenant-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            external_user_id="human-work-schema",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            tenant_id="tenant-a",
+            brand_id="b1",
+            platform="telegram",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"schema:{conversation_id}",
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.HumanWorkItem).values(
+                tenant_id="tenant-a",
+                conversation_id=conversation_id,
+                status="CLAIMED",
+                reason_code="TEST",
+            )
+        )
+        await session.commit()
+    await session.rollback()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.HumanWorkItem).values(
+                tenant_id="tenant-b",
+                conversation_id=conversation_id,
+                status="WAITING",
+                reason_code="TEST",
+            )
+        )
+        await session.commit()
+    await session.rollback()
+
+
 async def test_metadata_matches_migrations(migrated_db):
     """漂移护栏：models 改动但忘记生成迁移时在测试期报警"""
     from alembic.autogenerate import compare_metadata

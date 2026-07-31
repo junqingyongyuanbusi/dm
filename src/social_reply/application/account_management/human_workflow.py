@@ -29,6 +29,13 @@ class HumanWorkflowConflict(HumanWorkflowError):
     pass
 
 
+def require_work_conversation_tenant(
+    work: models.HumanWorkItem, *, conversation_tenant_id: str
+) -> None:
+    if work.tenant_id != conversation_tenant_id:
+        raise HumanWorkflowConflict("human_work_item_tenant_mismatch")
+
+
 async def ensure_open_human_work_item(
     session: AsyncSession,
     *,
@@ -37,6 +44,14 @@ async def ensure_open_human_work_item(
     reason_code: str,
     priority: int = 0,
 ) -> models.HumanWorkItem:
+    conversation_tenant_id = await session.scalar(
+        select(models.Conversation.tenant_id).where(models.Conversation.id == conversation_id)
+    )
+    if conversation_tenant_id is None:
+        raise HumanWorkflowError("conversation_not_found")
+    if conversation_tenant_id != tenant_id:
+        raise HumanWorkflowError("conversation_tenant_mismatch")
+
     candidate_id = uuid.uuid4()
     inserted_id = (
         await session.execute(
@@ -58,18 +73,22 @@ async def ensure_open_human_work_item(
             .returning(models.HumanWorkItem.id)
         )
     ).scalar_one_or_none()
-    work_id = (
-        inserted_id
-        or (
+    work = (
+        await session.get(models.HumanWorkItem, inserted_id)
+        if inserted_id is not None
+        else (
             await session.execute(
-                select(models.HumanWorkItem.id).where(
+                select(models.HumanWorkItem).where(
                     models.HumanWorkItem.conversation_id == conversation_id,
                     models.HumanWorkItem.status.in_(["WAITING", "CLAIMED"]),
                 )
             )
         ).scalar_one()
     )
-    return await session.get(models.HumanWorkItem, work_id)
+    if work is None:
+        raise HumanWorkflowError("human_work_item_not_found")
+    require_work_conversation_tenant(work, conversation_tenant_id=conversation_tenant_id)
+    return work
 
 
 async def _load_work_for_actor(
@@ -90,6 +109,12 @@ async def _load_work_for_actor(
     ).scalar_one_or_none()
     if work is None:
         raise HumanWorkflowError("human_work_item_not_found")
+    conversation_tenant_id = await session.scalar(
+        select(models.Conversation.tenant_id).where(models.Conversation.id == work.conversation_id)
+    )
+    if conversation_tenant_id is None:
+        raise HumanWorkflowError("conversation_not_found")
+    require_work_conversation_tenant(work, conversation_tenant_id=conversation_tenant_id)
     return work
 
 
@@ -195,13 +220,16 @@ async def resume_bot(
             raise HumanWorkflowError("meta_requires_bot_draft_only")
         open_work = (
             await session.execute(
-                select(models.HumanWorkItem.id).where(
+                select(models.HumanWorkItem).where(
                     models.HumanWorkItem.conversation_id == conversation_id,
                     models.HumanWorkItem.status.in_(["WAITING", "CLAIMED"]),
                 )
             )
-        ).first()
+        ).scalar_one_or_none()
         if open_work is not None:
+            require_work_conversation_tenant(
+                open_work, conversation_tenant_id=conversation.tenant_id
+            )
             raise HumanWorkflowConflict("human_work_item_still_open")
         await acquire_conversation_delivery_xact_lock(session, conversation_id)
         changed = await session.execute(
@@ -284,18 +312,18 @@ async def send_human_reply(
         else:
             outbox_id = None
 
-        work = None
-        if outbox_id is None:
-            work = (
-                await session.execute(
-                    select(models.HumanWorkItem)
-                    .where(
-                        models.HumanWorkItem.conversation_id == conversation_id,
-                        models.HumanWorkItem.status.in_(["WAITING", "CLAIMED"]),
-                    )
-                    .with_for_update()
+        work = (
+            await session.execute(
+                select(models.HumanWorkItem)
+                .where(
+                    models.HumanWorkItem.conversation_id == conversation_id,
+                    models.HumanWorkItem.status.in_(["WAITING", "CLAIMED"]),
                 )
-            ).scalar_one_or_none()
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if work is not None:
+            require_work_conversation_tenant(work, conversation_tenant_id=conversation.tenant_id)
         if outbox_id is None and work is None:
             work = await ensure_open_human_work_item(
                 session,

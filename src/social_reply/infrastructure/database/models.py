@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Sequence,
@@ -158,7 +159,10 @@ class Contact(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
-    __table_args__ = (UniqueConstraint("tenant_id", "conversation_key"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "conversation_key"),
+        UniqueConstraint("tenant_id", "id", name="uq_conversations_tenant_id_id"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     brand_id: Mapped[str] = mapped_column(Text)
@@ -430,6 +434,16 @@ class HumanWorkItem(Base):
             name="ck_human_work_items_status",
         ),
         CheckConstraint("version >= 1", name="ck_human_work_items_version"),
+        CheckConstraint(
+            "status <> 'CLAIMED' OR (assigned_actor IS NOT NULL AND claimed_at IS NOT NULL)",
+            name="ck_human_work_items_claimed_assignment",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "conversation_id"],
+            ["conversations.tenant_id", "conversations.id"],
+            name="fk_human_work_items_tenant_conversation",
+            ondelete="CASCADE",
+        ),
         Index(
             "uq_human_work_items_open_conversation",
             "conversation_id",
@@ -446,9 +460,7 @@ class HumanWorkItem(Base):
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text)
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("conversations.id", ondelete="CASCADE")
-    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     status: Mapped[str] = mapped_column(Text, default="WAITING")
     reason_code: Mapped[str] = mapped_column(Text)
     priority: Mapped[int] = mapped_column(Integer, default=0)

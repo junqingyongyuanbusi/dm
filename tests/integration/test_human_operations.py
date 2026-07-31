@@ -1,11 +1,14 @@
 import uuid
+from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select, text
 
 from social_reply.application.account_management.human_workflow import (
     HumanWorkflowConflict,
     HumanWorkflowError,
+    claim_human_work_item,
+    ensure_open_human_work_item,
     resolve_human_work_item,
     resume_bot,
     send_human_reply,
@@ -242,6 +245,7 @@ async def test_resolve_then_resume_requires_closed_work_item(session):
     state = await session.get(models.AutomationState, conversation_id)
     work.status = "CLAIMED"
     work.assigned_actor = "user:alice"
+    work.claimed_at = datetime.now(UTC)
     work.version = 2
     state.state = "HUMAN_ACTIVE"
     await session.commit()
@@ -261,6 +265,81 @@ async def test_resolve_then_resume_requires_closed_work_item(session):
     session.expire_all()
     state = await session.get(models.AutomationState, conversation_id)
     assert state.state == "BOT_DRAFT_ONLY"
+
+
+async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, monkeypatch):
+    _account_id, conversation_id, message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session
+    )
+    await session.execute(text("ALTER TABLE human_work_items DISABLE TRIGGER ALL"))
+    await session.execute(
+        text("UPDATE human_work_items SET tenant_id = 'tenant-b' WHERE id = :work_id"),
+        {"work_id": work_id},
+    )
+    await session.execute(text("ALTER TABLE human_work_items ENABLE TRIGGER ALL"))
+    await session.commit()
+
+    dispatched: list[uuid.UUID] = []
+
+    async def capture_dispatch(*args, **_kwargs):
+        dispatched.append(args[1])
+
+    monkeypatch.setattr(
+        "social_reply.application.account_management.human_workflow.dispatch_actor",
+        capture_dispatch,
+    )
+
+    with pytest.raises(HumanWorkflowConflict, match="tenant_mismatch"):
+        await ensure_open_human_work_item(
+            session,
+            tenant_id="tenant-a",
+            conversation_id=conversation_id,
+            reason_code="TEST",
+        )
+    await session.rollback()
+
+    for operation in (claim_human_work_item, resolve_human_work_item):
+        arguments = {
+            "work_item_id": work_id,
+            "allowed_tenants": frozenset({"tenant-b"}),
+            "actor": "user:alice",
+            "expected_version": 1,
+        }
+        if operation is claim_human_work_item:
+            arguments["user_id"] = None
+        else:
+            arguments["allow_override"] = True
+        with pytest.raises(HumanWorkflowConflict, match="tenant_mismatch"):
+            await operation(**arguments)
+
+    with pytest.raises(HumanWorkflowConflict, match="tenant_mismatch"):
+        await send_human_reply(
+            conversation_id=conversation_id,
+            reply_to_message_id=message_id,
+            text="Must not send",
+            idempotency_key="tenant-mismatch-manual",
+            allowed_tenants=frozenset({"tenant-a"}),
+            actor="user:alice",
+            user_id=None,
+            allow_override=True,
+            work_item_id=work_id,
+            expected_version=1,
+        )
+
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    assert work.status == "WAITING"
+    assert work.version == 1
+    assert dispatched == []
+    assert await session.scalar(select(func.count()).select_from(models.AuditLog)) == 0
+    assert (
+        await session.scalar(
+            select(func.count())
+            .select_from(models.OutboxMessage)
+            .where(models.OutboxMessage.origin_kind == "MANUAL_REPLY")
+        )
+        == 0
+    )
 
 
 async def test_resume_bot_active_respects_meta_release_gate(session):

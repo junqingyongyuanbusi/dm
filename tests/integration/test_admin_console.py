@@ -216,6 +216,7 @@ async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, mig
     newest_work.reason_code = "RISK_WORD"
     newest_work.status = "CLAIMED"
     newest_work.assigned_actor = "user:another-agent"
+    newest_work.claimed_at = now
     decision_id, outbox_id = uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.ReplyDecision).values(
@@ -533,8 +534,8 @@ async def test_inbox_rejects_cross_tenant_join_mismatches(session, migrated_db):
         )
     )
     await session.execute(
-        update(models.Conversation)
-        .where(models.Conversation.id == conversation_id)
+        update(models.PlatformAccount)
+        .where(models.PlatformAccount.id == account_id)
         .values(tenant_id="other")
     )
     await session.commit()
@@ -576,6 +577,17 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
         detail = await client.get(f"/admin/conversations/{conversation_id}")
         key_match = re.search(r'name="idempotency_key" value="([^"]+)"', detail.text)
         assert key_match is not None
+        invalid_csrf = await client.post(
+            f"/admin/conversations/{conversation_id}/reply",
+            data={
+                "csrf_token": "wrong",
+                "reply_to_message_id": str(message_id),
+                "idempotency_key": key_match.group(1),
+                "work_item_id": str(work_item_id),
+                "version": "1",
+                "text": "Human response",
+            },
+        )
         response = await client.post(
             f"/admin/conversations/{conversation_id}/reply",
             data={
@@ -593,12 +605,54 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
     assert "telegram_dm" in detail.text
     assert "4096 字符" in detail.text
     assert f'value="{message_id}"' in detail.text
+    assert invalid_csrf.status_code == 403
     assert response.status_code == 303
     assert captured["conversation_id"] == conversation_id
     assert captured["reply_to_message_id"] == message_id
     assert captured["work_item_id"] == work_item_id
     assert captured["expected_version"] == 1
     assert captured["idempotency_key"] == key_match.group(1)
+
+
+async def test_conversation_detail_uses_latest_200_messages_for_reply_target(session, migrated_db):
+    now = datetime.now(UTC)
+    _account_id, conversation_id, _message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="history-window",
+        display_name="History customer",
+        work_created_at=now - timedelta(hours=1),
+    )
+    message_ids = [uuid.uuid4() for _ in range(200)]
+    await session.execute(
+        insert(models.Message),
+        [
+            {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "direction": "inbound",
+                "sender_type": "contact",
+                "text": f"History message {index:03d}",
+                "reply_target": {"chat_id": f"history-{index:03d}"},
+                "occurred_at": now + timedelta(seconds=index),
+            }
+            for index, message_id in enumerate(message_ids, start=1)
+        ],
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        detail = await client.get(f"/admin/conversations/{conversation_id}")
+
+    assert detail.status_code == 200
+    assert "Message history-window" not in detail.text
+    assert detail.text.index("History message 001") < detail.text.index("History message 200")
+    latest_choice = re.search(
+        rf'name="reply_to_message_id" value="{message_ids[-1]}" checked required',
+        detail.text,
+    )
+    assert latest_choice is not None
+    assert "history-200" in detail.text
 
 
 async def test_draft_rejection_records_structured_review(session, migrated_db):

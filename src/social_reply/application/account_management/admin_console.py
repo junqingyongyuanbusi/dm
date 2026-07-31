@@ -34,6 +34,7 @@ from social_reply.application.account_management.human_workflow import (
     HumanWorkflowError,
     claim_human_work_item,
     ensure_open_human_work_item,
+    require_work_conversation_tenant,
     resolve_human_work_item,
     resume_bot,
     send_human_reply,
@@ -1340,18 +1341,19 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
                 )
             )
         ).scalar_one_or_none()
-        msgs = (
+        newest_messages = (
             (
                 await session.execute(
                     select(models.Message)
                     .where(models.Message.conversation_id == conversation_id)
-                    .order_by(models.Message.history_seq)
+                    .order_by(desc(models.Message.history_seq))
                     .limit(200)
                 )
             )
             .scalars()
             .all()
         )
+        msgs = list(reversed(newest_messages))
         decisions = (
             (
                 await session.execute(
@@ -1376,6 +1378,11 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
             .scalars()
             .first()
         )
+        if work_item is not None:
+            try:
+                require_work_conversation_tenant(work_item, conversation_tenant_id=conv.tenant_id)
+            except HumanWorkflowError as exc:
+                raise _workflow_error(exc) from exc
         outboxes = (
             (
                 await session.execute(
@@ -1747,15 +1754,21 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
                 reason_code="ADMIN_MANUAL",
             )
         else:
-            open_work = await session.scalar(
-                select(func.count())
-                .select_from(models.HumanWorkItem)
-                .where(
-                    models.HumanWorkItem.conversation_id == conversation_id,
-                    models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
+            open_work = (
+                await session.execute(
+                    select(models.HumanWorkItem).where(
+                        models.HumanWorkItem.conversation_id == conversation_id,
+                        models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
+                    )
                 )
-            )
-            if open_work:
+            ).scalar_one_or_none()
+            if open_work is not None:
+                try:
+                    require_work_conversation_tenant(
+                        open_work, conversation_tenant_id=conv.tenant_id
+                    )
+                except HumanWorkflowError as exc:
+                    raise _workflow_error(exc) from exc
                 raise HTTPException(status_code=409, detail="human_work_item_still_open")
             changed = await session.execute(
                 update(models.AutomationState)
