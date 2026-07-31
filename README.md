@@ -99,16 +99,18 @@ Meta 自动外发默认关闭。所有新接入的 Meta 账号始终从 `BOT_DRA
 不会改变自动化模式。要允许管理员之后把某个 Meta 账号切到 `BOT_ACTIVE`，API、Worker、
 Scheduler 必须同时设置 `META_AUTO_REPLY_ENABLED=true`。默认 `false`：
 
-- 关闭时：Control API 传 `automation_default=BOT_ACTIVE` 返回 422，后台「切为自动」按钮不渲染，
-  直接 POST 也返回 422 `meta_requires_bot_draft_only`。已是 `BOT_ACTIVE` 的历史账号仍可改回草稿。
-- 开启时：以上闸门放行；普通 Meta/Instagram 接入仍默认 `BOT_DRAFT_ONLY`，可在
-  `/admin/accounts` 逐个账号点「切为自动」。每次变更写入 `audit_logs`
-  （`action=SET_AUTOMATION_DEFAULT`）。
+- Meta Control API 接入始终拒绝 `automation_default=BOT_ACTIVE`；新账号必须先以
+  `BOT_DRAFT_ONLY` 完成接入。
+- 关闭时：后台「切为自动」按钮不渲染，直接 POST 也返回 422
+  `meta_requires_bot_draft_only`。已是 `BOT_ACTIVE` 的历史账号仍可改回草稿。
+- 开启时：管理员可在接入完成后到 `/admin/accounts` 逐个账号点「切为自动」。每次变更写入
+  `audit_logs`（`action=SET_AUTOMATION_DEFAULT`）。
 
 Facebook 与 Instagram 评论自动回复还要求三个角色同时设置
 `META_COMMENT_REPLY_ENABLED=true`。两个 Meta 开关都开启时，新授权账号默认
 `enable_comments=true`、`BOT_DRAFT_ONLY`；评论只会在原评论下发送公开子评论，不生成私信回复。
-由于自动化模式属于账号级，同一账号的 Messenger/Instagram 私信也会自动回复。
+由于自动化模式属于账号级，管理员后续显式切到 `BOT_ACTIVE` 时，同一账号的
+Messenger/Instagram 私信也会开始自动回复。
 
 这个开关不改变单会话控制：`/admin/conversations/{id}` 的状态翻转任何时候都可用。
 
@@ -127,7 +129,7 @@ POST /api/v1/platform-accounts/meta
   "brand_id": "default",
   "enable_dm": true,
   "enable_comments": true,
-  "automation_default": "BOT_ACTIVE"
+  "automation_default": "BOT_DRAFT_ONLY"
 }
 ```
 
@@ -149,9 +151,10 @@ Instagram 提供两条不可混用的接入路径：
   传 `instagram_login_mode=instagram_login`。
 
 评论开关关闭时，两条路径仍默认 `enable_comments=false`、`BOT_DRAFT_ONLY`；两个 Meta 开关都
-开启时则默认启用评论和自动回复。已有 Instagram token 必须从 `/admin/accounts` 按原登录路径
-重新授权。`meta` 与 `instagram` App family 共用 `/webhooks/meta/{app_public_id}` 路由，因此数据库
-会拒绝跨 family 重复的 `app_public_id`。
+开启时，评论 capability 可默认启用，但新账号仍是 `BOT_DRAFT_ONLY`。管理员必须在接入完成后逐个
+账号显式切到 `BOT_ACTIVE`，才会自动外发评论或私信。已有 Instagram token 必须从
+`/admin/accounts` 按原登录路径重新授权。`meta` 与 `instagram` App family 共用
+`/webhooks/meta/{app_public_id}` 路由，因此数据库会拒绝跨 family 重复的 `app_public_id`。
 
 Meta 只在「App 级 Webhooks 产品」与「账号级订阅」都列出某个字段时才投递事件。接入与健康巡检
 会同时完成两级订阅，无需在 App Dashboard 手工填回调 URL。App 级订阅以并集方式写入，不会覆盖

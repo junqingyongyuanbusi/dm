@@ -10,6 +10,31 @@ The system is split into two independently deployable concerns:
 - **Data Plane**: signed platform webhooks, `CanonicalEvent`, durable decision jobs, the shared Rules/RAG/LLM/Final Guard pipeline, transactional Outbox, and account-scoped senders.
 
 A Control Plane outage must not stop already-connected accounts from receiving or sending messages.
+Already-created Worker and Scheduler work continues from PostgreSQL, although operators cannot make
+new local claims, approvals or manual replies until Admin is available again.
+
+## Local-first operations contract
+
+`/admin`, PostgreSQL `HumanWorkItem`, and the transactional Outbox are the native operations control
+plane. Chatwoot is an optional compatibility bridge; it does not own local claims, draft review,
+delivery exceptions, conversation automation state, or manual-reply provenance.
+
+Every human mutation is tenant-scoped, audited and durable:
+
+- **claim** requires a `WAITING` item and its expected optimistic `version`, records the user/actor,
+  and advances the version; ordinary users cannot later mutate another user's claim;
+- **resolve** requires a current `CLAIMED` version and ownership, unless a superadmin explicitly
+  overrides it; it closes the work item but does not silently resume automation;
+- **resume** is a separate conversation action, allowed only after no open work remains, and requires
+  an explicit target of `BOT_DRAFT_ONLY` or `BOT_ACTIVE` subject to deployment/platform gates;
+- **manual reply** binds to an explicit inbound `Message` target, creates or claims the work item,
+  moves the conversation to `HUMAN_ACTIVE`, and commits a `MANUAL_REPLY/ADMIN_HUMAN` Outbox carrying
+  `actor_id` and `reply_to_message_id`.
+
+Successful local manual delivery records an outbound `Message` linked through `source_outbox_id`
+and does not require a synthetic `ReplyDecision`. Direct-platform accounts do not require a
+Chatwoot conversation; accounts intentionally configured for Chatwoot delivery still require their
+persisted conversation mapping.
 
 ## Trust boundaries
 

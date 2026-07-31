@@ -40,7 +40,9 @@ PostgreSQL owns:
 - tenants, users, platform apps/accounts and encrypted credentials;
 - webhook `RawEvent` rows and normalized event deduplication;
 - contacts, conversations, messages and automation state;
+- local operations inbox state in `HumanWorkItem`, including tenant-scoped claim ownership and optimistic versioning;
 - `ProvisioningJob`, `DecisionJob`, `ReplyDecision` and `OutboxMessage` state;
+- immutable Outbox origin, actor and explicit reply-target provenance for bot decisions, draft approvals and manual replies;
 - delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps.
 
 New webhook and Chatwoot reconciliation `RawEvent` rows persist a versioned initial-dispatch contract before commit. Process crashes and Redis queue loss are recoverable from that row before normalization, then from `DecisionJob` and `OutboxMessage` after their transactional boundaries.
@@ -75,10 +77,13 @@ Telegram / Meta / WhatsApp / X webhook
   -> NormalizedEvent dedupe
   -> text-only CanonicalEvent(kind=message)
   -> Contact / Conversation / inbound Message / AutomationState
-  -> DecisionJob(PENDING) in the same transaction
-  -> Worker claims DecisionJob(PROCESSING)
-  -> rules -> kill switch -> knowledge/history -> LLM -> final guard
-  -> ReplyDecision + OutboxMessage in one transaction
+  -> reserve Conversation.decision_generation
+  -> DecisionJob(PENDING, generation) in the same transaction
+  -> supersede older active jobs and cancel their unsent bot decision Outboxes
+  -> Worker claims DecisionJob(PROCESSING) with a random claim_token
+  -> commit claim; rules -> kill switch -> knowledge/history -> LLM -> final guard with no database transaction held
+  -> short final transaction locks the Conversation and validates job/generation/claim_token
+  -> ReplyDecision + OutboxMessage + DecisionJob(COMPLETED) in one transaction
   -> post-commit delivery fast path
   -> send-time tenant/status/capability/window/takeover validation
   -> account-scoped connector sender
@@ -89,9 +94,40 @@ A successful text send is written back as an outbound `Message`, linked to its s
 The delivery fast path reduces latency; it does not replace durability. `sweep_outbox` recovers rows
 that were committed but not sent because a process crashed.
 
+Each reply-eligible public inbound contact message advances one monotonic conversation generation;
+duplicate ingestion, private notes, outbound messages and agent/bot messages do not. Reserving a new
+generation makes older nonterminal jobs `SUPERSEDED`, which is terminal and counts as settled when
+aggregating the parent RawEvent. It also cancels only older `PENDING` or `FAILED`
+`DECISION/BOT` Outboxes with `STALE_CONVERSATION_INPUT`; manual replies and draft approvals remain
+valid. Delivery repeats the generation check immediately before provider I/O. Conversation advisory
+locks serialize cancellation with delivery, but an external send that already completed cannot be
+undone.
+
 Webhook ingestion and X polling persist `RawEvent` evidence before normalization. New Telegram, Meta, X direct, Chatwoot webhook, and Chatwoot reconciliation rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
 
 Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes.
+
+## Local human operations path
+
+The built-in Admin and PostgreSQL inbox are the native operations path; they do not depend on
+Chatwoot:
+
+```text
+HANDOFF / unsupported attachment -> HumanWorkItem(WAITING or CLAIMED) -> claim / resolve / resume
+DRAFT                         -> ReplyDecision(DRAFT) -> explicit approval
+Delivery exception            -> OutboxMessage(NEEDS_REVIEW) -> explicit retry
+Manual reply / draft approval -> explicit inbound Message target -> provenance-bearing OutboxMessage
+                               -> account-scoped sender -> outbound Message(source_outbox_id)
+```
+
+Only one open `WAITING` or `CLAIMED` work item exists per conversation. Ordinary administrators may
+mutate a claimed item only while they own it; superadmin override remains explicit and audited. A
+manual reply creates or claims the work, moves the conversation to `HUMAN_ACTIVE`, cancels pending or
+failed bot-decision Outboxes, and records `actor_id` plus `reply_to_message_id`. Bot decisions use
+`DECISION/BOT`, approved drafts use `DRAFT_APPROVAL/ADMIN_HUMAN`, and manual sends use
+`MANUAL_REPLY/ADMIN_HUMAN`, so the Outbox row is the durable provenance bridge from operator action
+to outbound history. Direct-platform delivery is independent of Chatwoot; accounts deliberately
+using a Chatwoot destination still require their persisted conversation mapping.
 
 ## Chatwoot bridge
 
@@ -157,6 +193,24 @@ These gates are process-local configuration. Old images do not recognize them, s
 platform requires the coordinated API/Worker/Scheduler restart documented in
 `docs/configuration.md`; a mixed-version rolling window is not a valid disable procedure.
 
+## Scheduler lanes
+
+Scheduler runs due sweeps independently rather than as one serial cycle:
+
+- the **core recovery lane** owns ProvisioningJob, initial RawEvent, DecisionJob, Outbox and XChat
+  recovery;
+- the **inspection lane** owns Chatwoot reconciliation, X polling/subscription/webhook inspection and
+  Meta health reconciliation.
+
+A slow inspection does not block recurring core recovery. Each named sweep permits at most one
+running instance, missed ticks coalesce, and submission, body and completion failures are isolated
+from other due sweeps. `SCHEDULER_CORE_WARN_AFTER_SECONDS` and
+`SCHEDULER_INSPECTION_WARN_AFTER_SECONDS` produce soft warnings only: potentially side-effecting
+provider work is not force-cancelled. Scheduler reads one settings snapshot at startup, scans due
+work at `SCHEDULER_TICK_SECONDS`, runs ordinary core sweeps at
+`SCHEDULER_CORE_INTERVAL_SECONDS`, and gives in-flight work a bounded five-second shutdown grace
+period without cancelling it.
+
 ## Provisioning path
 
 ```text
@@ -178,8 +232,12 @@ durable job boundary rather than directly mutating account rows.
 - Recoverable webhook actor arguments are committed as immutable RawEvent dispatch metadata before actor dispatch.
 - Initial dispatch uses a versioned dedicated queue, database reservations, worker claim tokens, leases and bounded dead-letter attempts.
 - Historical or polling RawEvents without that contract are never inferred by the generic sweep.
-- Inbound facts and their `DecisionJob` are committed together.
+- Inbound facts, their monotonic decision generation and their `DecisionJob` are committed together.
+- Older active generations become terminal `SUPERSEDED`; stale claim tokens cannot finalize after reclaim.
+- Rules, retrieval and LLM calls hold no PostgreSQL transaction or Conversation lock; finalization is a short fenced transaction.
+- A newer inbound cancels only unsent bot-decision Outboxes, and send-time generation validation is the final stale-input fence.
 - Decisions and Outbox intent are committed together.
+- Local human claims, explicit reply targets and manual/draft Outbox provenance remain tenant-scoped and durable without Chatwoot.
 - Public sending rechecks takeover state immediately before network I/O.
 - Direct sending rechecks tenant, account status, route/platform compatibility, capability, text
   limit and delivery window.
@@ -190,7 +248,15 @@ durable job boundary rather than directly mutating account rows.
   media, receipts and reactions remain RawEvent evidence and do not enter reply decisions.
 - Ambiguous post-send transport failures do not blindly retry.
 - Account sender caches are keyed by account config version and, for Meta senders, PlatformApp config version so App Secret rotation replaces the client.
-- Scheduler recovery is idempotent and each sweep is exception-isolated.
+- Scheduler recovery is idempotent; each sweep is exception-isolated, max-one-instance and coalescing, with soft slow-run warnings rather than hard cancellation.
+
+## Design precedents
+
+These public systems informed semantics only; Social Reply does not add them as dependencies:
+
+- [Oban unique jobs](https://hexdocs.pm/oban/unique_jobs.html): enqueue-time uniqueness has a configurable period and state scope; it is not, by itself, an execution-concurrency guarantee.
+- [GoodJob](https://github.com/bensheldon/good_job): a PostgreSQL job implementation that uses advisory locks to coordinate run-once execution across processes.
+- [APScheduler user guide](https://apscheduler.readthedocs.io/en/3.x/userguide.html#limiting-the-number-of-concurrently-executing-instances-of-a-job): `max_instances` limits concurrent executions, while coalescing controls how accumulated missed runs are submitted.
 
 ## Deployment invariants
 

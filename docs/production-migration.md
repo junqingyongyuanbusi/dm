@@ -249,21 +249,43 @@ on `reply_decisions`. The migration ranks every public inbound contact message b
 copies that generation through its job and decision, marks nonterminal older jobs `SUPERSEDED`, and
 cancels only their pending or failed bot decision outboxes with `STALE_CONVERSATION_INPUT`.
 
-Deploy the database migration before replacing Worker and Scheduler instances. PostgreSQL triggers
-keep old ingestion writers compatible during the rolling window: an eligible old message insert
-that omits the generation reserves one while holding the conversation delivery lock, and an old job
-insert inherits that message generation without advancing the conversation again. Explicit message
-generations, agent or bot messages, outgoing messages, and private messages do not advance the
-counter. Old decision writers receive provenance and are rejected if their generation is already
-stale. New workers do not hold a transaction or database lock
-while calling the LLM; finalization acquires its locks only after the model returns and atomically
-writes the decision provenance, completes the fenced job, and aggregates the RawEvent state.
+The required revision order is `f6c2a9d81b40` (human inbox and Outbox provenance), then
+`b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing). Do not
+cherry-pick only the final revision. Upgrade through `f6c2a9d81b40`, then run the Human operations
+inventory above and record repair counts before applying `b8e1d4f7a2c3`. Before the fencing step,
+inventory active DecisionJobs by conversation/status, pending or failed `DECISION/BOT` Outboxes tied
+to older inbound messages, conversations with multiple public inbound contact messages, and
+currently `SENDING` Outboxes; let
+active sends drain and retain the counts in the rollout log.
+
+Deploy the database migration before replacing Worker and Scheduler instances. Three PostgreSQL
+triggers bound the mixed-version window:
+
+- `trg_reserve_message_decision_generation` assigns a generation to eligible inbound rows written by
+  old ingestion code and retires stale work;
+- `trg_attach_decision_job_generation` derives the generation for old DecisionJob writers without
+  incrementing the conversation again;
+- `trg_attach_reply_decision_generation` attaches job/generation provenance and rejects stale old
+  decision writers.
+
+Explicit message generations, agent or bot messages, outgoing messages, and private messages do not
+advance the counter. New workers do not hold a transaction or database lock while calling the LLM;
+finalization acquires its locks only after the model returns and atomically writes decision
+provenance, completes the fenced job, and aggregates RawEvent state.
+
+Coordinate Scheduler replacement with the same rollout. The new recovery code understands
+`SUPERSEDED` as terminal and clears expired claim tokens before reclaim; keep old/new Scheduler
+overlap short, and do not start the new Worker or Scheduler until the database is at head. Scheduler
+reads one settings snapshot at startup, so deploy the intended `SCHEDULER_TICK_SECONDS`,
+`SCHEDULER_CORE_INTERVAL_SECONDS`, `SCHEDULER_CORE_WARN_AFTER_SECONDS`, and
+`SCHEDULER_INSPECTION_WARN_AFTER_SECONDS` values with the replacement rather than changing them
+mid-rollout. Compatibility triggers permit a bounded mixed-version generation window, but API,
+Worker and Scheduler must converge on one image digest before the rollout is complete.
 
 The migration briefly takes row and advisory locks for conversations with existing decision jobs or
-pending bot decision outboxes. Before upgrade, allow active sends to drain and take a database
-backup. A database downgrade removes the fencing columns and triggers and is safe only after all new
-Worker and Scheduler instances have been replaced with the prior image; otherwise restore the
-pre-upgrade backup.
+pending bot decision outboxes. Take a database backup before upgrade. A database downgrade removes
+the fencing columns and triggers and is safe only after all new Worker and Scheduler instances have
+been replaced with the prior image; otherwise restore the pre-upgrade backup.
 
 ## Railway X OAuth state-key rollout
 
