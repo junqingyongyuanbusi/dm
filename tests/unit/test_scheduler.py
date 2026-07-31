@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from concurrent.futures import Future
 
 from apps.scheduler import main as scheduler
@@ -137,6 +138,7 @@ async def test_one_tick_submits_all_due_specs_and_isolates_exceptions(caplog):
     assert healthy_record.lane == "core"
     assert healthy_record.duration == 0
     assert healthy_record.recovered_count == 1
+    assert not any(record.message == "scheduler sweep future failed" for record in caplog.records)
 
 
 async def test_due_intervals_coalesce_without_overlap_and_warn_once(caplog):
@@ -257,6 +259,112 @@ def test_submission_failure_does_not_block_other_due_specs(caplog):
     assert runtimes["first"].running is False
     assert runtimes["first"].future is None
     assert "scheduler sweep submission failed" in caplog.text
+
+
+def test_shutdown_drain_uses_future_snapshot_while_callback_clears_runtime():
+    drain_checked_future = threading.Event()
+    callback_cleared_runtime = threading.Event()
+
+    class BarrierFuture(Future):
+        def done(self):
+            drain_checked_future.set()
+            assert callback_cleared_runtime.wait(timeout=1)
+            return super().done()
+
+    async def run() -> list[str]:
+        return []
+
+    spec = scheduler.SweepSpec("core", "core", 3, 30, run)
+    future = BarrierFuture()
+    runtime = scheduler.SweepRuntime(
+        running=True,
+        next_due=3,
+        started_at=0,
+        warned=False,
+        future=future,
+    )
+    drain_errors: list[BaseException] = []
+
+    def drain():
+        try:
+            scheduler._drain_running_sweeps({"core": runtime}, timeout_seconds=1)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            drain_errors.append(exc)
+
+    drain_thread = threading.Thread(target=drain)
+    drain_thread.start()
+    assert drain_checked_future.wait(timeout=1)
+
+    future.set_result(None)
+    scheduler._observe_future(spec, runtime, future)
+    with runtime.lock:
+        assert runtime.future is None
+        assert runtime.running is True
+        runtime.running = False
+    callback_cleared_runtime.set()
+
+    drain_thread.join(timeout=1)
+    assert not drain_thread.is_alive()
+    assert drain_errors == []
+
+
+def test_cancelled_future_is_observed_and_cleared(caplog):
+    async def run() -> list[str]:
+        return []
+
+    spec = scheduler.SweepSpec("core", "core", 3, 30, run)
+    runtimes = scheduler._new_runtimes((spec,), now=0)
+    cancelled = Future()
+    cancelled.cancel()
+
+    def submit(coro):
+        coro.close()
+        return cancelled
+
+    with caplog.at_level(logging.WARNING):
+        scheduler._tick((spec,), runtimes, now=0, submit=submit)
+
+    with runtimes["core"].lock:
+        assert runtimes["core"].future is None
+        assert runtimes["core"].running is False
+    record = next(
+        record
+        for record in caplog.records
+        if record.message == "scheduler sweep future cancelled"
+    )
+    assert record.sweep_name == "core"
+    assert record.lane == "core"
+    assert record.status == "future_cancelled"
+
+
+def test_future_infrastructure_exception_is_observed_and_cleared(caplog):
+    async def run() -> list[str]:
+        return []
+
+    spec = scheduler.SweepSpec("inspection", "inspection", 3, 30, run)
+    runtimes = scheduler._new_runtimes((spec,), now=0)
+    failed = Future()
+    failed.set_exception(RuntimeError("actor loop stopped"))
+
+    def submit(coro):
+        coro.close()
+        return failed
+
+    with caplog.at_level(logging.ERROR):
+        scheduler._tick((spec,), runtimes, now=0, submit=submit)
+
+    with runtimes["inspection"].lock:
+        assert runtimes["inspection"].future is None
+        assert runtimes["inspection"].running is False
+    record = next(
+        record
+        for record in caplog.records
+        if record.message == "scheduler sweep future failed"
+    )
+    assert record.sweep_name == "inspection"
+    assert record.lane == "inspection"
+    assert record.status == "future_failure"
+    assert "actor loop stopped" in caplog.text
 
 
 def test_shutdown_drain_is_bounded_and_does_not_cancel_running_work(caplog):

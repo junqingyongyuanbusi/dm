@@ -6,7 +6,7 @@ import threading
 import time
 from collections.abc import Callable, Coroutine
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
@@ -47,6 +47,7 @@ class SweepRuntime:
     started_at: float | None
     warned: bool
     future: Future[Any] | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 def _build_sweep_specs(settings: Settings) -> tuple[SweepSpec, ...]:
@@ -177,10 +178,11 @@ async def _run_sweep(
     *,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    runtime.running = True
     started_at = clock()
-    runtime.started_at = started_at
-    runtime.warned = False
+    with runtime.lock:
+        runtime.running = True
+        runtime.started_at = started_at
+        runtime.warned = False
     recovered_count = 0
     status = "success"
     try:
@@ -210,14 +212,43 @@ async def _run_sweep(
             },
         )
     finally:
-        runtime.running = False
-        runtime.started_at = None
-        runtime.warned = False
+        with runtime.lock:
+            runtime.running = False
+            runtime.started_at = None
+            runtime.warned = False
 
 
-def _clear_future(runtime: SweepRuntime, completed: Future[Any]) -> None:
-    if runtime.future is completed:
-        runtime.future = None
+def _observe_future(
+    spec: SweepSpec,
+    runtime: SweepRuntime,
+    completed: Future[Any],
+) -> None:
+    try:
+        completed.result()
+    except BaseException as exc:  # noqa: BLE001 - the callback must observe all failures
+        if completed.cancelled():
+            logger.warning(
+                "scheduler sweep future cancelled",
+                extra={
+                    "sweep_name": spec.name,
+                    "lane": spec.lane,
+                    "status": "future_cancelled",
+                },
+            )
+        else:
+            logger.error(
+                "scheduler sweep future failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+                extra={
+                    "sweep_name": spec.name,
+                    "lane": spec.lane,
+                    "status": "future_failure",
+                },
+            )
+    finally:
+        with runtime.lock:
+            if runtime.future is completed:
+                runtime.future = None
 
 
 def _tick(
@@ -232,19 +263,23 @@ def _tick(
     current = clock() if now is None else now
     for spec in specs:
         runtime = runtimes[spec.name]
-        if (
-            runtime.running
-            and runtime.started_at is not None
-            and not runtime.warned
-            and current - runtime.started_at >= spec.warn_after_seconds
-        ):
-            runtime.warned = True
+        warning_duration: float | None = None
+        with runtime.lock:
+            if (
+                runtime.running
+                and runtime.started_at is not None
+                and not runtime.warned
+                and current - runtime.started_at >= spec.warn_after_seconds
+            ):
+                runtime.warned = True
+                warning_duration = current - runtime.started_at
+        if warning_duration is not None:
             logger.warning(
                 "scheduler sweep exceeded warning threshold",
                 extra={
                     "sweep_name": spec.name,
                     "lane": spec.lane,
-                    "duration": current - runtime.started_at,
+                    "duration": warning_duration,
                     "warn_after_seconds": spec.warn_after_seconds,
                     "max_instances": 1,
                 },
@@ -253,7 +288,9 @@ def _tick(
             continue
 
         runtime.next_due = current + spec.interval_seconds
-        if runtime.running or runtime.future is not None:
+        with runtime.lock:
+            in_flight = runtime.running or runtime.future is not None
+        if in_flight:
             continue
 
         coroutine = _run_sweep(spec, runtime, clock=clock)
@@ -270,8 +307,11 @@ def _tick(
                 },
             )
             continue
-        runtime.future = future
-        future.add_done_callback(lambda done, target=runtime: _clear_future(target, done))
+        with runtime.lock:
+            runtime.future = future
+        future.add_done_callback(
+            lambda done, target=runtime, sweep=spec: _observe_future(sweep, target, done)
+        )
 
 
 def _drain_running_sweeps(
@@ -283,10 +323,14 @@ def _drain_running_sweeps(
 ) -> None:
     deadline = clock() + timeout_seconds
     while True:
+        runtime_snapshots: list[tuple[str, Future[Any] | None, bool]] = []
+        for name, runtime in runtimes.items():
+            with runtime.lock:
+                runtime_snapshots.append((name, runtime.future, runtime.running))
         running = [
             name
-            for name, runtime in runtimes.items()
-            if runtime.future is not None and not runtime.future.done()
+            for name, future, is_running in runtime_snapshots
+            if (future is not None and not future.done()) or is_running
         ]
         if not running:
             return
