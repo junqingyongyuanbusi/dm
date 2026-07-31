@@ -36,6 +36,19 @@ class Settings(BaseSettings):
     x_legacy_dm_enabled: bool = True
     x_activity_enabled: bool = True
     xchat_enabled: bool = True
+    scheduler_tick_seconds: float = Field(default=0.5, ge=0.05, le=10)
+    scheduler_core_interval_seconds: float = Field(default=3, ge=0.5, le=60)
+    scheduler_core_warn_after_seconds: float = Field(default=30, ge=1, le=3600)
+    scheduler_inspection_warn_after_seconds: float = Field(default=300, ge=1, le=7200)
+    chatwoot_reconcile_interval_seconds: int = Field(default=3, ge=1, le=3600)
+    x_dm_poll_interval_seconds: int = Field(default=90, ge=0, le=86400)
+    x_webhook_check_interval_seconds: int = Field(default=600, ge=0, le=86400)
+    xchat_poll_interval_seconds: int = Field(default=900, ge=0, le=86400)
+    xchat_max_conversations_per_poll: int = Field(default=10, ge=1, le=1000)
+    xchat_subscription_check_interval_seconds: int = Field(default=600, ge=0, le=86400)
+    xchat_recovery_sweep_interval_seconds: int = Field(default=30, ge=0, le=3600)
+    xchat_ready_probe_interval_seconds: int = Field(default=21600, ge=0, le=604800)
+    xchat_pending_probe_interval_seconds: int = Field(default=600, ge=0, le=86400)
     # 公开回复 @mention。X 开发者条款对“AI 生成并发布的回复”要求事先报批，且每次互动
     # 最多回 1 条；默认关，开启前确保已获 X 批准并已标注为自动账号。
     x_public_reply_enabled: bool = False

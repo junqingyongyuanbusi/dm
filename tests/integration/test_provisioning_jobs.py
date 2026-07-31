@@ -129,15 +129,11 @@ async def test_disabled_platform_job_pauses_without_attempt_and_recovers(migrate
     enabled = disabled.model_copy(update={"facebook_messenger_enabled": True})
     monkeypatch.setattr(jobs, "get_settings", lambda: enabled)
     dispatched = []
-    from social_reply.application.account_management.actors import (
-        process_platform_provisioning,
-    )
 
-    monkeypatch.setattr(
-        process_platform_provisioning,
-        "send",
-        lambda pending_id: dispatched.append(pending_id),
-    )
+    async def dispatch(_actor, pending_id: str, **_kwargs):
+        dispatched.append(pending_id)
+
+    monkeypatch.setattr(jobs, "dispatch_actor", dispatch)
     assert job_id in await jobs.sweep_provisioning_jobs()
     assert dispatched == [str(job_id)]
     async with get_session_factory()() as session:
@@ -426,11 +422,10 @@ async def test_stale_provisioning_worker_cannot_overwrite_new_attempt(
         )
         await session.commit()
 
-    from social_reply.application.account_management.actors import (
-        process_platform_provisioning,
-    )
+    async def no_dispatch(_actor, _job_id: str, **_kwargs):
+        return None
 
-    monkeypatch.setattr(process_platform_provisioning, "send", lambda _job_id: None)
+    monkeypatch.setattr(jobs, "dispatch_actor", no_dispatch)
     assert job_id in await jobs.sweep_provisioning_jobs()
 
     new_worker = asyncio.create_task(jobs.process_provisioning_job(str(job_id)))
@@ -473,16 +468,12 @@ async def test_stale_eighth_provisioning_attempt_requires_action(migrated_db, mo
         )
         await session.commit()
 
-    from social_reply.application.account_management.actors import (
-        process_platform_provisioning,
-    )
-
     dispatched: list[str] = []
-    monkeypatch.setattr(
-        process_platform_provisioning,
-        "send",
-        lambda pending_id: dispatched.append(pending_id),
-    )
+
+    async def dispatch(_actor, pending_id: str, **_kwargs):
+        dispatched.append(pending_id)
+
+    monkeypatch.setattr(jobs, "dispatch_actor", dispatch)
 
     assert job_id not in await jobs.sweep_provisioning_jobs()
     assert dispatched == []
@@ -515,16 +506,13 @@ async def test_provisioning_sweep_isolates_broker_dispatch_failures(
         secrets={"token": "secret-2"},
     )
     calls: list[uuid.UUID] = []
-    from social_reply.application.account_management.actors import (
-        process_platform_provisioning,
-    )
 
-    def dispatch(job_id: str):
+    async def dispatch(_actor, job_id: str, **_kwargs):
         calls.append(uuid.UUID(job_id))
         if len(calls) == 1:
             raise RuntimeError("broker unavailable")
 
-    monkeypatch.setattr(process_platform_provisioning, "send", dispatch)
+    monkeypatch.setattr(jobs, "dispatch_actor", dispatch)
 
     dispatched = await jobs.sweep_provisioning_jobs()
     assert set(calls) == {first, second}

@@ -942,10 +942,11 @@ async def test_reclaimed_job_token_prevents_stale_worker_overwrite(session, monk
         return await actual_run(*args, **kwargs)
 
     monkeypatch.setattr(decision_jobs, "run_and_persist_decision", delayed_first)
-    monkeypatch.setattr(
-        "social_reply.application.reply_decision.actors.process_reply_decision.send",
-        lambda *_args, **_kwargs: None,
-    )
+
+    async def no_dispatch(_actor, _job_id: str, **_kwargs):
+        return None
+
+    monkeypatch.setattr(decision_jobs, "dispatch_actor", no_dispatch)
 
     stale_worker = asyncio.create_task(process_decision_job(str(job_id)))
     await asyncio.wait_for(first_started.wait(), timeout=2)

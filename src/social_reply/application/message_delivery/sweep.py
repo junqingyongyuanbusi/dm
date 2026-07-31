@@ -10,6 +10,7 @@ from social_reply.domain.platform_accounts import (
 )
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -157,7 +158,7 @@ async def sweep_outbox() -> list[uuid.UUID]:
     dispatched: list[uuid.UUID] = []
     for oid in enqueued:
         try:
-            deliver_outbox_message.send(str(oid))
+            await dispatch_actor(deliver_outbox_message, str(oid))
         except Exception:  # noqa: BLE001 - the durable row remains eligible for recovery
             logger.exception("outbox dispatch failed outbox_id=%s", oid)
         else:

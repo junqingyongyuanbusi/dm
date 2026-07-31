@@ -22,6 +22,7 @@ from social_reply.connectors.meta.client import MetaCommentPermissionError
 from social_reply.domain.platform_accounts import SUPPORTED_ACCOUNT_PLATFORMS
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
@@ -648,7 +649,7 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
     dispatched: list[uuid.UUID] = []
     for pending_id in rows:
         try:
-            process_platform_provisioning.send(str(pending_id))
+            await dispatch_actor(process_platform_provisioning, str(pending_id))
         except Exception:  # noqa: BLE001 - the durable row remains eligible for recovery
             logger.exception("provisioning dispatch failed job_id=%s", pending_id)
         else:

@@ -21,6 +21,19 @@ _ENV_KEYS = [
     "XCHAT_ENABLED",
     "X_PUBLIC_REPLY_ENABLED",
     "X_OAUTH_LEGACY_STATE_WRITE",
+    "SCHEDULER_TICK_SECONDS",
+    "SCHEDULER_CORE_INTERVAL_SECONDS",
+    "SCHEDULER_CORE_WARN_AFTER_SECONDS",
+    "SCHEDULER_INSPECTION_WARN_AFTER_SECONDS",
+    "CHATWOOT_RECONCILE_INTERVAL_SECONDS",
+    "X_DM_POLL_INTERVAL_SECONDS",
+    "X_WEBHOOK_CHECK_INTERVAL_SECONDS",
+    "XCHAT_POLL_INTERVAL_SECONDS",
+    "XCHAT_MAX_CONVERSATIONS_PER_POLL",
+    "XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS",
+    "XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS",
+    "XCHAT_READY_PROBE_INTERVAL_SECONDS",
+    "XCHAT_PENDING_PROBE_INTERVAL_SECONDS",
     "FACEBOOK_MESSENGER_ENABLED",
     "INSTAGRAM_MESSAGING_ENABLED",
     "WHATSAPP_ENABLED",
@@ -63,6 +76,19 @@ def test_testing_true_默认值可用() -> None:
     assert settings.x_activity_enabled is True
     assert settings.xchat_enabled is True
     assert settings.x_integration_enabled is True
+    assert settings.scheduler_tick_seconds == 0.5
+    assert settings.scheduler_core_interval_seconds == 3
+    assert settings.scheduler_core_warn_after_seconds == 30
+    assert settings.scheduler_inspection_warn_after_seconds == 300
+    assert settings.chatwoot_reconcile_interval_seconds == 3
+    assert settings.x_dm_poll_interval_seconds == 90
+    assert settings.x_webhook_check_interval_seconds == 600
+    assert settings.xchat_poll_interval_seconds == 900
+    assert settings.xchat_max_conversations_per_poll == 10
+    assert settings.xchat_subscription_check_interval_seconds == 600
+    assert settings.xchat_recovery_sweep_interval_seconds == 30
+    assert settings.xchat_ready_probe_interval_seconds == 21600
+    assert settings.xchat_pending_probe_interval_seconds == 600
     assert settings.facebook_messenger_enabled is True
     assert settings.instagram_messaging_enabled is True
     assert settings.whatsapp_enabled is True
@@ -140,6 +166,62 @@ def test_conversation_history_bounds_are_validated(name: str, value: int) -> Non
         _make(testing=True, **{name: value})
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("scheduler_tick_seconds", 0.049),
+        ("scheduler_tick_seconds", 10.01),
+        ("scheduler_core_interval_seconds", 0.49),
+        ("scheduler_core_interval_seconds", 60.01),
+        ("scheduler_core_warn_after_seconds", 0.99),
+        ("scheduler_core_warn_after_seconds", 3600.01),
+        ("scheduler_inspection_warn_after_seconds", 0.99),
+        ("scheduler_inspection_warn_after_seconds", 7200.01),
+        ("chatwoot_reconcile_interval_seconds", 0),
+        ("chatwoot_reconcile_interval_seconds", 3601),
+        ("x_dm_poll_interval_seconds", -1),
+        ("x_dm_poll_interval_seconds", 86401),
+        ("x_webhook_check_interval_seconds", -1),
+        ("x_webhook_check_interval_seconds", 86401),
+        ("xchat_poll_interval_seconds", -1),
+        ("xchat_poll_interval_seconds", 86401),
+        ("xchat_max_conversations_per_poll", 0),
+        ("xchat_max_conversations_per_poll", 1001),
+        ("xchat_subscription_check_interval_seconds", -1),
+        ("xchat_subscription_check_interval_seconds", 86401),
+        ("xchat_recovery_sweep_interval_seconds", -1),
+        ("xchat_recovery_sweep_interval_seconds", 3601),
+        ("xchat_ready_probe_interval_seconds", -1),
+        ("xchat_ready_probe_interval_seconds", 604801),
+        ("xchat_pending_probe_interval_seconds", -1),
+        ("xchat_pending_probe_interval_seconds", 86401),
+    ],
+)
+def test_scheduler_and_x_reconciliation_bounds(name: str, value: float) -> None:
+    with pytest.raises(ValueError):
+        _make(testing=True, **{name: value})
+
+
+def test_x_reconciliation_intervals_accept_zero() -> None:
+    settings = _make(
+        testing=True,
+        x_dm_poll_interval_seconds=0,
+        x_webhook_check_interval_seconds=0,
+        xchat_poll_interval_seconds=0,
+        xchat_subscription_check_interval_seconds=0,
+        xchat_recovery_sweep_interval_seconds=0,
+        xchat_ready_probe_interval_seconds=0,
+        xchat_pending_probe_interval_seconds=0,
+    )
+    assert settings.x_dm_poll_interval_seconds == 0
+    assert settings.x_webhook_check_interval_seconds == 0
+    assert settings.xchat_poll_interval_seconds == 0
+    assert settings.xchat_subscription_check_interval_seconds == 0
+    assert settings.xchat_recovery_sweep_interval_seconds == 0
+    assert settings.xchat_ready_probe_interval_seconds == 0
+    assert settings.xchat_pending_probe_interval_seconds == 0
+
+
 def test_x_app_credentials_must_be_configured_as_a_pair() -> None:
     with pytest.raises(ValueError, match="X_API_KEY"):
         _make(testing=True, x_api_key="key-only")
@@ -198,6 +280,14 @@ def test_environment_templates_disable_future_platforms() -> None:
         assert "INSTAGRAM_MESSAGING_ENABLED=false" in content
         assert "WHATSAPP_ENABLED=false" in content
         assert "META_HEALTH_CHECK_INTERVAL_SECONDS=600" in content
+        assert "SCHEDULER_TICK_SECONDS=0.5" in content
+        assert "SCHEDULER_CORE_INTERVAL_SECONDS=3" in content
+        assert "SCHEDULER_CORE_WARN_AFTER_SECONDS=30" in content
+        assert "SCHEDULER_INSPECTION_WARN_AFTER_SECONDS=300" in content
+        assert "CHATWOOT_RECONCILE_INTERVAL_SECONDS=3" in content
+        assert "XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS=30" in content
+        assert "XCHAT_READY_PROBE_INTERVAL_SECONDS=21600" in content
+        assert "XCHAT_PENDING_PROBE_INTERVAL_SECONDS=600" in content
 
 
 def test_meta_app_credentials_must_be_configured_as_pairs() -> None:

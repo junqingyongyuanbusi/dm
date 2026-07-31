@@ -138,21 +138,32 @@ created them.
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
-## Module-level reconciliation variables
+## Scheduler and reconciliation settings
 
-These variables are not yet `Settings` fields. Their modules read them once at import, so changing
-them requires recreating API/Worker/Scheduler containers as applicable.
+The scheduler reads one validated settings snapshot at startup. X reconciliation functions also read
+one snapshot per public invocation and retain those cadence and budget values for the full run.
+Configuration changes take effect after the relevant process restarts. A zero X interval disables
+local throttling, which is useful for direct invocations and tests.
 
-| Variable | Default | Consumer |
-| --- | --- | --- |
-| `X_DM_POLL_INTERVAL_SECONDS` | `90` | Scheduler legacy DM poll |
-| `X_WEBHOOK_CHECK_INTERVAL_SECONDS` | `600` | Scheduler X webhook health |
-| `XCHAT_POLL_INTERVAL_SECONDS` | `900` | Scheduler XChat poll |
-| `XCHAT_MAX_CONVERSATIONS_PER_POLL` | `10` | XChat poll work budget |
-| `XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | `600` | Scheduler XChat subscription reconciliation |
-| `XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS` | `30` | Scheduler XChat RawEvent recovery sweep |
-| `XCHAT_READY_PROBE_INTERVAL_SECONDS` | `21600` | Public-key health probe for ready XChat accounts |
-| `XCHAT_PENDING_PROBE_INTERVAL_SECONDS` | `600` | Public-key health probe for pending XChat accounts |
+Each sweep allows at most one running instance. Missed intervals are coalesced instead of queued, and
+a slow sweep is warned about without hard cancellation because reconciliation may have external side
+effects.
+
+| Variable | Default | Validation | Consumer |
+| --- | --- | --- | --- |
+| `SCHEDULER_TICK_SECONDS` | `0.5` | 0.05-10 | Scheduler due-work scan cadence |
+| `SCHEDULER_CORE_INTERVAL_SECONDS` | `3` | 0.5-60 | Durable core recovery cadence |
+| `SCHEDULER_CORE_WARN_AFTER_SECONDS` | `30` | 1-3600 | Core slow-run warning threshold |
+| `SCHEDULER_INSPECTION_WARN_AFTER_SECONDS` | `300` | 1-7200 | Inspection slow-run warning threshold |
+| `CHATWOOT_RECONCILE_INTERVAL_SECONDS` | `3` | 1-3600 | Chatwoot reconciliation cadence |
+| `X_DM_POLL_INTERVAL_SECONDS` | `90` | 0-86400 | Legacy DM poll cadence |
+| `X_WEBHOOK_CHECK_INTERVAL_SECONDS` | `600` | 0-86400 | X webhook health cadence |
+| `XCHAT_POLL_INTERVAL_SECONDS` | `900` | 0-86400 | XChat poll cadence |
+| `XCHAT_MAX_CONVERSATIONS_PER_POLL` | `10` | 1-1000 | XChat poll work budget |
+| `XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | `600` | 0-86400 | XChat subscription reconciliation cadence |
+| `XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS` | `30` | 0-3600 | XChat RawEvent recovery cadence |
+| `XCHAT_READY_PROBE_INTERVAL_SECONDS` | `21600` | 0-604800 | Public-key health probe for ready XChat accounts |
+| `XCHAT_PENDING_PROBE_INTERVAL_SECONDS` | `600` | 0-86400 | Public-key health probe for pending XChat accounts |
 
 ## Deployment-only variables
 

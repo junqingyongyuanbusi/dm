@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -12,6 +11,7 @@ from social_reply.application.event_ingestion.xchat_subscription import (
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,6 @@ _SCHEDULER_STATUSES = (
 _ACTIVATION_ONLY_STATUSES = ("XCHAT_DECRYPT_FAILED",)
 _REPLAY_BATCH_SIZE = 100
 _DISPATCH_RESERVATION = timedelta(minutes=5)
-_SWEEP_INTERVAL_SECONDS = int(os.getenv("XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS", "30"))
 _MAX_RETRY_ATTEMPTS = 8
 _last_sweep_at: float | None = None
 
@@ -186,8 +185,10 @@ async def _recover_expired_claims(*, limit: int = _REPLAY_BATCH_SIZE) -> list[st
 
 async def sweep_xchat_recovery() -> list[str]:
     global _last_sweep_at
+    settings = get_settings()
+    sweep_interval_seconds = settings.xchat_recovery_sweep_interval_seconds
     now = time.monotonic()
-    if _last_sweep_at is not None and now - _last_sweep_at < _SWEEP_INTERVAL_SECONDS:
+    if _last_sweep_at is not None and now - _last_sweep_at < sweep_interval_seconds:
         return []
     _last_sweep_at = now
 

@@ -1,7 +1,6 @@
 """Durable XChat polling with per-conversation checkpoints and recoverable gaps."""
 
 import logging
-import os
 import time
 import uuid
 from collections import defaultdict
@@ -39,12 +38,11 @@ from social_reply.connectors.xchat.key_cache import (
     save_conversation_key_events,
 )
 from social_reply.domain.platform_accounts import CapabilityKey, capability_enabled
+from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_POLL_INTERVAL_SECONDS = int(os.getenv("XCHAT_POLL_INTERVAL_SECONDS", "900"))
 _MAX_CONVERSATION_PAGES = 3
-_MAX_CONVERSATIONS_PER_POLL = int(os.getenv("XCHAT_MAX_CONVERSATIONS_PER_POLL", "10"))
 _MAX_EVENT_PAGES = 3
 _BACKFILL_REPLY_WINDOW = timedelta(hours=24)
 _last_poll_at: float | None = None
@@ -77,8 +75,11 @@ class _EventRead:
 
 async def poll_xchat_messages(*, scheduler_owner: str | None = None) -> list[str]:
     global _last_poll_at
+    settings = get_settings()
+    poll_interval_seconds = settings.xchat_poll_interval_seconds
+    max_conversations = settings.xchat_max_conversations_per_poll
     now = time.monotonic()
-    if _last_poll_at is not None and now - _last_poll_at < _POLL_INTERVAL_SECONDS:
+    if _last_poll_at is not None and now - _last_poll_at < poll_interval_seconds:
         return []
     _last_poll_at = now
 
@@ -98,13 +99,21 @@ async def poll_xchat_messages(*, scheduler_owner: str | None = None) -> list[str
         if claim is None:
             continue
         try:
-            ingested.extend(await _poll_account(account, claim=claim, owner=owner))
+            ingested.extend(
+                await _poll_account(
+                    account,
+                    claim=claim,
+                    owner=owner,
+                    poll_interval_seconds=poll_interval_seconds,
+                    max_conversations=max_conversations,
+                )
+            )
         except httpx.HTTPStatusError as exc:
             await fail_run(
                 claim,
                 error_code=f"XCHAT_HTTP_{exc.response.status_code}",
                 error_message=str(exc),
-                retry_after_seconds=_POLL_INTERVAL_SECONDS,
+                retry_after_seconds=poll_interval_seconds,
             )
             logger.error(
                 "xchat poll http error account=%s status=%s",
@@ -116,7 +125,7 @@ async def poll_xchat_messages(*, scheduler_owner: str | None = None) -> list[str
                 claim,
                 error_code="XCHAT_DISCOVERY_FAILED",
                 error_message=str(exc),
-                retry_after_seconds=_POLL_INTERVAL_SECONDS,
+                retry_after_seconds=poll_interval_seconds,
             )
             logger.exception("xchat poll failed account=%s", account.id)
     return ingested
@@ -127,13 +136,15 @@ async def _poll_account(
     *,
     claim: ClaimedCheckpoint,
     owner: str,
+    poll_interval_seconds: int,
+    max_conversations: int,
 ) -> list[str]:
     if not account.external_account_id:
         await fail_run(
             claim,
             error_code="XCHAT_ACCOUNT_ID_MISSING",
             error_message="platform account has no external_account_id",
-            retry_after_seconds=_POLL_INTERVAL_SECONDS,
+            retry_after_seconds=poll_interval_seconds,
         )
         return []
     credentials = x_credentials(account)
@@ -145,7 +156,11 @@ async def _poll_account(
         api_base_url=(account.config or {}).get("api_base_url", "https://api.x.com"),
     )
     try:
-        discovery = await _read_conversations(client, claim=claim)
+        discovery = await _read_conversations(
+            client,
+            claim=claim,
+            max_conversations=max_conversations,
+        )
         discovery.conversations.sort(
             key=lambda item: str(item.get("updated_at") or ""), reverse=True
         )
@@ -172,6 +187,7 @@ async def _poll_account(
                     conversation_id=conversation_id,
                     peer_id=participant_ids[0],
                     owner=owner,
+                    poll_interval_seconds=poll_interval_seconds,
                 )
             )
             await require_claim(claim)
@@ -179,7 +195,7 @@ async def _poll_account(
             await record_gap(
                 claim,
                 discovery.gap,
-                retry_after_seconds=_POLL_INTERVAL_SECONDS,
+                retry_after_seconds=poll_interval_seconds,
                 page_count=discovery.page_count,
                 occurrence_count=0,
             )
@@ -188,7 +204,7 @@ async def _poll_account(
                 claim,
                 cursor=None,
                 bootstrapped=True,
-                interval_seconds=_POLL_INTERVAL_SECONDS,
+                interval_seconds=poll_interval_seconds,
                 page_count=discovery.page_count,
                 occurrence_count=0,
             )
@@ -201,11 +217,12 @@ async def _read_conversations(
     client: XChatClient,
     *,
     claim: ClaimedCheckpoint,
+    max_conversations: int,
 ) -> _ConversationRead:
     token = claim.active_gap.resume_token if claim.active_gap else None
     conversations: list[dict] = []
     seen_tokens: set[str] = set()
-    work_budget = max(1, _MAX_CONVERSATIONS_PER_POLL)
+    work_budget = max(1, max_conversations)
     for page_index in range(_MAX_CONVERSATION_PAGES):
         request_token = token
         remaining = max(work_budget - len(conversations), 1)
@@ -277,6 +294,7 @@ async def _poll_conversation(
     conversation_id: str,
     peer_id: str,
     owner: str,
+    poll_interval_seconds: int,
 ) -> list[str]:
     config = account.config or {}
     initial_cursor = (config.get("xchat_cursors") or {}).get(conversation_id)
@@ -300,13 +318,14 @@ async def _poll_conversation(
             conversation_id=conversation_id,
             peer_id=peer_id,
             claim=claim,
+            poll_interval_seconds=poll_interval_seconds,
         )
     except Exception as exc:  # noqa: BLE001 - one conversation must not block discovery
         await fail_run(
             claim,
             error_code="XCHAT_CONVERSATION_FAILED",
             error_message=str(exc),
-            retry_after_seconds=_POLL_INTERVAL_SECONDS,
+            retry_after_seconds=poll_interval_seconds,
         )
         logger.exception(
             "xchat conversation poll failed account=%s conversation=%s",
@@ -324,6 +343,7 @@ async def _process_conversation(
     conversation_id: str,
     peer_id: str,
     claim: ClaimedCheckpoint,
+    poll_interval_seconds: int,
 ) -> list[str]:
     credentials = x_credentials(account)
     result = await _read_until_cursor(
@@ -476,7 +496,7 @@ async def _process_conversation(
                     "error_indexes": sorted(error_indexes),
                 },
             ),
-            retry_after_seconds=_POLL_INTERVAL_SECONDS,
+            retry_after_seconds=poll_interval_seconds,
             page_count=result.page_count,
             occurrence_count=result.occurrence_count,
         )
@@ -485,7 +505,7 @@ async def _process_conversation(
         await record_gap(
             claim,
             result.gap,
-            retry_after_seconds=_POLL_INTERVAL_SECONDS,
+            retry_after_seconds=poll_interval_seconds,
             page_count=result.page_count,
             occurrence_count=result.occurrence_count,
         )
@@ -495,7 +515,7 @@ async def _process_conversation(
         claim,
         cursor=_max_cursor(claim.cursor, result.candidate_cursor),
         bootstrapped=True,
-        interval_seconds=_POLL_INTERVAL_SECONDS,
+        interval_seconds=poll_interval_seconds,
         page_count=result.page_count,
         occurrence_count=result.occurrence_count,
     )

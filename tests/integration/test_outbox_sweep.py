@@ -83,17 +83,16 @@ async def test_outbox_sweep_isolates_broker_dispatch_failures(session, monkeypat
     first = await _seed(session)
     second = await _seed(session)
     calls: list[uuid.UUID] = []
-    from social_reply.application.message_delivery.actors import deliver_outbox_message
-    from social_reply.application.message_delivery.sweep import sweep_outbox
+    from social_reply.application.message_delivery import sweep as sweep_module
 
-    def dispatch(outbox_id: str):
+    async def dispatch(_actor, outbox_id: str, **_kwargs):
         calls.append(uuid.UUID(outbox_id))
         if len(calls) == 1:
             raise RuntimeError("broker unavailable")
 
-    monkeypatch.setattr(deliver_outbox_message, "send", dispatch)
+    monkeypatch.setattr(sweep_module, "dispatch_actor", dispatch)
 
-    dispatched = await sweep_outbox()
+    dispatched = await sweep_module.sweep_outbox()
     assert set(calls) == {first, second}
     assert len(dispatched) == 1
     assert dispatched[0] == calls[1]

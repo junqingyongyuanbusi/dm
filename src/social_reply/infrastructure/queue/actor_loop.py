@@ -1,6 +1,7 @@
 import asyncio
 import threading
 from collections.abc import Coroutine
+from concurrent.futures import Future
 from typing import Any
 
 # 单一常驻事件循环：所有 Dramatiq actor 共用，使单例引擎连接池只绑定这一个循环。
@@ -9,11 +10,16 @@ _loop = asyncio.new_event_loop()
 threading.Thread(target=_loop.run_forever, daemon=True, name="actor-loop").start()
 
 
+def submit_on_actor_loop(coro: Coroutine[Any, Any, Any]) -> Future[Any]:
+    """Submit a coroutine to the shared actor loop without blocking the caller."""
+    return asyncio.run_coroutine_threadsafe(coro, _loop)
+
+
 def run_on_actor_loop(coro: Coroutine[Any, Any, Any], timeout: float = 120) -> Any:
     """在常驻 loop 上跑协程并阻塞取结果。
     无超时的 result() 会阻塞在 C 层锁上，Dramatiq TimeLimit 杀不掉
     """
-    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    future = submit_on_actor_loop(coro)
     try:
         return future.result(timeout=timeout)
     except TimeoutError:

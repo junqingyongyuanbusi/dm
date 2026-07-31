@@ -288,14 +288,12 @@ async def test_decision_sweep_isolates_broker_dispatch_failures(session, monkeyp
     second = await _seed_job(session)
     calls: list[uuid.UUID] = []
 
-    from social_reply.application.reply_decision.actors import process_reply_decision
-
-    def dispatch(job_id: str):
+    async def dispatch(_actor, job_id: str, **_kwargs):
         calls.append(uuid.UUID(job_id))
         if len(calls) == 1:
             raise RuntimeError("broker unavailable")
 
-    monkeypatch.setattr(process_reply_decision, "send", dispatch)
+    monkeypatch.setattr(decision_jobs, "dispatch_actor", dispatch)
 
     dispatched = await sweep_decision_jobs()
     assert set(calls) == {first, second}

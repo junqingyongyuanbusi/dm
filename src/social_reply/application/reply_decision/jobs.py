@@ -24,6 +24,7 @@ from social_reply.infrastructure.database.advisory_locks import (
     acquire_conversation_delivery_xact_lock,
 )
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -527,7 +528,7 @@ async def sweep_decision_jobs() -> list[uuid.UUID]:
     dispatched: list[uuid.UUID] = []
     for pending_id in job_ids:
         try:
-            process_reply_decision.send(str(pending_id))
+            await dispatch_actor(process_reply_decision, str(pending_id))
         except Exception:  # noqa: BLE001 - durable state remains eligible for recovery
             logger.exception("decision dispatch failed job_id=%s", pending_id)
         else:
