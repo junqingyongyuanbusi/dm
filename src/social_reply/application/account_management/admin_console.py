@@ -9,6 +9,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import NoReturn
 from urllib.parse import urlencode
 
 import redis.asyncio as aioredis
@@ -1320,6 +1321,21 @@ _TRANSITION_LABELS = {
 }
 
 
+def _fail_conversation_detail_scope(
+    *,
+    conversation_id: uuid.UUID,
+    relation: str,
+    related_id: uuid.UUID | None,
+) -> NoReturn:
+    logger.warning(
+        "conversation detail scope mismatch conversation_id=%s relation=%s related_id=%s",
+        conversation_id,
+        relation,
+        related_id,
+    )
+    raise HTTPException(status_code=404, detail="conversation_not_found")
+
+
 @router.get("/conversations/{conversation_id}", response_class=HTMLResponse)
 async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> Response:
     principal = await _web_principal(request)
@@ -1330,10 +1346,35 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         conv = await session.get(models.Conversation, conversation_id)
         if conv is None or conv.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="conversation_not_found")
-        contact = await session.get(models.Contact, conv.contact_id)
-        account = await session.get(models.PlatformAccount, conv.platform_account_id)
-        if account is None or account.tenant_id != conv.tenant_id:
-            raise HTTPException(status_code=409, detail="conversation_account_scope_mismatch")
+        contact = (
+            await session.execute(
+                select(models.Contact).where(
+                    models.Contact.id == conv.contact_id,
+                    models.Contact.tenant_id == conv.tenant_id,
+                    models.Contact.platform_account_id == conv.platform_account_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if contact is None:
+            _fail_conversation_detail_scope(
+                conversation_id=conversation_id,
+                relation="contact",
+                related_id=conv.contact_id,
+            )
+        account = (
+            await session.execute(
+                select(models.PlatformAccount).where(
+                    models.PlatformAccount.id == conv.platform_account_id,
+                    models.PlatformAccount.tenant_id == conv.tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if account is None:
+            _fail_conversation_detail_scope(
+                conversation_id=conversation_id,
+                relation="platform_account",
+                related_id=conv.platform_account_id,
+            )
         state_row = (
             await session.execute(
                 select(models.AutomationState).where(
@@ -1341,6 +1382,28 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
                 )
             )
         ).scalar_one_or_none()
+        message_source_scope_mismatch = await session.scalar(
+            select(models.Message.id)
+            .join(
+                models.OutboxMessage,
+                models.Message.source_outbox_id == models.OutboxMessage.id,
+            )
+            .where(
+                models.Message.conversation_id == conversation_id,
+                or_(
+                    models.OutboxMessage.tenant_id != conv.tenant_id,
+                    models.OutboxMessage.conversation_id != conversation_id,
+                    models.OutboxMessage.platform_account_id != conv.platform_account_id,
+                ),
+            )
+            .limit(1)
+        )
+        if message_source_scope_mismatch is not None:
+            _fail_conversation_detail_scope(
+                conversation_id=conversation_id,
+                relation="message_source_outbox",
+                related_id=message_source_scope_mismatch,
+            )
         newest_messages = (
             (
                 await session.execute(
@@ -1354,11 +1417,28 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
             .all()
         )
         msgs = list(reversed(newest_messages))
+        decision_scope_mismatch = await session.scalar(
+            select(models.ReplyDecision.id)
+            .where(
+                models.ReplyDecision.conversation_id == conversation_id,
+                models.ReplyDecision.tenant_id != conv.tenant_id,
+            )
+            .limit(1)
+        )
+        if decision_scope_mismatch is not None:
+            _fail_conversation_detail_scope(
+                conversation_id=conversation_id,
+                relation="reply_decision",
+                related_id=decision_scope_mismatch,
+            )
         decisions = (
             (
                 await session.execute(
                     select(models.ReplyDecision)
-                    .where(models.ReplyDecision.conversation_id == conversation_id)
+                    .where(
+                        models.ReplyDecision.conversation_id == conversation_id,
+                        models.ReplyDecision.tenant_id == conv.tenant_id,
+                    )
                     .order_by(desc(models.ReplyDecision.created_at))
                     .limit(10)
                 )
@@ -1366,11 +1446,28 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
             .scalars()
             .all()
         )
+        work_item_scope_mismatch = await session.scalar(
+            select(models.HumanWorkItem.id)
+            .where(
+                models.HumanWorkItem.conversation_id == conversation_id,
+                models.HumanWorkItem.tenant_id != conv.tenant_id,
+            )
+            .limit(1)
+        )
+        if work_item_scope_mismatch is not None:
+            _fail_conversation_detail_scope(
+                conversation_id=conversation_id,
+                relation="human_work_item",
+                related_id=work_item_scope_mismatch,
+            )
         work_item = (
             (
                 await session.execute(
                     select(models.HumanWorkItem)
-                    .where(models.HumanWorkItem.conversation_id == conversation_id)
+                    .where(
+                        models.HumanWorkItem.conversation_id == conversation_id,
+                        models.HumanWorkItem.tenant_id == conv.tenant_id,
+                    )
                     .order_by(desc(models.HumanWorkItem.created_at))
                     .limit(1)
                 )
@@ -1383,11 +1480,32 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
                 require_work_conversation_tenant(work_item, conversation_tenant_id=conv.tenant_id)
             except HumanWorkflowError as exc:
                 raise _workflow_error(exc) from exc
+        outbox_scope_mismatch = await session.scalar(
+            select(models.OutboxMessage.id)
+            .where(
+                models.OutboxMessage.conversation_id == conversation_id,
+                or_(
+                    models.OutboxMessage.tenant_id != conv.tenant_id,
+                    models.OutboxMessage.platform_account_id != conv.platform_account_id,
+                ),
+            )
+            .limit(1)
+        )
+        if outbox_scope_mismatch is not None:
+            _fail_conversation_detail_scope(
+                conversation_id=conversation_id,
+                relation="outbox_message",
+                related_id=outbox_scope_mismatch,
+            )
         outboxes = (
             (
                 await session.execute(
                     select(models.OutboxMessage)
-                    .where(models.OutboxMessage.conversation_id == conversation_id)
+                    .where(
+                        models.OutboxMessage.conversation_id == conversation_id,
+                        models.OutboxMessage.tenant_id == conv.tenant_id,
+                        models.OutboxMessage.platform_account_id == conv.platform_account_id,
+                    )
                     .order_by(desc(models.OutboxMessage.created_at))
                     .limit(20)
                 )
@@ -1395,18 +1513,56 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
             .scalars()
             .all()
         )
-        subject_ids = [str(conversation_id)]
+        audit_subjects = [
+            and_(
+                models.AuditLog.subject_type == "conversation",
+                models.AuditLog.subject_id == str(conversation_id),
+            )
+        ]
         if work_item is not None:
-            subject_ids.append(str(work_item.id))
-        subject_ids.extend(str(decision.id) for decision in decisions)
-        subject_ids.extend(str(outbox.id) for outbox in outboxes)
+            audit_subjects.append(
+                and_(
+                    models.AuditLog.subject_type == "human_work_item",
+                    models.AuditLog.subject_id == str(work_item.id),
+                )
+            )
+        if decisions:
+            audit_subjects.append(
+                and_(
+                    models.AuditLog.subject_type == "reply_decision",
+                    models.AuditLog.subject_id.in_(
+                        tuple(str(decision.id) for decision in decisions)
+                    ),
+                )
+            )
+        if outboxes:
+            audit_subjects.append(
+                and_(
+                    models.AuditLog.subject_type == "outbox",
+                    models.AuditLog.subject_id.in_(tuple(str(outbox.id) for outbox in outboxes)),
+                )
+            )
+        audit_scope_mismatch = await session.scalar(
+            select(models.AuditLog.id)
+            .where(
+                models.AuditLog.tenant_id != conv.tenant_id,
+                or_(*audit_subjects),
+            )
+            .limit(1)
+        )
+        if audit_scope_mismatch is not None:
+            _fail_conversation_detail_scope(
+                conversation_id=conversation_id,
+                relation="audit_log",
+                related_id=audit_scope_mismatch,
+            )
         audit_logs = (
             (
                 await session.execute(
                     select(models.AuditLog)
                     .where(
                         models.AuditLog.tenant_id == conv.tenant_id,
-                        models.AuditLog.subject_id.in_(subject_ids),
+                        or_(*audit_subjects),
                     )
                     .order_by(desc(models.AuditLog.created_at))
                     .limit(30)

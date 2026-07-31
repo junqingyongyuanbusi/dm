@@ -552,6 +552,251 @@ async def test_inbox_rejects_cross_tenant_join_mismatches(session, migrated_db):
     assert counts.json() == {"human": 0, "drafts": 0, "delivery": 0}
 
 
+@pytest.mark.parametrize(
+    ("mismatch", "expected_relation"),
+    [
+        ("contact_tenant", "contact"),
+        ("contact_account", "contact"),
+        ("reply_decision", "reply_decision"),
+        ("outbox_tenant", "outbox_message"),
+        ("outbox_account", "outbox_message"),
+        ("message_source_outbox", "message_source_outbox"),
+        ("audit_log", "audit_log"),
+    ],
+)
+async def test_conversation_detail_fails_closed_on_tenant_mismatch(
+    session, migrated_db, caplog, mismatch, expected_relation
+):
+    now = datetime.now(UTC)
+    account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix=f"detail-{mismatch}",
+        display_name=f"Safe customer {mismatch}",
+        work_created_at=now,
+    )
+    local_decision_text = f"LOCAL-{mismatch}-DECISION"
+    local_outbox_text = f"LOCAL-{mismatch}-OUTBOX"
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            id=uuid.uuid4(),
+            tenant_id="default",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            action="draft",
+            reply_text=local_decision_text,
+            original_reply_text=local_decision_text,
+            review_action="PENDING",
+            reason_codes=[],
+            source="rule",
+        )
+    )
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=uuid.uuid4(),
+            tenant_id="default",
+            conversation_id=conversation_id,
+            platform_account_id=account_id,
+            destination_type="telegram_dm",
+            destination_id="telegram:local:user",
+            message_type="text",
+            payload={"text": local_outbox_text, "target": {"chat_id": "local"}},
+            reply_to_message_id=message_id,
+            origin_kind="MANUAL_REPLY",
+            actor_kind="ADMIN_HUMAN",
+            actor_id="user:admin",
+            idempotency_key=f"local-{uuid.uuid4()}",
+            status="SENT",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        healthy_detail = await client.get(f"/admin/conversations/{conversation_id}")
+
+        foreign_secret = f"FOREIGN-{mismatch}-SECRET"
+        if mismatch in {"contact_tenant", "contact_account"}:
+            contact_id = await session.scalar(
+                select(models.Conversation.contact_id).where(
+                    models.Conversation.id == conversation_id
+                )
+            )
+            contact_values = {"display_name": foreign_secret}
+            if mismatch == "contact_tenant":
+                contact_values["tenant_id"] = "other"
+            else:
+                other_account_id = uuid.uuid4()
+                await session.execute(
+                    insert(models.PlatformAccount).values(
+                        id=other_account_id,
+                        tenant_id="default",
+                        brand_id="b1",
+                        platform="telegram",
+                        name="Other local account",
+                        public_id=f"other-local-{uuid.uuid4()}",
+                        credential_bundle=encrypt_secret_bundle({"bot_token": "token"}),
+                        config={"delivery_mode": "direct"},
+                        capability={"dm": True, "max_text_length": 4096},
+                        automation_default="BOT_DRAFT_ONLY",
+                        status="active",
+                    )
+                )
+                contact_values["platform_account_id"] = other_account_id
+            await session.execute(
+                update(models.Contact)
+                .where(models.Contact.id == contact_id)
+                .values(**contact_values)
+            )
+        elif mismatch == "reply_decision":
+            await session.execute(
+                insert(models.ReplyDecision).values(
+                    id=uuid.uuid4(),
+                    tenant_id="other",
+                    conversation_id=conversation_id,
+                    message_id=None,
+                    action="draft",
+                    intent=foreign_secret,
+                    reply_text=foreign_secret,
+                    original_reply_text=foreign_secret,
+                    review_action="PENDING",
+                    reason_codes=[foreign_secret],
+                    source="rule",
+                )
+            )
+        elif mismatch in {"outbox_tenant", "outbox_account"}:
+            outbox_tenant = "other" if mismatch == "outbox_tenant" else "default"
+            outbox_account_id = account_id
+            if mismatch == "outbox_account":
+                outbox_account_id = uuid.uuid4()
+                await session.execute(
+                    insert(models.PlatformAccount).values(
+                        id=outbox_account_id,
+                        tenant_id="default",
+                        brand_id="b1",
+                        platform="telegram",
+                        name="Other outbox account",
+                        public_id=f"other-outbox-{uuid.uuid4()}",
+                        credential_bundle=encrypt_secret_bundle({"bot_token": "token"}),
+                        config={"delivery_mode": "direct"},
+                        capability={"dm": True, "max_text_length": 4096},
+                        automation_default="BOT_DRAFT_ONLY",
+                        status="active",
+                    )
+                )
+            await session.execute(
+                insert(models.OutboxMessage).values(
+                    id=uuid.uuid4(),
+                    tenant_id=outbox_tenant,
+                    conversation_id=conversation_id,
+                    platform_account_id=outbox_account_id,
+                    destination_type="telegram_dm",
+                    destination_id="telegram:foreign:user",
+                    message_type="text",
+                    payload={"text": foreign_secret, "target": {"chat_id": "foreign"}},
+                    reply_to_message_id=message_id,
+                    origin_kind="MANUAL_REPLY",
+                    actor_kind="ADMIN_HUMAN",
+                    actor_id="user:foreign",
+                    idempotency_key=f"foreign-{uuid.uuid4()}",
+                    status="FAILED",
+                    last_error_code="FOREIGN_ERROR",
+                    last_error_message=foreign_secret,
+                )
+            )
+        elif mismatch == "message_source_outbox":
+            foreign_account_id, foreign_contact_id, foreign_conversation_id, foreign_outbox_id = (
+                uuid.uuid4() for _ in range(4)
+            )
+            await session.execute(
+                insert(models.PlatformAccount).values(
+                    id=foreign_account_id,
+                    tenant_id="other",
+                    brand_id="foreign",
+                    platform="telegram",
+                    name="Foreign account",
+                    public_id=f"foreign-{uuid.uuid4()}",
+                    credential_bundle=encrypt_secret_bundle({"bot_token": "foreign-token"}),
+                    config={"delivery_mode": "direct"},
+                    capability={"dm": True, "max_text_length": 4096},
+                    automation_default="BOT_DRAFT_ONLY",
+                    status="active",
+                )
+            )
+            await session.execute(
+                insert(models.Contact).values(
+                    id=foreign_contact_id,
+                    tenant_id="other",
+                    platform="telegram",
+                    platform_account_id=foreign_account_id,
+                    external_user_id=f"foreign-{uuid.uuid4()}",
+                    display_name="Foreign contact",
+                )
+            )
+            await session.execute(
+                insert(models.Conversation).values(
+                    id=foreign_conversation_id,
+                    tenant_id="other",
+                    brand_id="foreign",
+                    platform="telegram",
+                    platform_account_id=foreign_account_id,
+                    contact_id=foreign_contact_id,
+                    conversation_key=f"foreign:{uuid.uuid4()}",
+                    channel_type="dm",
+                )
+            )
+            await session.execute(
+                insert(models.OutboxMessage).values(
+                    id=foreign_outbox_id,
+                    tenant_id="other",
+                    conversation_id=foreign_conversation_id,
+                    platform_account_id=foreign_account_id,
+                    destination_type="telegram_dm",
+                    destination_id="telegram:foreign-source:user",
+                    message_type="text",
+                    payload={"text": foreign_secret, "target": {"chat_id": "foreign-source"}},
+                    origin_kind="MANUAL_REPLY",
+                    actor_kind="ADMIN_HUMAN",
+                    actor_id="user:foreign",
+                    idempotency_key=f"foreign-source-{uuid.uuid4()}",
+                    status="SENT",
+                )
+            )
+            await session.execute(
+                update(models.Message)
+                .where(models.Message.id == message_id)
+                .values(source_outbox_id=foreign_outbox_id, text=foreign_secret)
+            )
+        else:
+            await session.execute(
+                insert(models.AuditLog).values(
+                    id=uuid.uuid4(),
+                    tenant_id="other",
+                    category="admin_action",
+                    actor="user:foreign",
+                    action="FOREIGN_AUDIT",
+                    subject_type="conversation",
+                    subject_id=str(conversation_id),
+                    detail={"secret": foreign_secret},
+                )
+            )
+        await session.commit()
+
+        caplog.clear()
+        mismatched_detail = await client.get(f"/admin/conversations/{conversation_id}")
+
+    assert healthy_detail.status_code == 200
+    assert f"Safe customer {mismatch}" in healthy_detail.text
+    assert local_decision_text in healthy_detail.text
+    assert local_outbox_text in healthy_detail.text
+    assert mismatched_detail.status_code == 404
+    assert foreign_secret not in mismatched_detail.text
+    assert any(
+        "conversation detail scope mismatch" in record.message
+        and f"relation={expected_relation}" in record.message
+        for record in caplog.records
+    )
+
+
 async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
     session, migrated_db, monkeypatch
 ):
