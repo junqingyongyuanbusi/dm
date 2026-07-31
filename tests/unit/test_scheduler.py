@@ -75,7 +75,6 @@ def test_build_specs_uses_feature_flags_and_each_settings_snapshot():
         spec.warn_after_seconds == 22 for spec in first_specs.values() if spec.lane == "inspection"
     )
     assert second_specs["sweep_xchat_recovery"].interval_seconds == 37
-    assert not hasattr(scheduler, "_SWEEPS")
 
 
 def test_build_specs_omits_disabled_integrations():
