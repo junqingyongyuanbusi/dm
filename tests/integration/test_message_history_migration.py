@@ -1,39 +1,15 @@
-import asyncio
-import os
-import subprocess
-import sys
 import uuid
-from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
+from tests.integration.migration_support import assert_alembic_succeeds, run_alembic
 
 from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-async def _run_alembic(database_url: str, *args: str):
-    env = {**os.environ, "DATABASE_URL": database_url, "TESTING": "true"}
-    return await asyncio.to_thread(
-        subprocess.run,
-        [sys.executable, "-m", "alembic", *args],
-        cwd=_REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-async def _alembic(database_url: str, *args: str) -> None:
-    result = await _run_alembic(database_url, *args)
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 async def test_platform_account_migration_rejects_incompatible_capability():
@@ -47,7 +23,7 @@ async def test_platform_account_migration_rejects_incompatible_capability():
         await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
 
     try:
-        await _alembic(database_url, "upgrade", "f3a6c1d8e250")
+        await assert_alembic_succeeds(database_url, "upgrade", "f3a6c1d8e250")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -63,7 +39,7 @@ async def test_platform_account_migration_rejects_incompatible_capability():
             )
         await engine.dispose()
 
-        result = await _run_alembic(database_url, "upgrade", "head")
+        result = await run_alembic(database_url, "upgrade", "head")
         assert result.returncode != 0
         assert "capability violates the application contract" in (result.stdout + result.stderr)
     finally:
@@ -90,7 +66,7 @@ async def test_meta_route_migration_rejects_cross_family_collision():
         await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
 
     try:
-        await _alembic(database_url, "upgrade", "c5a8e2f4d901")
+        await assert_alembic_succeeds(database_url, "upgrade", "c5a8e2f4d901")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -106,7 +82,7 @@ async def test_meta_route_migration_rejects_cross_family_collision():
             )
         await engine.dispose()
 
-        result = await _run_alembic(database_url, "upgrade", "head")
+        result = await run_alembic(database_url, "upgrade", "head")
         assert result.returncode != 0
         assert "cross-family Meta webhook public_id collision" in (result.stdout + result.stderr)
     finally:
@@ -128,7 +104,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
         await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
 
     try:
-        await _alembic(database_url, "upgrade", "a1c4e8b7f302")
+        await assert_alembic_succeeds(database_url, "upgrade", "a1c4e8b7f302")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -192,7 +168,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
             )
         await engine.dispose()
 
-        await _alembic(database_url, "upgrade", "f6c2a9d81b40")
+        await assert_alembic_succeeds(database_url, "upgrade", "f6c2a9d81b40")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -236,7 +212,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
             )
         await engine.dispose()
 
-        await _alembic(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             rows = (
@@ -308,7 +284,7 @@ async def test_message_history_migration_backfills_and_round_trips():
         await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
 
     try:
-        await _alembic(database_url, "upgrade", "e7b2c4d9a610")
+        await assert_alembic_succeeds(database_url, "upgrade", "e7b2c4d9a610")
         engine = create_async_engine(database_url)
         seed_statements = (
             """
@@ -393,7 +369,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                 await connection.execute(text(statement))
         await engine.dispose()
 
-        await _alembic(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = (
@@ -482,8 +458,8 @@ async def test_message_history_migration_backfills_and_round_trips():
                 )
         await engine.dispose()
 
-        await _alembic(database_url, "downgrade", "e7b2c4d9a610")
-        await _alembic(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "downgrade", "e7b2c4d9a610")
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             counts = (

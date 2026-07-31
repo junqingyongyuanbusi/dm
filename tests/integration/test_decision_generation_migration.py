@@ -1,45 +1,22 @@
 import asyncio
-import os
-import subprocess
-import sys
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
+from tests.integration.migration_support import assert_alembic_succeeds
 
 from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _BASE_REVISION = "b8e1d4f7a2c3"
 _FENCING_REVISION = "c2f4a6d8e901"
 _ACCOUNT_ID = uuid.UUID("10000000-0000-0000-0000-000000000001")
 _CONTACT_ID = uuid.UUID("10000000-0000-0000-0000-000000000002")
 _CONVERSATION_ID = uuid.UUID("10000000-0000-0000-0000-000000000003")
-
-
-async def _run_alembic(database_url: str, *args: str):
-    env = {**os.environ, "DATABASE_URL": database_url, "TESTING": "true"}
-    return await asyncio.to_thread(
-        subprocess.run,
-        [sys.executable, "-m", "alembic", *args],
-        cwd=_REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-async def _alembic(database_url: str, *args: str) -> None:
-    result = await _run_alembic(database_url, *args)
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 async def _create_database(prefix: str):
@@ -228,7 +205,7 @@ async def test_generation_migration_backfill_triggers_and_downgrade():
         "social_reply_generation_migration"
     )
     try:
-        await _alembic(database_url, "upgrade", _BASE_REVISION)
+        await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         orphan_message_id = uuid.uuid4()
         private_message_id = uuid.uuid4()
@@ -291,7 +268,7 @@ async def test_generation_migration_backfill_triggers_and_downgrade():
                 )
 
         await engine.dispose()
-        await _alembic(database_url, "upgrade", _FENCING_REVISION)
+        await assert_alembic_succeeds(database_url, "upgrade", _FENCING_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             generations = (
@@ -710,7 +687,7 @@ async def test_generation_migration_backfill_triggers_and_downgrade():
         assert direct_job_id is None
 
         await engine.dispose()
-        await _alembic(database_url, "downgrade", _BASE_REVISION)
+        await assert_alembic_succeeds(database_url, "downgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             trigger_count = (
@@ -801,7 +778,7 @@ async def test_reply_decision_trigger_rejects_stale_overlapping_transaction():
         "social_reply_decision_commit_race"
     )
     try:
-        await _alembic(database_url, "upgrade", _FENCING_REVISION)
+        await assert_alembic_succeeds(database_url, "upgrade", _FENCING_REVISION)
         engine = create_async_engine(database_url)
         old_message_id = uuid.uuid4()
         new_message_id = uuid.uuid4()
@@ -954,7 +931,7 @@ async def test_migration_cancellation_waits_for_delivery_advisory_lock():
         "social_reply_generation_race"
     )
     try:
-        await _alembic(database_url, "upgrade", _BASE_REVISION)
+        await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         old_message_id, new_message_id = uuid.uuid4(), uuid.uuid4()
         old_job_id, new_job_id = uuid.uuid4(), uuid.uuid4()
@@ -982,7 +959,9 @@ async def test_migration_cancellation_waits_for_delivery_advisory_lock():
             {"key": key},
         )
         await lock_connection.commit()
-        migration = asyncio.create_task(_alembic(database_url, "upgrade", _FENCING_REVISION))
+        migration = asyncio.create_task(
+            assert_alembic_succeeds(database_url, "upgrade", _FENCING_REVISION)
+        )
         await asyncio.sleep(0.25)
         assert not migration.done()
 
