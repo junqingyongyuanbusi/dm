@@ -327,9 +327,7 @@ def test_cancelled_future_is_observed_and_cleared(caplog):
         assert runtimes["core"].future is None
         assert runtimes["core"].running is False
     record = next(
-        record
-        for record in caplog.records
-        if record.message == "scheduler sweep future cancelled"
+        record for record in caplog.records if record.message == "scheduler sweep future cancelled"
     )
     assert record.sweep_name == "core"
     assert record.lane == "core"
@@ -356,9 +354,7 @@ def test_future_infrastructure_exception_is_observed_and_cleared(caplog):
         assert runtimes["inspection"].future is None
         assert runtimes["inspection"].running is False
     record = next(
-        record
-        for record in caplog.records
-        if record.message == "scheduler sweep future failed"
+        record for record in caplog.records if record.message == "scheduler sweep future failed"
     )
     assert record.sweep_name == "inspection"
     assert record.lane == "inspection"
