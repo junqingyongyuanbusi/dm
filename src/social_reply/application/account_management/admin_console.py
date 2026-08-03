@@ -2895,10 +2895,12 @@ async def accounts_page(request: Request) -> Response:
             )
             bot_name = str(account_config.get("feishu_bot_name") or "—")
             checked_at = str(account_config.get("feishu_health_checked_at") or "—")
+            error_code = str(account_config.get("feishu_health_error_code") or "—")
             channel_status = (
                 f"<div>Health {_pill(health_status)}</div>"
                 f"<div>Bot {_pill(bot_status)}</div>"
                 f"<div class='muted'>{html.escape(bot_name)}</div>"
+                f"<div class='muted'>{html.escape(error_code)}</div>"
                 f"<div class='muted'>{html.escape(checked_at)}</div>"
             )
         elif a.platform in {"facebook", "instagram"}:

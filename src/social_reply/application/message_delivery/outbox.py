@@ -288,6 +288,17 @@ async def _validate_direct_send(
             "META_ACCOUNT_NOT_READY",
             count_attempt=False,
         )
+    if (
+        account.platform == "feishu"
+        and str((account.config or {}).get("feishu_health_status") or "") != "READY"
+    ):
+        return await _reject_direct_send(
+            session,
+            row,
+            attempt_no,
+            "FEISHU_ACCOUNT_NOT_READY",
+            count_attempt=False,
+        )
     destination = DIRECT_DESTINATION_CAPABILITIES.get(row.destination_type)
     try:
         platform = account_platform(account.platform)

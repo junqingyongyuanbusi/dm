@@ -25,6 +25,18 @@ async def _seed_conversation(session, *, platform: str = "telegram") -> tuple[uu
     account_id, contact_id, conversation_id, message_id, work_id, bot_outbox_id = (
         uuid.uuid4() for _ in range(6)
     )
+    is_feishu = platform == "feishu"
+    reply_target = (
+        {
+            "kind": "dm",
+            "message_id": "om_manual_source",
+            "chat_id": "oc_manual",
+            "chat_type": "p2p",
+            "sender_open_id": "user-1",
+        }
+        if is_feishu
+        else {"chat_id": 123}
+    )
     await session.execute(
         insert(models.PlatformAccount).values(
             id=account_id,
@@ -32,11 +44,22 @@ async def _seed_conversation(session, *, platform: str = "telegram") -> tuple[uu
             brand_id="brand-a",
             platform=platform,
             name="operations-account",
-            external_account_id="account-1",
+            external_account_id="cli_12345678" if is_feishu else "account-1",
             public_id=f"operations-{uuid.uuid4().hex}",
-            credential_bundle=encrypt_secret_bundle({"bot_token": "token"}),
-            config={"delivery_mode": "direct"},
-            capability={"dm": True, "max_text_length": 1000},
+            credential_bundle=encrypt_secret_bundle(
+                {"app_id": "cli_12345678", "app_secret": "secret"}
+                if is_feishu
+                else {"bot_token": "token"}
+            ),
+            config={
+                "delivery_mode": "direct",
+                **({"feishu_health_status": "READY"} if is_feishu else {}),
+            },
+            capability={
+                "dm": True,
+                "max_text_length": 4000 if is_feishu else 1000,
+                **({"mentions": True} if is_feishu else {}),
+            },
             automation_default="BOT_ACTIVE",
             status="active",
         )
@@ -75,7 +98,7 @@ async def _seed_conversation(session, *, platform: str = "telegram") -> tuple[uu
             direction="inbound",
             sender_type="contact",
             text="Need help",
-            reply_target={"chat_id": 123},
+            reply_target=reply_target,
         )
     )
     await session.execute(
@@ -94,10 +117,10 @@ async def _seed_conversation(session, *, platform: str = "telegram") -> tuple[uu
             tenant_id="tenant-a",
             conversation_id=conversation_id,
             platform_account_id=account_id,
-            destination_type="telegram_dm",
-            destination_id="123",
+            destination_type="feishu_p2p_reply" if is_feishu else "telegram_dm",
+            destination_id="oc_manual" if is_feishu else "123",
             message_type="text",
-            payload={"text": "stale bot reply", "target": {"chat_id": 123}},
+            payload={"text": "stale bot reply", "target": reply_target},
             reply_to_message_id=message_id,
             origin_kind="DECISION",
             actor_kind="BOT",
@@ -173,6 +196,66 @@ async def test_manual_reply_is_atomic_and_browser_idempotent(session, monkeypatc
 
     with pytest.raises(OutboxIdempotencyConflict):
         await send_human_reply(**{**command, "text": "Different answer"})
+
+
+async def test_feishu_manual_reply_uses_shared_sender_and_outbox_uuid(session, monkeypatch):
+    account_id, conversation_id, message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session, platform="feishu"
+    )
+
+    async def skip_dispatch(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "social_reply.application.account_management.human_workflow.dispatch_actor",
+        skip_dispatch,
+    )
+    outbox_id = await send_human_reply(
+        conversation_id=conversation_id,
+        reply_to_message_id=message_id,
+        text="人工回复",
+        idempotency_key="feishu-manual-command-1",
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        user_id=None,
+        allow_override=True,
+        work_item_id=work_id,
+        expected_version=1,
+    )
+    calls = []
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            calls.append((target, text))
+            return "om_human_reply"
+
+        async def aclose(self):
+            return None
+
+    async def get_sender(resolved_account_id):
+        assert resolved_account_id == account_id
+        return Sender()
+
+    from social_reply.application.message_delivery import outbox as outbox_module
+
+    settings = outbox_module.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+
+    assert await deliver_outbox(str(outbox_id)) == "SENT"
+    assert calls == [
+        (
+            {
+                "kind": "dm",
+                "message_id": "om_manual_source",
+                "chat_id": "oc_manual",
+                "chat_type": "p2p",
+                "sender_open_id": "user-1",
+                "uuid": str(outbox_id),
+            },
+            "人工回复",
+        )
+    ]
 
 
 async def test_manual_reply_delivers_without_reply_decision(session, monkeypatch):

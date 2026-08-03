@@ -85,3 +85,79 @@ async def test_meta_sender_cache_replaces_client_after_app_secret_rotation(sessi
     assert second is not first
     assert first.closed is True
     await registry.close_platform_senders()
+
+
+async def test_feishu_sender_cache_rotates_on_account_config_version(session, monkeypatch):
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="feishu",
+            name="Feishu",
+            external_account_id="cli_12345678",
+            public_id=f"fs_{uuid.uuid4().hex}",
+            credential_bundle=encrypt_secret_bundle(
+                {"app_id": "cli_12345678", "app_secret": "secret-1"}
+            ),
+            config={"delivery_mode": "direct", "api_base_url": "https://attacker.example"},
+            capability={"dm": True, "mentions": True, "max_text_length": 4000},
+            config_version=1,
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    created = []
+
+    class FakeFeishuClient:
+        def __init__(self, **kwargs):
+            self.app_secret = kwargs["app_secret"]
+            self.api_base_url = kwargs["api_base_url"]
+            self.closed = False
+            created.append(self)
+
+        async def send_text(self, *, target, text):
+            return f"{target}:{text}"
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(registry, "FeishuClient", FakeFeishuClient)
+    registry._senders.clear()
+
+    first = await registry.get_platform_sender(account_id)
+    cached = await registry.get_platform_sender(account_id)
+    assert cached is first
+    assert first.app_secret == "secret-1"
+    assert first.api_base_url == "https://open.feishu.cn"
+
+    await session.execute(
+        update(models.PlatformAccount)
+        .where(models.PlatformAccount.id == account_id)
+        .values(
+            credential_bundle=encrypt_secret_bundle(
+                {"app_id": "cli_12345678", "app_secret": "secret-2"}
+            ),
+            config_version=2,
+        )
+    )
+    await session.commit()
+
+    second = await registry.get_platform_sender(account_id)
+    assert second is not first
+    assert second.app_secret == "secret-2"
+    assert first.closed is True
+    await registry.close_platform_senders()
+    assert second.closed is True
+
+    await session.execute(
+        update(models.PlatformAccount)
+        .where(models.PlatformAccount.id == account_id)
+        .values(external_account_id="cli_other123", config_version=3)
+    )
+    await session.commit()
+    with pytest.raises(LookupError, match="feishu_app_id_scope_mismatch"):
+        await registry.get_platform_sender(account_id)

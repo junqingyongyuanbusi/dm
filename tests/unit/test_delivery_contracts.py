@@ -101,6 +101,8 @@ def test_parse_direct_text_command_accepts_canonical_targets(
     if destination_type == "x_chat_message":
         assert command.target["message_id"] == str(outbox_id)
         assert command.target["conversation_token"] == "t1"
+    elif platform == "feishu":
+        assert command.target == {**target, "uuid": str(outbox_id)}
     else:
         assert command.target == target
 
@@ -151,6 +153,29 @@ def test_parse_feishu_group_reply_rejects_changed_immutable_fields(field):
         )
 
     assert error.value.code == "DELIVERY_TARGET_INVALID"
+
+
+def test_parse_feishu_reply_ignores_caller_uuid_and_uses_outbox_id():
+    outbox_id = uuid.uuid4()
+    target = {
+        "kind": "dm",
+        "message_id": "om_1",
+        "chat_id": "oc_1",
+        "chat_type": "p2p",
+        "sender_open_id": "ou_1",
+    }
+    command = parse_direct_text_command(
+        destination_type="feishu_p2p_reply",
+        message_type="text",
+        payload={"text": "hello", "target": target, "uuid": "caller-controlled"},
+        destination_id="feishu:account:chat",
+        account_platform="feishu",
+        account_external_id="app-1",
+        source_target=target,
+        conversation_external_user_id="ou_1",
+        outbox_id=outbox_id,
+    )
+    assert command.target["uuid"] == str(outbox_id)
 
 
 def test_parse_feishu_reply_rejects_unknown_target_fields():

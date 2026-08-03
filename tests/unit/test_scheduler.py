@@ -77,6 +77,23 @@ def test_build_specs_uses_feature_flags_and_each_settings_snapshot():
     assert second_specs["sweep_xchat_recovery"].interval_seconds == 37
 
 
+def test_build_specs_registers_feishu_health_in_inspection_lane():
+    specs = {
+        spec.name: spec
+        for spec in scheduler._build_sweep_specs(
+            _settings(
+                feishu_enabled=True,
+                feishu_health_check_interval_seconds=701,
+                scheduler_inspection_warn_after_seconds=44,
+            )
+        )
+    }
+    feishu = specs["reconcile_feishu_account_health"]
+    assert feishu.lane == "inspection"
+    assert feishu.interval_seconds == 701
+    assert feishu.warn_after_seconds == 44
+
+
 def test_build_specs_omits_disabled_integrations():
     specs = {
         spec.name

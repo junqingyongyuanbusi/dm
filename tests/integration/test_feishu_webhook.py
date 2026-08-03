@@ -24,7 +24,13 @@ _APP_ID = "cli_fixture123"
 _BOT_OPEN_ID = "ou_bot"
 
 
-async def _seed_account(session, *, tenant_id="tenant-feishu", public_id="fs_primary"):
+async def _seed_account(
+    session,
+    *,
+    tenant_id="tenant-feishu",
+    public_id="fs_primary",
+    automation_default="BOT_DRAFT_ONLY",
+):
     account_id = uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -48,9 +54,10 @@ async def _seed_account(session, *, tenant_id="tenant-feishu", public_id="fs_pri
                 "delivery_mode": "direct",
                 "feishu_group_mode": "mentions_only",
                 "feishu_bot_open_id": _BOT_OPEN_ID,
+                "feishu_health_status": "READY",
             },
             capability={"dm": True, "mentions": True, "max_text_length": 4000},
-            automation_default="BOT_DRAFT_ONLY",
+            automation_default=automation_default,
             status="active",
         )
     )
@@ -369,6 +376,42 @@ async def test_raw_event_recovery_dispatches_committed_context(session, monkeypa
     assert (
         await session.execute(select(models.Message))
     ).scalar_one().platform_message_id == "om_1"
+
+
+@pytest.mark.parametrize("chat_type", ["p2p", "group"])
+async def test_bot_active_feishu_ingress_reaches_sent_once(session, monkeypatch, chat_type):
+    await _seed_account(session, automation_default="BOT_ACTIVE")
+    calls = []
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            calls.append((target, text))
+            return "om_provider_reply"
+
+        async def aclose(self):
+            return None
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(
+        "social_reply.application.message_delivery.outbox.get_platform_sender",
+        get_sender,
+    )
+    settings = get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(
+        "social_reply.application.message_delivery.outbox.get_settings",
+        lambda: settings,
+    )
+    body, headers = _encrypted_request(_event_payload(chat_type=chat_type))
+    response = await _post(_app(), "/webhooks/feishu/fs_primary", content=body, headers=headers)
+    assert response.status_code == 200
+    assert len(calls) == 1
+    outbox = (await session.execute(select(models.OutboxMessage))).scalar_one()
+    assert outbox.status == "SENT"
+    assert outbox.platform_message_id == "om_provider_reply"
+    assert calls[0][0]["uuid"] == str(outbox.id)
+    assert calls[0][0]["message_id"] == "om_1"
 
 
 async def test_group_mention_reaches_decision_job_and_draft_without_outbound(session):

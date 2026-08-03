@@ -129,6 +129,27 @@ def test_group_and_thread_conversations_are_isolated_by_sender_and_thread():
     assert threaded.reply_target["root_id"] == "om_root"
 
 
+def test_thread_scope_uses_one_preferred_dimension():
+    mentions = [{"key": "@bot", "id": {"open_id": "ou_bot"}}]
+    thread_event = _adapter().normalize(
+        _payload(chat_type="group", mentions=mentions, thread_id="om_topic")
+    )[0]
+    root_event = _adapter().normalize(
+        _payload(message_id="om_2", chat_type="group", mentions=mentions, root_id="om_topic")
+    )[0]
+    both_event = _adapter().normalize(
+        _payload(
+            message_id="om_3",
+            chat_type="group",
+            mentions=mentions,
+            thread_id="om_topic",
+            root_id="different-root",
+        )
+    )[0]
+    assert thread_event.conversation_key == root_event.conversation_key
+    assert both_event.conversation_key == thread_event.conversation_key
+
+
 def test_bot_app_and_unsupported_events_are_ignored():
     assert _adapter().normalize(_payload(sender_open_id="ou_bot")) == []
     assert _adapter().normalize(_payload(sender_type="app")) == []

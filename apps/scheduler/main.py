@@ -9,6 +9,9 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from social_reply.application.account_management.feishu_health import (
+    reconcile_feishu_account_health,
+)
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
 from social_reply.application.account_management.meta_health import reconcile_meta_account_health
 from social_reply.application.event_ingestion.raw_recovery import sweep_initial_raw_events
@@ -155,6 +158,16 @@ def _build_sweep_specs(settings: Settings) -> tuple[SweepSpec, ...]:
                 settings.meta_health_check_interval_seconds,
                 inspection_warn_after,
                 reconcile_meta_account_health,
+            )
+        )
+    if settings.feishu_enabled:
+        specs.append(
+            SweepSpec(
+                "reconcile_feishu_account_health",
+                "inspection",
+                settings.feishu_health_check_interval_seconds,
+                inspection_warn_after,
+                reconcile_feishu_account_health,
             )
         )
     return tuple(specs)

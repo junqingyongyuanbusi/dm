@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 
+import httpx
 import pytest
 from sqlalchemy import insert, select, update
 
@@ -787,6 +788,205 @@ async def test_meta_delivery_pauses_until_subscription_health_is_ready(session, 
     monkeypatch.setattr(outbox_module, "get_platform_sender", ready_sender)
     assert await deliver_outbox(str(outbox_id)) == "SENT"
     assert sent == [({"kind": "dm", "recipient_id": "user-1"}, "hi")]
+
+
+@pytest.mark.parametrize(
+    ("destination_type", "target", "capability"),
+    [
+        (
+            "feishu_p2p_reply",
+            {
+                "kind": "dm",
+                "message_id": "om_p2p",
+                "chat_id": "oc_p2p",
+                "chat_type": "p2p",
+                "sender_open_id": "ou_1",
+            },
+            {"dm": True, "mentions": True, "max_text_length": 4000},
+        ),
+        (
+            "feishu_group_reply",
+            {
+                "kind": "mention",
+                "message_id": "om_group",
+                "chat_id": "oc_group",
+                "chat_type": "group",
+                "sender_open_id": "ou_1",
+                "root_id": "om_root",
+            },
+            {"dm": True, "mentions": True, "max_text_length": 4000},
+        ),
+    ],
+)
+async def test_feishu_automatic_replies_use_one_sender_call_with_stable_uuid(
+    session,
+    monkeypatch,
+    destination_type,
+    target,
+    capability,
+):
+    settings = outbox_module.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    _account_id, outbox_id = await _seed_direct_platform(
+        session,
+        platform="feishu",
+        destination_type=destination_type,
+        capability=capability,
+        target=target,
+        external_account_id="cli_12345678",
+        config={"feishu_health_status": "READY"},
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": "您好", "target": target, "uuid": "caller-value"})
+    )
+    await session.commit()
+    calls = []
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            calls.append((target, text))
+            return "om_provider_reply"
+
+        async def aclose(self):
+            return None
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    assert await deliver_outbox(str(outbox_id)) == "SENT"
+    assert len(calls) == 1
+    assert calls[0][0] == {**target, "uuid": str(outbox_id)}
+    assert calls[0][1] == "您好"
+    session.expire_all()
+    sent = await session.get(models.OutboxMessage, outbox_id)
+    assert sent.status == "SENT"
+    assert sent.platform_message_id == "om_provider_reply"
+
+
+async def test_feishu_reenable_recovers_disabled_outbox(session, monkeypatch):
+    disabled = outbox_module.get_settings().model_copy(update={"feishu_enabled": False})
+    enabled = disabled.model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: disabled)
+    _account_id, outbox_id = await _seed_direct_platform(
+        session,
+        platform="feishu",
+        destination_type="feishu_p2p_reply",
+        capability={"dm": True, "mentions": True, "max_text_length": 4000},
+        target={
+            "kind": "dm",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "chat_type": "p2p",
+            "sender_open_id": "ou_1",
+        },
+        external_account_id="cli_12345678",
+        config={"feishu_health_status": "READY"},
+    )
+    assert await deliver_outbox(str(outbox_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    paused = await session.get(models.OutboxMessage, outbox_id)
+    assert paused.attempt_count == 0
+    assert paused.last_error_code == "FEISHU_DISABLED"
+
+    monkeypatch.setattr(sweep_module, "get_settings", lambda: enabled)
+    assert outbox_id in await sweep_outbox()
+
+
+async def test_feishu_health_gate_pauses_without_attempt_and_recovers(session, monkeypatch):
+    settings = outbox_module.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(sweep_module, "get_settings", lambda: settings)
+    account_id, outbox_id = await _seed_direct_platform(
+        session,
+        platform="feishu",
+        destination_type="feishu_p2p_reply",
+        capability={"dm": True, "mentions": True, "max_text_length": 4000},
+        target={
+            "kind": "dm",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "chat_type": "p2p",
+            "sender_open_id": "ou_1",
+        },
+        external_account_id="cli_12345678",
+        config={"feishu_health_status": "ERROR"},
+    )
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("non-ready Feishu account must not resolve a sender")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(outbox_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    paused = await session.get(models.OutboxMessage, outbox_id)
+    assert paused.attempt_count == 0
+    assert paused.last_error_code == "FEISHU_ACCOUNT_NOT_READY"
+
+    await session.execute(
+        update(models.PlatformAccount)
+        .where(models.PlatformAccount.id == account_id)
+        .values(config={"feishu_health_status": "READY"})
+    )
+    await session.commit()
+    assert outbox_id in await sweep_outbox()
+
+
+async def test_feishu_manual_reply_and_ambiguous_timeout_share_delivery_semantics(
+    session, monkeypatch
+):
+    settings = outbox_module.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    _account_id, outbox_id = await _seed_direct_platform(
+        session,
+        platform="feishu",
+        destination_type="feishu_p2p_reply",
+        capability={"dm": True, "mentions": True, "max_text_length": 4000},
+        target={
+            "kind": "dm",
+            "message_id": "om_1",
+            "chat_id": "oc_1",
+            "chat_type": "p2p",
+            "sender_open_id": "ou_1",
+        },
+        external_account_id="cli_12345678",
+        config={"feishu_health_status": "READY"},
+    )
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    await session.execute(
+        update(models.AutomationState)
+        .where(models.AutomationState.conversation_id == outbox.conversation_id)
+        .values(state="HUMAN_ACTIVE")
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(origin_kind="MANUAL_REPLY", actor_kind="ADMIN_HUMAN")
+    )
+    await session.commit()
+    calls = 0
+
+    class TimeoutSender:
+        async def send_text(self, *, target, text):
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadTimeout("reply outcome unknown")
+
+        async def aclose(self):
+            return None
+
+    async def get_sender(_account_id):
+        return TimeoutSender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    assert await deliver_outbox(str(outbox_id)) == "NEEDS_REVIEW"
+    assert calls == 1
+    session.expire_all()
+    failed = await session.get(models.OutboxMessage, outbox_id)
+    assert failed.last_error_code == "AMBIGUOUS_SEND"
+    assert failed.next_attempt_at is None
 
 
 async def _seed_direct_x(

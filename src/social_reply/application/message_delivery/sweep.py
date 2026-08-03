@@ -119,6 +119,30 @@ async def sweep_outbox() -> list[uuid.UUID]:
                 last_error_message=None,
             )
         )
+        ready_feishu_accounts = select(models.PlatformAccount.id).where(
+            models.PlatformAccount.platform == "feishu",
+            models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+            models.PlatformAccount.config["feishu_health_status"].astext == "READY",
+        )
+        await session.execute(
+            update(models.OutboxMessage)
+            .where(
+                models.OutboxMessage.status == "NEEDS_REVIEW",
+                models.OutboxMessage.last_error_code == "FEISHU_ACCOUNT_NOT_READY",
+                models.OutboxMessage.destination_type.in_(
+                    ("feishu_p2p_reply", "feishu_group_reply")
+                ),
+                models.OutboxMessage.platform_account_id.in_(ready_feishu_accounts),
+            )
+            .values(
+                status="PENDING",
+                next_attempt_at=None,
+                locked_at=None,
+                locked_by=None,
+                last_error_code=None,
+                last_error_message=None,
+            )
+        )
         stale_rows = (
             await session.execute(
                 update(models.OutboxMessage)

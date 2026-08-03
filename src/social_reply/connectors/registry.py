@@ -7,6 +7,7 @@ from social_reply.application.platform_accounts import (
     get_platform_app_runtime,
 )
 from social_reply.connectors.base import PlatformSender
+from social_reply.connectors.feishu.client import FeishuClient
 from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.whatsapp.client import WhatsAppClient
@@ -82,6 +83,21 @@ def _build_sender(
             api_version=account.config.get("api_version", "v23.0"),
             instagram_login_mode=account.config.get("instagram_login_mode", "facebook_login"),
             page_id=account.config.get("page_id"),
+        )
+    if account.platform == "feishu":
+        app_id = credentials.get("app_id")
+        app_secret = credentials.get("app_secret")
+        if not isinstance(app_id, str) or not app_id.strip():
+            raise LookupError(f"feishu_app_id_missing:{account.id}")
+        if not isinstance(app_secret, str) or not app_secret.strip():
+            raise LookupError(f"feishu_app_secret_missing:{account.id}")
+        app_id = app_id.strip()
+        if not account.external_account_id or app_id != account.external_account_id:
+            raise LookupError(f"feishu_app_id_scope_mismatch:{account.id}")
+        return FeishuClient(
+            app_id=app_id,
+            app_secret=app_secret.strip(),
+            api_base_url="https://open.feishu.cn",
         )
     if account.platform == "whatsapp":
         if not account.external_account_id:

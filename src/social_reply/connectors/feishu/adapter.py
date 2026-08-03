@@ -106,10 +106,13 @@ class FeishuWebhookAdapter:
             chat_id,
             sender_open_id,
         ]
-        for key, value in (("thread", thread_id), ("root", root_id)):
-            if value is not None:
-                reply_target[f"{key}_id"] = value
-                conversation_parts.extend((key, value))
+        if thread_id is not None:
+            reply_target["thread_id"] = thread_id
+        if root_id is not None:
+            reply_target["root_id"] = root_id
+        thread_scope = thread_id or root_id
+        if thread_scope is not None:
+            conversation_parts.extend(("thread", thread_scope))
 
         return [
             CanonicalEvent(

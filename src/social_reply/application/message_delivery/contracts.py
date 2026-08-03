@@ -273,8 +273,10 @@ def parse_direct_text_command(
             target["conversation_token"] = conversation_token
     elif destination_type == "feishu_p2p_reply":
         target = _feishu_reply_target(target, source_target, kind="dm", chat_type="p2p")
+        target["uuid"] = str(outbox_id)
     elif destination_type == "feishu_group_reply":
         target = _feishu_reply_target(target, source_target, kind="mention", chat_type="group")
+        target["uuid"] = str(outbox_id)
 
     return TextSendCommand(
         destination_type=destination_type,
