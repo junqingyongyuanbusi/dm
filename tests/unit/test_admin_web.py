@@ -221,8 +221,12 @@ async def test_admin_feishu_submission_preserves_csrf_tenant_and_secret_boundari
         allowed_tenants=frozenset({"tenant-a"}),
     )
     settings = admin.get_settings().model_copy(update={"feishu_enabled": True})
+
+    async def fake_current_principal(_request):
+        return principal
+
     monkeypatch.setattr(admin, "get_settings", lambda: settings)
-    monkeypatch.setattr(admin, "current_principal", lambda _request: _async_value(principal))
+    monkeypatch.setattr(admin, "current_principal", fake_current_principal)
 
     async def fake_submit(**kwargs):
         captured.update(kwargs)
@@ -262,10 +266,6 @@ async def test_admin_feishu_submission_preserves_csrf_tenant_and_secret_boundari
     }
 
 
-async def _async_value(value):
-    return value
-
-
 async def test_admin_feishu_rejects_bad_csrf_and_other_tenant(monkeypatch):
     from social_reply.application.account_management import admin
     from social_reply.application.account_management.auth import Principal
@@ -277,8 +277,12 @@ async def test_admin_feishu_rejects_bad_csrf_and_other_tenant(monkeypatch):
         allowed_tenants=frozenset({"tenant-a"}),
     )
     settings = admin.get_settings().model_copy(update={"feishu_enabled": True})
+
+    async def fake_current_principal(_request):
+        return principal
+
     monkeypatch.setattr(admin, "get_settings", lambda: settings)
-    monkeypatch.setattr(admin, "current_principal", lambda _request: _async_value(principal))
+    monkeypatch.setattr(admin, "current_principal", fake_current_principal)
     payload = {
         "tenant_id": "tenant-b",
         "app_id": "cli_12345678",
@@ -312,7 +316,11 @@ async def test_admin_feishu_enforces_gate_and_draft_only(monkeypatch):
         actor="user:tenant-admin",
         allowed_tenants=frozenset({"tenant-a"}),
     )
-    monkeypatch.setattr(admin, "current_principal", lambda _request: _async_value(principal))
+
+    async def fake_current_principal(_request):
+        return principal
+
+    monkeypatch.setattr(admin, "current_principal", fake_current_principal)
     base = {
         "tenant_id": "tenant-a",
         "app_id": "cli_12345678",
