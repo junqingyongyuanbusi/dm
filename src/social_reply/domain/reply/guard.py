@@ -21,8 +21,7 @@ def redact_pii(text: str) -> str:
 
 
 _MAX_TEXT_LENGTH = {
-    platform.value: spec.max_text_length
-    for platform, spec in PLATFORM_CAPABILITY_SPECS.items()
+    platform.value: spec.max_text_length for platform, spec in PLATFORM_CAPABILITY_SPECS.items()
 }
 _DEFAULT_MAX = 2000
 
