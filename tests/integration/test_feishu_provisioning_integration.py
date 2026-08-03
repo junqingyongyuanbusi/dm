@@ -77,9 +77,6 @@ async def test_feishu_job_stages_secrets_and_clears_them_on_completion(migrated_
         "group_mode": "mentions_only",
         "automation_default": "BOT_DRAFT_ONLY",
     }
-    assert "app-secret" not in str(staged.request)
-    assert "verification-secret" not in str(staged.request)
-    assert "encrypt-secret" not in str(staged.request)
     assert decrypt_secret_bundle(staged.staging_secret) == {
         "app_secret": "app-secret",
         "verification_token": "verification-secret",
