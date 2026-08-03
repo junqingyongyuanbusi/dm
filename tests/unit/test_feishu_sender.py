@@ -219,8 +219,14 @@ async def test_send_text_classifies_reply_failures(response, error_type, code):
         await client.send_text(target=_target(), text="hello")
     await client.aclose()
 
-    if code is not None:
-        assert getattr(exc_info.value, "code", str(exc_info.value)) == code
+    if code is None:
+        assert isinstance(exc_info.value, httpx.HTTPStatusError)
+    else:
+        assert isinstance(
+            exc_info.value,
+            (RetryableSendError, PermanentSendError, FeishuClientError),
+        )
+        assert exc_info.value.code == code
     assert "credential-must-not-leak" not in str(exc_info.value)
 
 
