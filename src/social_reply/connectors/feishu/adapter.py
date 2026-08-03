@@ -2,7 +2,10 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from social_reply.connectors.feishu.contracts import FEISHU_GROUP_MODE
+from social_reply.connectors.feishu.contracts import (
+    FEISHU_GROUP_MODE,
+    nonblank_string_or_none,
+)
 from social_reply.domain.messages.canonical import CanonicalEvent, ChannelType
 
 _EVENT_NAMESPACE = "im.message.receive_v1"
@@ -102,8 +105,8 @@ class FeishuWebhookAdapter:
             text = None
             attachments.append(_attachment(message_type, message_id, content))
 
-        thread_id = _optional_string(message.get("thread_id"))
-        root_id = _optional_string(message.get("root_id"))
+        thread_id = nonblank_string_or_none(message.get("thread_id"))
+        root_id = nonblank_string_or_none(message.get("root_id"))
         reply_target = {
             "kind": kind,
             "message_id": message_id,
@@ -160,10 +163,6 @@ class FeishuWebhookAdapter:
 
 def _nonempty(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
-
-
-def _optional_string(value: object) -> str | None:
-    return value if _nonempty(value) else None
 
 
 def _occurred_at(value: object) -> datetime | None:

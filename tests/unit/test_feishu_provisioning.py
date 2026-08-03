@@ -170,7 +170,6 @@ async def test_connect_feishu_provisions_direct_draft_account(monkeypatch, tmp_p
     assert captured["capability"] == {
         "dm": True,
         "mentions": True,
-        "max_text_length": 4000,
     }
     assert captured["status"] == "active"
     assert captured["automation_default"] == "BOT_DRAFT_ONLY"

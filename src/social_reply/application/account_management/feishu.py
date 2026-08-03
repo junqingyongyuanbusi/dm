@@ -98,7 +98,7 @@ async def connect_feishu_account(
             "feishu_health_status": "READY",
             "feishu_health_checked_at": checked_at,
         },
-        capability={"dm": True, "mentions": True, "max_text_length": 4000},
+        capability={"dm": True, "mentions": True},
         automation_default=automation_default,
         status=ACTIVE_ACCOUNT_STATUS,
     )

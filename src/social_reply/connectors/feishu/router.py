@@ -13,6 +13,7 @@ from social_reply.application.event_ingestion.raw_recovery import (
 )
 from social_reply.application.platform_accounts import find_platform_account_by_public_id
 from social_reply.connectors.feishu.adapter import FeishuWebhookAdapter
+from social_reply.connectors.feishu.contracts import nonblank_string_or_none
 from social_reply.connectors.feishu.security import (
     FEISHU_MAX_BODY_BYTES,
     FeishuSecurityError,
@@ -76,7 +77,7 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
         header_app_id = header.get("app_id")
         if not isinstance(header_app_id, str) or not secrets.compare_digest(header_app_id, app_id):
             raise FeishuSecurityError()
-        if _safe_string(header.get("event_id")) is None:
+        if nonblank_string_or_none(header.get("event_id")) is None:
             raise FeishuSecurityError()
     except FeishuSecurityError as exc:
         status_code = 413 if exc.code == "feishu_request_too_large" else 401
@@ -96,12 +97,12 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
     feature_enabled = getattr(request.app.state, "settings", get_settings()).feishu_enabled
     should_dispatch = feature_enabled and bool(serialized_events)
     raw_header = sanitized_payload.get("header")
-    raw_event_id_value = _safe_string(raw_header.get("event_id")) if raw_header else None
-    event_namespace = _safe_string(raw_header.get("event_type")) if raw_header else None
+    raw_event_id_value = nonblank_string_or_none(raw_header.get("event_id")) if raw_header else None
+    event_namespace = nonblank_string_or_none(raw_header.get("event_type")) if raw_header else None
     event = sanitized_payload.get("event")
     message = event.get("message") if isinstance(event, dict) else None
     external_conversation_id = (
-        _safe_string(message.get("chat_id")) if isinstance(message, dict) else None
+        nonblank_string_or_none(message.get("chat_id")) if isinstance(message, dict) else None
     )
     ignored_at = None if should_dispatch else datetime.now(UTC)
     async with get_session_factory()() as session:
@@ -172,7 +173,3 @@ def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(header, dict):
         sanitized["header"] = {key: value for key, value in header.items() if key != "token"}
     return sanitized
-
-
-def _safe_string(value: object) -> str | None:
-    return value if isinstance(value, str) and value.strip() else None
