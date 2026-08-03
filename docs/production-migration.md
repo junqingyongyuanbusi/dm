@@ -85,11 +85,26 @@ HAVING count(*) > 1;
 
 The result must be empty. The migration fails rather than deleting or rewriting append-only RawEvent
 evidence when historical duplicates exist; stop and use a separately reviewed data-repair plan or a
-verified backup instead of editing evidence ad hoc. The index is created and dropped concurrently in
-an Alembic autocommit block, so existing Feishu and non-Feishu ingress stays online and neither only
-Feishu nor all RawEvent writers need to pause. A concurrent index build can consume substantial
-storage I/O, so monitor database load and schedule it for an appropriate operating window.
-Downgrading to `e4b7c2d9a610` only drops this index, also concurrently.
+verified backup instead of editing evidence ad hoc. PostgreSQL can leave a failed concurrent build as
+an invalid same-name index. Inspect that state before retrying:
+
+```sql
+SELECT index_class.relname, index_row.indisvalid, index_row.indisready
+FROM pg_index AS index_row
+JOIN pg_class AS index_class ON index_class.oid = index_row.indexrelid
+JOIN pg_namespace AS namespace ON namespace.oid = index_class.relnamespace
+WHERE namespace.nspname = current_schema()
+  AND index_class.relname = 'uq_raw_events_feishu_webhook_external_event';
+```
+
+After the reviewed duplicate repair, rerunning Alembic is safe: revision `f8a1c3d5e702` detects and
+concurrently removes an invalid leftover before rebuilding the index. A valid same-name index is
+accepted as completed, covering a process exit after concurrent DDL but before the Alembic version
+row advanced. The index is created and dropped concurrently in an Alembic autocommit block, so
+existing Feishu and non-Feishu ingress stays online and neither only Feishu nor all RawEvent writers
+need to pause. A concurrent index build can consume substantial storage I/O, so monitor database
+load and schedule it for an appropriate operating window. Downgrading to `e4b7c2d9a610` only drops
+this index, also concurrently and safely if it is already absent.
 
 Downgrading `e4b7c2d9a610` first queries for any Feishu account and fails closed with
 `cannot downgrade while Feishu platform accounts exist`. Disablement is not sufficient: remove and

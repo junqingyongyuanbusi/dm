@@ -3,6 +3,7 @@ import uuid
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import assert_alembic_succeeds, run_alembic
 
@@ -173,6 +174,120 @@ async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
         await engine.dispose()
         assert revision == _HEAD_REVISION
         assert index_count == 1
+    finally:
+        async with admin_engine.connect() as connection:
+            await connection.execute(
+                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
+            )
+        await admin_engine.dispose()
+
+
+async def test_feishu_dedup_migration_recovers_invalid_concurrent_index():
+    base_url = make_url(get_settings().database_url)
+    database_name = f"social_reply_feishu_invalid_{uuid.uuid4().hex[:12]}"
+    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
+    admin_engine = create_async_engine(
+        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
+    )
+    async with admin_engine.connect() as connection:
+        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+
+    account_id = uuid.uuid4()
+    first_raw_id = uuid.uuid4()
+    second_raw_id = uuid.uuid4()
+    try:
+        await assert_alembic_succeeds(database_url, "upgrade", _FEISHU_REVISION)
+        engine = create_async_engine(database_url)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO platform_accounts ("
+                    "id, tenant_id, brand_id, platform, name, external_account_id, public_id, "
+                    "config, capability, config_version, automation_default, status) VALUES ("
+                    ":id, 'default', 'b1', 'feishu', 'invalid-index-bot', 'cli_invalid123', "
+                    "'fs_invalid', '{}'::jsonb, "
+                    '\'{"dm": true, "mentions": true, '
+                    '"max_text_length": 4000}\'::jsonb, '
+                    "1, 'BOT_DRAFT_ONLY', 'active')"
+                ),
+                {"id": account_id},
+            )
+            for raw_event_id in (first_raw_id, second_raw_id):
+                await connection.execute(
+                    text(
+                        "INSERT INTO raw_events ("
+                        "id, tenant_id, platform_account_id, source, ingress_kind, "
+                        "external_event_id, payload, headers, context, schema_version, "
+                        "processing_status, processing_attempt_count) VALUES ("
+                        ":id, 'default', :account_id, 'feishu', 'webhook', 'evt_duplicate', "
+                        "'{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, "
+                        "'IGNORED_AT_INGRESS', 0)"
+                    ),
+                    {"id": raw_event_id, "account_id": account_id},
+                )
+        await engine.dispose()
+
+        concurrent_engine = create_async_engine(database_url, isolation_level="AUTOCOMMIT")
+        with pytest.raises(IntegrityError):
+            async with concurrent_engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_raw_events_feishu_webhook_external_event ON raw_events "
+                        "(platform_account_id, external_event_id) "
+                        "WHERE source = 'feishu' AND ingress_kind = 'webhook' "
+                        "AND external_event_id IS NOT NULL"
+                    )
+                )
+        async with concurrent_engine.connect() as connection:
+            invalid = (
+                await connection.execute(
+                    text(
+                        "SELECT NOT index_row.indisvalid "
+                        "FROM pg_index AS index_row "
+                        "JOIN pg_class AS index_class ON index_class.oid = index_row.indexrelid "
+                        "WHERE index_class.relname = "
+                        "'uq_raw_events_feishu_webhook_external_event'"
+                    )
+                )
+            ).scalar_one()
+            assert invalid is True
+            await connection.execute(
+                text("DELETE FROM raw_events WHERE id = :id"),
+                {"id": second_raw_id},
+            )
+        await concurrent_engine.dispose()
+
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        engine = create_async_engine(database_url)
+        async with engine.connect() as connection:
+            validity = (
+                await connection.execute(
+                    text(
+                        "SELECT index_row.indisvalid "
+                        "FROM pg_index AS index_row "
+                        "JOIN pg_class AS index_class ON index_class.oid = index_row.indexrelid "
+                        "WHERE index_class.relname = "
+                        "'uq_raw_events_feishu_webhook_external_event'"
+                    )
+                )
+            ).scalar_one()
+        assert validity is True
+        async with engine.begin() as connection:
+            with pytest.raises(IntegrityError):
+                await connection.execute(
+                    text(
+                        "INSERT INTO raw_events ("
+                        "id, tenant_id, platform_account_id, source, ingress_kind, "
+                        "external_event_id, payload, headers, context, schema_version, "
+                        "processing_status, processing_attempt_count) VALUES ("
+                        ":id, 'default', :account_id, 'feishu', 'webhook', "
+                        "'evt_duplicate', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, "
+                        "'IGNORED_AT_INGRESS', 0)"
+                    ),
+                    {"id": uuid.uuid4(), "account_id": account_id},
+                )
+        await engine.dispose()
     finally:
         async with admin_engine.connect() as connection:
             await connection.execute(

@@ -164,6 +164,103 @@ async def test_connect_feishu_persists_direct_account_contract(migrated_db, monk
     assert platform_app_count == 0
 
 
+async def test_concurrent_first_feishu_provisioning_returns_one_callback_identity(
+    migrated_db, monkeypatch
+):
+    settings = feishu.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(feishu, "get_settings", lambda: settings)
+
+    def transport() -> httpx.MockTransport:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/tenant_access_token/internal"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "tenant_access_token": "tenant-token",
+                        "expire": 7200,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "bot": {
+                        "open_id": "ou_bot_first",
+                        "app_name": "First Bot",
+                        "activate_status": 2,
+                    },
+                },
+            )
+
+        return httpx.MockTransport(handler)
+
+    engine = get_engine()
+    async with engine.begin() as connection:
+        await connection.execute(text("DROP FUNCTION IF EXISTS delay_first_feishu_create()"))
+        await connection.execute(
+            text(
+                "CREATE FUNCTION delay_first_feishu_create() RETURNS trigger "
+                "LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$"
+            )
+        )
+        await connection.execute(
+            text(
+                "CREATE TRIGGER delay_first_feishu_create BEFORE INSERT ON platform_accounts "
+                "FOR EACH ROW WHEN (NEW.tenant_id = 'tenant-first-race') "
+                "EXECUTE FUNCTION delay_first_feishu_create()"
+            )
+        )
+
+    tasks: list[asyncio.Task] = []
+    try:
+        tasks = [
+            asyncio.create_task(
+                feishu.connect_feishu_account(
+                    app_id="cli_first1234",
+                    app_secret=app_secret,
+                    verification_token="verification-secret",
+                    encrypt_key="encrypt-secret",
+                    public_base_url="https://reply.example",
+                    tenant_id="tenant-first-race",
+                    brand_id="brand-a",
+                    transport=transport(),
+                )
+            )
+            for app_secret in ("first-secret", "second-secret")
+        ]
+        results = await asyncio.gather(*tasks)
+
+        assert len({result.account_id for result in results}) == 1
+        assert len({result.public_id for result in results}) == 1
+        assert len({result.webhook_url for result in results}) == 1
+        async with get_session_factory()() as session:
+            account = (
+                await session.execute(
+                    select(models.PlatformAccount).where(
+                        models.PlatformAccount.tenant_id == "tenant-first-race",
+                        models.PlatformAccount.platform == "feishu",
+                        models.PlatformAccount.external_account_id == "cli_first1234",
+                    )
+                )
+            ).scalar_one()
+        assert results[0].account_id == account.id
+        assert results[0].public_id == account.public_id
+        assert results[0].webhook_url.endswith(f"/webhooks/feishu/{account.public_id}")
+        assert account.config_version == 2
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DROP TRIGGER IF EXISTS delay_first_feishu_create ON platform_accounts")
+            )
+            await connection.execute(text("DROP FUNCTION IF EXISTS delay_first_feishu_create()"))
+
+
 async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_sender(
     migrated_db, monkeypatch
 ):

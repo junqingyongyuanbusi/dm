@@ -3,7 +3,7 @@ import secrets
 import uuid
 from pathlib import Path  # noqa: F401  secrets_root 参数签名保留（内联存储后不再使用）
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.domain.platform_accounts import (
@@ -258,16 +258,27 @@ async def provision_direct_account(
     async with get_session_factory()() as session:
         statement = pg_insert(models.PlatformAccount).values(**values)
         update_values = {
-            key: value for key, value in values.items() if key not in {"id", "config_version"}
+            key: value
+            for key, value in values.items()
+            if key not in {"id", "public_id", "config_version"}
         }
+        update_values["public_id"] = func.coalesce(
+            models.PlatformAccount.public_id,
+            statement.excluded.public_id,
+        )
         update_values["config_version"] = models.PlatformAccount.config_version + 1
-        account_id = (
+        persisted = (
             await session.execute(
                 statement.on_conflict_do_update(
                     index_elements=["tenant_id", "platform", "external_account_id"],
                     set_=update_values,
-                ).returning(models.PlatformAccount.id)
+                ).returning(
+                    models.PlatformAccount.id,
+                    models.PlatformAccount.public_id,
+                )
             )
-        ).scalar_one()
+        ).one()
         await session.commit()
-    return account_id, resolved_public_id
+    if persisted.public_id is None:
+        raise RuntimeError("platform_account_public_id_missing")
+    return persisted.id, persisted.public_id
