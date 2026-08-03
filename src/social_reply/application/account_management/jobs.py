@@ -18,6 +18,7 @@ from social_reply.application.account_management.service import (
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.connectors.feishu.client import FeishuClientError
 from social_reply.connectors.meta.client import MetaCommentPermissionError
 from social_reply.domain.platform_accounts import PROVISIONABLE_ACCOUNT_PLATFORMS
 from social_reply.infrastructure.database import models
@@ -82,6 +83,8 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
         # The XChat PIN is removed after the first attempt. Never schedule an
         # automatic retry that would silently reconnect without unlocking keys.
         return exc.code, exc.operator_message, False
+    if isinstance(exc, FeishuClientError):
+        return exc.code, "Feishu account validation failed", exc.retryable
     if isinstance(exc, MetaCommentPermissionError):
         return (
             "META_COMMENT_PERMISSION_REQUIRED",
@@ -265,6 +268,9 @@ def _result_payload(result: AccountConnectionResult) -> dict[str, Any]:
         "app_public_id": result.app_public_id,
         "pending_update_count": result.pending_update_count,
         "last_webhook_error": result.last_webhook_error,
+        "bot_name": result.bot_name,
+        "bot_status": result.bot_status,
+        "callback_url": result.webhook_url if result.platform == "feishu" else None,
         "manual_steps": list(result.manual_steps),
     }
 
@@ -320,6 +326,18 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
             app_name=request.get("app_name"),
             verify_token=credentials["verify_token"],
             api_version=request.get("api_version", "v23.0"),
+            **common,
+        )
+    if job.platform == "feishu":
+        from social_reply.application.account_management.feishu import connect_feishu_account
+
+        return await connect_feishu_account(
+            app_id=str(request["app_id"]),
+            app_secret=credentials["app_secret"],
+            verification_token=credentials["verification_token"],
+            encrypt_key=credentials["encrypt_key"],
+            api_base_url=str(request.get("api_base_url") or "https://open.feishu.cn"),
+            group_mode=str(request.get("group_mode") or "mentions_only"),
             **common,
         )
     return await connect_x_account(
@@ -664,6 +682,8 @@ def _public_result(value: Any) -> Any:
         "access_token",
         "access_token_secret",
         "app_secret",
+        "verification_token",
+        "encrypt_key",
         "consumer_key",
         "consumer_secret",
         "xchat_pin",

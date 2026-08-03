@@ -354,7 +354,7 @@ def _inbox_filter_form(
     )
     platform_options = '<option value="">全部平台</option>' + "".join(
         f'<option value="{value}"{_selected(platform, value)}>{html.escape(value)}</option>'
-        for value in ("telegram", "facebook", "instagram", "whatsapp", "x")
+        for value in ("telegram", "facebook", "instagram", "whatsapp", "x", "feishu")
     )
     status_values = {
         "human": ("WAITING", "CLAIMED", "RESOLVED", "CANCELLED"),
@@ -396,7 +396,7 @@ def _conversation_filter_form(
     )
     platform_options = '<option value="">全部平台</option>' + "".join(
         f'<option value="{value}"{_selected(platform, value)}>{html.escape(value)}</option>'
-        for value in ("telegram", "facebook", "instagram", "whatsapp", "x")
+        for value in ("telegram", "facebook", "instagram", "whatsapp", "x", "feishu")
     )
     return f"""<form class="filters" method="get" action="/admin/conversations">
 <input type="hidden" name="channel" value="{channel}">
@@ -826,7 +826,14 @@ async def inbox_counts(request: Request) -> Response:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
     platform = request.query_params.get("platform", "").strip()
-    if platform and platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+    if platform and platform not in {
+        "telegram",
+        "facebook",
+        "instagram",
+        "whatsapp",
+        "x",
+        "feishu",
+    }:
         raise HTTPException(status_code=422, detail="invalid_platform_filter")
     channel = request.query_params.get("channel", "all").strip()
     if channel not in _CHANNEL_FILTERS:
@@ -875,7 +882,14 @@ async def inbox_page(request: Request) -> Response:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
     platform = request.query_params.get("platform", "").strip()
-    if platform and platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+    if platform and platform not in {
+        "telegram",
+        "facebook",
+        "instagram",
+        "whatsapp",
+        "x",
+        "feishu",
+    }:
         raise HTTPException(status_code=422, detail="invalid_platform_filter")
     channel = request.query_params.get("channel", "all").strip()
     if channel not in _CHANNEL_FILTERS:
@@ -1209,7 +1223,14 @@ async def conversations_page(request: Request) -> Response:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
     platform = request.query_params.get("platform", "").strip()
-    if platform and platform not in {"telegram", "facebook", "instagram", "whatsapp", "x"}:
+    if platform and platform not in {
+        "telegram",
+        "facebook",
+        "instagram",
+        "whatsapp",
+        "x",
+        "feishu",
+    }:
         raise HTTPException(status_code=422, detail="invalid_platform_filter")
     channel = request.query_params.get("channel", "all").strip()
     if channel not in _CHANNEL_FILTERS:
@@ -2694,6 +2715,7 @@ _CHANNEL_LABELS = {
     "instagram": "Instagram",
     "telegram": "Telegram",
     "whatsapp": "WhatsApp",
+    "feishu": "Feishu",
 }
 
 _CHANNEL_KINDS = {
@@ -2702,6 +2724,7 @@ _CHANNEL_KINDS = {
     "instagram": "2 种登录方式",
     "telegram": "Bot Token",
     "whatsapp": "Cloud API",
+    "feishu": "自建应用 Bot",
 }
 
 
@@ -2864,6 +2887,20 @@ async def accounts_page(request: Request) -> Response:
             )
             if settings.xchat_enabled and xchat_registered and not capability.get("x_chat", False):
                 xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="csrf_token" value="{csrf}"><input type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><button class="btn-sm btn-ghost">恢复 XChat 密钥</button></form>"""
+        elif a.platform == "feishu":
+            account_config = dict(a.config or {})
+            health_status = str(account_config.get("feishu_health_status") or "UNKNOWN")
+            bot_status = (
+                "ACTIVE" if account_config.get("feishu_bot_activate_status") == 2 else "UNKNOWN"
+            )
+            bot_name = str(account_config.get("feishu_bot_name") or "—")
+            checked_at = str(account_config.get("feishu_health_checked_at") or "—")
+            channel_status = (
+                f"<div>Health {_pill(health_status)}</div>"
+                f"<div>Bot {_pill(bot_status)}</div>"
+                f"<div class='muted'>{html.escape(bot_name)}</div>"
+                f"<div class='muted'>{html.escape(checked_at)}</div>"
+            )
         elif a.platform in {"facebook", "instagram"}:
             account_config = dict(a.config or {})
             capability = dict(a.capability or {})
@@ -2940,6 +2977,7 @@ async def accounts_page(request: Request) -> Response:
         "instagram": settings.instagram_messaging_enabled,
         "telegram": True,
         "whatsapp": settings.whatsapp_enabled,
+        "feishu": settings.feishu_enabled,
     }
     requested_channel = request.query_params.get("connect", "")
     selected_channel = (
@@ -2959,7 +2997,7 @@ async def accounts_page(request: Request) -> Response:
         for channel in _CHANNEL_LABELS
     )
     channel_picker = f"""<section class="channel-section" aria-labelledby="add-channel-title">
-<div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">5 个平台</span></div>
+<div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">6 个平台</span></div>
 <div class="channel-grid" role="list">{channel_tiles}</div></section>{channel_notice}"""
     facebook_comments = settings.meta_comment_reply_enabled
     facebook_policy_fields = (
@@ -3004,6 +3042,10 @@ async def accounts_page(request: Request) -> Response:
         selected_panel = f"""<section class="channel-setup" id="channel-setup">
 {_channel_setup_head("whatsapp", "连接 WhatsApp Cloud API 号码")}
 <form class="channel-form" method="post" action="/admin/connect/whatsapp">{common}{_input("external_account_id", "Phone Number ID")}{_input("access_token", "Access Token", secret=True)}{_input("app_secret", "Meta App Secret", secret=True)}{_input("app_id", "Meta App ID", required=False)}{_input("app_public_id", "Existing App Public ID", required=False)}{_input("verify_token", "Webhook Verify Token", secret=True)}<button class="btn-block">连接 WhatsApp</button></form></section>"""
+    elif selected_channel == "feishu":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("feishu", "连接企业自建应用 Bot")}
+<form class="channel-form" method="post" action="/admin/connect/feishu">{common}{_input("app_id", "App ID")}{_input("app_secret", "App Secret", secret=True)}{_input("verification_token", "Verification Token", secret=True)}{_input("encrypt_key", "Encrypt Key", secret=True)}<input type="hidden" name="api_base_url" value="https://open.feishu.cn"><input type="hidden" name="group_mode" value="mentions_only"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><button class="btn-block">连接 Feishu</button></form></section>"""
     account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:

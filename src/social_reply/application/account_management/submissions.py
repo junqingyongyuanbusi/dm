@@ -59,6 +59,10 @@ PLATFORM_SUBMISSIONS = {
             }
         ),
     ),
+    AccountPlatform.FEISHU.value: PlatformSubmissionSpec(
+        public_fields=_COMMON_PUBLIC | {"app_id", "api_base_url", "group_mode"},
+        secret_fields=frozenset({"app_secret", "verification_token", "encrypt_key"}),
+    ),
 }
 
 

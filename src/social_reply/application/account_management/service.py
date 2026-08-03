@@ -65,6 +65,8 @@ class AccountConnectionResult:
     verify_token: str | None = None
     pending_update_count: int | None = None
     last_webhook_error: str | None = None
+    bot_name: str | None = None
+    bot_status: int | None = None
     manual_steps: tuple[str, ...] = ()
 
 

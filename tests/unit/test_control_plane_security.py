@@ -19,18 +19,6 @@ async def test_provisioning_rejects_tenant_path_traversal(tmp_path, monkeypatch)
         )
 
 
-async def test_feishu_contract_does_not_enable_provisioning():
-    with pytest.raises(ValueError, match="unsupported_platform:feishu"):
-        await jobs.submit_provisioning_job(
-            tenant_id="default",
-            brand_id="brand",
-            platform="feishu",
-            actor="user:admin",
-            request={},
-            secrets={},
-        )
-
-
 def test_production_settings_require_https_public_base_url():
     with pytest.raises(ValueError, match="PUBLIC_BASE_URL"):
         Settings(

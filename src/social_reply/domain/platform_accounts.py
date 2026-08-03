@@ -77,6 +77,7 @@ PROVISIONABLE_ACCOUNT_PLATFORMS = frozenset(
         AccountPlatform.INSTAGRAM.value,
         AccountPlatform.WHATSAPP.value,
         AccountPlatform.X.value,
+        AccountPlatform.FEISHU.value,
     }
 )
 ACTIVE_ACCOUNT_STATUS = AccountStatus.ACTIVE.value

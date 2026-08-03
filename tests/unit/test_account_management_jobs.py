@@ -6,6 +6,8 @@ import pytest
 from social_reply.application.account_management import jobs
 from social_reply.application.account_management.service import AccountConnectionResult
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.connectors.feishu.client import FeishuClientError
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 
 def test_meta_boolean_form_values_are_parsed_strictly():
@@ -76,6 +78,7 @@ def test_error_explains_missing_x_direct_message_permission():
         ("facebook", {"facebook_messenger_enabled": False}),
         ("instagram", {"instagram_messaging_enabled": False}),
         ("whatsapp", {"whatsapp_enabled": False}),
+        ("feishu", {"feishu_enabled": False}),
     ],
 )
 async def test_provisioning_execution_rechecks_platform_flag_before_decrypting_secrets(
@@ -133,6 +136,115 @@ def test_public_job_defensively_redacts_nested_credentials():
         },
     )()
     assert jobs.public_job(job)["result"] == {"nested": {}}
+
+
+def test_feishu_safe_request_and_public_result_redact_all_secrets():
+    safe = jobs._safe_request(
+        "feishu",
+        {
+            "app_id": "cli_12345678",
+            "api_base_url": "https://open.feishu.cn",
+            "group_mode": "mentions_only",
+            "app_secret": "app-secret",
+            "verification_token": "verification-secret",
+            "encrypt_key": "encrypt-secret",
+        },
+    )
+    assert safe == {
+        "app_id": "cli_12345678",
+        "api_base_url": "https://open.feishu.cn",
+        "group_mode": "mentions_only",
+    }
+    assert jobs._public_result(
+        {
+            "app_id": "cli_12345678",
+            "app_secret": "app-secret",
+            "verification_token": "verification-secret",
+            "encrypt_key": "encrypt-secret",
+        }
+    ) == {"app_id": "cli_12345678"}
+
+
+async def test_connect_dispatches_feishu_with_staged_secrets(monkeypatch):
+    from social_reply.application.account_management import feishu
+
+    captured = {}
+    settings = jobs.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+
+    async def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return AccountConnectionResult(
+            account_id=__import__("uuid").uuid4(),
+            platform="feishu",
+            external_account_id=kwargs["app_id"],
+            public_id="fs_public",
+            webhook_url="https://reply.example/webhooks/feishu/fs_public",
+            name="Support Bot",
+            automation_default="BOT_DRAFT_ONLY",
+        )
+
+    monkeypatch.setattr(feishu, "connect_feishu_account", fake_connect)
+    job = type(
+        "Job",
+        (),
+        {
+            "platform": "feishu",
+            "tenant_id": "tenant-a",
+            "brand_id": "brand-a",
+            "request": {
+                "app_id": "cli_12345678",
+                "api_base_url": "https://open.feishu.cn",
+                "group_mode": "mentions_only",
+                "automation_default": "BOT_DRAFT_ONLY",
+            },
+            "staging_secret": encrypt_secret_bundle(
+                {
+                    "app_secret": "app-secret",
+                    "verification_token": "verification-secret",
+                    "encrypt_key": "encrypt-secret",
+                }
+            ),
+        },
+    )()
+
+    await jobs._connect(job)
+    assert captured["app_id"] == "cli_12345678"
+    assert captured["app_secret"] == "app-secret"
+    assert captured["verification_token"] == "verification-secret"
+    assert captured["encrypt_key"] == "encrypt-secret"
+    assert captured["group_mode"] == "mentions_only"
+    assert captured["tenant_id"] == "tenant-a"
+    assert captured["automation_default"] == "BOT_DRAFT_ONLY"
+
+
+def test_feishu_client_error_is_sanitized_for_provisioning_job():
+    assert jobs._error(FeishuClientError("FEISHU_API_10003", retryable=False)) == (
+        "FEISHU_API_10003",
+        "Feishu account validation failed",
+        False,
+    )
+
+
+def test_feishu_result_payload_contains_only_public_onboarding_data():
+    result = AccountConnectionResult(
+        account_id=__import__("uuid").uuid4(),
+        platform="feishu",
+        external_account_id="cli_12345678",
+        public_id="fs_public",
+        webhook_url="https://reply.example/webhooks/feishu/fs_public",
+        name="Support Bot",
+        automation_default="BOT_DRAFT_ONLY",
+        bot_name="Support Bot",
+        bot_status=2,
+        manual_steps=("Subscribe to im.message.receive_v1.",),
+    )
+    payload = jobs._result_payload(result)
+    assert payload["callback_url"] == "https://reply.example/webhooks/feishu/fs_public"
+    assert payload["bot_name"] == "Support Bot"
+    assert payload["bot_status"] == 2
+    assert payload["manual_steps"] == ["Subscribe to im.message.receive_v1."]
+    assert "secret" not in str(payload).lower()
 
 
 def test_secret_store_staging_path_is_outside_database(tmp_path):

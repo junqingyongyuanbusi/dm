@@ -427,3 +427,117 @@ async def test_meta_account_api_still_rejects_bot_active_once_deployment_opts_in
         )
     assert response.status_code == 422
     assert "BOT_DRAFT_ONLY" in response.text
+
+
+async def test_feishu_account_api_splits_public_and_secret_fields(monkeypatch):
+    captured = {}
+    settings = account_router.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+
+    async def fake_enqueue(_job_id):
+        return None
+
+    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/feishu",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "app_id": "cli_12345678",
+                "app_secret": "app-secret",
+                "verification_token": "verification-secret",
+                "encrypt_key": "encrypt-secret",
+            },
+        )
+
+    assert response.status_code == 202
+    assert captured["platform"] == "feishu"
+    assert captured["request"] == {
+        "automation_default": "BOT_DRAFT_ONLY",
+        "app_id": "cli_12345678",
+        "api_base_url": "https://open.feishu.cn",
+        "group_mode": "mentions_only",
+    }
+    assert captured["secrets"] == {
+        "app_secret": "app-secret",
+        "verification_token": "verification-secret",
+        "encrypt_key": "encrypt-secret",
+    }
+    assert not set(captured["secrets"]) & set(captured["request"])
+
+
+async def test_feishu_account_api_enforces_gate_before_submission(monkeypatch):
+    settings = account_router.get_settings().model_copy(update={"feishu_enabled": False})
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+
+    async def unexpected_submit(**_kwargs):
+        raise AssertionError("disabled Feishu must not submit")
+
+    monkeypatch.setattr(account_router, "submit_provisioning_job", unexpected_submit)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/feishu",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "app_id": "cli_12345678",
+                "app_secret": "app-secret",
+                "verification_token": "verification-secret",
+                "encrypt_key": "encrypt-secret",
+            },
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "feishu_integration_disabled"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"app_id": "bad-app-id"},
+        {"app_secret": "   "},
+        {"verification_token": ""},
+        {"encrypt_key": "   "},
+        {"automation_default": "BOT_ACTIVE"},
+        {"unexpected": "field"},
+    ],
+)
+async def test_feishu_account_api_rejects_invalid_or_extra_fields(monkeypatch, overrides):
+    settings = account_router.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    payload = {
+        "app_id": "cli_12345678",
+        "app_secret": "app-secret",
+        "verification_token": "verification-secret",
+        "encrypt_key": "encrypt-secret",
+        **overrides,
+    }
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/feishu",
+            headers={"Authorization": "Bearer test-control-key"},
+            json=payload,
+        )
+    assert response.status_code == 422
+
+
+async def test_feishu_account_api_denies_other_tenant_even_when_disabled(monkeypatch):
+    settings = account_router.get_settings().model_copy(update={"feishu_enabled": False})
+    monkeypatch.setattr(account_router, "get_settings", lambda: settings)
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/platform-accounts/feishu",
+            headers={"Authorization": "Bearer test-control-key"},
+            json={
+                "tenant_id": "forbidden",
+                "app_id": "cli_12345678",
+                "app_secret": "app-secret",
+                "verification_token": "verification-secret",
+                "encrypt_key": "encrypt-secret",
+            },
+        )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "tenant_access_denied"

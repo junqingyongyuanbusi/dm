@@ -626,6 +626,25 @@ async def _submit_form(
         raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
     if platform == "x" and (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
         raise HTTPException(status_code=422, detail="xchat_disabled")
+    if platform == "feishu":
+        from social_reply.application.account_management.feishu import (
+            FEISHU_GROUP_MODE,
+            validate_feishu_app_id,
+        )
+
+        try:
+            validate_feishu_app_id(form.get("app_id") or "")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if form.get("automation_default", "BOT_DRAFT_ONLY") != "BOT_DRAFT_ONLY":
+            raise HTTPException(status_code=422, detail="feishu_requires_bot_draft_only")
+        if form.get("api_base_url", "https://open.feishu.cn") != "https://open.feishu.cn":
+            raise HTTPException(status_code=422, detail="invalid_feishu_api_base_url")
+        if form.get("group_mode", FEISHU_GROUP_MODE) != FEISHU_GROUP_MODE:
+            raise HTTPException(status_code=422, detail="unsupported_feishu_group_mode")
+        for secret_name in ("app_secret", "verification_token", "encrypt_key"):
+            if not (form.get(secret_name) or "").strip():
+                raise HTTPException(status_code=422, detail=f"blank_{secret_name}")
     brand_id = form.get("brand_id", "default") or "default"
     request_data, secrets_data = split_submission(platform, form)
     job_id = await submit_provisioning_job(
@@ -670,6 +689,11 @@ async def admin_connect_whatsapp(request: Request) -> Response:
 @router.post("/connect/x")
 async def admin_connect_x(request: Request) -> Response:
     return await _submit_form(request, "x")
+
+
+@router.post("/connect/feishu")
+async def admin_connect_feishu(request: Request) -> Response:
+    return await _submit_form(request, "feishu")
 
 
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)

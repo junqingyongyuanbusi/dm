@@ -2,7 +2,7 @@ import logging
 import secrets
 import uuid
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
@@ -117,6 +117,25 @@ class XAccountRequest(_BaseAccountRequest):
     xchat_pin: SecretStr | None = None
 
 
+class FeishuAccountRequest(_BaseAccountRequest):
+    app_id: str = Field(pattern=r"^cli_[A-Za-z0-9]{8,64}$")
+    app_secret: SecretStr = Field(min_length=1, max_length=512)
+    verification_token: SecretStr = Field(min_length=1, max_length=512)
+    encrypt_key: SecretStr = Field(min_length=1, max_length=512)
+    api_base_url: Literal["https://open.feishu.cn"] = "https://open.feishu.cn"
+    group_mode: Literal["mentions_only"] = "mentions_only"
+
+    @model_validator(mode="after")
+    def _validate_feishu_request(self) -> "FeishuAccountRequest":
+        for field_name in ("app_secret", "verification_token", "encrypt_key"):
+            value = getattr(self, field_name).get_secret_value()
+            if not value.strip():
+                raise ValueError(f"blank_{field_name}")
+        if self.automation_default != "BOT_DRAFT_ONLY":
+            raise ValueError("新接入的 Feishu 账号必须使用 BOT_DRAFT_ONLY")
+        return self
+
+
 class ProvisioningJobResponse(BaseModel):
     job_id: str
     status: str
@@ -163,21 +182,20 @@ def _require_platform_enabled(platform: str) -> None:
         raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
 
 
+def _reveal_secret_values(value: Any) -> Any:
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    if isinstance(value, dict):
+        return {key: _reveal_secret_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_reveal_secret_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_reveal_secret_values(item) for item in value)
+    return value
+
+
 def _split_request(platform: str, request: BaseModel) -> tuple[dict, dict[str, str]]:
-    values = request.model_dump()
-    for key in (
-        "token",
-        "access_token",
-        "app_secret",
-        "verify_token",
-        "consumer_key",
-        "consumer_secret",
-        "access_token_secret",
-        "xchat_pin",
-    ):
-        value = values.get(key)
-        if isinstance(value, SecretStr):
-            values[key] = value.get_secret_value()
+    values = _reveal_secret_values(request.model_dump())
     return split_submission(platform, values)
 
 
@@ -246,6 +264,26 @@ async def create_or_update_whatsapp_account(
         tenant_id=request.tenant_id,
         brand_id=request.brand_id,
         platform="whatsapp",
+        actor=principal.actor,
+        request=payload,
+        secrets=secrets_bundle,
+    )
+    await _enqueue(job_id)
+    return _job_response(job_id)
+
+
+@router.post("/feishu", response_model=ProvisioningJobResponse, status_code=202)
+async def create_or_update_feishu_account(
+    request: FeishuAccountRequest,
+    principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
+) -> ProvisioningJobResponse:
+    principal.require_tenant(request.tenant_id)
+    _require_platform_enabled("feishu")
+    payload, secrets_bundle = _split_request("feishu", request)
+    job_id = await submit_provisioning_job(
+        tenant_id=request.tenant_id,
+        brand_id=request.brand_id,
+        platform="feishu",
         actor=principal.actor,
         request=payload,
         secrets=secrets_bundle,

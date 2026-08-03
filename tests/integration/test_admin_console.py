@@ -1005,7 +1005,7 @@ async def test_draft_edit_records_final_text_and_outbox_provenance(
     assert outbox.actor_kind == "ADMIN_HUMAN"
 
 
-async def test_accounts_page_renders_five_channel_tiles(migrated_db, monkeypatch):
+async def test_accounts_page_renders_six_channel_tiles(migrated_db, monkeypatch):
     from social_reply.application.account_management import admin_console
 
     settings = admin_console.get_settings().model_copy(
@@ -1016,6 +1016,7 @@ async def test_accounts_page_renders_five_channel_tiles(migrated_db, monkeypatch
             "meta_comment_reply_enabled": True,
             "meta_auto_reply_enabled": True,
             "whatsapp_enabled": True,
+            "feishu_enabled": True,
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
@@ -1032,6 +1033,7 @@ async def test_accounts_page_renders_five_channel_tiles(migrated_db, monkeypatch
         ("instagram", "Instagram"),
         ("telegram", "Telegram"),
         ("whatsapp", "WhatsApp"),
+        ("feishu", "Feishu"),
     ):
         assert f'data-channel="{channel}"' in html
         assert f"/static/channel-icons/{channel}.svg" in html
@@ -1088,12 +1090,15 @@ async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypat
 async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypatch):
     from social_reply.application.account_management import admin_console
 
-    settings = admin_console.get_settings().model_copy(update={"whatsapp_enabled": True})
+    settings = admin_console.get_settings().model_copy(
+        update={"whatsapp_enabled": True, "feishu_enabled": True}
+    )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
         telegram_page = await client.get("/admin/accounts?connect=telegram")
         whatsapp_page = await client.get("/admin/accounts?connect=whatsapp")
+        feishu_page = await client.get("/admin/accounts?connect=feishu")
 
     assert 'action="/admin/connect/telegram"' in telegram_page.text
     assert "@BotFather" in telegram_page.text
@@ -1102,6 +1107,96 @@ async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypa
     assert "Phone Number ID" in whatsapp_page.text
     assert 'name="access_token"' in whatsapp_page.text
     assert 'name="verify_token"' in whatsapp_page.text
+    assert 'action="/admin/connect/feishu"' in feishu_page.text
+    assert 'name="app_id"' in feishu_page.text
+    assert 'name="app_secret"' in feishu_page.text
+    assert 'name="verification_token"' in feishu_page.text
+    assert 'name="encrypt_key"' in feishu_page.text
+    assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in feishu_page.text
+    assert 'name="group_mode" value="mentions_only"' in feishu_page.text
+
+
+async def test_accounts_page_renders_feishu_sanitized_channel_health(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="feishu",
+            name="Support Bot",
+            external_account_id="cli_12345678",
+            public_id=f"fs_{uuid.uuid4().hex}",
+            config={
+                "feishu_health_status": "READY",
+                "feishu_health_checked_at": "2026-08-03T00:00:00+00:00",
+                "feishu_bot_name": "Support Bot",
+                "feishu_bot_activate_status": 2,
+            },
+            capability={"dm": True, "mentions": True, "max_text_length": 4000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    assert "Health" in response.text
+    assert "READY" in response.text
+    assert "Support Bot" in response.text
+    assert "2026-08-03T00:00:00+00:00" in response.text
+    assert "verification_token" not in response.text
+    assert "encrypt_key" not in response.text
+
+
+async def test_feishu_account_can_be_explicitly_promoted_after_provisioning(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"feishu_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="feishu",
+            name="Support Bot",
+            external_account_id="cli_87654321",
+            public_id=f"fs_{uuid.uuid4().hex}",
+            config={"feishu_health_status": "READY"},
+            capability={"dm": True, "mentions": True, "max_text_length": 4000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/accounts")
+        assert f'action="/admin/accounts/{account_id}/automation"' in page.text
+        promoted = await client.post(
+            f"/admin/accounts/{account_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
+        )
+
+    assert promoted.status_code == 303
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.automation_default == "BOT_ACTIVE"
 
 
 async def test_meta_account_automation_only_converges_to_draft_while_switch_is_off(
@@ -1225,6 +1320,7 @@ async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
             "facebook_messenger_enabled": False,
             "instagram_messaging_enabled": False,
             "whatsapp_enabled": False,
+            "feishu_enabled": False,
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
@@ -1234,12 +1330,13 @@ async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
         disabled = await client.get("/admin/accounts?connect=instagram")
 
     assert response.status_code == 200
-    for channel in ("facebook", "instagram", "whatsapp"):
+    for channel in ("facebook", "instagram", "whatsapp", "feishu"):
         assert f'data-channel="{channel}" role="listitem" aria-disabled="true"' in response.text
         assert f'href="/admin/accounts?connect={channel}' not in response.text
     assert 'action="/admin/oauth/meta/start"' not in response.text
     assert 'action="/admin/oauth/instagram/start"' not in response.text
     assert 'action="/admin/connect/whatsapp"' not in response.text
+    assert 'action="/admin/connect/feishu"' not in response.text
     assert "该渠道尚未在当前部署启用" in disabled.text
     assert 'id="channel-setup"' not in disabled.text
 
