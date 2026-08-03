@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from social_reply.domain.platform_accounts import DIRECT_DESTINATION_CAPABILITIES
+
 
 class SendContractError(ValueError):
     def __init__(self, code: str, detail: str) -> None:
@@ -28,17 +30,8 @@ class DirectReplyDestination:
 
 
 _DESTINATION_PLATFORMS = {
-    "telegram_dm": frozenset({"telegram"}),
-    "meta_messenger_dm": frozenset({"facebook"}),
-    "meta_instagram_dm": frozenset({"instagram"}),
-    "meta_public_comment": frozenset({"facebook", "instagram"}),
-    "meta_private_reply": frozenset({"facebook", "instagram"}),
-    "whatsapp_session_message": frozenset({"whatsapp"}),
-    "x_dm": frozenset({"x"}),
-    "x_chat_message": frozenset({"x"}),
-    "x_post_reply": frozenset({"x"}),
-    "feishu_p2p_reply": frozenset({"feishu"}),
-    "feishu_group_reply": frozenset({"feishu"}),
+    destination_type: frozenset(platform.value for platform in spec.platforms)
+    for destination_type, spec in DIRECT_DESTINATION_CAPABILITIES.items()
 }
 
 

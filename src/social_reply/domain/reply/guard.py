@@ -1,6 +1,7 @@
 import re
 from dataclasses import replace
 
+from social_reply.domain.platform_accounts import PLATFORM_CAPABILITY_SPECS
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 
 # 账户号/长数字串、邮箱——公开回复禁止回显，发送给外部 LLM 前也需脱敏。
@@ -20,11 +21,8 @@ def redact_pii(text: str) -> str:
 
 
 _MAX_TEXT_LENGTH = {
-    "telegram": 4096,
-    "facebook": 2000,
-    "instagram": 1000,
-    "x": 280,
-    "feishu": 4000,
+    platform.value: spec.max_text_length
+    for platform, spec in PLATFORM_CAPABILITY_SPECS.items()
 }
 _DEFAULT_MAX = 2000
 

@@ -14,6 +14,7 @@ from social_reply.application.account_management.jobs import (
     submit_provisioning_job,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.connectors.feishu.contracts import FEISHU_APP_ID_PATTERN
 from social_reply.domain.platform_accounts import (
     ACTIVE_ACCOUNT_STATUS,
     DISABLED_ACCOUNT_STATUS,
@@ -118,7 +119,7 @@ class XAccountRequest(_BaseAccountRequest):
 
 
 class FeishuAccountRequest(_BaseAccountRequest):
-    app_id: str = Field(pattern=r"^cli_[A-Za-z0-9]{8,64}$")
+    app_id: str = Field(pattern=FEISHU_APP_ID_PATTERN)
     app_secret: SecretStr = Field(min_length=1, max_length=512)
     verification_token: SecretStr = Field(min_length=1, max_length=512)
     encrypt_key: SecretStr = Field(min_length=1, max_length=512)
