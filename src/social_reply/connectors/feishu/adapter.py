@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from social_reply.connectors.feishu.contracts import FEISHU_GROUP_MODE
 from social_reply.domain.messages.canonical import CanonicalEvent, ChannelType
 
 _EVENT_NAMESPACE = "im.message.receive_v1"
@@ -81,7 +82,7 @@ class FeishuWebhookAdapter:
             kind = "dm"
         elif chat_type == "group":
             mention_key = self._bot_mention_key(message.get("mentions"))
-            if self._group_mode != "mentions_only" or mention_key is None:
+            if self._group_mode != FEISHU_GROUP_MODE or mention_key is None:
                 return []
             channel_type = ChannelType.MENTION
             kind = "mention"

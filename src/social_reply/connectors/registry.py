@@ -9,6 +9,7 @@ from social_reply.application.platform_accounts import (
 )
 from social_reply.connectors.base import PlatformSender
 from social_reply.connectors.feishu.client import FeishuClient
+from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
 from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
 from social_reply.connectors.whatsapp.client import WhatsAppClient
@@ -103,7 +104,7 @@ def _build_sender(
         return FeishuClient(
             app_id=app_id,
             app_secret=app_secret.strip(),
-            api_base_url="https://open.feishu.cn",
+            api_base_url=FEISHU_API_BASE_URL,
         )
     if account.platform == "whatsapp":
         if not account.external_account_id:

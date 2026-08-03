@@ -12,13 +12,15 @@ from social_reply.application.account_management.service import (
 )
 from social_reply.connectors.feishu.client import FeishuClient
 from social_reply.connectors.feishu.contracts import (
+    FEISHU_API_BASE_URL,
+    FEISHU_GROUP_MODE,
+)
+from social_reply.connectors.feishu.contracts import (
     FEISHU_APP_ID_PATTERN as FEISHU_APP_ID_PATTERN_TEXT,
 )
 from social_reply.domain.platform_accounts import ACTIVE_ACCOUNT_STATUS
 from social_reply.shared.config import get_settings
 
-FEISHU_API_BASE_URL = "https://open.feishu.cn"
-FEISHU_GROUP_MODE = "mentions_only"
 FEISHU_APP_ID_PATTERN = re.compile(FEISHU_APP_ID_PATTERN_TEXT)
 
 

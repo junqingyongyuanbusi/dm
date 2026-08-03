@@ -27,6 +27,7 @@ from social_reply.application.account_management.jobs import (
     submit_provisioning_job,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -641,7 +642,7 @@ async def _submit_form(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if form.get("automation_default", "BOT_DRAFT_ONLY") != "BOT_DRAFT_ONLY":
             raise HTTPException(status_code=422, detail="feishu_requires_bot_draft_only")
-        if form.get("api_base_url", "https://open.feishu.cn") != "https://open.feishu.cn":
+        if form.get("api_base_url", FEISHU_API_BASE_URL) != FEISHU_API_BASE_URL:
             raise HTTPException(status_code=422, detail="invalid_feishu_api_base_url")
         if form.get("group_mode", FEISHU_GROUP_MODE) != FEISHU_GROUP_MODE:
             raise HTTPException(status_code=422, detail="unsupported_feishu_group_mode")

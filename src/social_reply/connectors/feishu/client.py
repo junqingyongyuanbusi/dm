@@ -9,6 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
+from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
 
 _TOKEN_INVALID_CODE = 99991663
 _RATE_LIMIT_CODES = frozenset({99991400})
@@ -37,7 +38,7 @@ class FeishuClient:
         *,
         app_id: str,
         app_secret: str,
-        api_base_url: str = "https://open.feishu.cn",
+        api_base_url: str = FEISHU_API_BASE_URL,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:

@@ -19,6 +19,7 @@ from social_reply.application.account_management.service import (
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.connectors.feishu.client import FeishuClientError
+from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL, FEISHU_GROUP_MODE
 from social_reply.connectors.meta.client import MetaCommentPermissionError
 from social_reply.domain.platform_accounts import PROVISIONABLE_ACCOUNT_PLATFORMS
 from social_reply.infrastructure.database import models
@@ -336,8 +337,8 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
             app_secret=credentials["app_secret"],
             verification_token=credentials["verification_token"],
             encrypt_key=credentials["encrypt_key"],
-            api_base_url=str(request.get("api_base_url") or "https://open.feishu.cn"),
-            group_mode=str(request.get("group_mode") or "mentions_only"),
+            api_base_url=str(request.get("api_base_url") or FEISHU_API_BASE_URL),
+            group_mode=str(request.get("group_mode") or FEISHU_GROUP_MODE),
             **common,
         )
     return await connect_x_account(
