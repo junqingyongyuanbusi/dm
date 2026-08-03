@@ -120,7 +120,7 @@ async def test_send_text_retries_token_invalid_once_with_same_uuid():
     assert reply_bodies[0]["uuid"] == reply_bodies[1]["uuid"]
 
 
-async def test_concurrent_rejected_token_refreshes_only_if_cache_still_matches():
+async def test_concurrent_rejected_same_token_generation_refreshes_once():
     token_calls = 0
     invalid_replies = 0
     both_invalid = asyncio.Event()
@@ -134,12 +134,13 @@ async def test_concurrent_rejected_token_refreshes_only_if_cache_still_matches()
                 200,
                 json={
                     "code": 0,
-                    "tenant_access_token": f"tenant-{token_calls}",
+                    "tenant_access_token": "same-tenant-token",
                     "expire": 7200,
                 },
             )
-        reply_uuids.setdefault(request.url.path, []).append(json.loads(request.content)["uuid"])
-        if request.headers["authorization"] == "Bearer tenant-1":
+        path_replies = reply_uuids.setdefault(request.url.path, [])
+        path_replies.append(json.loads(request.content)["uuid"])
+        if len(path_replies) == 1:
             invalid_replies += 1
             if invalid_replies == 2:
                 both_invalid.set()

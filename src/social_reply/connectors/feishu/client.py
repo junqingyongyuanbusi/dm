@@ -46,6 +46,7 @@ class FeishuClient:
         self._app_secret = app_secret
         self._clock = clock
         self._tenant_token: str | None = None
+        self._tenant_token_generation = 0
         self._tenant_token_refresh_at = 0.0
         self._token_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
@@ -90,31 +91,44 @@ class FeishuClient:
             raise FeishuClientError("FEISHU_TOKEN_EXPIRE_INVALID", retryable=False)
         return token.strip(), expire
 
-    async def tenant_access_token(
+    async def _tenant_access_token(
         self,
         *,
-        rejected_token: str | None = None,
-    ) -> tuple[str, int]:
+        rejected_generation: int | None = None,
+    ) -> tuple[str, int, int]:
         now = self._clock()
         if (
             self._tenant_token
-            and self._tenant_token != rejected_token
+            and self._tenant_token_generation != rejected_generation
             and now < self._tenant_token_refresh_at
         ):
-            return self._tenant_token, max(1, int(self._tenant_token_refresh_at - now))
+            return (
+                self._tenant_token,
+                max(1, int(self._tenant_token_refresh_at - now)),
+                self._tenant_token_generation,
+            )
         async with self._token_lock:
             now = self._clock()
             if (
                 self._tenant_token
-                and self._tenant_token != rejected_token
+                and self._tenant_token_generation != rejected_generation
                 and now < self._tenant_token_refresh_at
             ):
-                return self._tenant_token, max(1, int(self._tenant_token_refresh_at - now))
+                return (
+                    self._tenant_token,
+                    max(1, int(self._tenant_token_refresh_at - now)),
+                    self._tenant_token_generation,
+                )
             token, expire = await self._fetch_tenant_access_token()
             refresh_margin = min(300, max(30, expire // 10))
             self._tenant_token = token
+            self._tenant_token_generation += 1
             self._tenant_token_refresh_at = now + expire - refresh_margin
-            return token, expire
+            return token, expire, self._tenant_token_generation
+
+    async def tenant_access_token(self) -> tuple[str, int]:
+        token, expire, _generation = await self._tenant_access_token()
+        return token, expire
 
     async def get_bot_info(
         self,
@@ -197,7 +211,7 @@ class FeishuClient:
     async def send_text(self, *, target: dict, text: str) -> str:
         body = self._reply_body(target=target, text=text)
         try:
-            token, _expire = await self.tenant_access_token()
+            token, _expire, token_generation = await self._tenant_access_token()
         except (httpx.ConnectError, httpx.ConnectTimeout):
             raise
         except Exception as exc:
@@ -208,7 +222,9 @@ class FeishuClient:
             response, payload, code = await self._send_reply(target=target, body=body, token=token)
             if code == _TOKEN_INVALID_CODE and refresh_attempt == 0:
                 try:
-                    token, _expire = await self.tenant_access_token(rejected_token=token)
+                    token, _expire, token_generation = await self._tenant_access_token(
+                        rejected_generation=token_generation
+                    )
                 except (httpx.ConnectError, httpx.ConnectTimeout):
                     raise
                 except Exception as exc:

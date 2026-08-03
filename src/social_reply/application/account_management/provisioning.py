@@ -239,7 +239,7 @@ async def provision_direct_account(
         "webhook_secret_bundle": webhook_bundle,
         "config": {"delivery_mode": "direct", **config},
         "capability": capability,
-        "config_version": existing.config_version + 1 if existing is not None else 1,
+        "config_version": 1,
         "chatwoot_inbox_id": None,
         # Reauthorization must not silently change an operator-selected automation mode.
         "automation_default": (
@@ -256,15 +256,17 @@ async def provision_direct_account(
         ),
     }
     async with get_session_factory()() as session:
+        statement = pg_insert(models.PlatformAccount).values(**values)
+        update_values = {
+            key: value for key, value in values.items() if key not in {"id", "config_version"}
+        }
+        update_values["config_version"] = models.PlatformAccount.config_version + 1
         account_id = (
             await session.execute(
-                pg_insert(models.PlatformAccount)
-                .values(**values)
-                .on_conflict_do_update(
+                statement.on_conflict_do_update(
                     index_elements=["tenant_id", "platform", "external_account_id"],
-                    set_={key: value for key, value in values.items() if key != "id"},
-                )
-                .returning(models.PlatformAccount.id)
+                    set_=update_values,
+                ).returning(models.PlatformAccount.id)
             )
         ).scalar_one()
         await session.commit()

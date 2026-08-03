@@ -71,7 +71,7 @@ Current head `f8a1c3d5e702` follows `e4b7c2d9a610` and creates the unique partia
 `raw_events(platform_account_id, external_event_id)` where `source='feishu'`,
 `ingress_kind='webhook'`, and `external_event_id IS NOT NULL`. The ingress value is the sanitized,
 nonblank Feishu `header.event_id`, not `message_id`, and the same constraint applies while the
-feature flag is off. Before upgrade, run this inventory while Feishu ingress is paused:
+feature flag is off. Before upgrade, run this inventory while normal ingress remains online:
 
 ```sql
 SELECT platform_account_id, external_event_id, count(*)
@@ -85,9 +85,11 @@ HAVING count(*) > 1;
 
 The result must be empty. The migration fails rather than deleting or rewriting append-only RawEvent
 evidence when historical duplicates exist; stop and use a separately reviewed data-repair plan or a
-verified backup instead of editing evidence ad hoc. Index creation takes a lock on `raw_events`, so
-keep Feishu ingress paused until the API migration owner reports head `f8a1c3d5e702`. Downgrading to
-`e4b7c2d9a610` only drops this index.
+verified backup instead of editing evidence ad hoc. The index is created and dropped concurrently in
+an Alembic autocommit block, so existing Feishu and non-Feishu ingress stays online and neither only
+Feishu nor all RawEvent writers need to pause. A concurrent index build can consume substantial
+storage I/O, so monitor database load and schedule it for an appropriate operating window.
+Downgrading to `e4b7c2d9a610` only drops this index, also concurrently.
 
 Downgrading `e4b7c2d9a610` first queries for any Feishu account and fails closed with
 `cannot downgrade while Feishu platform accounts exist`. Disablement is not sufficient: remove and

@@ -18,14 +18,21 @@ _PREDICATE = "source = 'feishu' AND ingress_kind = 'webhook' AND external_event_
 
 
 def upgrade() -> None:
-    op.create_index(
-        _INDEX_NAME,
-        "raw_events",
-        ["platform_account_id", "external_event_id"],
-        unique=True,
-        postgresql_where=sa.text(_PREDICATE),
-    )
+    with op.get_context().autocommit_block():
+        op.create_index(
+            _INDEX_NAME,
+            "raw_events",
+            ["platform_account_id", "external_event_id"],
+            unique=True,
+            postgresql_where=sa.text(_PREDICATE),
+            postgresql_concurrently=True,
+        )
 
 
 def downgrade() -> None:
-    op.drop_index(_INDEX_NAME, table_name="raw_events")
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            _INDEX_NAME,
+            table_name="raw_events",
+            postgresql_concurrently=True,
+        )
