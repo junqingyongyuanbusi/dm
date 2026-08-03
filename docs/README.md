@@ -8,6 +8,8 @@
   environment variables.
 - [Platform account control plane](admin-control-plane.md): account, credential, tenant and
   provisioning trust boundaries.
+- [Feishu integration operator runbook](feishu-integration.md): self-built application Bot setup,
+  callback verification, draft-first smoke checks, activation and rollback.
 - [Production migration notes](production-migration.md): database, encrypted-secret and staged
   rollout requirements.
 - [Reliability fault drills](reliability-drills.md): repeatable queue-loss, crash, lease, takeover,

@@ -1,6 +1,6 @@
 # Social Reply（多租户社媒消息中台）
 
-这是一个直连 X、Telegram、Meta 和 WhatsApp 的模块化单体，使用 PostgreSQL 保存会话、消息、决策与 Transactional Outbox，并支持 AI 自动回复和本地人工接管。Chatwoot 是可选 Bridge，不是系统启动依赖。
+这是一个直连 X、Telegram、Facebook、Instagram、WhatsApp 和 Feishu（飞书）的模块化单体，使用 PostgreSQL 保存会话、消息、决策与 Transactional Outbox，并支持 AI 自动回复和本地人工接管。Chatwoot 是可选 Bridge，不是系统启动依赖。
 
 ## 本地运行
 
@@ -47,7 +47,7 @@ ${PUBLIC_BASE_URL}/admin
 
 - Web 控制面：`/admin`，PostgreSQL 服务端会话（浏览器仅持有 opaque HTTP-only Cookie）、CSRF 防护；
 - Provisioning API：`/api/v1/platform-accounts/*`，使用独立 `CONTROL_API_KEY`，只供服务间调用；
-- 数据面：`/webhooks/telegram/*`、`/webhooks/meta/*`、`/webhooks/x/*`；
+- 数据面：`/webhooks/telegram/*`、`/webhooks/meta/*`、`/webhooks/x/*`、`/webhooks/feishu/*`；
 - Durable provisioning：提交后返回 `202 + job_id`，Worker 执行平台验证/落库/Webhook 配置，Scheduler 恢复失败或中断任务；
 - Secret isolation：OAuth 临时状态加密存入 Redis；平台凭证由 `PLATFORM_SECRET_KEYS` 加密后暂存于 durable ProvisioningJob，并最终写入 PostgreSQL encrypted bundle；
 - 安全默认：新账号默认为 `BOT_DRAFT_ONLY`。直连平台草稿只保存在 `reply_decisions`，绝不会作为客户消息发送。
@@ -168,6 +168,22 @@ Meta 只在「App 级 Webhooks 产品」与「账号级订阅」都列出某个�
 或 `REAUTH_REQUIRED`。Business Verification、Advanced Access/App Review、App Live 状态、隐私
 政策和数据删除流程仍需在 Meta 后台完成。普通私信发送受 24 小时消息窗口约束。
 
+### 连接 Feishu（飞书）
+
+Feishu 使用企业自建应用 Bot，不使用自定义群机器人 webhook。新部署先用
+`FEISHU_ENABLED=false` 将同一镜像部署到 API、Worker、Scheduler，确认数据库与三个角色就绪后，
+再协调重启并同时设为 `true`。然后在 `/admin/accounts` 提交 App ID、App Secret、Verification
+Token 和 Encrypt Key；Control API 等价入口为
+`POST /api/v1/platform-accounts/feishu`。凭证按 Tenant 暂存和落库时均由
+`PLATFORM_SECRET_KEYS` 加密。
+
+接入任务验证应用与 Bot，但不会通过 API 修改飞书开放平台的事件回调。管理员必须复制任务返回的
+`${PUBLIC_BASE_URL}/webhooks/feishu/{public_id}`，在飞书开放平台手工订阅
+`im.message.receive_v1`，完成 URL verification，并发布应用。账号固定从 `BOT_DRAFT_ONLY`
+开始；草稿 smoke 通过后，再在 `/admin/accounts` 明确点击「切为自动」进入 `BOT_ACTIVE`。
+私信和群内明确 `@Bot` 的文本消息受支持；普通群消息与 `@所有人` 不在范围内。完整操作步骤见
+[Feishu operator runbook](docs/feishu-integration.md)。
+
 ### 连接 X
 
 ```http
@@ -197,14 +213,14 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 
 ```text
 平台 Webhook
-→ 验签并提交 RawEvent + versioned dispatch contract
-→ PostgreSQL reservation / lease → Redis / Dramatiq dispatch
-→ CanonicalEvent + NormalizedEvent 去重
+→ 验签、解密/识别账号并提交 RawEvent + versioned dispatch contract
+→ PostgreSQL reservation / lease → Redis / Dramatiq durable dispatch
+→ CanonicalEvent + NormalizedEvent 去重与会话隔离
 → Message + DecisionJob（同一事务）
 → Rules / RAG / LLM / Final Guard
 → ReplyDecision + Transactional Outbox（同一事务）
-→ 发送前状态/capability/接管复检
-→ Telegram / Facebook / Instagram / WhatsApp / X / XChat
+→ 发送前状态/capability/接管/平台健康复检
+→ Telegram / Facebook / Instagram / WhatsApp / Feishu / X / XChat
 ```
 
 PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Scheduler 会恢复带版本化 dispatch contract 的新 RawEvent、DecisionJob 和 Outbox；历史缺少安全重建参数的 `PENDING` RawEvent 不会被猜测执行。Worker 提交 Outbox 后仍走低延迟 Fast Path。
@@ -214,6 +230,7 @@ PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；R
 - [运行架构](docs/architecture.md)
 - [配置参考](docs/configuration.md)
 - [账号控制面](docs/admin-control-plane.md)
+- [Feishu operator runbook](docs/feishu-integration.md)
 - [生产迁移](docs/production-migration.md)
 - [VPS 运维](deploy/vps/README.md)
 - [文档地图与历史材料](docs/README.md)
@@ -223,16 +240,16 @@ PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；R
 ```bash
 uv sync --frozen --all-groups
 uv run ruff check .
-uv run pytest -m "not integration"   # 纯单元
+uv run pytest -m "not integration"   # 本地单元门禁，覆盖 6 个直连账号平台
 
 docker compose -f deploy/docker-compose.yml up -d postgres redis
 docker compose -f deploy/docker-compose.yml exec -T postgres sh -c \
   'psql -U dev -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '\''social_reply_test'\''" | grep -q 1 || createdb -U dev social_reply_test'
 DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
-REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 全量
+REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 6 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `e4b7c2d9a610`。当前 Feishu 专用测试文件收集 60 个用例（39 unit + 21 integration）；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
 
 ## X 贴文评论自动回复
 

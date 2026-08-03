@@ -119,6 +119,28 @@ object adds `comments`. Standalone Instagram Login requests
 subscriptions. Existing Instagram tokens must be reauthorized through the same login path that
 created them.
 
+## Feishu integration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FEISHU_ENABLED` | `false` | Feishu provisioning, normal-event dispatch, health inspection and sending |
+| `FEISHU_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler credential/Bot health cadence; range 60-86400 |
+
+API, Worker and Scheduler must receive the same values, and configuration changes take effect only
+after all three roles restart on one flag-aware image. The environment templates keep
+`FEISHU_ENABLED=false`. Prepare the self-built application Bot first, deploy the flag-aware image
+with Feishu disabled, then enable all three roles together, provision the account and configure the
+returned account-specific Callback URL. The provider API origin is fixed at
+`https://open.feishu.cn` rather than configured by an environment variable.
+
+The Feishu webhook route is always registered. While the feature is disabled, plaintext or encrypted
+URL-verification challenges still receive their challenge response. A valid encrypted normal event
+is acknowledged and retained as sanitized ignored ingress evidence, but is not dispatched into the
+decision pipeline. Provisioning and health work pause, and matching Outbox sends move to recoverable
+`NEEDS_REVIEW/FEISHU_DISABLED` without consuming an attempt. Re-enabling all three roles returns
+durable work to recovery; disabling never deletes account credentials, callback identity or Outbox
+evidence.
+
 ## Decision, LLM and knowledge
 
 | Variable | Default | Meaning |

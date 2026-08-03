@@ -59,7 +59,7 @@ Redis is not the source of truth for accounts, ingestion, decisions, deliveries,
 
 ### External systems
 
-- Platform APIs are the transport boundary for Telegram, Facebook, Instagram, WhatsApp and X.
+- Platform APIs are the transport boundary for Telegram, Facebook, Instagram, WhatsApp, Feishu and X.
 - Chatwoot is an optional bridge, not a startup dependency.
 - OpenAI-compatible chat and embedding APIs are called only from decision/knowledge code, never
   directly from webhook routers.
@@ -67,8 +67,8 @@ Redis is not the source of truth for accounts, ingestion, decisions, deliveries,
 ## Direct message path
 
 ```text
-Telegram / Meta / WhatsApp / X webhook
-  -> API signature and account validation
+Telegram / Meta / WhatsApp / Feishu / X webhook
+  -> API signature, encryption and account validation
   -> Meta: minimal verified-request evidence + account-scoped occurrence RawEvent
   -> other platforms: account-scoped RawEvent
   -> RawEvent committed in PostgreSQL
@@ -103,7 +103,7 @@ valid. Delivery repeats the generation check immediately before provider I/O. Co
 locks serialize cancellation with delivery, but an external send that already completed cannot be
 undone.
 
-Webhook ingestion and X polling persist `RawEvent` evidence before normalization. New Telegram, Meta, X direct, Chatwoot webhook, and Chatwoot reconciliation rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
+Webhook ingestion and X polling persist `RawEvent` evidence before normalization. New Telegram, Meta, Feishu, X direct, Chatwoot webhook, and Chatwoot reconciliation rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
 
 Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes.
 
@@ -193,14 +193,48 @@ These gates are process-local configuration. Old images do not recognize them, s
 platform requires the coordinated API/Worker/Scheduler restart documented in
 `docs/configuration.md`; a mixed-version rolling window is not a valid disable procedure.
 
+## Feishu platform boundary
+
+Feishu uses one account-owned `PlatformAccount` per enterprise self-built application Bot. App ID,
+App Secret, Verification Token and Encrypt Key belong to that account's encrypted credential bundle;
+Feishu does not create or share a `PlatformApp`. The account's opaque `public_id` selects the
+always-registered `/webhooks/feishu/{public_id}` route.
+
+URL-verification challenges may be plaintext or AES-encrypted and remain available while
+`FEISHU_ENABLED=false`. Normal events must use the encrypted envelope, carry valid `X-Lark-*`
+signature headers within the replay window, match the account Verification Token and App ID, and
+decrypt successfully before dispatch. Invalid authentication creates no `RawEvent`. A verified
+normal event is acknowledged even while disabled; the API persists sanitized
+`IGNORED_AT_INGRESS` evidence with `ingress_gate=FEISHU_DISABLED` and does not dispatch it.
+
+Accepted `im.message.receive_v1` occurrences are committed as account-scoped `RawEvent` rows with
+the same immutable direct-dispatch contract used by other recoverable webhook ingress. Worker
+normalization supports P2P text and group text that explicitly mentions the configured Bot. Group
+conversation identity includes account, chat, sender and any available thread/root scope so users
+and threads do not share decision history accidentally. Bot/self events, unsupported schemas and
+blank mention-only text do not enter decisions; unsupported attachments remain durable evidence and
+follow the human-work path.
+
+Outbox delivery has two explicit destinations: `feishu_p2p_reply` and `feishu_group_reply`. Both
+reply to the persisted inbound Feishu message target; thread replies preserve thread scope. The
+Outbox row UUID is sent as Feishu's `uuid`, so recovery and token refresh reuse one provider
+idempotency key. Delivery rechecks `FEISHU_ENABLED` and account health immediately before network
+I/O. Disabled or non-ready accounts pause in operator-visible `NEEDS_REVIEW` without consuming an
+attempt; ambiguous post-dispatch outcomes are never retried blindly.
+
+Scheduler's Feishu health sweep validates credentials, Bot activation and Bot identity, then stores
+sanitized `READY`, `BOT_NOT_ACTIVE`, `BOT_ID_MISMATCH`, `CREDENTIAL_INVALID` or `ERROR` status. This
+inspection lane is separate from durable core recovery and cannot serialize RawEvent, DecisionJob or
+Outbox recovery.
+
 ## Scheduler lanes
 
 Scheduler runs due sweeps independently rather than as one serial cycle:
 
 - the **core recovery lane** owns ProvisioningJob, initial RawEvent, DecisionJob, Outbox and XChat
   recovery;
-- the **inspection lane** owns Chatwoot reconciliation, X polling/subscription/webhook inspection and
-  Meta health reconciliation.
+- the **inspection lane** owns Chatwoot reconciliation, X polling/subscription/webhook inspection,
+  Meta health reconciliation and Feishu account health inspection.
 
 A slow inspection does not block recurring core recovery. Each named sweep permits at most one
 running instance, missed ticks coalesce, and submission, body and completion failures are isolated
@@ -244,8 +278,10 @@ durable job boundary rather than directly mutating account rows.
 - Direct text commands bind destination and target kind to the source ReplyDecision/Message target
   and Conversation contact before sender resolution; malformed or wrong-recipient rows never call a
   connector.
-- Telegram/Meta/WhatsApp/X adapters only emit supported text-message CanonicalEvents. Unsupported
-  media, receipts and reactions remain RawEvent evidence and do not enter reply decisions.
+- Telegram/Meta/WhatsApp/X adapters only emit supported text-message CanonicalEvents. Feishu also
+  canonicalizes unsupported attachment metadata so it enters the `UNSUPPORTED_ATTACHMENT`
+  human-work path rather than an automated text decision; receipts, reactions and other unsupported
+  occurrences remain RawEvent evidence.
 - Ambiguous post-send transport failures do not blindly retry.
 - Account sender caches are keyed by account config version and, for Meta senders, PlatformApp config version so App Secret rotation replaces the client.
 - Scheduler recovery is idempotent; each sweep is exception-isolated, max-one-instance and coalescing, with soft slow-run warnings rather than hard cancellation.
@@ -260,7 +296,8 @@ These public systems informed semantics only; Social Reply does not add them as 
 
 ## Deployment invariants
 
-- API, Worker, and Scheduler must receive the same feature flags and `PLATFORM_SECRET_KEYS`.
+- API, Worker, and Scheduler must receive the same feature flags, including `FEISHU_ENABLED`, and
+  the same `PLATFORM_SECRET_KEYS`.
 - Only API performs migration; Worker and Scheduler start after the database reaches head.
 - PostgreSQL and Redis are private infrastructure endpoints. Only API is exposed through the public
   ingress/tunnel.

@@ -68,6 +68,9 @@ Failed jobs retain only the encrypted staging envelope for controlled retry, use
 `PlatformApp` owns application-level webhook credentials and one webhook route. It may contain many `PlatformAccount` rows.
 
 - Telegram: one direct `PlatformAccount`, account-level webhook.
+- Feishu: one tenant-scoped direct `PlatformAccount` for one enterprise self-built application Bot;
+  App ID is the external account identity, the account owns all four credentials and its webhook
+  route, and no `PlatformApp` is created.
 - Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows. App secrets sign webhook bodies and generate `appsecret_proof`; account tokens remain account-scoped. Facebook Login Instagram rows belong to family `meta` and require a Page ID; standalone Instagram Login rows belong to family `instagram` and forbid a Page ID. Shared webhook public IDs are unique across both families.
 - WhatsApp: a Meta `PlatformApp` plus one account per `phone_number_id`.
 - X: deployment-level OAuth Consumer App credentials, a tenant-shared `PlatformApp` webhook route, and one `PlatformAccount` per authorized user. Events route by `for_user_id`; legacy account-level webhook secrets remain readable during migration.
@@ -85,6 +88,8 @@ Supported destination commands:
 - `meta_instagram_dm`
 - `meta_public_comment`
 - `meta_private_reply`
+- `feishu_p2p_reply`
+- `feishu_group_reply`
 - `whatsapp_session_message`
 - `x_dm`
 - `x_chat_message`
@@ -108,13 +113,34 @@ The built-in administration surface provides:
 - a conversation archive at `/admin/conversations`, where direct messages and public comments/mentions are separated while every reply remains bound to an explicit inbound message target;
 - read-only runtime diagnostics at `/admin/health`; draft approval and delivery retry remain inbox workflows instead of being duplicated across diagnostic pages;
 - platform account and provisioning-job overview;
-- Telegram, Facebook, Instagram, WhatsApp, and X connection forms;
+- Telegram, Facebook, Instagram, WhatsApp, Feishu, and X connection forms;
 - asynchronous job status and retry;
 - account enable/disable and health checks, including separate Messaging/Comments status plus app-level and account-level subscription state; Meta accounts can only use `BOT_ACTIVE` when the deployment sets `META_AUTO_REPLY_ENABLED=true`, and every change is written to `audit_logs` as `SET_AUTOMATION_DEFAULT`; when `META_COMMENT_REPLY_ENABLED=true` too, newly authorized Facebook and Instagram accounts enable comments, still start as `BOT_DRAFT_ONLY`, validate account-targeted comment permissions, and install the required App/account webhook fields;
 - tenant-editable LLM persona at `/admin/prompt`, stored in PostgreSQL so the Worker sees saves immediately; only the persona is editable, while the output contract and prompt-injection defences are appended by code and rendered read-only. Saves bump a revision that is recorded in `reply_decisions.prompt_version` and audited as `SET_REPLY_PERSONA`, and a dry-run box exercises the model without persisting a decision or creating an Outbox row;
 - no account-creation CLI requirement.
 
 OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.
+
+### Feishu provisioning contract
+
+A tenant administrator selects Feishu on `/admin/accounts` and supplies exactly four Feishu values:
+`app_id`, `app_secret`, `verification_token`, and `encrypt_key`, together with the already-selected
+Tenant and Brand and an optional display name. The same tenant-scoped operation is available to
+service callers at `POST /api/v1/platform-accounts/feishu`. The browser and job result never receive
+the secrets back: intake is encrypted into the durable staging envelope, final credentials are
+stored in the account's encrypted PostgreSQL bundle, and completed jobs clear staging material.
+
+Provisioning validates the tenant token, Bot identity and active Bot status, then returns the
+account-specific Callback URL and manual steps. It does not and cannot configure the Feishu event
+callback through the provider API. An operator must enter the Callback URL in the Feishu developer
+console, complete URL verification, subscribe to `im.message.receive_v1`, publish the application,
+and add the Bot where group mentions are expected.
+
+Feishu provisioning only accepts `BOT_DRAFT_ONLY`. After callback setup and draft smoke testing, an
+administrator must explicitly use the account action on `/admin/accounts` to change that account to
+`BOT_ACTIVE`; the mutation is tenant-scoped and audited as `SET_AUTOMATION_DEFAULT`. This explicit
+post-provisioning promotion is separate from Feishu's deployment feature gate and does not imply
+that production credentials or a live provider E2E are present.
 
 Production deployments should put `/admin` behind an identity-aware proxy or replace the local administrator login with OIDC/MFA. The service API and data-plane webhooks remain separate.
 

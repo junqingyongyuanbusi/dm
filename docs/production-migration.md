@@ -58,6 +58,34 @@ Paused provisioning jobs and Outbox rows resume automatically without consuming 
 attempt. Signed webhooks received while disabled retain only tenant/app ownership, the event family,
 and a SHA-256 body digest, not the original message payload.
 
+## Feishu additive platform revision and rollout
+
+Alembic head `e4b7c2d9a610` is an additive revision directly after `c2f4a6d8e901`. It only replaces
+`ck_platform_accounts_platform` so `platform_accounts.platform` also accepts `feishu`; it does not
+create a table, rewrite account rows or change existing credentials. Dropping and recreating the
+check constraint takes a PostgreSQL table lock, so apply it through the API migration owner during a
+quiet rollout window and do not run an ad hoc concurrent migration.
+
+Downgrade first queries for any Feishu account and fails closed with
+`cannot downgrade while Feishu platform accounts exist`. Disablement is not sufficient: remove and
+reprovision those accounts only under an approved rollback plan, or restore the verified pre-release
+database backup. After all Feishu rows are absent, downgrade restores the previous five-value
+platform constraint.
+
+Roll out the Feishu-capable code with `FEISHU_ENABLED=false` on API, Worker and Scheduler. Confirm all
+three roles run the same immutable image digest and the database is at `e4b7c2d9a610`. Enablement is
+then a coordinated release operation: stop or replace API, Worker and Scheduler so all three receive
+`FEISHU_ENABLED=true` and the same health interval on that one digest. Do not expose ingress on a new
+API while an old Worker or Scheduler remains.
+
+After coordinated enablement, provision the tenant account, copy the returned Callback URL into the
+Feishu console, complete URL verification, subscribe to `im.message.receive_v1`, publish the
+application and perform draft-only smoke checks. Callback configuration is manual and is not
+performed by the provisioning API. Do not declare the release complete until API, Worker and
+Scheduler all report the identical digest required by `scripts/publish_railway_release.sh`. Promote
+an account from `BOT_DRAFT_ONLY` to `BOT_ACTIVE` only after provider-side smoke verification. No
+production Feishu credential or successful live Feishu E2E is implied by this migration.
+
 Revision `d4e7f2a9b608` makes `/webhooks/meta/{app_public_id}` unambiguous across Facebook Login
 `platform_family=meta` and standalone Instagram Login `platform_family=instagram`. The migration
 aborts if a public ID is already present in both families. Check and rename/reprovision a collision
@@ -250,8 +278,9 @@ copies that generation through its job and decision, marks nonterminal older job
 cancels only their pending or failed bot decision outboxes with `STALE_CONVERSATION_INPUT`.
 
 The required revision order is `f6c2a9d81b40` (human inbox and Outbox provenance), then
-`b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing). Do not
-cherry-pick only the final revision. Upgrade through `f6c2a9d81b40`, then run the Human operations
+`b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing), then
+`e4b7c2d9a610` (add Feishu to the platform constraint). Do not cherry-pick only the final revision.
+Upgrade through `f6c2a9d81b40`, then run the Human operations
 inventory above and record repair counts before applying `b8e1d4f7a2c3`. Before the fencing step,
 inventory active DecisionJobs by conversation/status, pending or failed `DECISION/BOT` Outboxes tied
 to older inbound messages, conversations with multiple public inbound contact messages, and
