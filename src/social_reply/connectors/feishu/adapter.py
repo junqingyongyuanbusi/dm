@@ -48,7 +48,7 @@ class FeishuWebhookAdapter:
         sender_open_id = sender_id.get("open_id") if isinstance(sender_id, dict) else None
         if (
             sender.get("sender_type") != "user"
-            or not _nonempty(sender_open_id)
+            or nonblank_string_or_none(sender_open_id) is None
             or sender_open_id == self._bot_open_id
         ):
             return []
@@ -64,7 +64,7 @@ class FeishuWebhookAdapter:
                 "create_time",
             )
         }
-        if not all(_nonempty(value) for value in required.values()):
+        if not all(nonblank_string_or_none(value) is not None for value in required.values()):
             return []
         occurred_at = _occurred_at(required["create_time"])
         if occurred_at is None:
@@ -156,13 +156,12 @@ class FeishuWebhookAdapter:
             mention_id = mention.get("id")
             if not isinstance(mention_id, dict):
                 continue
-            if mention_id.get("open_id") == self._bot_open_id and _nonempty(mention.get("key")):
+            if (
+                mention_id.get("open_id") == self._bot_open_id
+                and nonblank_string_or_none(mention.get("key")) is not None
+            ):
                 return mention["key"]
         return None
-
-
-def _nonempty(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
 
 
 def _occurred_at(value: object) -> datetime | None:
@@ -190,7 +189,7 @@ def _attachment(message_type: str, message_id: str, content: dict[str, Any]) -> 
         (
             content[key]
             for key in ("file_key", "image_key", "media_id")
-            if _nonempty(content.get(key))
+            if nonblank_string_or_none(content.get(key)) is not None
         ),
         message_id,
     )
