@@ -2,7 +2,7 @@ import logging
 import secrets
 import uuid
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
@@ -187,20 +187,11 @@ def _require_platform_enabled(platform: str) -> None:
         raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
 
 
-def _reveal_secret_values(value: Any) -> Any:
-    if isinstance(value, SecretStr):
-        return value.get_secret_value()
-    if isinstance(value, dict):
-        return {key: _reveal_secret_values(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_reveal_secret_values(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_reveal_secret_values(item) for item in value)
-    return value
-
-
 def _split_request(platform: str, request: BaseModel) -> tuple[dict, dict[str, str]]:
-    values = _reveal_secret_values(request.model_dump())
+    values = request.model_dump()
+    for key, value in values.items():
+        if isinstance(value, SecretStr):
+            values[key] = value.get_secret_value()
     return split_submission(platform, values)
 
 
