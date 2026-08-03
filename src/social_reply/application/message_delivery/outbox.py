@@ -267,7 +267,7 @@ async def _validate_direct_send(
         return await _reject_direct_send(session, row, attempt_no, "TENANT_SCOPE_MISMATCH")
     if not is_active_account_status(account.status):
         return await _reject_direct_send(session, row, attempt_no, "ACCOUNT_NOT_ACTIVE")
-    if account.platform in {"facebook", "instagram", "whatsapp"}:
+    if account.platform in {"facebook", "instagram", "whatsapp", "feishu"}:
         disabled_code = get_settings().platform_disabled_code(account.platform)
         if disabled_code is not None:
             return await _reject_direct_send(

@@ -47,6 +47,32 @@ from social_reply.application.message_delivery.contracts import (
             "x-1",
             {"kind": "reply", "in_reply_to_post_id": "p1"},
         ),
+        (
+            "feishu_p2p_reply",
+            "feishu",
+            "app-1",
+            {
+                "kind": "dm",
+                "message_id": "om_1",
+                "chat_id": "oc_1",
+                "chat_type": "p2p",
+                "sender_open_id": "ou_1",
+            },
+        ),
+        (
+            "feishu_group_reply",
+            "feishu",
+            "app-1",
+            {
+                "kind": "mention",
+                "message_id": "om_2",
+                "chat_id": "oc_2",
+                "chat_type": "group",
+                "sender_open_id": "ou_2",
+                "thread_id": "omt_1",
+                "root_id": "om_root",
+            },
+        ),
     ],
 )
 def test_parse_direct_text_command_accepts_canonical_targets(
@@ -96,6 +122,58 @@ def test_parse_direct_text_command_rejects_wrong_recipient_with_valid_shape():
             outbox_id=uuid.uuid4(),
         )
     assert error.value.code == "DELIVERY_TARGET_INVALID"
+
+
+@pytest.mark.parametrize("field", ["message_id", "chat_id", "sender_open_id", "thread_id"])
+def test_parse_feishu_group_reply_rejects_changed_immutable_fields(field):
+    source_target = {
+        "kind": "mention",
+        "message_id": "om_1",
+        "chat_id": "oc_1",
+        "chat_type": "group",
+        "sender_open_id": "ou_1",
+        "thread_id": "omt_1",
+        "root_id": "om_root",
+    }
+    target = {**source_target, field: "changed"}
+
+    with pytest.raises(SendContractError) as error:
+        parse_direct_text_command(
+            destination_type="feishu_group_reply",
+            message_type="text",
+            payload={"text": "hello", "target": target},
+            destination_id="feishu:account:chat",
+            account_platform="feishu",
+            account_external_id="app-1",
+            source_target=source_target,
+            conversation_external_user_id="ou_1",
+            outbox_id=uuid.uuid4(),
+        )
+
+    assert error.value.code == "DELIVERY_TARGET_INVALID"
+
+
+def test_parse_feishu_reply_rejects_unknown_target_fields():
+    target = {
+        "kind": "dm",
+        "message_id": "om_1",
+        "chat_id": "oc_1",
+        "chat_type": "p2p",
+        "sender_open_id": "ou_1",
+        "tenant_key": "must-not-pass-through",
+    }
+    with pytest.raises(SendContractError, match="feishu_target_unknown_keys"):
+        parse_direct_text_command(
+            destination_type="feishu_p2p_reply",
+            message_type="text",
+            payload={"text": "hello", "target": target},
+            destination_id="feishu:account:chat",
+            account_platform="feishu",
+            account_external_id="app-1",
+            source_target=target,
+            conversation_external_user_id="ou_1",
+            outbox_id=uuid.uuid4(),
+        )
 
 
 def test_parse_direct_text_command_preserves_telegram_legacy_fallback():
@@ -213,3 +291,53 @@ def test_build_direct_reply_destination_centralizes_target_and_window_mapping():
     assert private_reply.destination_type == "meta_private_reply"
     assert private_reply.target == {"kind": "private_reply", "comment_id": "c1"}
     assert private_reply.valid_until == now + timedelta(days=7)
+
+    feishu_p2p_target = {
+        "kind": "dm",
+        "message_id": "om_1",
+        "chat_id": "oc_1",
+        "chat_type": "p2p",
+        "sender_open_id": "ou_1",
+    }
+    feishu_p2p = build_direct_reply_destination(
+        platform="feishu",
+        reply_target=feishu_p2p_target,
+        visibility="private",
+        occurred_at=occurred_at,
+        now=now,
+    )
+    assert feishu_p2p.destination_type == "feishu_p2p_reply"
+    assert feishu_p2p.target == feishu_p2p_target
+    assert feishu_p2p.valid_until is None
+
+    feishu_group_target = {
+        "kind": "mention",
+        "message_id": "om_2",
+        "chat_id": "oc_2",
+        "chat_type": "group",
+        "sender_open_id": "ou_2",
+        "thread_id": "omt_1",
+        "root_id": "om_root",
+    }
+    feishu_group = build_direct_reply_destination(
+        platform="feishu",
+        reply_target=feishu_group_target,
+        visibility="public",
+        occurred_at=occurred_at,
+        now=now,
+    )
+    assert feishu_group.destination_type == "feishu_group_reply"
+    assert feishu_group.target == feishu_group_target
+    assert feishu_group.valid_until is None
+
+
+def test_build_direct_reply_destination_rejects_incomplete_feishu_target():
+    with pytest.raises(SendContractError) as error:
+        build_direct_reply_destination(
+            platform="feishu",
+            reply_target={"kind": "mention", "chat_type": "group"},
+            visibility="public",
+            occurred_at=None,
+            now=datetime.now(UTC),
+        )
+    assert error.value.code == "DELIVERY_TARGET_INVALID"

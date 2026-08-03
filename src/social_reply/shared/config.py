@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     facebook_messenger_enabled: bool = True
     instagram_messaging_enabled: bool = True
     whatsapp_enabled: bool = True
+    feishu_enabled: bool = False
     # Meta 发布范围默认是「人工审核后才外发」。只有部署方完成 App Review 并显式接受
     # 自动回复的合规责任后，才能把 Meta 账号提升为 BOT_ACTIVE。
     meta_auto_reply_enabled: bool = False
@@ -68,6 +69,7 @@ class Settings(BaseSettings):
     instagram_app_secret: SecretStr = SecretStr("")
     instagram_verify_token: SecretStr = SecretStr("")
     meta_health_check_interval_seconds: int = Field(default=600, ge=60, le=86400)
+    feishu_health_check_interval_seconds: int = Field(default=600, ge=60, le=86400)
     account_secrets_root: Path = Path(".secrets/accounts")
     platform_secret_keys: SecretStr = SecretStr("")
     openai_api_key: str = ""
@@ -187,6 +189,8 @@ class Settings(BaseSettings):
             return self.whatsapp_enabled
         if platform == "x":
             return self.x_integration_enabled
+        if platform == "feishu":
+            return self.feishu_enabled
         return True
 
     def platform_disabled_code(self, platform: str) -> str | None:
@@ -197,6 +201,7 @@ class Settings(BaseSettings):
             "instagram": "INSTAGRAM_MESSAGING_DISABLED",
             "whatsapp": "WHATSAPP_DISABLED",
             "x": "X_INTEGRATION_DISABLED",
+            "feishu": "FEISHU_DISABLED",
         }.get(platform, "PLATFORM_DISABLED")
 
     def meta_automation_default_allowed(self, platform: str, automation_default: str) -> bool:

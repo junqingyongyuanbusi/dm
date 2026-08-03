@@ -111,7 +111,7 @@ class PlatformAccount(Base):
         UniqueConstraint("platform", "public_id"),
         UniqueConstraint("tenant_id", "platform", "external_account_id"),
         CheckConstraint(
-            "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x')",
+            "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x', 'feishu')",
             name="ck_platform_accounts_platform",
         ),
         CheckConstraint(

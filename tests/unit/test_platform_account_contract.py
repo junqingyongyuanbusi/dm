@@ -37,6 +37,19 @@ def test_capability_defaults_are_platform_specific_and_strict():
     assert capability_enabled(capability, CapabilityKey.X_CHAT) is False
 
 
+def test_feishu_capability_supports_only_dm_and_mentions():
+    capability = normalize_account_capability("feishu", {"dm": True})
+
+    assert account_platform("feishu") is AccountPlatform.FEISHU
+    assert capability == {
+        "dm": True,
+        "mentions": False,
+        "max_text_length": 4000,
+    }
+    with pytest.raises(ValueError, match="unknown_keys"):
+        normalize_account_capability("feishu", {"dm": True, "comments": False})
+
+
 @pytest.mark.parametrize(
     "capability,error",
     [
@@ -52,6 +65,12 @@ def test_invalid_capability_is_rejected(capability, error):
 
 def test_destination_capabilities_bind_routes_to_platforms():
     x_dm = DIRECT_DESTINATION_CAPABILITIES["x_dm"]
+    feishu_p2p = DIRECT_DESTINATION_CAPABILITIES["feishu_p2p_reply"]
+    feishu_group = DIRECT_DESTINATION_CAPABILITIES["feishu_group_reply"]
 
     assert x_dm.platforms == frozenset({AccountPlatform.X})
     assert x_dm.capability is CapabilityKey.DM
+    assert feishu_p2p.platforms == frozenset({AccountPlatform.FEISHU})
+    assert feishu_p2p.capability is CapabilityKey.DM
+    assert feishu_group.platforms == frozenset({AccountPlatform.FEISHU})
+    assert feishu_group.capability is CapabilityKey.MENTIONS

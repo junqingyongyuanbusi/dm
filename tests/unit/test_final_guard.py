@@ -71,6 +71,16 @@ def test_too_long_downgraded():
     assert "GUARD_TOO_LONG" in out.reason_codes
 
 
+def test_feishu_text_limit_is_4000_characters():
+    at_limit = ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text="x" * 4000)
+    over_limit = ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text="x" * 4001)
+
+    assert run_final_guard(at_limit, "feishu").action is ReplyAction.AUTO_REPLY
+    rejected = run_final_guard(over_limit, "feishu")
+    assert rejected.action is ReplyAction.HANDOFF
+    assert "GUARD_TOO_LONG" in rejected.reason_codes
+
+
 def test_empty_reply_blocked():
     d = ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text="  ")
     assert run_final_guard(d, "telegram").action is ReplyAction.HANDOFF

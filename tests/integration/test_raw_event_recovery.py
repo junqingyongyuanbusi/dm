@@ -1,5 +1,6 @@
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import insert, select, update
@@ -19,14 +20,19 @@ from social_reply.infrastructure.database import models
 pytestmark = pytest.mark.integration
 
 
-def _event(account_id: uuid.UUID, external_event_id: str = "event-1") -> dict:
+def _event(
+    account_id: uuid.UUID,
+    external_event_id: str = "event-1",
+    *,
+    platform: str = "telegram",
+) -> dict:
     return canonical_event_to_dict(
         CanonicalEvent(
-            platform="telegram",
+            platform=platform,
             platform_account_key=str(account_id),
             external_event_id=external_event_id,
             external_user_id="user-1",
-            conversation_key=f"telegram:{account_id}:chat-1",
+            conversation_key=f"{platform}:{account_id}:chat-1",
             text="hello",
             external_conversation_id="chat-1",
             reply_target={"chat_id": "chat-1"},
@@ -62,6 +68,19 @@ async def _seed_raw(
     )
     await session.commit()
     return raw_event_id
+
+
+def test_versioned_direct_dispatch_allows_only_feishu_webhooks():
+    account_id = uuid.uuid4()
+    context = raw_recovery.direct_dispatch_context([_event(account_id, platform="feishu")])
+    webhook_row = SimpleNamespace(source="feishu", ingress_kind="webhook", context=context)
+    poll_row = SimpleNamespace(source="feishu", ingress_kind="poll", context=context)
+
+    kind, events = raw_recovery._dispatch_spec(webhook_row)
+    assert kind == "direct"
+    assert events[0]["platform"] == "feishu"
+    with pytest.raises(ValueError, match="INITIAL_DISPATCH_SOURCE_INVALID"):
+        raw_recovery._dispatch_spec(poll_row)
 
 
 async def test_sweep_redispatches_persisted_work_after_queue_loss(session, monkeypatch):

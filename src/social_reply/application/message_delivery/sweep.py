@@ -53,6 +53,13 @@ async def sweep_outbox() -> list[uuid.UUID]:
         recoverable_routes.append(
             ("whatsapp_session_message", "WHATSAPP_DISABLED", "session_messages", "whatsapp")
         )
+    if getattr(settings, "feishu_enabled", False):
+        recoverable_routes.extend(
+            (
+                ("feishu_p2p_reply", "FEISHU_DISABLED", "dm", "feishu"),
+                ("feishu_group_reply", "FEISHU_DISABLED", "mentions", "feishu"),
+            )
+        )
     async with get_session_factory()() as session:
         for destination_type, error_code, capability_key, platform in recoverable_routes:
             statement = update(models.OutboxMessage).where(

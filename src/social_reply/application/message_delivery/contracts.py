@@ -37,6 +37,8 @@ _DESTINATION_PLATFORMS = {
     "x_dm": frozenset({"x"}),
     "x_chat_message": frozenset({"x"}),
     "x_post_reply": frozenset({"x"}),
+    "feishu_p2p_reply": frozenset({"feishu"}),
+    "feishu_group_reply": frozenset({"feishu"}),
 }
 
 
@@ -67,6 +69,67 @@ def _target_kind(target: Mapping[str, Any], expected: str) -> None:
             "DELIVERY_TARGET_INVALID",
             f"target_kind_must_be_{expected}",
         )
+
+
+def _optional_bound_string(
+    target: Mapping[str, Any],
+    source_target: Mapping[str, Any],
+    key: str,
+) -> str | None:
+    value = target.get(key)
+    expected = source_target.get(key)
+    if value is None and expected is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or not isinstance(expected, str)
+        or not expected.strip()
+        or value != expected
+    ):
+        raise SendContractError("DELIVERY_TARGET_INVALID", f"{key}_scope_mismatch")
+    return value
+
+
+def _feishu_reply_target(
+    target: Mapping[str, Any],
+    source_target: Mapping[str, Any],
+    *,
+    kind: str,
+    chat_type: str,
+) -> dict[str, Any]:
+    allowed_keys = {
+        "kind",
+        "message_id",
+        "chat_id",
+        "chat_type",
+        "sender_open_id",
+        "thread_id",
+        "root_id",
+    }
+    if unknown_keys := set(target) - allowed_keys:
+        raise SendContractError(
+            "DELIVERY_TARGET_INVALID",
+            f"feishu_target_unknown_keys:{','.join(sorted(unknown_keys))}",
+        )
+    _target_kind(target, kind)
+    bound_chat_type = _bound_string(target, source_target, "chat_type")
+    if bound_chat_type != chat_type:
+        raise SendContractError(
+            "DELIVERY_TARGET_INVALID",
+            f"feishu_chat_type_must_be_{chat_type}",
+        )
+    normalized = {
+        "kind": kind,
+        "message_id": _bound_string(target, source_target, "message_id"),
+        "chat_id": _bound_string(target, source_target, "chat_id"),
+        "chat_type": bound_chat_type,
+        "sender_open_id": _bound_string(target, source_target, "sender_open_id"),
+    }
+    for key in ("thread_id", "root_id"):
+        if value := _optional_bound_string(target, source_target, key):
+            normalized[key] = value
+    return normalized
 
 
 def _telegram_target(
@@ -208,6 +271,10 @@ def parse_direct_text_command(
         }
         if conversation_token:
             target["conversation_token"] = conversation_token
+    elif destination_type == "feishu_p2p_reply":
+        target = _feishu_reply_target(target, source_target, kind="dm", chat_type="p2p")
+    elif destination_type == "feishu_group_reply":
+        target = _feishu_reply_target(target, source_target, kind="mention", chat_type="group")
 
     return TextSendCommand(
         destination_type=destination_type,
@@ -253,6 +320,15 @@ def build_direct_reply_destination(
         destination_type = (
             "x_post_reply" if kind == "reply" else "x_chat_message" if kind == "x_chat" else "x_dm"
         )
+    elif platform == "feishu":
+        if kind == "dm":
+            destination_type = "feishu_p2p_reply"
+            target = _feishu_reply_target(target, target, kind="dm", chat_type="p2p")
+        elif kind == "mention":
+            destination_type = "feishu_group_reply"
+            target = _feishu_reply_target(target, target, kind="mention", chat_type="group")
+        else:
+            raise ValueError(f"unsupported_feishu_reply_target:{kind}")
     else:
         raise ValueError(f"unsupported_direct_platform:{platform}")
 

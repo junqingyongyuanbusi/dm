@@ -69,7 +69,7 @@ def _dispatch_spec(row: models.RawEvent) -> tuple[str, tuple[dict[str, Any], ...
         raise ValueError("INITIAL_DISPATCH_VERSION_INVALID")
     kind = dispatch.get("kind")
     if kind == "direct":
-        if row.source not in {"telegram", "meta", "x"} or row.ingress_kind != "webhook":
+        if row.source not in {"telegram", "meta", "x", "feishu"} or row.ingress_kind != "webhook":
             raise ValueError("INITIAL_DISPATCH_SOURCE_INVALID")
         values = dispatch.get("events")
         if not isinstance(values, list) or not values:

@@ -19,7 +19,7 @@ from social_reply.application.account_management.service import (
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.connectors.meta.client import MetaCommentPermissionError
-from social_reply.domain.platform_accounts import SUPPORTED_ACCOUNT_PLATFORMS
+from social_reply.domain.platform_accounts import PROVISIONABLE_ACCOUNT_PLATFORMS
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -38,7 +38,7 @@ def _disabled_platform(exc: Exception) -> str | None:
     if not isinstance(exc, ValueError):
         return None
     message = str(exc)
-    for platform in SUPPORTED_ACCOUNT_PLATFORMS:
+    for platform in PROVISIONABLE_ACCOUNT_PLATFORMS:
         if message == f"{platform}_integration_disabled":
             return platform
     return None
@@ -111,7 +111,7 @@ async def submit_provisioning_job(
     secrets: dict[str, str],
     admin_session_id: uuid.UUID | str | None = None,
 ) -> uuid.UUID:
-    if platform not in SUPPORTED_ACCOUNT_PLATFORMS:
+    if platform not in PROVISIONABLE_ACCOUNT_PLATFORMS:
         raise ValueError(f"unsupported_platform:{platform}")
     if not tenant_id or not all(ch.isalnum() or ch in {"_", "-"} for ch in tenant_id):
         raise ValueError("invalid_tenant_id")

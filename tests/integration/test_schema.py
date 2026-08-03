@@ -226,6 +226,23 @@ async def test_platform_account_contract_rejects_invalid_rows(session, overrides
     await session.rollback()
 
 
+async def test_platform_account_contract_accepts_feishu(session):
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="feishu",
+            name="feishu-contract",
+            status="active",
+            capability={"dm": True, "mentions": True, "max_text_length": 4000},
+        )
+    )
+    await session.commit()
+    assert (await session.get(models.PlatformAccount, account_id)).platform == "feishu"
+
+
 async def test_platform_account_model_defaults_to_canonical_active_status(session):
     account = models.PlatformAccount(
         id=uuid.uuid4(),

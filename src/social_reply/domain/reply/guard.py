@@ -19,7 +19,13 @@ def redact_pii(text: str) -> str:
     return _GROUPED_DIGITS.sub("[REDACTED_NUMBER]", redacted)
 
 
-_MAX_TEXT_LENGTH = {"telegram": 4096, "facebook": 2000, "instagram": 1000, "x": 280}
+_MAX_TEXT_LENGTH = {
+    "telegram": 4096,
+    "facebook": 2000,
+    "instagram": 1000,
+    "x": 280,
+    "feishu": 4000,
+}
 _DEFAULT_MAX = 2000
 
 

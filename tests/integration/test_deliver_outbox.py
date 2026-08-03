@@ -1142,6 +1142,20 @@ async def test_x_stack_disabled_outbox_pauses_and_recovers(
             {"whatsapp_enabled": False},
             "WHATSAPP_DISABLED",
         ),
+        (
+            "feishu",
+            "feishu_p2p_reply",
+            {"dm": True, "mentions": False, "max_text_length": 4000},
+            {
+                "kind": "dm",
+                "message_id": "om_1",
+                "chat_id": "oc_1",
+                "chat_type": "p2p",
+                "sender_open_id": "user-1",
+            },
+            {"feishu_enabled": False},
+            "FEISHU_DISABLED",
+        ),
     ],
 )
 async def test_future_platform_disabled_outbox_pauses_and_recovers(
@@ -1185,6 +1199,7 @@ async def test_future_platform_disabled_outbox_pauses_and_recovers(
             "facebook_messenger_enabled": True,
             "instagram_messaging_enabled": True,
             "whatsapp_enabled": True,
+            "feishu_enabled": True,
         }
     )
     monkeypatch.setattr(sweep_module, "get_settings", lambda: enabled)

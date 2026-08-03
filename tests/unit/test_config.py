@@ -37,6 +37,8 @@ _ENV_KEYS = [
     "FACEBOOK_MESSENGER_ENABLED",
     "INSTAGRAM_MESSAGING_ENABLED",
     "WHATSAPP_ENABLED",
+    "FEISHU_ENABLED",
+    "FEISHU_HEALTH_CHECK_INTERVAL_SECONDS",
     "META_AUTO_REPLY_ENABLED",
     "FACEBOOK_APP_ID",
     "FACEBOOK_APP_SECRET",
@@ -92,8 +94,10 @@ def test_testing_true_默认值可用() -> None:
     assert settings.facebook_messenger_enabled is True
     assert settings.instagram_messaging_enabled is True
     assert settings.whatsapp_enabled is True
+    assert settings.feishu_enabled is False
     assert settings.meta_auto_reply_enabled is False
     assert settings.meta_health_check_interval_seconds == 600
+    assert settings.feishu_health_check_interval_seconds == 600
 
 
 def test_非测试环境_默认_chatwoot_api_token_拒绝() -> None:
@@ -195,9 +199,11 @@ def test_conversation_history_bounds_are_validated(name: str, value: int) -> Non
         ("xchat_ready_probe_interval_seconds", 604801),
         ("xchat_pending_probe_interval_seconds", -1),
         ("xchat_pending_probe_interval_seconds", 86401),
+        ("feishu_health_check_interval_seconds", 59),
+        ("feishu_health_check_interval_seconds", 86401),
     ],
 )
-def test_scheduler_and_x_reconciliation_bounds(name: str, value: float) -> None:
+def test_scheduler_and_platform_reconciliation_bounds(name: str, value: float) -> None:
     with pytest.raises(ValueError):
         _make(testing=True, **{name: value})
 
@@ -262,13 +268,17 @@ def test_future_platform_flags_are_independent() -> None:
         facebook_messenger_enabled=False,
         instagram_messaging_enabled=True,
         whatsapp_enabled=False,
+        feishu_enabled=True,
     )
     assert settings.platform_integration_enabled("facebook") is False
     assert settings.platform_integration_enabled("instagram") is True
     assert settings.platform_integration_enabled("whatsapp") is False
+    assert settings.platform_integration_enabled("feishu") is True
     assert settings.platform_disabled_code("facebook") == "FACEBOOK_MESSENGER_DISABLED"
     assert settings.platform_disabled_code("instagram") is None
     assert settings.platform_disabled_code("whatsapp") == "WHATSAPP_DISABLED"
+    assert settings.platform_disabled_code("feishu") is None
+    assert _make(testing=True).platform_disabled_code("feishu") == "FEISHU_DISABLED"
     assert settings.platform_integration_enabled("telegram") is True
 
 
@@ -279,7 +289,9 @@ def test_environment_templates_disable_future_platforms() -> None:
         assert "FACEBOOK_MESSENGER_ENABLED=false" in content
         assert "INSTAGRAM_MESSAGING_ENABLED=false" in content
         assert "WHATSAPP_ENABLED=false" in content
+        assert "FEISHU_ENABLED=false" in content
         assert "META_HEALTH_CHECK_INTERVAL_SECONDS=600" in content
+        assert "FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600" in content
         assert "SCHEDULER_TICK_SECONDS=0.5" in content
         assert "SCHEDULER_CORE_INTERVAL_SECONDS=3" in content
         assert "SCHEDULER_CORE_WARN_AFTER_SECONDS=30" in content
