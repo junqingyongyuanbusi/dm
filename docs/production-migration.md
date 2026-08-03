@@ -58,22 +58,45 @@ Paused provisioning jobs and Outbox rows resume automatically without consuming 
 attempt. Signed webhooks received while disabled retain only tenant/app ownership, the event family,
 and a SHA-256 body digest, not the original message payload.
 
-## Feishu additive platform revision and rollout
+## Feishu additive platform revisions and rollout
 
-Alembic head `e4b7c2d9a610` is an additive revision directly after `c2f4a6d8e901`. It only replaces
+Revision `e4b7c2d9a610` is additive directly after `c2f4a6d8e901`. It only replaces
 `ck_platform_accounts_platform` so `platform_accounts.platform` also accepts `feishu`; it does not
 create a table, rewrite account rows or change existing credentials. Dropping and recreating the
 check constraint takes a PostgreSQL table lock, so apply it through the API migration owner during a
 quiet rollout window and do not run an ad hoc concurrent migration.
 
-Downgrade first queries for any Feishu account and fails closed with
+Current head `f8a1c3d5e702` follows `e4b7c2d9a610` and creates the unique partial index
+`uq_raw_events_feishu_webhook_external_event` on
+`raw_events(platform_account_id, external_event_id)` where `source='feishu'`,
+`ingress_kind='webhook'`, and `external_event_id IS NOT NULL`. The ingress value is the sanitized,
+nonblank Feishu `header.event_id`, not `message_id`, and the same constraint applies while the
+feature flag is off. Before upgrade, run this inventory while Feishu ingress is paused:
+
+```sql
+SELECT platform_account_id, external_event_id, count(*)
+FROM raw_events
+WHERE source = 'feishu'
+  AND ingress_kind = 'webhook'
+  AND external_event_id IS NOT NULL
+GROUP BY platform_account_id, external_event_id
+HAVING count(*) > 1;
+```
+
+The result must be empty. The migration fails rather than deleting or rewriting append-only RawEvent
+evidence when historical duplicates exist; stop and use a separately reviewed data-repair plan or a
+verified backup instead of editing evidence ad hoc. Index creation takes a lock on `raw_events`, so
+keep Feishu ingress paused until the API migration owner reports head `f8a1c3d5e702`. Downgrading to
+`e4b7c2d9a610` only drops this index.
+
+Downgrading `e4b7c2d9a610` first queries for any Feishu account and fails closed with
 `cannot downgrade while Feishu platform accounts exist`. Disablement is not sufficient: remove and
 reprovision those accounts only under an approved rollback plan, or restore the verified pre-release
 database backup. After all Feishu rows are absent, downgrade restores the previous five-value
 platform constraint.
 
 Roll out the Feishu-capable code with `FEISHU_ENABLED=false` on API, Worker and Scheduler. Confirm all
-three roles run the same immutable image digest and the database is at `e4b7c2d9a610`. Enablement is
+three roles run the same immutable image digest and the database is at `f8a1c3d5e702`. Enablement is
 then a coordinated release operation: stop or replace API, Worker and Scheduler so all three receive
 `FEISHU_ENABLED=true` and the same health interval on that one digest. Do not expose ingress on a new
 API while an old Worker or Scheduler remains.
@@ -279,7 +302,7 @@ cancels only their pending or failed bot decision outboxes with `STALE_CONVERSAT
 
 The required revision order is `f6c2a9d81b40` (human inbox and Outbox provenance), then
 `b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing), then
-`e4b7c2d9a610` (add Feishu to the platform constraint). Do not cherry-pick only the final revision.
+`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication). Do not cherry-pick only the final revision.
 Upgrade through `f6c2a9d81b40`, then run the Human operations
 inventory above and record repair counts before applying `b8e1d4f7a2c3`. Before the fencing step,
 inventory active DecisionJobs by conversation/status, pending or failed `DECISION/BOT` Outboxes tied

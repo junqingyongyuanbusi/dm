@@ -74,12 +74,16 @@ def _event_payload(
     chat_type="p2p",
     sender_open_id="ou_user",
     event_type="im.message.receive_v1",
+    message_create_time=None,
+    header_create_time=None,
 ):
+    provider_now = str(int(time.time() * 1000))
     message = {
         "message_id": message_id,
         "chat_id": "oc_group" if chat_type == "group" else "oc_dm",
         "chat_type": chat_type,
         "message_type": "text",
+        "create_time": provider_now if message_create_time is None else message_create_time,
         "content": json.dumps(
             {"text": "@_user_1 hello from Feishu" if chat_type == "group" else "hello"}
         ),
@@ -92,7 +96,7 @@ def _event_payload(
         "header": {
             "event_id": event_id,
             "event_type": event_type,
-            "create_time": str(int(time.time() * 1000)),
+            "create_time": provider_now if header_create_time is None else header_create_time,
             "token": token,
             "app_id": app_id,
             "tenant_key": "provider-tenant-key",
@@ -260,6 +264,21 @@ async def test_body_size_unknown_and_disabled_account_fail_without_evidence(sess
     ).scalar_one() == 0
 
 
+@pytest.mark.parametrize("event_id", [None, "", "   "])
+async def test_normal_callback_requires_nonblank_header_event_id(session, event_id):
+    await _seed_account(session)
+    payload = _event_payload()
+    payload["header"]["event_id"] = event_id
+    body, headers = _encrypted_request(payload)
+
+    response = await _post(_app(), "/webhooks/feishu/fs_primary", content=body, headers=headers)
+
+    assert response.status_code == 401
+    assert (
+        await session.execute(select(func.count()).select_from(models.RawEvent))
+    ).scalar_one() == 0
+
+
 async def test_valid_callback_persists_redacted_scoped_evidence_and_dispatches(session):
     account_id = await _seed_account(session)
     body, headers = _encrypted_request(_event_payload())
@@ -314,13 +333,12 @@ async def test_feature_disabled_acks_and_persists_ignored_without_dispatch(sessi
 
     monkeypatch.setattr("social_reply.connectors.feishu.router.dispatch_initial_raw_event", capture)
     body, headers = _encrypted_request(_event_payload())
-    response = await _post(
-        _app(feishu_enabled=False),
-        "/webhooks/feishu/fs_primary",
-        content=body,
-        headers=headers,
+    app = _app(feishu_enabled=False)
+    first, duplicate = await asyncio.gather(
+        _post(app, "/webhooks/feishu/fs_primary", content=body, headers=headers),
+        _post(app, "/webhooks/feishu/fs_primary", content=body, headers=headers),
     )
-    assert response.status_code == 200
+    assert first.status_code == duplicate.status_code == 200
     raw = (await session.execute(select(models.RawEvent))).scalar_one()
     assert raw.processing_status == "IGNORED_AT_INGRESS"
     assert raw.headers["ingress_gate"] == "FEISHU_DISABLED"
@@ -339,6 +357,47 @@ async def test_unknown_event_is_acknowledged_and_stored_ignored(session):
     assert raw.context == {}
 
 
+async def test_raw_event_dedup_uses_header_event_id_not_message_id(session):
+    await _seed_account(session)
+    same_event_first = _event_payload(event_id="evt_same", message_id="om_first")
+    same_event_second = _event_payload(event_id="evt_same", message_id="om_second")
+    app = _app()
+    for payload in (same_event_first, same_event_second):
+        body, headers = _encrypted_request(payload)
+        response = await _post(
+            app,
+            "/webhooks/feishu/fs_primary",
+            content=body,
+            headers=headers,
+        )
+        assert response.status_code == 200
+
+    same_message_new_event = _event_payload(event_id="evt_new", message_id="om_first")
+    body, headers = _encrypted_request(same_message_new_event)
+    response = await _post(
+        app,
+        "/webhooks/feishu/fs_primary",
+        content=body,
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    raw_events = list(
+        (
+            await session.execute(select(models.RawEvent).order_by(models.RawEvent.received_at))
+        ).scalars()
+    )
+    assert [
+        (raw.external_event_id, raw.payload["event"]["message"]["message_id"]) for raw in raw_events
+    ] == [
+        ("evt_same", "om_first"),
+        ("evt_new", "om_first"),
+    ]
+    assert (
+        await session.execute(select(func.count()).select_from(models.NormalizedEvent))
+    ).scalar_one() == 1
+
+
 async def test_duplicate_delivery_is_idempotent_downstream(session):
     await _seed_account(session)
     body, headers = _encrypted_request(_event_payload())
@@ -349,13 +408,167 @@ async def test_duplicate_delivery_is_idempotent_downstream(session):
     )
     assert [response.status_code for response in responses] == [200, 200]
     for model, expected in (
-        (models.RawEvent, 2),
+        (models.RawEvent, 1),
         (models.NormalizedEvent, 1),
         (models.Message, 1),
         (models.DecisionJob, 1),
     ):
         count = (await session.execute(select(func.count()).select_from(model))).scalar_one()
         assert count == expected
+
+
+async def test_delayed_older_dispatch_is_recorded_without_superseding_newer_work(
+    session, monkeypatch
+):
+    await _seed_account(session)
+    app = _app()
+    older_dispatch_started = asyncio.Event()
+    release_older_dispatch = asyncio.Event()
+    dispatch_calls = 0
+
+    async def delay_first_dispatch(raw_event_id):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        if dispatch_calls == 1:
+            older_dispatch_started.set()
+            await release_older_dispatch.wait()
+        return await raw_recovery.dispatch_initial_raw_event(raw_event_id)
+
+    monkeypatch.setattr(
+        "social_reply.connectors.feishu.router.dispatch_initial_raw_event",
+        delay_first_dispatch,
+    )
+    older_body, older_headers = _encrypted_request(
+        _event_payload(
+            event_id="evt_older",
+            message_id="om_older",
+            message_create_time="1785729500000",
+            header_create_time="1785730000000",
+        )
+    )
+    newer_body, newer_headers = _encrypted_request(
+        _event_payload(
+            event_id="evt_newer",
+            message_id="om_newer",
+            message_create_time="1785729600000",
+            header_create_time="1785720000000",
+        )
+    )
+
+    older_request = asyncio.create_task(
+        _post(
+            app,
+            "/webhooks/feishu/fs_primary",
+            content=older_body,
+            headers=older_headers,
+        )
+    )
+    await older_dispatch_started.wait()
+    newer_response = await _post(
+        app,
+        "/webhooks/feishu/fs_primary",
+        content=newer_body,
+        headers=newer_headers,
+    )
+    release_older_dispatch.set()
+    older_response = await older_request
+
+    assert newer_response.status_code == older_response.status_code == 200
+    stale = (
+        await session.execute(
+            select(models.NormalizedEvent).where(
+                models.NormalizedEvent.external_event_id == "om_older"
+            )
+        )
+    ).scalar_one()
+    conversation = (await session.execute(select(models.Conversation))).scalar_one()
+    assert stale.conversation_id == conversation.id
+    assert stale.message_id is None
+    assert stale.event_metadata["disposition"] == "stale_provider_order"
+    assert "token" not in json.dumps(stale.event_metadata)
+    assert conversation.decision_generation == 1
+    for model, expected in (
+        (models.RawEvent, 2),
+        (models.NormalizedEvent, 2),
+        (models.Message, 1),
+        (models.DecisionJob, 1),
+        (models.OutboxMessage, 0),
+    ):
+        count = (await session.execute(select(func.count()).select_from(model))).scalar_one()
+        assert count == expected
+
+
+async def test_messages_in_provider_order_create_normal_work(session):
+    await _seed_account(session)
+    app = _app()
+    for event_id, message_id, create_time in (
+        ("evt_ordered_1", "om_ordered_1", "1785729500000"),
+        ("evt_ordered_2", "om_ordered_2", "1785729600000"),
+    ):
+        body, headers = _encrypted_request(
+            _event_payload(
+                event_id=event_id,
+                message_id=message_id,
+                message_create_time=create_time,
+            )
+        )
+        response = await _post(
+            app,
+            "/webhooks/feishu/fs_primary",
+            content=body,
+            headers=headers,
+        )
+        assert response.status_code == 200
+
+    messages = list(
+        (
+            await session.execute(
+                select(models.Message).order_by(models.Message.decision_generation)
+            )
+        ).scalars()
+    )
+    conversation = (await session.execute(select(models.Conversation))).scalar_one()
+    assert [message.platform_message_id for message in messages] == [
+        "om_ordered_1",
+        "om_ordered_2",
+    ]
+    assert [message.decision_generation for message in messages] == [1, 2]
+    assert conversation.decision_generation == 2
+    assert (
+        await session.execute(select(func.count()).select_from(models.DecisionJob))
+    ).scalar_one() == 2
+
+
+async def test_equal_message_create_time_is_not_stale(session):
+    await _seed_account(session)
+    app = _app()
+    for event_id, message_id in (("evt_equal_1", "om_equal_1"), ("evt_equal_2", "om_equal_2")):
+        body, headers = _encrypted_request(
+            _event_payload(
+                event_id=event_id,
+                message_id=message_id,
+                message_create_time="1785729600000",
+            )
+        )
+        response = await _post(
+            app,
+            "/webhooks/feishu/fs_primary",
+            content=body,
+            headers=headers,
+        )
+        assert response.status_code == 200
+
+    normalized = list((await session.execute(select(models.NormalizedEvent))).scalars())
+    conversation = (await session.execute(select(models.Conversation))).scalar_one()
+    assert len(normalized) == 2
+    assert all("disposition" not in event.event_metadata for event in normalized)
+    assert (
+        await session.execute(select(func.count()).select_from(models.Message))
+    ).scalar_one() == 2
+    assert (
+        await session.execute(select(func.count()).select_from(models.DecisionJob))
+    ).scalar_one() == 2
+    assert conversation.decision_generation == 2
 
 
 async def test_raw_event_recovery_dispatches_committed_context(session, monkeypatch):

@@ -282,6 +282,25 @@ async def ingest_canonical_event(
                     .values(processing_status="PROCESSING")
                 )
 
+        stale_provider_order = False
+        if event.platform == "feishu" and event.occurred_at is not None:
+            latest_inbound_occurred_at = await session.scalar(
+                select(func.max(models.Message.occurred_at)).where(
+                    models.Message.conversation_id == conversation.id,
+                    models.Message.direction == "inbound",
+                )
+            )
+            stale_provider_order = (
+                latest_inbound_occurred_at is not None
+                and event.occurred_at < latest_inbound_occurred_at
+            )
+        normalized_metadata = {
+            "event_namespace": event.event_namespace or event.platform,
+            **event.event_metadata,
+        }
+        if stale_provider_order:
+            normalized_metadata["disposition"] = "stale_provider_order"
+
         normalized_id = (
             await session.execute(
                 pg_insert(models.NormalizedEvent)
@@ -292,11 +311,9 @@ async def ingest_canonical_event(
                     external_event_id=event.external_event_id,
                     event_type=f"{event.channel_type}.message.created",
                     raw_event_id=raw_event_id,
+                    conversation_id=conversation.id if stale_provider_order else None,
                     external_conversation_id=event.external_conversation_id,
-                    event_metadata={
-                        "event_namespace": event.event_namespace or event.platform,
-                        **event.event_metadata,
-                    },
+                    event_metadata=normalized_metadata,
                     occurred_at=event.occurred_at,
                 )
                 .on_conflict_do_nothing(
@@ -317,6 +334,10 @@ async def ingest_canonical_event(
                     .where(models.RawEvent.id == raw_event_id)
                     .values(processing_status="SKIPPED_DUPLICATE")
                 )
+            await session.commit()
+            return None
+
+        if stale_provider_order:
             await session.commit()
             return None
 

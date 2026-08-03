@@ -12,6 +12,7 @@ pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "c2f4a6d8e901"
 _FEISHU_REVISION = "e4b7c2d9a610"
+_HEAD_REVISION = "f8a1c3d5e702"
 _FEISHU_ACCOUNT_ID = "00000000-0000-0000-0000-00000000fe15"
 
 
@@ -91,8 +92,87 @@ async def test_feishu_platform_constraint_upgrade_and_fail_closed_downgrade():
                 )
             ).scalar_one()
         await engine.dispose()
-        assert revision == _FEISHU_REVISION
+        assert revision == _HEAD_REVISION
         assert "feishu" in new_definition
+    finally:
+        async with admin_engine.connect() as connection:
+            await connection.execute(
+                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
+            )
+        await admin_engine.dispose()
+
+
+async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
+    base_url = make_url(get_settings().database_url)
+    database_name = f"social_reply_feishu_dedup_{uuid.uuid4().hex[:12]}"
+    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
+    admin_engine = create_async_engine(
+        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
+    )
+    async with admin_engine.connect() as connection:
+        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+
+    try:
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        engine = create_async_engine(database_url)
+        async with engine.connect() as connection:
+            revision = (
+                await connection.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar_one()
+            index_definition = (
+                await connection.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() "
+                        "AND tablename = 'raw_events' "
+                        "AND indexname = 'uq_raw_events_feishu_webhook_external_event'"
+                    )
+                )
+            ).scalar_one()
+        await engine.dispose()
+        assert revision == _HEAD_REVISION
+        assert "UNIQUE INDEX" in index_definition
+        assert "(platform_account_id, external_event_id)" in index_definition
+        assert "source = 'feishu'::text" in index_definition
+        assert "ingress_kind = 'webhook'::text" in index_definition
+        assert "external_event_id IS NOT NULL" in index_definition
+
+        await assert_alembic_succeeds(database_url, "downgrade", _FEISHU_REVISION)
+        engine = create_async_engine(database_url)
+        async with engine.connect() as connection:
+            revision = (
+                await connection.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar_one()
+            index_count = (
+                await connection.execute(
+                    text(
+                        "SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                        "AND tablename = 'raw_events' "
+                        "AND indexname = 'uq_raw_events_feishu_webhook_external_event'"
+                    )
+                )
+            ).scalar_one()
+        await engine.dispose()
+        assert revision == _FEISHU_REVISION
+        assert index_count == 0
+
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        engine = create_async_engine(database_url)
+        async with engine.connect() as connection:
+            revision = (
+                await connection.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar_one()
+            index_count = (
+                await connection.execute(
+                    text(
+                        "SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                        "AND tablename = 'raw_events' "
+                        "AND indexname = 'uq_raw_events_feishu_webhook_external_event'"
+                    )
+                )
+            ).scalar_one()
+        await engine.dispose()
+        assert revision == _HEAD_REVISION
+        assert index_count == 1
     finally:
         async with admin_engine.connect() as connection:
             await connection.execute(

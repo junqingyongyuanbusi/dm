@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from social_reply.application.account_management.x_credentials import x_credentials
@@ -16,46 +17,51 @@ from social_reply.connectors.xchat.sender import DualXSender, XChatSender
 from social_reply.shared.config import get_settings
 
 _senders: dict[tuple[str, uuid.UUID, int, int], PlatformSender] = {}
+_senders_lock = asyncio.Lock()
 
 
 async def close_platform_senders() -> None:
-    senders = list(_senders.values())
-    _senders.clear()
-    for sender in senders:
-        await sender.aclose()
+    async with _senders_lock:
+        senders = list(_senders.values())
+        _senders.clear()
+        for sender in senders:
+            await sender.aclose()
 
 
 async def get_platform_sender(account_id: uuid.UUID) -> PlatformSender:
-    account = await get_platform_account_runtime(account_id)
-    meta_app_secret = None
-    meta_app_version = 0
-    if account.platform in {"facebook", "instagram"}:
-        if account.platform_app_id is None:
-            raise LookupError(f"platform_app_missing:{account.id}")
-        app = await get_platform_app_runtime(account.platform_app_id)
-        expected_family = (
-            "instagram"
-            if account.platform == "instagram"
-            and account.config.get("instagram_login_mode") == "instagram_login"
-            else "meta"
-        )
-        if app.tenant_id != account.tenant_id or app.platform_family != expected_family:
-            raise LookupError(f"platform_app_scope_mismatch:{account.id}")
-        meta_app_secret = app.credential_bundle["app_secret"]
-        meta_app_version = app.config_version
-    key = (account.platform, account.id, account.config_version, meta_app_version)
-    if key in _senders:
-        return _senders[key]
-    sender = _build_sender(account, meta_app_secret=meta_app_secret)
-    stale_keys = [
-        cached_key
-        for cached_key in _senders
-        if cached_key[0] == account.platform and cached_key[1] == account.id and cached_key != key
-    ]
-    for stale_key in stale_keys:
-        await _senders.pop(stale_key).aclose()
-    _senders[key] = sender
-    return sender
+    async with _senders_lock:
+        account = await get_platform_account_runtime(account_id)
+        meta_app_secret = None
+        meta_app_version = 0
+        if account.platform in {"facebook", "instagram"}:
+            if account.platform_app_id is None:
+                raise LookupError(f"platform_app_missing:{account.id}")
+            app = await get_platform_app_runtime(account.platform_app_id)
+            expected_family = (
+                "instagram"
+                if account.platform == "instagram"
+                and account.config.get("instagram_login_mode") == "instagram_login"
+                else "meta"
+            )
+            if app.tenant_id != account.tenant_id or app.platform_family != expected_family:
+                raise LookupError(f"platform_app_scope_mismatch:{account.id}")
+            meta_app_secret = app.credential_bundle["app_secret"]
+            meta_app_version = app.config_version
+        key = (account.platform, account.id, account.config_version, meta_app_version)
+        if key in _senders:
+            return _senders[key]
+        sender = _build_sender(account, meta_app_secret=meta_app_secret)
+        stale_keys = [
+            cached_key
+            for cached_key in _senders
+            if cached_key[0] == account.platform
+            and cached_key[1] == account.id
+            and cached_key != key
+        ]
+        for stale_key in stale_keys:
+            await _senders.pop(stale_key).aclose()
+        _senders[key] = sender
+        return sender
 
 
 def _build_sender(

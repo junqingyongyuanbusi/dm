@@ -89,13 +89,25 @@ class FeishuClient:
             raise FeishuClientError("FEISHU_TOKEN_EXPIRE_INVALID", retryable=False)
         return token.strip(), expire
 
-    async def tenant_access_token(self, *, force_refresh: bool = False) -> tuple[str, int]:
+    async def tenant_access_token(
+        self,
+        *,
+        rejected_token: str | None = None,
+    ) -> tuple[str, int]:
         now = self._clock()
-        if not force_refresh and self._tenant_token and now < self._tenant_token_refresh_at:
+        if (
+            self._tenant_token
+            and self._tenant_token != rejected_token
+            and now < self._tenant_token_refresh_at
+        ):
             return self._tenant_token, max(1, int(self._tenant_token_refresh_at - now))
         async with self._token_lock:
             now = self._clock()
-            if not force_refresh and self._tenant_token and now < self._tenant_token_refresh_at:
+            if (
+                self._tenant_token
+                and self._tenant_token != rejected_token
+                and now < self._tenant_token_refresh_at
+            ):
                 return self._tenant_token, max(1, int(self._tenant_token_refresh_at - now))
             token, expire = await self._fetch_tenant_access_token()
             refresh_margin = min(300, max(30, expire // 10))
@@ -195,7 +207,7 @@ class FeishuClient:
             response, payload, code = await self._send_reply(target=target, body=body, token=token)
             if code == _TOKEN_INVALID_CODE and refresh_attempt == 0:
                 try:
-                    token, _expire = await self.tenant_access_token(force_refresh=True)
+                    token, _expire = await self.tenant_access_token(rejected_token=token)
                 except (httpx.ConnectError, httpx.ConnectTimeout):
                     raise
                 except Exception as exc:

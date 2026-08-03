@@ -207,13 +207,19 @@ decrypt successfully before dispatch. Invalid authentication creates no `RawEven
 normal event is acknowledged even while disabled; the API persists sanitized
 `IGNORED_AT_INGRESS` evidence with `ingress_gate=FEISHU_DISABLED` and does not dispatch it.
 
-Accepted `im.message.receive_v1` occurrences are committed as account-scoped `RawEvent` rows with
-the same immutable direct-dispatch contract used by other recoverable webhook ingress. Worker
-normalization supports P2P text and group text that explicitly mentions the configured Bot. Group
-conversation identity includes account, chat, sender and any available thread/root scope so users
-and threads do not share decision history accidentally. Bot/self events, unsupported schemas and
-blank mention-only text do not enter decisions; unsupported attachments remain durable evidence and
-follow the human-work path.
+Accepted normal callbacks require a nonblank `header.event_id`. The API atomically reserves that
+provider callback ID per account in PostgreSQL, so a duplicate callback returns 200 without creating
+a second `RawEvent` or dispatching again, including while `FEISHU_ENABLED=false`. New
+`im.message.receive_v1` occurrences are committed as account-scoped `RawEvent` rows with the same
+immutable direct-dispatch contract used by other recoverable webhook ingress. Worker normalization
+requires `event.message.create_time` and uses it for provider ordering; header `create_time` remains
+metadata only. Under the conversation delivery advisory lock, a strictly older occurrence is kept as
+a `NormalizedEvent` with `stale_provider_order` disposition but creates no Message, generation,
+DecisionJob or Outbox. Normalization supports P2P text and group text that explicitly mentions the
+configured Bot. Group conversation identity includes account, chat, sender and any available
+thread/root scope so users and threads do not share decision history accidentally. Bot/self events,
+unsupported schemas and blank mention-only text do not enter decisions; unsupported attachments
+remain durable evidence and follow the human-work path.
 
 Outbox delivery has two explicit destinations: `feishu_p2p_reply` and `feishu_group_reply`. Both
 reply to the persisted inbound Feishu message target; thread replies preserve thread scope. The

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import httpx
@@ -89,6 +90,50 @@ async def test_feishu_health_isolates_accounts_and_persists_typed_states(session
     assert accounts[invalid_id].config["feishu_health_status"] == "CREDENTIAL_INVALID"
     assert accounts[invalid_id].config["feishu_health_error_code"] == "FEISHU_API_10003"
     assert all(account.config["feishu_health_checked_at"] for account in accounts.values())
+
+
+async def test_feishu_health_discards_result_after_config_version_rotation(session, monkeypatch):
+    account_id = await _account(session, app_id="cli_rotate123")
+    check_started = asyncio.Event()
+    release_check = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def tenant_access_token(self):
+            return "tenant", 7200
+
+        async def get_bot_info(self, _token, *, require_active=True):
+            assert require_active is False
+            check_started.set()
+            await release_check.wait()
+            return FeishuBotInfo("ou_stored", "Stale Bot", 1)
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(feishu_health, "FeishuClient", BlockingClient)
+    reconciliation = asyncio.create_task(feishu_health.reconcile_feishu_account_health(force=True))
+    await check_started.wait()
+    rotated_config = {
+        "delivery_mode": "direct",
+        "feishu_health_status": "ROTATED",
+        "feishu_bot_open_id": "ou_rotated",
+    }
+    await session.execute(
+        models.PlatformAccount.__table__.update()
+        .where(models.PlatformAccount.id == account_id)
+        .values(config=rotated_config, config_version=2)
+    )
+    await session.commit()
+    release_check.set()
+
+    assert await reconciliation == []
+    session.expire_all()
+    account = await session.get(models.PlatformAccount, account_id)
+    assert account.config_version == 2
+    assert account.config == rotated_config
 
 
 async def test_transient_feishu_health_failure_preserves_account_and_bot_identity(

@@ -244,6 +244,15 @@ class RawEvent(Base):
             "processing_status",
             "processing_next_attempt_at",
         ),
+        Index(
+            "uq_raw_events_feishu_webhook_external_event",
+            "platform_account_id",
+            "external_event_id",
+            unique=True,
+            postgresql_where=text(
+                "source = 'feishu' AND ingress_kind = 'webhook' AND external_event_id IS NOT NULL"
+            ),
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str | None] = mapped_column(Text)

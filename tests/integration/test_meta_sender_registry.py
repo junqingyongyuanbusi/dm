@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import pytest
@@ -117,20 +118,25 @@ async def test_feishu_sender_cache_rotates_on_account_config_version(session, mo
             self.app_secret = kwargs["app_secret"]
             self.api_base_url = kwargs["api_base_url"]
             self.closed = False
+            self.close_calls = 0
             created.append(self)
 
         async def send_text(self, *, target, text):
             return f"{target}:{text}"
 
         async def aclose(self):
+            self.close_calls += 1
             self.closed = True
 
     monkeypatch.setattr(registry, "FeishuClient", FakeFeishuClient)
     registry._senders.clear()
 
-    first = await registry.get_platform_sender(account_id)
-    cached = await registry.get_platform_sender(account_id)
+    first, cached = await asyncio.gather(
+        registry.get_platform_sender(account_id),
+        registry.get_platform_sender(account_id),
+    )
     assert cached is first
+    assert len(created) == 1
     assert first.app_secret == "secret-1"
     assert first.api_base_url == "https://open.feishu.cn"
 
@@ -146,12 +152,23 @@ async def test_feishu_sender_cache_rotates_on_account_config_version(session, mo
     )
     await session.commit()
 
-    second = await registry.get_platform_sender(account_id)
+    second, rotated_cached = await asyncio.gather(
+        registry.get_platform_sender(account_id),
+        registry.get_platform_sender(account_id),
+    )
+    assert rotated_cached is second
     assert second is not first
     assert second.app_secret == "secret-2"
     assert first.closed is True
-    await registry.close_platform_senders()
+    assert first.close_calls == 1
+    assert len(created) == 2
+    await asyncio.gather(
+        registry.close_platform_senders(),
+        registry.close_platform_senders(),
+    )
     assert second.closed is True
+    assert second.close_calls == 1
+    assert registry._senders == {}
 
     await session.execute(
         update(models.PlatformAccount)

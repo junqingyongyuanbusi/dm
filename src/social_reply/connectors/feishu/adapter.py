@@ -51,9 +51,19 @@ class FeishuWebhookAdapter:
 
         required = {
             key: message.get(key)
-            for key in ("message_id", "chat_id", "chat_type", "message_type", "content")
+            for key in (
+                "message_id",
+                "chat_id",
+                "chat_type",
+                "message_type",
+                "content",
+                "create_time",
+            )
         }
         if not all(_nonempty(value) for value in required.values()):
+            return []
+        occurred_at = _occurred_at(required["create_time"])
+        if occurred_at is None:
             return []
         message_id = required["message_id"]
         chat_id = required["chat_id"]
@@ -122,7 +132,7 @@ class FeishuWebhookAdapter:
                 external_user_id=sender_open_id,
                 conversation_key=":".join(conversation_parts),
                 text=text,
-                occurred_at=_occurred_at(header.get("create_time")),
+                occurred_at=occurred_at,
                 channel_type=channel_type,
                 event_namespace=_EVENT_NAMESPACE,
                 external_conversation_id=chat_id,

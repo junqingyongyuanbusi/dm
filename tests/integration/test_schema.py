@@ -128,6 +128,7 @@ async def test_poll_raw_event_journal_columns_and_indexes_exist(migrated_db):
         "ix_raw_events_account_received",
         "ix_raw_events_processing_due",
         "ix_raw_events_tenant_status_received",
+        "uq_raw_events_feishu_webhook_external_event",
     } <= indexes
 
 

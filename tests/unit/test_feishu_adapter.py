@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 
 from social_reply.connectors.feishu.adapter import FeishuWebhookAdapter
 from social_reply.domain.messages.canonical import ChannelType
@@ -17,6 +18,8 @@ def _payload(
     thread_id=None,
     root_id=None,
     event_type="im.message.receive_v1",
+    message_create_time="1785729600000",
+    header_create_time="1785729500000",
 ):
     message = {
         "message_id": message_id,
@@ -24,6 +27,7 @@ def _payload(
         "chat_type": chat_type,
         "message_type": message_type,
         "content": json.dumps(content if content is not None else {"text": "hello"}),
+        "create_time": message_create_time,
     }
     if mentions is not None:
         message["mentions"] = mentions
@@ -36,7 +40,7 @@ def _payload(
         "header": {
             "event_id": "evt_1",
             "event_type": event_type,
-            "create_time": "1785729600000",
+            "create_time": header_create_time,
             "token": "must-not-be-copied-to-metadata",
             "app_id": "cli_fixture",
             "tenant_key": "tenant-key",
@@ -67,6 +71,7 @@ def test_p2p_text_normalizes_to_dm_contract():
     assert event.channel_type is ChannelType.DM
     assert event.event_namespace == "im.message.receive_v1"
     assert event.text == "hello"
+    assert event.occurred_at == datetime.fromtimestamp(1785729600, tz=UTC)
     assert event.reply_target == {
         "kind": "dm",
         "message_id": "om_1",
@@ -182,6 +187,14 @@ def test_non_text_message_is_preserved_as_safe_attachment():
             },
         }
     ]
+
+
+def test_message_create_time_is_required_and_must_be_valid():
+    missing = _payload(message_create_time="")
+    invalid = _payload(message_create_time="not-a-timestamp")
+
+    assert _adapter().normalize(missing) == []
+    assert _adapter().normalize(invalid) == []
 
 
 def test_blank_mention_only_and_malformed_content_are_ignored():

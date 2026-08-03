@@ -4,7 +4,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import insert
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.application.event_ingestion.raw_recovery import (
     direct_dispatch_context,
@@ -75,6 +76,8 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
         header_app_id = header.get("app_id")
         if not isinstance(header_app_id, str) or not secrets.compare_digest(header_app_id, app_id):
             raise FeishuSecurityError()
+        if _safe_string(header.get("event_id")) is None:
+            raise FeishuSecurityError()
     except FeishuSecurityError as exc:
         status_code = 413 if exc.code == "feishu_request_too_large" else 401
         detail = "feishu_request_too_large" if status_code == 413 else "invalid_feishu_request"
@@ -104,7 +107,7 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
     async with get_session_factory()() as session:
         raw_event_id = (
             await session.execute(
-                insert(models.RawEvent)
+                pg_insert(models.RawEvent)
                 .values(
                     tenant_id=account.tenant_id,
                     platform_account_id=account.id,
@@ -124,11 +127,18 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
                     processing_status=("PENDING" if should_dispatch else "IGNORED_AT_INGRESS"),
                     processed_at=ignored_at,
                 )
+                .on_conflict_do_nothing(
+                    index_elements=["platform_account_id", "external_event_id"],
+                    index_where=text(
+                        "source = 'feishu' AND ingress_kind = 'webhook' "
+                        "AND external_event_id IS NOT NULL"
+                    ),
+                )
                 .returning(models.RawEvent.id)
             )
-        ).scalar_one()
+        ).scalar_one_or_none()
         await session.commit()
-    if should_dispatch:
+    if should_dispatch and raw_event_id is not None:
         await dispatch_initial_raw_event(raw_event_id)
     return Response(status_code=200)
 

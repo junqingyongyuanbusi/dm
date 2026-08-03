@@ -36,12 +36,13 @@ def _health_error_code(exc: Exception) -> str:
 async def _save_health(
     account_id: uuid.UUID,
     *,
+    expected_config_version: int,
     status: str,
     error_code: str | None = None,
     bot_open_id: str | None = None,
     bot_name: str | None = None,
     bot_activate_status: int | None = None,
-) -> None:
+) -> bool:
     health = {
         "feishu_health_status": status,
         "feishu_health_checked_at": datetime.now(UTC).isoformat(),
@@ -54,12 +55,16 @@ async def _save_health(
     if bot_activate_status is not None:
         health["feishu_bot_activate_status"] = bot_activate_status
     async with get_session_factory()() as session:
-        await session.execute(
+        result = await session.execute(
             models.PlatformAccount.__table__.update()
-            .where(models.PlatformAccount.id == account_id)
+            .where(
+                models.PlatformAccount.id == account_id,
+                models.PlatformAccount.config_version == expected_config_version,
+            )
             .values(config=models.PlatformAccount.config.op("||")(health))
         )
         await session.commit()
+        return result.rowcount == 1
 
 
 async def _check_account(account: PlatformAccountRuntime) -> str | None:
@@ -69,15 +74,21 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
         app_secret = credentials["app_secret"].strip()
     except Exception as exc:  # noqa: BLE001 - encrypted credential failures are account-local
         error_code = _health_error_code(exc)
-        await _save_health(account.id, status="CREDENTIAL_INVALID", error_code=error_code)
-        return str(account.id)
-    if not app_id or not app_secret or account.external_account_id != app_id:
-        await _save_health(
+        saved = await _save_health(
             account.id,
+            expected_config_version=account.config_version,
+            status="CREDENTIAL_INVALID",
+            error_code=error_code,
+        )
+        return str(account.id) if saved else None
+    if not app_id or not app_secret or account.external_account_id != app_id:
+        saved = await _save_health(
+            account.id,
+            expected_config_version=account.config_version,
             status="CREDENTIAL_INVALID",
             error_code="FEISHU_APP_ID_SCOPE_MISMATCH",
         )
-        return str(account.id)
+        return str(account.id) if saved else None
 
     client = FeishuClient(app_id=app_id, app_secret=app_secret)
     try:
@@ -93,24 +104,30 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
         else:
             status = "READY"
             error_code = None
-        await _save_health(
+        saved = await _save_health(
             account.id,
+            expected_config_version=account.config_version,
             status=status,
             error_code=error_code,
             bot_name=bot.name,
             bot_activate_status=bot.activate_status,
         )
-        return str(account.id) if status != "READY" else None
+        return str(account.id) if saved and status != "READY" else None
     except Exception as exc:  # noqa: BLE001 - provider failures become sanitized health state
         error_code = _health_error_code(exc)
         status = "CREDENTIAL_INVALID" if error_code in _CREDENTIAL_ERROR_CODES else "ERROR"
-        await _save_health(account.id, status=status, error_code=error_code)
+        saved = await _save_health(
+            account.id,
+            expected_config_version=account.config_version,
+            status=status,
+            error_code=error_code,
+        )
         logger.warning(
             "feishu health check failed account=%s code=%s",
             account.id,
             error_code,
         )
-        return str(account.id)
+        return str(account.id) if saved else None
     finally:
         await client.aclose()
 
@@ -132,13 +149,18 @@ async def reconcile_feishu_account_health(*, force: bool = False) -> list[str]:
             result = await _check_account(account)
         except Exception as exc:  # noqa: BLE001 - isolate accounts in the scheduler sweep
             error_code = _health_error_code(exc)
-            await _save_health(account.id, status="ERROR", error_code=error_code)
+            saved = await _save_health(
+                account.id,
+                expected_config_version=account.config_version,
+                status="ERROR",
+                error_code=error_code,
+            )
             logger.exception(
                 "feishu health account check crashed account=%s code=%s",
                 account.id,
                 error_code,
             )
-            result = str(account.id)
+            result = str(account.id) if saved else None
         if result is not None:
             unhealthy.append(result)
     return unhealthy

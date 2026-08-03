@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -117,6 +118,71 @@ async def test_send_text_retries_token_invalid_once_with_same_uuid():
     assert token_calls == 2
     assert len(reply_bodies) == 2
     assert reply_bodies[0]["uuid"] == reply_bodies[1]["uuid"]
+
+
+async def test_concurrent_rejected_token_refreshes_only_if_cache_still_matches():
+    token_calls = 0
+    invalid_replies = 0
+    both_invalid = asyncio.Event()
+    reply_uuids: dict[str, list[str]] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_calls, invalid_replies
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            token_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "tenant_access_token": f"tenant-{token_calls}",
+                    "expire": 7200,
+                },
+            )
+        reply_uuids.setdefault(request.url.path, []).append(json.loads(request.content)["uuid"])
+        if request.headers["authorization"] == "Bearer tenant-1":
+            invalid_replies += 1
+            if invalid_replies == 2:
+                both_invalid.set()
+            await both_invalid.wait()
+            return httpx.Response(200, json={"code": 99991663})
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "om_sent"}})
+
+    client = FeishuClient(
+        app_id="cli_12345678",
+        app_secret="app-secret",
+        transport=httpx.MockTransport(handler),
+    )
+    results = await asyncio.gather(
+        client.send_text(
+            target=_target(
+                message_id="om_1",
+                uuid="11111111-1111-1111-1111-111111111111",
+            ),
+            text="one",
+        ),
+        client.send_text(
+            target=_target(
+                message_id="om_2",
+                uuid="22222222-2222-2222-2222-222222222222",
+            ),
+            text="two",
+        ),
+    )
+    await client.aclose()
+
+    assert results == ["om_sent", "om_sent"]
+    assert invalid_replies == 2
+    assert token_calls == 2
+    assert reply_uuids == {
+        "/open-apis/im/v1/messages/om_1/reply": [
+            "11111111-1111-1111-1111-111111111111",
+            "11111111-1111-1111-1111-111111111111",
+        ],
+        "/open-apis/im/v1/messages/om_2/reply": [
+            "22222222-2222-2222-2222-222222222222",
+            "22222222-2222-2222-2222-222222222222",
+        ],
+    }
 
 
 @pytest.mark.parametrize(

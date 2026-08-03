@@ -41,7 +41,7 @@ FEISHU_ENABLED=true
 FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 ```
 
-先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库 head 为 `e4b7c2d9a610` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
+先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库 head 为 `f8a1c3d5e702` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
 
 ## 在 Admin 创建账号
 
@@ -100,7 +100,7 @@ FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 
 ## 安全与回调语义
 
-正常消息必须使用加密 envelope，并通过 `X-Lark-*` 签名、时间窗口、Verification Token、App ID 和 AES 解密检查。失效、重放、签名错误或账号不匹配的请求不会创建 `RawEvent`。已验证的正常事件在功能关闭时仍返回 ACK，但只保存去除敏感 token 的 sanitized `IGNORED_AT_INGRESS` 证据，不会进入决策或发送。
+正常消息必须使用加密 envelope，并通过 `X-Lark-*` 签名、时间窗口、Verification Token、App ID 和 AES 解密检查，同时提供非空 `header.event_id` 和有效的 `event.message.create_time`。失效、重放、签名错误或账号不匹配的请求不会创建 `RawEvent`。同一账号的已验证回调按 `header.event_id` 在 RawEvent ingress 去重；该键不是 `message_id`，并且在 `FEISHU_ENABLED=false` 时同样生效。`message.create_time` 是同会话 provider 顺序的事实时间，header `create_time` 只保留为元数据；严格更旧的延迟消息只保存带 `stale_provider_order` disposition 的 NormalizedEvent，不创建 Message、generation、DecisionJob 或 Outbox。已验证的正常事件在功能关闭时仍返回 ACK，但只保存去除敏感 token 的 sanitized `IGNORED_AT_INGRESS` 证据，不会进入决策或发送。
 
 **Secret warning:** App Secret、Verification Token 和 Encrypt Key 都按生产密钥处理。只通过 TLS Admin/Control API 提交；不要写入文档、工单、聊天、截图、shell history、Git、日志或飞书消息。Social Reply 使用 `PLATFORM_SECRET_KEYS` 加密 durable staging 和最终 PostgreSQL credential bundle；丢失该密钥集会使已有账号凭证不可读。
 
@@ -118,4 +118,4 @@ FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 
 紧急暂停时，在 API、Worker、Scheduler 上同时设置 `FEISHU_ENABLED=false` 并协调重启到同一 digest。该操作暂停 provisioning、正常事件 dispatch、health 和发送，但保留账号、加密凭证、Callback 身份、RawEvent 和 Outbox；URL verification 仍可用。不要通过删除凭证来实现临时暂停。
 
-代码回滚必须同时考虑数据库：`e4b7c2d9a610` 的 downgrade 在任何 Feishu `PlatformAccount` 存在时会拒绝执行。若必须回到不识别 Feishu 的旧代码，先保持 Feishu 禁用并按 `docs/production-migration.md` 执行已审核的账号移除/重建或数据库备份恢复方案。镜像回滚不等于数据库回滚，API、Worker、Scheduler 最终仍必须收敛到同一个 digest。
+代码回滚必须同时考虑数据库：从 `f8a1c3d5e702` downgrade 到 `e4b7c2d9a610` 只移除 Feishu RawEvent 去重索引；继续 downgrade `e4b7c2d9a610` 时，任何 Feishu `PlatformAccount` 存在都会被拒绝。若必须回到不识别 Feishu 的旧代码，先保持 Feishu 禁用并按 `docs/production-migration.md` 执行已审核的账号移除/重建或数据库备份恢复方案。镜像回滚不等于数据库回滚，API、Worker、Scheduler 最终仍必须收敛到同一个 digest。
