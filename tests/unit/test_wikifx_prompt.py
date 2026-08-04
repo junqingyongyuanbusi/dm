@@ -36,7 +36,7 @@ _CONTRACT_PROMPT_ANCHORS = (
 )
 
 
-def test_default_persona_fits_the_editable_segment_budget() -> None:
+def test_compiled_default_voice_fits_the_compatibility_budget() -> None:
     assert DEFAULT_PERSONA.strip() == DEFAULT_PERSONA
     assert len(DEFAULT_PERSONA) < PERSONA_MAX_CHARS
 

@@ -74,7 +74,13 @@ from social_reply.domain.platform_accounts import capability_text_limit
 from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
-from social_reply.domain.reply.voice import VoiceEmoji, VoiceEmpathy, VoiceLength, VoiceTone
+from social_reply.domain.reply.voice import (
+    VOICE_PREFERENCE_FIELDS,
+    VoiceEmoji,
+    VoiceEmpathy,
+    VoiceLength,
+    VoiceTone,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -2517,40 +2523,47 @@ _PROMPT_BANNERS = {
     "voice_preferences_invalid": ("err", "品牌语气偏好无效，请只选择页面提供的选项。"),
 }
 
-_VOICE_OPTIONS = {
+_VOICE_UI = {
     "tone": (
-        (VoiceTone.PROFESSIONAL.value, "专业"),
-        (VoiceTone.WARM.value, "温暖"),
-        (VoiceTone.FORMAL.value, "正式"),
+        "语气",
+        (
+            (VoiceTone.PROFESSIONAL.value, "专业"),
+            (VoiceTone.WARM.value, "温暖"),
+            (VoiceTone.FORMAL.value, "正式"),
+        ),
     ),
     "length": (
-        (VoiceLength.CONCISE.value, "简洁"),
-        (VoiceLength.BALANCED.value, "均衡"),
+        "篇幅",
+        (
+            (VoiceLength.CONCISE.value, "简洁"),
+            (VoiceLength.BALANCED.value, "均衡"),
+        ),
     ),
     "empathy": (
-        (VoiceEmpathy.STANDARD.value, "标准"),
-        (VoiceEmpathy.HIGH.value, "高同理心"),
+        "同理心",
+        (
+            (VoiceEmpathy.STANDARD.value, "标准"),
+            (VoiceEmpathy.HIGH.value, "高同理心"),
+        ),
     ),
     "emoji": (
-        (VoiceEmoji.NEVER.value, "不使用"),
-        (VoiceEmoji.SPARINGLY.value, "少量使用"),
+        "Emoji",
+        (
+            (VoiceEmoji.NEVER.value, "不使用"),
+            (VoiceEmoji.SPARINGLY.value, "少量使用"),
+        ),
     ),
-}
-_VOICE_LABELS = {
-    "tone": "语气",
-    "length": "篇幅",
-    "empathy": "同理心",
-    "emoji": "Emoji",
 }
 
 
 def _voice_select(name: str, current: str) -> str:
+    field_label, field_options = _VOICE_UI[name]
     options = "".join(
         f'<option value="{value}"{" selected" if value == current else ""}>{label}</option>'
-        for value, label in _VOICE_OPTIONS[name]
+        for value, label in field_options
     )
     return (
-        f'<label for="f-{name}">{_VOICE_LABELS[name]}</label>'
+        f'<label for="f-{name}">{field_label}</label>'
         f'<select id="f-{name}" name="{name}" required>{options}</select>'
     )
 
@@ -2588,7 +2601,7 @@ async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -
         trial = _render_trial(request)
     preferences = resolved.preferences
     voice_fields = "".join(
-        _voice_select(name, getattr(preferences, name).value) for name in _VOICE_OPTIONS
+        _voice_select(name, getattr(preferences, name).value) for name in _VOICE_UI
     )
     body = f"""<h1>提示词</h1><p class="lede">只选择有限的品牌语气偏好；后台不接受任意系统指令。WikiFX 身份、领域事实边界、动作含义和安全规则由系统固定，不可修改。</p>{banner}
 <section class="card"><h2>结构化品牌语气偏好 {origin}</h2>
@@ -2649,20 +2662,12 @@ async def prompt_save(request: Request) -> Response:
     _require_csrf(request, form)
     tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
     brand = (form.get("brand_id") or "default").strip() or "default"
-    allowed_fields = {
-        "csrf_token",
-        "tenant_id",
-        "brand_id",
-        "tone",
-        "length",
-        "empathy",
-        "emoji",
-    }
+    allowed_fields = {"csrf_token", "tenant_id", "brand_id"} | VOICE_PREFERENCE_FIELDS
     try:
         if set(form) - allowed_fields:
             raise ValueError("voice_preferences_invalid")
         preferences = parse_voice_preferences(
-            {name: form.get(name) or "" for name in ("tone", "length", "empathy", "emoji")}
+            {name: form.get(name) or "" for name in VOICE_PREFERENCE_FIELDS}
         )
     except ValueError:
         return RedirectResponse(
@@ -2718,7 +2723,7 @@ async def prompt_save(request: Request) -> Response:
 
 @router.post("/prompt/trial")
 async def prompt_trial(request: Request) -> Response:
-    """用当前人设跑一次 LLM，仅回显结果——不落 reply_decisions，也不建 outbox。"""
+    """Run compiled voice preferences through the LLM without persistence or delivery."""
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal

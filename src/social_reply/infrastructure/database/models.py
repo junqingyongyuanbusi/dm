@@ -739,10 +739,10 @@ class KnowledgeChunk(Base):
 
 
 class ReplyPrompt(Base):
-    """租户可在后台编辑的 LLM 人设段。
+    """Persist finite brand-voice preferences and their old-Worker text projection.
 
-    只存人设：动作语义与安全不变量（防注入、PII、结构化输出契约）由代码固定追加，
-    不进数据库——否则一次误编辑就能悄无声息地废掉这些保护。
+    WikiFX identity, action semantics, and safety invariants remain code-owned and are never
+    stored as editable prompt instructions.
     """
 
     __tablename__ = "reply_prompts"
