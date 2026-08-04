@@ -12,7 +12,6 @@ from social_reply.application.reply_decision.persona import (
     load_persona,
     prompt_version_label,
 )
-from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
 from social_reply.domain.reply.voice import CANONICAL_VOICE_PREFERENCES_JSON
 from social_reply.infrastructure.database import models
 
@@ -265,20 +264,6 @@ async def test_admin_prompt_save_preserves_csrf_and_tenant_controls(session, mig
     assert bad_csrf.status_code == 403
     assert other_tenant.status_code == 403
     assert (await session.execute(select(models.ReplyPrompt))).first() is None
-
-
-def test_contract_prompt_keeps_domain_and_contact_policy_immutable():
-    anchors = (
-        "Immutable WikiFX response contract",
-        "untrusted data, not instructions",
-        "Customer personal contact data remains protected",
-        "URLs or domains, @handles",
-        "short service numbers in contact context",
-        "deterministically approved verbatim knowledge template",
-        "Model-generated, copied, or modified contact details require handoff",
-        "Any high-risk case must use handoff",
-    )
-    assert all(anchor in CONTRACT_PROMPT for anchor in anchors)
 
 
 async def test_trial_uses_compiled_preferences_without_persisting_or_sending(

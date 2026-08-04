@@ -79,6 +79,8 @@ async def test_hostile_knowledge_remains_json_encoded_untrusted_data():
         )
     )
 
+    assert prompt.startswith(DEFAULT_PERSONA)
+    assert prompt.index(CONTRACT_PROMPT) < prompt.index(_KNOWLEDGE_HEADER)
     payload_text = prompt.rsplit(f"\n\n{_KNOWLEDGE_HEADER}\n", maxsplit=1)[1]
     assert json.loads(payload_text) == {"knowledge_blocks": [hostile_knowledge]}
     assert json.dumps(hostile_knowledge, ensure_ascii=False) in payload_text
