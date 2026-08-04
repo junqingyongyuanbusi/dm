@@ -226,9 +226,10 @@ Take and verify a database backup before upgrade. Downgrade preserves the repair
 reconstruct released assignment attribution; restore the backup if that history must be recovered.
 
 The previous Worker cannot deliver `MANUAL_REPLY` rows because it resolves direct targets only
-through a ReplyDecision. During the API-first Railway rollout, operators must not submit manual
-replies or draft approvals from the new inbox until API, Worker, and Scheduler all report `SUCCESS`
-at the new identical digest. Read-only inbox use, claims, and resolves are safe. Run the standard
+through a ReplyDecision. For this release's API-first Railway rollout, pause claims, resolves,
+account-policy mutations, manual replies, and draft approvals before the migration starts. Keep the
+pause until every API instance runs the new image and API, Worker, and Scheduler all report
+`SUCCESS` at the same digest. Read-only inbox use remains safe. Run the standard
 `scripts/publish_railway_release.sh`, keep the coordinated pause through its final digest
 verification, then perform one manual-reply smoke test with a dedicated platform account. A row
 accepted during an accidental mixed-version window may move to `NEEDS_REVIEW`; inspect its delivery
@@ -243,7 +244,9 @@ same conversation delivery advisory locks as runtime claim/resolve, in determini
 order, before changing affected rows. It repairs:
 
 - open `CLAIMED` work paired with `HANDOFF_PENDING`, `BOT_ACTIVE`, or `BOT_DRAFT_ONLY` to
-  `HUMAN_ACTIVE`, using the assigned actor as `human_agent_id`;
+  `HUMAN_ACTIVE`, using the assigned actor as `human_agent_id`; it also repairs mismatched
+  attribution for claimed work already paired with `HUMAN_ACTIVE` without rewriting correctly
+  attributed rows;
 - open `WAITING` work paired with `BOT_ACTIVE` or `BOT_DRAFT_ONLY` to `HANDOFF_PENDING`;
 - `HANDOFF_PENDING` with no open work and at least one `RESOLVED` item to the owning account's current
   `automation_default`, clearing human attribution. Because Alembic has no runtime deployment
@@ -253,9 +256,15 @@ order, before changing affected rows. It repairs:
 
 The repair deliberately does not rewrite `CLOSED`, `BOT_COOLDOWN`, or resolved `HUMAN_ACTIVE` rows.
 Every changed automation row increments `state_version` and records a migration-specific
-`state_changed_reason`. Inventory the four repair classes and record counts before upgrade; after
-upgrade, verify no open work remains paired with a bot state and no claimed work remains paired with
-`HANDOFF_PENDING`:
+`state_changed_reason`; a correctly attributed claimed `HUMAN_ACTIVE` row is unchanged. After taking
+conversation advisory locks, the migration locks every affected account row in deterministic account
+ID order before any state update. The account selection requires matching Conversation and account
+tenants and ignores mismatched ownership. A concurrent account-policy update that commits before the
+migration obtains the row lock is therefore read as the committed policy; one that starts later waits
+for the migration transaction. The operational pause is still required because Alembic cannot
+coordinate mixed-version API behavior around those locks. Inventory the four repair classes and
+record counts before upgrade; after upgrade, verify no open work remains paired with a bot state and
+no claimed work remains paired with `HANDOFF_PENDING`:
 
 ```sql
 SELECT w.status, s.state, count(*)
@@ -279,13 +288,14 @@ WHERE s.state = 'HANDOFF_PENDING'
 ```
 
 This migration accompanies an API behavior change: claim now means active human takeover, and
-resolve now restores the account policy in the same transaction. During a mixed-version rollout,
-pause Admin claim/resolve actions until the API migration owner and every API instance run the new
-image. Worker and Scheduler retain the same durable paused-message behavior: inbound messages during
-`HANDOFF_PENDING` or `HUMAN_ACTIVE` persist terminal ignore decisions and are never replayed after
-resolve. The Alembic downgrade to `f8a1c3d5e702` is explicitly a data no-op and cannot reconstruct
-prior inconsistent state; downgrade/re-upgrade is safe but irreversible. Restore the verified backup
-if the pre-repair data itself must be recovered.
+resolve now restores the account policy in the same transaction. During the mixed-version window,
+keep claims, resolves, account-policy mutations, manual replies, and draft approvals paused until
+every API instance runs the new image and API, Worker, and Scheduler have converged on the same
+digest. Read-only inbox use remains safe. Worker and Scheduler retain the same durable paused-message
+behavior: inbound messages during `HANDOFF_PENDING` or `HUMAN_ACTIVE` persist terminal ignore
+decisions and are never replayed after resolve. The Alembic downgrade to `f8a1c3d5e702` is explicitly
+a data no-op and cannot reconstruct prior inconsistent state; downgrade/re-upgrade is safe but
+irreversible. Restore the verified backup if the pre-repair data itself must be recovered.
 
 ## Polling RawEvent journal
 
