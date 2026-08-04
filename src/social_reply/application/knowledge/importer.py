@@ -55,12 +55,12 @@ def _parse_rows(
         raise ValueError(f"CSV 表头缺少必需列: {'、'.join(sorted(missing))}（必需 question,reply）")
     rows: list[KnowledgeDraft] = []
     blank = 0
-    for raw in reader:
+    for row_number, raw in enumerate(reader, start=2):
         question = (raw.get("question") or "").strip()
         reply = (raw.get("reply") or "").strip()
         if not question or not reply:
             blank += 1
-            logger.warning("跳过空行（question/reply 为空）: %r", raw)
+            logger.warning("Skipping blank knowledge CSV row: row=%d", row_number)
             continue
         rows.append(
             build_knowledge_draft(

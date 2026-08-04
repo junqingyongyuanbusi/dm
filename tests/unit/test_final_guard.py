@@ -173,6 +173,9 @@ def test_pii_with_dash_separators_blocked():
         "The price is USD @ 5 per unit.",
         "客服将在 3 天内回复。",
         "Please read the support article in the help center.",
+        "Contact Energy and LINE Corporation are broker names in this example.",
+        "Broker license 12345 is listed for reference.",
+        "The risk score is 9555 out of 10000.",
         "The malformed values https:// and www. are not contact destinations.",
     ),
 )
