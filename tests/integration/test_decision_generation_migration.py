@@ -180,10 +180,7 @@ async def _insert_legacy_decision(
 
 
 async def test_generation_migration_backfill_triggers_and_downgrade():
-    async with temporary_database("social_reply_generation_migration") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_generation_migration") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         orphan_message_id = uuid.uuid4()
@@ -751,10 +748,7 @@ async def test_generation_migration_backfill_triggers_and_downgrade():
 
 
 async def test_reply_decision_trigger_rejects_stale_overlapping_transaction():
-    async with temporary_database("social_reply_decision_commit_race") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_decision_commit_race") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _FENCING_REVISION)
         engine = create_async_engine(database_url)
         old_message_id = uuid.uuid4()
@@ -902,10 +896,7 @@ async def _insert_current_job(connection, *, job_id: uuid.UUID, message_id: uuid
 
 
 async def test_migration_cancellation_waits_for_delivery_advisory_lock():
-    async with temporary_database("social_reply_generation_race") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_generation_race") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         old_message_id, new_message_id = uuid.uuid4(), uuid.uuid4()

@@ -19,7 +19,7 @@ _HEAD_REVISION = "d3f6a1b8c904"
 
 
 async def test_historical_data_upgrade_downgrade_and_reupgrade():
-    async with temporary_database("social_reply_governance") as (_database_name, database_url):
+    async with temporary_database("social_reply_governance") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -203,10 +203,7 @@ async def test_historical_data_upgrade_downgrade_and_reupgrade():
 
 
 async def test_unknown_historical_knowledge_status_aborts_migration():
-    async with temporary_database("social_reply_governance_invalid") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_governance_invalid") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -244,10 +241,7 @@ async def test_unknown_historical_knowledge_status_aborts_migration():
 
 
 async def test_active_bot_decision_send_aborts_migration():
-    async with temporary_database("social_reply_governance_sending") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_governance_sending") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:

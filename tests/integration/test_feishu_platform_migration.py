@@ -19,7 +19,7 @@ _FEISHU_ACCOUNT_ID = "00000000-0000-0000-0000-00000000fe15"
 
 
 async def test_feishu_platform_constraint_upgrade_and_fail_closed_downgrade():
-    async with temporary_database("social_reply_feishu") as (_database_name, database_url):
+    async with temporary_database("social_reply_feishu") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         await assert_alembic_succeeds(database_url, "upgrade", _FEISHU_REVISION)
         engine = create_async_engine(database_url)
@@ -90,10 +90,7 @@ async def test_feishu_platform_constraint_upgrade_and_fail_closed_downgrade():
 
 
 async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
-    async with temporary_database("social_reply_feishu_dedup") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_feishu_dedup") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", "head")
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
@@ -157,10 +154,7 @@ async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
 
 
 async def test_feishu_dedup_migration_recovers_invalid_concurrent_index():
-    async with temporary_database("social_reply_feishu_invalid") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_feishu_invalid") as database_url:
         account_id = uuid.uuid4()
         first_raw_id = uuid.uuid4()
         second_raw_id = uuid.uuid4()

@@ -14,7 +14,7 @@ pytestmark = pytest.mark.integration
 
 
 async def test_human_handoff_repair_downgrade_and_reupgrade():
-    async with temporary_database("social_reply_handoff") as (_database_name, database_url):
+    async with temporary_database("social_reply_handoff") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", "f8a1c3d5e702")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -205,10 +205,7 @@ async def test_human_handoff_repair_downgrade_and_reupgrade():
 
 
 async def test_human_handoff_repair_waits_for_committed_account_policy():
-    async with temporary_database("social_reply_handoff_policy") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_handoff_policy") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", "f8a1c3d5e702")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:

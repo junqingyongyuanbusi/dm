@@ -17,7 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @asynccontextmanager
-async def temporary_database(prefix: str) -> AsyncIterator[tuple[str, str]]:
+async def temporary_database(prefix: str) -> AsyncIterator[str]:
     base_url = make_url(get_settings().database_url)
     database_name = f"{prefix}_{uuid.uuid4().hex[:12]}"
     database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
@@ -27,7 +27,7 @@ async def temporary_database(prefix: str) -> AsyncIterator[tuple[str, str]]:
     try:
         async with admin_engine.connect() as connection:
             await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-        yield database_name, database_url
+        yield database_url
     finally:
         try:
             async with admin_engine.connect() as connection:

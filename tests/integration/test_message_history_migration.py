@@ -12,7 +12,7 @@ pytestmark = pytest.mark.integration
 
 
 async def test_platform_account_migration_rejects_incompatible_capability():
-    async with temporary_database("social_reply_contract") as (_database_name, database_url):
+    async with temporary_database("social_reply_contract") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", "f3a6c1d8e250")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -35,7 +35,7 @@ async def test_platform_account_migration_rejects_incompatible_capability():
 
 
 async def test_meta_route_migration_rejects_cross_family_collision():
-    async with temporary_database("social_reply_meta_route") as (_database_name, database_url):
+    async with temporary_database("social_reply_meta_route") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", "c5a8e2f4d901")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -58,10 +58,7 @@ async def test_meta_route_migration_rejects_cross_family_collision():
 
 
 async def test_human_work_hardening_repairs_legacy_rows():
-    async with temporary_database("social_reply_human_work") as (
-        _database_name,
-        database_url,
-    ):
+    async with temporary_database("social_reply_human_work") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", "a1c4e8b7f302")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -226,7 +223,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
 
 
 async def test_message_history_migration_backfills_and_round_trips():
-    async with temporary_database("social_reply_history") as (_database_name, database_url):
+    async with temporary_database("social_reply_history") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", "e7b2c4d9a610")
         engine = create_async_engine(database_url)
         seed_statements = (
