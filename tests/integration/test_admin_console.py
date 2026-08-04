@@ -1762,8 +1762,9 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
                 "csrf_token": csrf,
                 "tenant_id": "default",
                 "question": "你们几点营业",
-                "reply": "每天 9:00-21:00",
+                "reply": "请联系 support@example.com",
                 "category": "常见",
+                "is_official_contact": "true",
             },
         )
         assert resp.status_code == 303
@@ -1771,8 +1772,19 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
 
     docs = (await session.execute(select(models.KnowledgeDocument))).scalars().all()
     assert any(d.question == "你们几点营业" for d in docs)
+    assert {d.status for d in docs} == {"draft"}
+    assert {d.is_official_contact for d in docs} == {True}
     chunk = (await session.execute(select(models.KnowledgeChunk))).scalars().first()
     assert chunk.embed_text == "你们几点营业"  # 非对称嵌入：只嵌问题
+    audit = (
+        await session.execute(
+            select(models.AuditLog).where(
+                models.AuditLog.action == "SET_KNOWLEDGE_OFFICIAL_CONTACT"
+            )
+        )
+    ).scalar_one()
+    assert audit.actor == "user:admin"
+    assert audit.detail["content_hash"] == chunk.content_hash
 
 
 async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatch):
@@ -1807,6 +1819,8 @@ async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatc
     assert len(chunks) == 2
     assert all(len(c.embedding) == 1536 for c in chunks)
     assert all(d.source_file == "templates.csv" for d in docs)
+    assert {d.status for d in docs} == {"draft"}
+    assert {d.is_official_contact for d in docs} == {False}
 
     # 重复上传：全部 skipped，不新增
     async with _app_client() as client:
@@ -1823,6 +1837,159 @@ async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatc
         assert "skipped=2" in loc
     docs2 = (await session.execute(select(models.KnowledgeDocument))).scalars().all()
     assert len(docs2) == 2
+
+
+async def test_knowledge_explicit_publish_unpublish_is_audited_and_idempotent(session, migrated_db):
+    doc = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        question="official contact",
+        reply="support@example.com",
+        status="draft",
+        is_official_contact=True,
+    )
+    session.add(doc)
+    await session.commit()
+    doc_id = doc.id
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        published = await client.post(
+            f"/admin/knowledge/{doc_id}/status",
+            data={"csrf_token": csrf, "target": "published"},
+        )
+        same_target = await client.post(
+            f"/admin/knowledge/{doc_id}/status",
+            data={"csrf_token": csrf, "target": "published"},
+        )
+        unpublished = await client.post(
+            f"/admin/knowledge/{doc_id}/status",
+            data={"csrf_token": csrf, "target": "draft"},
+        )
+    assert published.status_code == same_target.status_code == unpublished.status_code == 303
+    session.expire_all()
+    assert (await session.get(models.KnowledgeDocument, doc_id)).status == "draft"
+    audits = (
+        (
+            await session.execute(
+                select(models.AuditLog)
+                .where(models.AuditLog.subject_id == str(doc_id))
+                .order_by(models.AuditLog.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [audit.action for audit in audits] == [
+        "PUBLISH_KNOWLEDGE",
+        "UNPUBLISH_KNOWLEDGE",
+    ]
+    assert audits[0].detail == {
+        "from": "draft",
+        "to": "published",
+        "brand": "b1",
+        "platform": "telegram",
+        "is_official_contact": True,
+    }
+    assert audits[1].detail["from"] == "published"
+    assert audits[1].detail["to"] == "draft"
+
+
+async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
+    doc = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="historical contact",
+        reply="support@example.com",
+        status="draft",
+    )
+    session.add(doc)
+    await session.flush()
+    session.add(
+        models.KnowledgeChunk(
+            tenant_id="default",
+            document_id=doc.id,
+            content="问：historical contact\n答：support@example.com",
+            embed_text="historical contact",
+            content_hash="c" * 64,
+            embedding_version="fake",
+            embedding=[0.0] * 1536,
+        )
+    )
+    await session.commit()
+    doc_id = doc.id
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        classified = await client.post(
+            f"/admin/knowledge/{doc_id}/official-contact",
+            data={"csrf_token": csrf, "target": "true"},
+        )
+        same_target = await client.post(
+            f"/admin/knowledge/{doc_id}/official-contact",
+            data={"csrf_token": csrf, "target": "true"},
+        )
+        await client.post(
+            f"/admin/knowledge/{doc_id}/status",
+            data={"csrf_token": csrf, "target": "published"},
+        )
+        published_change = await client.post(
+            f"/admin/knowledge/{doc_id}/official-contact",
+            data={"csrf_token": csrf, "target": "false"},
+        )
+    assert classified.status_code == same_target.status_code == 303
+    assert published_change.status_code == 409
+    session.expire_all()
+    stored = await session.get(models.KnowledgeDocument, doc_id)
+    assert stored.is_official_contact is True
+    audits = (
+        (
+            await session.execute(
+                select(models.AuditLog).where(
+                    models.AuditLog.subject_id == str(doc_id),
+                    models.AuditLog.action == "SET_KNOWLEDGE_OFFICIAL_CONTACT",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 1
+    assert audits[0].detail == {
+        "from": False,
+        "to": True,
+        "brand": "b1",
+        "platform": None,
+        "status": "draft",
+        "content_hash": "c" * 64,
+    }
+
+
+async def test_knowledge_status_is_tenant_scoped_and_target_is_explicit(session, migrated_db):
+    foreign = models.KnowledgeDocument(
+        tenant_id="other-tenant",
+        question="q",
+        reply="r",
+        status="draft",
+    )
+    session.add(foreign)
+    await session.commit()
+    foreign_id = foreign.id
+    async with _app_client() as client:
+        csrf = await _login(client)
+        invalid = await client.post(
+            f"/admin/knowledge/{foreign_id}/status",
+            data={"csrf_token": csrf, "target": "toggle"},
+        )
+        cross_tenant = await client.post(
+            f"/admin/knowledge/{foreign_id}/status",
+            data={"csrf_token": csrf, "target": "published"},
+        )
+    assert invalid.status_code == 422
+    assert cross_tenant.status_code == 404
+    session.expire_all()
+    assert (await session.get(models.KnowledgeDocument, foreign_id)).status == "draft"
 
 
 async def test_knowledge_csv_import_bad_header(session, migrated_db, monkeypatch):

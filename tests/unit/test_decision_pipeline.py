@@ -135,6 +135,43 @@ async def test_verbatim_auto_reply_with_pii_is_blocked_by_final_guard():
     assert "GUARD_PII_LEAK" in d.reason_codes
 
 
+async def test_approved_official_contact_verbatim_reply_passes_final_guard():
+    template = "Official support: support@example.com"
+    decision = await run_decision_pipeline(
+        _snap(text="official contact"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        verbatim_reply=template,
+        approved_official_contact_reply=template,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_text == template
+    assert decision.source == "knowledge"
+
+
+async def test_llm_copy_of_approved_contact_is_still_blocked():
+    template = "Official support: support@example.com"
+
+    class _CopyingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text=template,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(text="official contact"),
+        llm=_CopyingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=(template,),
+        approved_official_contact_reply=template,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert "GUARD_PII_LEAK" in decision.reason_codes
+
+
 async def test_risk_word_beats_verbatim_template():
     # 安全规则优先：风险词即使命中模板也必须转人工
     d = await run_decision_pipeline(

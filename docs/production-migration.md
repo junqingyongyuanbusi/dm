@@ -113,7 +113,7 @@ database backup. After all Feishu rows are absent, downgrade restores the previo
 platform constraint.
 
 Roll out the Feishu-capable code with `FEISHU_ENABLED=false` on API, Worker and Scheduler. Confirm all
-three roles run the same immutable image digest and the database is at the unique current head `a9d4e6f2b713`. Enablement is
+three roles run the same immutable image digest and the database is at the unique current head `d3f6a1b8c904`. Enablement is
 then a coordinated release operation: stop or replace API, Worker and Scheduler so all three receive
 `FEISHU_ENABLED=true` and the same health interval on that one digest. Do not expose ingress on a new
 API while an old Worker or Scheduler remains.
@@ -297,6 +297,45 @@ decisions and are never replayed after resolve. The Alembic downgrade to `f8a1c3
 a data no-op and cannot reconstruct prior inconsistent state; downgrade/re-upgrade is safe but
 irreversible. Restore the verified backup if the pre-repair data itself must be recovered.
 
+## Prompt governance and draft-first knowledge rollout
+
+Revision `d3f6a1b8c904` follows `a9d4e6f2b713`. Before upgrade, take and verify a PostgreSQL backup and record these inventories:
+
+```sql
+SELECT tenant_id, brand_id, revision, updated_by, length(persona) AS legacy_persona_chars
+FROM reply_prompts
+ORDER BY tenant_id, brand_id;
+
+SELECT status, count(*)
+FROM knowledge_documents
+GROUP BY status
+ORDER BY status;
+
+SELECT id, tenant_id, brand_id, platform, reply
+FROM knowledge_documents
+WHERE status = 'published'
+  AND (reply ~ '[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]{2,}'
+       OR reply ~ '(^|[^0-9])[0-9]([[:space:].-]*[0-9]){5,}([^0-9]|$)');
+```
+
+Treat every PII-looking published template in the pre-upgrade inventory as unclassified. After upgrade, repeat the query with `is_official_contact` in the selected columns and retain both exports in the rollout record.
+
+The migration aborts if any knowledge status is not exactly `draft` or `published`. It preserves every existing valid status: the production inventory of 399 published rows remains published and is grandfathered. It does not classify, unpublish, rewrite, or broadly moderate historical templates. New manual and CSV rows become drafts and cannot be retrieved until an administrator explicitly publishes them.
+
+Every existing `reply_prompts` row is intentionally neutralized: `voice_preferences` becomes the canonical code default, `persona` becomes the exact code-compiled compatibility projection, `revision` increments once, and `updated_by` becomes `migration:d3f6a1b8c904`. Arbitrary legacy prompt text is not copied into JSON or audit. Alembic downgrade cannot recover that text; restore the verified pre-upgrade backup if it is required.
+
+During the API mixed-version window, pause all `/admin/prompt` and `/admin/knowledge` mutations, including save, add, import, publish, unpublish, and delete. Keep the pause until all API instances run the new image; old Workers may continue because new admin saves dual-write only code-generated compatibility text. Read-only inventory is safe. API, Worker, and Scheduler must still converge to one image digest before the rollout is complete.
+
+After upgrade:
+
+1. verify prompt rows contain only canonical JSON and the compiled projection, with the expected single revision increment;
+2. verify knowledge status counts exactly match the pre-upgrade inventory and unknown statuses are rejected by the database constraint;
+3. keep all new/imported records as drafts while they are reviewed;
+4. for an official email or long-number contact template, explicitly classify it as `is_official_contact=true`, review the exact reply text and tenant/brand/platform scope, then explicitly publish it;
+5. smoke-test that the exact published template is sent verbatim, while a draft/unpublished copy and any LLM-generated, copied, or modified contact detail produce `GUARD_PII_LEAK` handoff with no Outbox.
+
+Official-contact classification is a narrow deterministic sending approval, not a general content moderation system. Historical templates are never automatically classified.
+
 ## Polling RawEvent journal
 
 Revision `d6b8f0a2c431` adds tenant/account/stream/conversation/occurrence metadata to `raw_events` and preserves Legacy X DM plus XChat polling occurrences before normalization or decryption side effects. It also persists external conversation and event metadata on `normalized_events`.
@@ -378,7 +417,7 @@ cancels only their pending or failed bot decision outboxes with `STALE_CONVERSAT
 
 The required revision order is `f6c2a9d81b40` (human inbox and Outbox provenance), then
 `b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing), then
-`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication), then `a9d4e6f2b713` (human handoff lifecycle repair). Do not cherry-pick only the final revision.
+`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication), then `a9d4e6f2b713` (human handoff lifecycle repair), then `d3f6a1b8c904` (structured voice and draft-first knowledge governance). Do not cherry-pick only the final revision.
 Upgrade through `f6c2a9d81b40`, then run the Human operations
 inventory above and record repair counts before applying `b8e1d4f7a2c3`. Before the fencing step,
 inventory active DecisionJobs by conversation/status, pending or failed `DECISION/BOT` Outboxes tied

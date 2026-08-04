@@ -23,6 +23,69 @@ def test_public_reply_with_pii_downgraded_to_handoff():
     assert "GUARD_PII_LEAK" in out.reason_codes
 
 
+def test_approved_official_contact_template_passes_only_verbatim_from_knowledge():
+    template = "Official support: support@example.com"
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text=template,
+        source="knowledge",
+    )
+    assert (
+        run_final_guard(
+            decision,
+            "telegram",
+            approved_official_contact_reply=template,
+        )
+        is decision
+    )
+
+
+def test_approved_contact_exemption_rejects_llm_copy_and_modified_text():
+    template = "Official support: support@example.com"
+    llm_copy = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text=template,
+        source="llm",
+    )
+    modified = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text=f"Please use {template}",
+        source="knowledge",
+    )
+    assert (
+        run_final_guard(
+            llm_copy,
+            "telegram",
+            approved_official_contact_reply=template,
+        ).action
+        is ReplyAction.HANDOFF
+    )
+    assert (
+        run_final_guard(
+            modified,
+            "telegram",
+            approved_official_contact_reply=template,
+        ).action
+        is ReplyAction.HANDOFF
+    )
+
+
+def test_approved_official_contact_still_obeys_length_guard():
+    template = f"support@example.com {'x' * 5000}"
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text=template,
+        source="knowledge",
+    )
+    result = run_final_guard(
+        decision,
+        "telegram",
+        approved_official_contact_reply=template,
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_TOO_LONG" in result.reason_codes
+
+
 def test_private_auto_reply_with_pii_is_also_blocked():
     d = ReplyDecision(
         action=ReplyAction.AUTO_REPLY,

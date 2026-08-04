@@ -251,7 +251,7 @@ DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
 REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 6 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `a9d4e6f2b713`。当前 Feishu 专用测试文件的精确收集数以 `pytest --collect-only` 为准；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `d3f6a1b8c904`。当前 Feishu 专用测试文件的精确收集数以 `pytest --collect-only` 为准；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
 
 ## X 贴文评论自动回复
 
@@ -307,29 +307,19 @@ XAA 的完整事件枚举里没有任何回复/评论专用事件（只有 `post
 
 ## 提示词品牌表达偏好（后台可配）
 
-`/admin/prompt` 只编辑 LLM 的品牌声音、语气、风格与本地化表达偏好，保存后**下一条决策立即生效**，无需重启或发版。
+`/admin/prompt` 不再接受自由文本系统指令，只允许选择 `tone`、`length`、`empathy`、`emoji` 四个有限枚举。保存后 API 同时写入规范 JSON `voice_preferences` 和代码编译的兼容 `persona` 文本；新 Worker 只读取 JSON 并编译固定英文条款，旧 Worker 在混合版本窗口也只能看到代码生成文本。
 
-可编辑段存 PostgreSQL 而非环境变量：Worker 跑决策、API 跑后台，两个进程必须看到同一份内容；
-每次决策直读也免去多 Worker 的缓存失效问题。
+**WikiFX 身份、同语言回复策略、领域事实边界、动作含义、风险/可见性规则和安全策略不可编辑。** 这些规则与严格六字段输出 schema 由代码固定追加。数据库中的旧 `persona` 任意文本永远不会被新代码执行；缺失或畸形 JSON 会安全回落到代码编译的默认偏好。
 
-**WikiFX 身份、同语言回复策略、领域事实边界、动作含义、风险/可见性规则和安全策略不可编辑。**
-这些规则与严格六字段输出 schema 由代码固定追加，页面上以只读形式展示；自定义内容不能删除或覆盖。
-模型输出未通过字段或动作交叉校验时会按同一请求重试一次，再失败则安全降级转人工。
-
-`4000` 字符限制只适用于租户可编辑段，不是完整 system prompt 或模型上下文上限。内置不可变契约、
-知识 JSON 数据、历史和当前消息会在该段之外另行加入；默认可编辑段自身保持在 `4000` 字符以内。
-
-- 作用域按 `(tenant_id, brand_id)`；未配置的租户回落到代码内置默认品牌表达偏好。
-- 每次保存 `revision` 自增，并写进 `reply_decisions.prompt_version`（形如 `v1-wikifx-multilingual#r7`），
-  可回溯某条回复出自哪一版人设。变更记入 `audit_logs`（`action=SET_REPLY_PERSONA`）。
-- **试运行**:页面内可用当前人设跑一次真实 LLM 调用，只回显 action/回复/置信度，
-  不写 `reply_decisions`、不建 outbox、不发送。发给模型前同样做 PII 脱敏。
-- 检索到的知识块会在固定声明后编码成 JSON 数据载荷，避免把自由文本模板伪装成 system 指令；这只是提示词边界强化，不等同于确定性的事实核验。
-- 知识库精确命中并原文直答时不经过 LLM，因此也不受品牌表达偏好或 LLM 策略约束。原文模式只适合已经审核批准的模板；模板发布、导入、变更和撤回应有人工治理。原文回复仍经过确定性 Final Guard（包括 PII、空文本和平台长度检查），但它不是通用内容审核系统。
+- 作用域按 `(tenant_id, brand_id)`；未配置的租户使用规范默认值 `professional/concise/standard/never`。
+- 每次保存 `revision` 自增，并写进 `reply_decisions.prompt_version`（形如 `v1-wikifx-multilingual#r7`）；审计 `SET_REPLY_PERSONA` 只记录结构化枚举，不记录任意文本或字符数。
+- **试运行**使用当前保存并编译的偏好，只回显结果，不写 `reply_decisions`、不建 Outbox、不发送；客户 PII 仍先脱敏。
+- `PERSONA_MAX_CHARS=4000` 仅保留为代码编译输出不变量，不是后台输入额度。
+- 检索知识作为不可信 JSON 数据传给模型。只有已发布模板参与检索；官方联系方式仅在命中的已分类模板被确定性原文发送且回复与批准模板完全一致时获得 PII 例外。模型生成、复制或修改的联系方式一律转人工。
 
 ## 回复模板导入（知识库）
 
-CSV 格式（UTF-8，表头必需 `question,reply`，可选 `brand_id,platform,category`）：
+CSV 格式（UTF-8，表头必需 `question,reply`，可选 `brand_id,platform,category,is_official_contact`）。所有新建/导入行均为草稿，明确发布前不会参与检索：
 
 | 列 | 必需 | 说明 |
 | --- | --- | --- |
@@ -338,11 +328,13 @@ CSV 格式（UTF-8，表头必需 `question,reply`，可选 `brand_id,platform,c
 | brand_id | 否 | 品牌，缺省用 `--brand`（默认 default） |
 | platform | 否 | 平台，留空表示全平台 |
 | category | 否 | 分类标签 |
+| is_official_contact | 否 | 仅接受 true/false/1/0/yes/no（不区分大小写）；空白为 false |
 
 ```bash
 uv run python -m apps.cli.import_knowledge 模板.csv --brand default
 ```
 
-- 幂等：按内容 sha256（content_hash）去重，重复导入/模板未变的行自动跳过，不重复扣 embedding 费；修改模板文本后重导会追加新记录。
+- 幂等：按内容 sha256（content_hash）去重，重复导入/模板未变的行自动跳过，不重复扣 embedding 费；修改模板文本后重导会追加新草稿。
+- 官方联系方式分类只能在草稿状态显式更改并审计为 `SET_KNOWLEDGE_OFFICIAL_CONTACT`；先复核并分类，再发布。发布和下架分别审计为 `PUBLISH_KNOWLEDGE` / `UNPUBLISH_KNOWLEDGE`。历史状态不会由迁移自动改变。
 - 未配置 `OPENAI_API_KEY` 时（非测试环境）导入会直接报错，防止误导入不可用向量；仅试跑请加 `--allow-fake`（伪向量按 version=fake-sha256 与真实向量隔离，正式检索不可用）。
 - Excel 用户：请在 Excel 中「另存为 → CSV UTF-8（逗号分隔）」后再导入。

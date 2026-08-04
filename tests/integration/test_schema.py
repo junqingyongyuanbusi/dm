@@ -551,6 +551,43 @@ async def test_human_work_items_enforce_tenant_and_claim_assignment(session, mig
     await session.rollback()
 
 
+async def test_prompt_and_knowledge_governance_schema_matches_contract(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        columns = {
+            (row.table_name, row.column_name): row
+            for row in await conn.execute(
+                text(
+                    "SELECT table_name, column_name, is_nullable, column_default, data_type "
+                    "FROM information_schema.columns "
+                    "WHERE (table_name='reply_prompts' AND column_name='voice_preferences') "
+                    "OR (table_name='knowledge_documents' "
+                    "AND column_name IN ('status', 'is_official_contact'))"
+                )
+            )
+        }
+        constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='knowledge_documents'"
+                )
+            )
+        }
+    voice = columns[("reply_prompts", "voice_preferences")]
+    knowledge_status = columns[("knowledge_documents", "status")]
+    official = columns[("knowledge_documents", "is_official_contact")]
+    assert voice.is_nullable == "NO"
+    assert voice.data_type == "jsonb"
+    assert all(value in voice.column_default for value in ("professional", "concise", "never"))
+    assert knowledge_status.is_nullable == "NO"
+    assert "draft" in knowledge_status.column_default
+    assert official.is_nullable == "NO"
+    assert official.column_default == "false"
+    assert "ck_knowledge_documents_status" in constraints
+
+
 async def test_metadata_matches_migrations(migrated_db):
     """漂移护栏：models 改动但忘记生成迁移时在测试期报警"""
     from alembic.autogenerate import compare_metadata

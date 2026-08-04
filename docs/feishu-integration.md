@@ -41,7 +41,7 @@ FEISHU_ENABLED=true
 FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 ```
 
-先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库 head 为 `a9d4e6f2b713` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
+先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库 head 为 `d3f6a1b8c904` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
 
 ## 在 Admin 创建账号
 
@@ -118,4 +118,4 @@ FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 
 紧急暂停时，在 API、Worker、Scheduler 上同时设置 `FEISHU_ENABLED=false` 并协调重启到同一 digest。该操作暂停 provisioning、正常事件 dispatch、health 和发送，但保留账号、加密凭证、Callback 身份、RawEvent 和 Outbox；URL verification 仍可用。不要通过删除凭证来实现临时暂停。
 
-代码回滚必须同时考虑数据库：从 `a9d4e6f2b713` downgrade 到 `f8a1c3d5e702` 是不可逆的人工作业生命周期数据 no-op；再 downgrade 到 `e4b7c2d9a610` 才会移除 Feishu RawEvent 去重索引；继续 downgrade `e4b7c2d9a610` 时，任何 Feishu `PlatformAccount` 存在都会被拒绝。若必须回到不识别 Feishu 的旧代码，先保持 Feishu 禁用并按 `docs/production-migration.md` 执行已审核的账号移除/重建或数据库备份恢复方案。镜像回滚不等于数据库回滚，API、Worker、Scheduler 最终仍必须收敛到同一个 digest。
+代码回滚必须同时考虑数据库：从 `d3f6a1b8c904` downgrade 到 `f8a1c3d5e702` 是不可逆的人工作业生命周期数据 no-op；再 downgrade 到 `e4b7c2d9a610` 才会移除 Feishu RawEvent 去重索引；继续 downgrade `e4b7c2d9a610` 时，任何 Feishu `PlatformAccount` 存在都会被拒绝。若必须回到不识别 Feishu 的旧代码，先保持 Feishu 禁用并按 `docs/production-migration.md` 执行已审核的账号移除/重建或数据库备份恢复方案。镜像回滚不等于数据库回滚，API、Worker、Scheduler 最终仍必须收敛到同一个 digest。

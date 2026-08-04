@@ -22,8 +22,16 @@ async def test_insert_document_and_chunk(session):
     await session.flush()
 
     assert doc.brand_id == "default"
-    assert doc.status == "published"
+    assert doc.status == "draft"
+    assert doc.is_official_contact is False
     assert chunk.id is not None
+
+
+async def test_unknown_knowledge_status_is_rejected(session):
+    session.add(KnowledgeDocument(question="q", reply="r", status="unknown"))
+    with pytest.raises(IntegrityError):
+        await session.flush()
+    await session.rollback()
 
 
 async def test_duplicate_content_hash_rejected(session):

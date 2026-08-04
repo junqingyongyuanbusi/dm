@@ -146,7 +146,7 @@ evidence.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `LLM_PROVIDER` | `stub` | `stub` or `openai`; stub is forbidden outside tests |
-| `PROMPT_VERSION` | `v1-wikifx-multilingual` | Persisted decision/audit identifier for the built-in WikiFX multilingual prompt; custom persona revisions append `#rN` |
+| `PROMPT_VERSION` | `v1-wikifx-multilingual` | Persisted decision/audit identifier for the immutable prompt plus code-compiled structured voice preferences; saved revisions append `#rN` |
 | `OPENAI_API_KEY` | empty | Required outside tests when provider is `openai` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Chat completion model |

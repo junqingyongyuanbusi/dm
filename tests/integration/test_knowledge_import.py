@@ -11,7 +11,7 @@ from social_reply.application.knowledge.importer import (
     import_knowledge_rows,
 )
 from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
-from social_reply.infrastructure.database.models import KnowledgeChunk, KnowledgeDocument
+from social_reply.infrastructure.database.models import AuditLog, KnowledgeChunk, KnowledgeDocument
 
 _CSV = (
     "question,reply,category\n"
@@ -39,6 +39,8 @@ async def test_导入三行并幂等重复跳过(migrated_db, session, csv_file)
     assert len(chunks) == 3
     assert all(len(c.embedding) == 1536 for c in chunks)
     assert {d.category for d in docs} == {"账号", "售后", "物流"}
+    assert {d.status for d in docs} == {"draft"}
+    assert {d.is_official_contact for d in docs} == {False}
 
     # 非对称嵌入：embed_text 只存 question（不含答案），content 仍是问+答拼接
     by_q = {d.question: d for d in docs}
@@ -74,6 +76,46 @@ async def test_空行与空字段跳过计数(migrated_db, tmp_path):
     report = await import_knowledge_csv(path, embedder=FakeEmbeddingClient())
     assert report.inserted == 1
     assert report.blank == 2
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("1", True),
+        ("yes", True),
+        ("No", False),
+        ("0", False),
+        ("false", False),
+        ("", False),
+    ],
+)
+async def test_官方联系方式布尔列严格解析(migrated_db, session, value, expected):
+    csv_text = f"question,reply,is_official_contact\nq-{value or 'blank'},r,{value}\n"
+    await import_knowledge_rows(
+        io.StringIO(csv_text),
+        source_name="official.csv",
+        embedder=FakeEmbeddingClient(),
+    )
+    doc = (await session.execute(select(KnowledgeDocument))).scalar_one()
+    assert doc.status == "draft"
+    assert doc.is_official_contact is expected
+    audits = (await session.execute(select(AuditLog))).scalars().all()
+    assert len(audits) == int(expected)
+    if expected:
+        assert audits[0].actor == "knowledge-import"
+        assert audits[0].action == "SET_KNOWLEDGE_OFFICIAL_CONTACT"
+        assert audits[0].detail["content_hash"]
+
+
+async def test_官方联系方式无效布尔值报错(migrated_db):
+    with pytest.raises(ValueError, match="is_official_contact"):
+        await import_knowledge_rows(
+            io.StringIO("question,reply,is_official_contact\nq,r,maybe\n"),
+            source_name="invalid.csv",
+            embedder=FakeEmbeddingClient(),
+        )
 
 
 async def test_缺表头中文报错(migrated_db, tmp_path):

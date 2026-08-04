@@ -32,6 +32,8 @@ async def _seed_chunk(
     platform=None,
     status="published",
     embedding_version=None,
+    reply=None,
+    is_official_contact=False,
 ):
     doc_id = uuid.uuid4()
     await session.execute(
@@ -40,8 +42,9 @@ async def _seed_chunk(
             brand_id=brand_id,
             platform=platform,
             question=content,
-            reply=content,
+            reply=reply or content,
             status=status,
+            is_official_contact=is_official_contact,
         )
     )
     embedding = (await _EMBEDDER.embed([content]))[0]
@@ -65,6 +68,30 @@ async def test_短模板忽略大小写和空白精确命中(session):
     assert hit is not None
     assert hit.reply == "True"
     assert hit.similarity == 1.0
+
+
+async def test_精确匹配排除草稿并传播官方联系方式标记(session):
+    await _seed_chunk(session, "draft contact", status="draft", is_official_contact=True)
+    await _seed_chunk(session, "official contact", is_official_contact=True)
+    assert (
+        await retrieve_exact_knowledge(
+            session,
+            "draft contact",
+            tenant_id="default",
+            brand_id="b1",
+            platform="telegram",
+        )
+        is None
+    )
+    hit = await retrieve_exact_knowledge(
+        session,
+        "official contact",
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+    )
+    assert hit is not None
+    assert hit.is_official_contact is True
 
 
 async def test_精确匹配仍过滤品牌和平台(session):
@@ -100,6 +127,23 @@ async def test_同文本查询相似度为一命中(session):
     )
     assert [h.content for h in hits] == [_TPL_HOURS]
     assert hits[0].similarity == pytest.approx(1.0, abs=1e-6)
+    assert hits[0].is_official_contact is False
+
+
+async def test_向量检索传播官方联系方式标记(session):
+    await _seed_chunk(session, _TPL_HOURS, is_official_contact=True)
+    vec = (await _EMBEDDER.embed([_TPL_HOURS]))[0]
+    hits = await retrieve_knowledge(
+        session,
+        vec,
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        embedding_version=_EMBEDDER.version,
+        min_similarity=0.9,
+    )
+    assert len(hits) == 1
+    assert hits[0].is_official_contact is True
 
 
 async def test_不相干文本低于阈值不命中(session):
@@ -284,6 +328,28 @@ async def test_词法路命中向量漏掉的关键词(session):
     # 向量未达阈值，该命中不得被标记为可原文直答
     pip_hit = next(h for h in hits if h.content == "What is pip")
     assert pip_hit.verbatim_safe is False
+    assert pip_hit.is_official_contact is False
+
+
+async def test_混合检索词法路径排除草稿并传播官方标记(session):
+    from social_reply.application.knowledge.retrieval import retrieve_hybrid_knowledge
+
+    await _seed_chunk(session, "official pip contact", is_official_contact=True)
+    await _seed_chunk(session, "draft pip contact", status="draft", is_official_contact=True)
+    off_vec = (await _EMBEDDER.embed(["unrelated query"]))[0]
+    hits = await retrieve_hybrid_knowledge(
+        session,
+        off_vec,
+        "pip contact",
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        embedding_version=_EMBEDDER.version,
+        top_k=10,
+        min_similarity=0.99,
+    )
+    assert {hit.content for hit in hits} == {"official pip contact"}
+    assert hits[0].is_official_contact is True
 
 
 async def test_verbatim_闸门_低相似度词法命中不原文外发(session, knowledge_enabled):
@@ -298,6 +364,69 @@ async def test_verbatim_闸门_低相似度词法命中不原文外发(session, 
     dec = (await session.execute(select(models.ReplyDecision))).scalar_one()
     # 不得走 KNOWLEDGE_VERBATIM（那会把模板原文直接外发）
     assert "KNOWLEDGE_VERBATIM" not in dec.reason_codes
+
+
+async def test_已发布分类官方联系方式精确模板可创建_outbox(session, knowledge_enabled):
+    knowledge_enabled.setenv("KNOWLEDGE_VERBATIM_REPLY", "true")
+    get_settings.cache_clear()
+    reply = "Official support: support@example.com"
+    await _seed_chunk(
+        session,
+        "请问几点营业",
+        reply=reply,
+        is_official_contact=True,
+    )
+    account_id, conv_id, msg_id = await _seed_conversation(session)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id), conv_id, msg_id, account_id
+    )
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.reply_text == reply
+    assert "KNOWLEDGE_VERBATIM" in decision.reason_codes
+
+
+async def test_同模板未分类为官方联系方式时阻止发送(session, knowledge_enabled):
+    knowledge_enabled.setenv("KNOWLEDGE_VERBATIM_REPLY", "true")
+    get_settings.cache_clear()
+    await _seed_chunk(
+        session,
+        "请问几点营业",
+        reply="Official support: support@example.com",
+        is_official_contact=False,
+    )
+    account_id, conv_id, msg_id = await _seed_conversation(session)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id), conv_id, msg_id, account_id
+    )
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert decision.reply_text is None
+    assert "GUARD_PII_LEAK" in decision.reason_codes
+
+
+async def test_草稿官方联系方式不会被选中或发送(session, knowledge_enabled):
+    knowledge_enabled.setenv("KNOWLEDGE_VERBATIM_REPLY", "true")
+    knowledge_enabled.setenv("REQUIRE_KNOWLEDGE", "true")
+    get_settings.cache_clear()
+    await _seed_chunk(
+        session,
+        "请问几点营业",
+        reply="Official support: support@example.com",
+        status="draft",
+        is_official_contact=True,
+    )
+    account_id, conv_id, msg_id = await _seed_conversation(session)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id), conv_id, msg_id, account_id
+    )
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert "INSUFFICIENT_KNOWLEDGE" in decision.reason_codes
+    assert "KNOWLEDGE_VERBATIM" not in decision.reason_codes
 
 
 async def test_精确匹配仍优先于混合检索(session, knowledge_enabled):
