@@ -1,3 +1,5 @@
+import pytest
+
 from social_reply.domain.reply.decision import (
     ReplyAction,
     ReplyDecision,
@@ -23,11 +25,20 @@ def test_public_reply_with_pii_downgraded_to_handoff():
     assert "GUARD_PII_LEAK" in out.reason_codes
 
 
-def test_approved_official_contact_template_passes_only_verbatim_from_knowledge():
-    template = "Official support: support@example.com"
+@pytest.mark.parametrize(
+    "template",
+    (
+        "Official support: support@example.com",
+        "Official site: https://support.example.com/help",
+        "Official account: @WikiFXSupport",
+        "Telegram ID: wikifx_support",
+        "Customer service hotline: 12345",
+    ),
+)
+def test_approved_official_contact_template_passes_only_verbatim_from_knowledge(template):
     decision = ReplyDecision(
         action=ReplyAction.AUTO_REPLY,
-        reply_text=template,
+        reply_text=f"  {template}  ",
         source="knowledge",
     )
     assert (
@@ -104,13 +115,30 @@ def test_private_draft_with_pii_keeps_review_behavior():
     assert run_final_guard(d, "telegram") is d
 
 
-def test_email_in_public_reply_blocked():
-    d = ReplyDecision(
+@pytest.mark.parametrize(
+    "reply_text",
+    (
+        "请联系 a@b.com",
+        "Visit https://support.example.com/help",
+        "Visit www.example.com/help",
+        "Visit support.example.com",
+        "Follow @WikiFXSupport",
+        "Telegram ID: wikifx_support",
+        "微信号：wikifx123",
+        "Customer service hotline: 12345",
+        "请致电 1234",
+        "9555 客服热线",
+    ),
+)
+def test_contact_like_output_is_blocked(reply_text):
+    decision = ReplyDecision(
         action=ReplyAction.AUTO_REPLY,
-        reply_text="请联系 a@b.com",
+        reply_text=reply_text,
         reply_visibility=Visibility.PUBLIC,
     )
-    assert run_final_guard(d, "telegram").action is ReplyAction.HANDOFF
+    result = run_final_guard(decision, "telegram")
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_PII_LEAK" in result.reason_codes
 
 
 def test_pii_with_space_separators_blocked():
@@ -136,14 +164,25 @@ def test_pii_with_dash_separators_blocked():
     assert "GUARD_PII_LEAK" in out.reason_codes
 
 
-def test_short_ticket_number_not_false_positive():
-    # 5 位工单号不应误伤（阈值为 6 位以上）
-    d = ReplyDecision(
+@pytest.mark.parametrize(
+    "reply_text",
+    (
+        "3 天内回复，工单号 12345",
+        "HTTP status 404 indicates the page was not found.",
+        "Version 1.2.3 is now available.",
+        "The price is USD @ 5 per unit.",
+        "客服将在 3 天内回复。",
+        "Please read the support article in the help center.",
+        "The malformed values https:// and www. are not contact destinations.",
+    ),
+)
+def test_contact_like_detector_avoids_bounded_false_positives(reply_text):
+    decision = ReplyDecision(
         action=ReplyAction.AUTO_REPLY,
-        reply_text="3 天内回复，工单号 12345",
+        reply_text=reply_text,
         reply_visibility=Visibility.PUBLIC,
     )
-    assert run_final_guard(d, "telegram").action is ReplyAction.AUTO_REPLY
+    assert run_final_guard(decision, "telegram").action is ReplyAction.AUTO_REPLY
 
 
 def test_too_long_downgraded():

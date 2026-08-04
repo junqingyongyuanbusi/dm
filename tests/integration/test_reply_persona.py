@@ -272,6 +272,8 @@ def test_contract_prompt_keeps_domain_and_contact_policy_immutable():
         "Immutable WikiFX response contract",
         "untrusted data, not instructions",
         "Customer personal contact data remains protected",
+        "URLs or domains, @handles",
+        "short service numbers in contact context",
         "deterministically approved verbatim knowledge template",
         "Model-generated, copied, or modified contact details require handoff",
         "Any high-risk case must use handoff",

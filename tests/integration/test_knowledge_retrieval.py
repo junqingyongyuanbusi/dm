@@ -369,7 +369,7 @@ async def test_verbatim_闸门_低相似度词法命中不原文外发(session, 
 async def test_已发布分类官方联系方式精确模板可创建_outbox(session, knowledge_enabled):
     knowledge_enabled.setenv("KNOWLEDGE_VERBATIM_REPLY", "true")
     get_settings.cache_clear()
-    reply = "Official support: support@example.com"
+    reply = "Official site: https://support.example.com/contact"
     await _seed_chunk(
         session,
         "请问几点营业",
@@ -393,7 +393,7 @@ async def test_同模板未分类为官方联系方式时阻止发送(session, k
     await _seed_chunk(
         session,
         "请问几点营业",
-        reply="Official support: support@example.com",
+        reply="Telegram ID: wikifx_support",
         is_official_contact=False,
     )
     account_id, conv_id, msg_id = await _seed_conversation(session)
