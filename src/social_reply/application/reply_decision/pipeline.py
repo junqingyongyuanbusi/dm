@@ -103,16 +103,21 @@ async def run_decision_pipeline(
             # Preserve whether retrieved knowledge influenced the model decision.
             decision = replace(decision, reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
 
-    # Meta 评论只能在原评论下公开回复。先固定 visibility 再执行 Final Guard，
-    # 否则模型给出的 private 会绕过公开回复的 PII 检查，随后再被改成公开发送。
-    if snapshot.platform in {"facebook", "instagram"} and (
-        snapshot.channel_type is ChannelType.COMMENT
+    # Customer sends are public at this boundary; delivery channels own effective visibility.
+    if (
+        decision.action is ReplyAction.AUTO_REPLY
+        and decision.reply_visibility is not Visibility.PUBLIC
     ):
-        reason = (
-            "FACEBOOK_COMMENT_PUBLIC"
-            if snapshot.platform == "facebook"
-            else "INSTAGRAM_COMMENT_PUBLIC"
-        )
+        if snapshot.platform in {"facebook", "instagram"} and (
+            snapshot.channel_type is ChannelType.COMMENT
+        ):
+            reason = (
+                "FACEBOOK_COMMENT_PUBLIC"
+                if snapshot.platform == "facebook"
+                else "INSTAGRAM_COMMENT_PUBLIC"
+            )
+        else:
+            reason = "AUTO_REPLY_VISIBILITY_PUBLIC"
         decision = replace(
             decision,
             reply_visibility=Visibility.PUBLIC,
@@ -127,6 +132,10 @@ async def run_decision_pipeline(
     # Persistence creates a public Outbox only when state and version still match BOT_ACTIVE.
     # Keep this draft downgrade separate from that send-time race check.
     if snapshot.automation_state == "BOT_DRAFT_ONLY" and decision.action is ReplyAction.AUTO_REPLY:
-        decision = replace(decision, action=ReplyAction.DRAFT)
+        decision = replace(
+            decision,
+            action=ReplyAction.DRAFT,
+            reply_visibility=Visibility.PRIVATE,
+        )
 
     return decision

@@ -19,7 +19,26 @@ def test_public_reply_with_pii_downgraded_to_handoff():
     )
     out = run_final_guard(d, "telegram")
     assert out.action is ReplyAction.HANDOFF
+    assert out.reply_text is None
     assert "GUARD_PII_LEAK" in out.reason_codes
+
+
+def test_private_auto_reply_with_pii_is_also_blocked():
+    d = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="请联系 a@b.com",
+        reply_visibility=Visibility.PRIVATE,
+    )
+    assert run_final_guard(d, "telegram").action is ReplyAction.HANDOFF
+
+
+def test_private_draft_with_pii_keeps_review_behavior():
+    d = ReplyDecision(
+        action=ReplyAction.DRAFT,
+        reply_text="请人工核对 a@b.com",
+        reply_visibility=Visibility.PRIVATE,
+    )
+    assert run_final_guard(d, "telegram") is d
 
 
 def test_email_in_public_reply_blocked():

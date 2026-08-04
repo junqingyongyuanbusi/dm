@@ -25,9 +25,7 @@ async def _seed_instagram_account(
     app_family = "instagram" if login_mode == "instagram_login" else "meta"
     app_public_id = f"{app_family}_{uuid.uuid4().hex}"
     account_fields = (
-        ["messages", "comments"]
-        if comments and login_mode == "instagram_login"
-        else ["messages"]
+        ["messages", "comments"] if comments and login_mode == "instagram_login" else ["messages"]
     )
     config = {
         "delivery_mode": "direct",
@@ -230,7 +228,7 @@ async def test_instagram_comment_webhook_sends_public_reply_for_each_login_mode(
     assert conversation.channel_type == "comment"
     assert decision.action == "auto_reply"
     assert decision.reply_visibility == "public"
-    assert "INSTAGRAM_COMMENT_PUBLIC" in decision.reason_codes
+    assert "INSTAGRAM_COMMENT_PUBLIC" not in decision.reason_codes
     assert outbox.destination_type == "meta_public_comment"
     assert outbox.status == "SENT"
     assert outbox.platform_message_id == "instagram-reply-1"
@@ -239,8 +237,11 @@ async def test_instagram_comment_webhook_sends_public_reply_for_each_login_mode(
         "comment_id": f"comment-{login_mode}",
     }
     assert sent == [{"target": outbox.payload["target"], "text": outbox.payload["text"]}]
-    assert await session.scalar(
-        select(func.count())
-        .select_from(models.OutboxMessage)
-        .where(models.OutboxMessage.destination_type == "meta_private_reply")
-    ) == 0
+    assert (
+        await session.scalar(
+            select(func.count())
+            .select_from(models.OutboxMessage)
+            .where(models.OutboxMessage.destination_type == "meta_private_reply")
+        )
+        == 0
+    )

@@ -2386,12 +2386,15 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
     )
 
 
-# ---------- 提示词人设/领域策略 ----------
+# ---------- 提示词品牌表达偏好 ----------
 
 _PROMPT_BANNERS = {
-    "saved": ("ok", "人设/领域策略已保存，下一条决策立即生效。"),
-    "persona_required": ("err", "人设/领域策略不能为空。"),
-    "persona_too_long": ("err", f"人设/领域策略过长：最多 {PERSONA_MAX_CHARS} 字符。"),
+    "saved": ("ok", "品牌语气/本地化偏好已保存，下一条决策立即生效。"),
+    "persona_required": ("err", "品牌语气/本地化偏好不能为空。"),
+    "persona_too_long": (
+        "err",
+        f"品牌语气/本地化偏好过长：可编辑段最多 {PERSONA_MAX_CHARS} 字符。",
+    ),
 }
 
 
@@ -2426,18 +2429,18 @@ async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -
     trial = ""
     if request.query_params.get("trial"):
         trial = _render_trial(request)
-    body = f"""<h1>提示词</h1><p class="lede">编辑 LLM 人设/领域策略；严格输出 schema、动作交叉约束与安全规则由系统固定追加，不可修改。</p>{banner}
-<section class="card"><h2>人设/领域策略 {origin}</h2>
-<p class="hint">决定语言、语气、身份和业务侧决策偏好。知识库命中并原文直答时不经过它——它只影响需要 LLM 生成的回复。</p>
+    body = f"""<h1>提示词</h1><p class="lede">只编辑品牌语气、风格与本地化表达偏好；WikiFX 身份、领域事实边界、动作含义和安全规则由系统固定，不可修改。</p>{banner}
+<section class="card"><h2>品牌语气/本地化偏好 {origin}</h2>
+<p class="hint">可编辑段只影响需要 LLM 生成回复时的品牌声音、语气和本地化表达。知识库原文直答不经过它。{PERSONA_MAX_CHARS} 字符限制仅适用于此可编辑段，不是完整模型上下文限制。</p>
 <form method="post" action="/admin/prompt/save"><input type="hidden" name="csrf_token" value="{csrf}">
 <input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
 <input type="hidden" name="brand_id" value="{html.escape(brand)}">
-<label for="f-persona">人设/领域策略内容（最多 {PERSONA_MAX_CHARS} 字符）</label>
+<label for="f-persona">品牌语气/本地化偏好（可编辑段最多 {PERSONA_MAX_CHARS} 字符）</label>
 <textarea id="f-persona" name="persona" rows="10" required>{html.escape(resolved.text)}</textarea>
 <button class="btn-block">保存</button></form></section>
 
 <section class="card"><h2>系统固定追加</h2>
-<p class="hint">以下不可变安全契约始终拼在人设之后，后台无法删除或覆盖；严格六字段 schema 也由代码控制。</p>
+<p class="hint">以下不可变契约始终拼在可编辑段之后，后台无法删除或覆盖；严格六字段 schema 也由代码控制。</p>
 <pre class="thread" style="white-space:pre-wrap">{html.escape(CONTRACT_PROMPT)}</pre></section>
 
 <section class="card"><h2>试运行</h2>

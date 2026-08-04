@@ -143,6 +143,99 @@ async def test_无历史时保持单轮结构():
     assert messages[1]["content"] == "你们几点营业？"
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"confidence": 0.84},
+        {"risk_level": "high"},
+        {"action": "draft", "risk_level": "high", "reply_visibility": "private"},
+        {"reply_text": ""},
+        {"action": "draft", "reply_text": "", "reply_visibility": "private"},
+        {"action": "handoff", "reply_text": "not blank"},
+        {"action": "handoff", "reply_text": "   "},
+        {"action": "ignore", "reply_text": "not blank"},
+        {"reply_visibility": "private"},
+        {"action": "draft", "reply_visibility": "public"},
+        {"intent": "Business Hours"},
+        {"unexpected": "field"},
+    ],
+    ids=[
+        "low-confidence-auto",
+        "high-risk-auto",
+        "high-risk-draft",
+        "blank-auto",
+        "blank-draft",
+        "nonblank-handoff",
+        "whitespace-handoff",
+        "nonblank-ignore",
+        "private-auto",
+        "public-draft",
+        "invalid-intent",
+        "extra-field",
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_action_combinations_retry_once_then_handoff(changes):
+    calls = 0
+    output = {**_GOOD_OUTPUT, **changes}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _completion_response(json.dumps(output))
+
+    decision = await _client(handler).decide(_CTX)
+
+    assert calls == 2
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert decision.reason_codes == ("LLM_SCHEMA_FAIL",)
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_action", "expected_visibility", "expected_risk"),
+    [
+        (
+            {
+                **_GOOD_OUTPUT,
+                "action": "draft",
+                "reply_text": "Please review this wording.",
+                "risk_level": "medium",
+                "reply_visibility": "private",
+            },
+            ReplyAction.DRAFT,
+            Visibility.PRIVATE,
+            RiskLevel.MEDIUM,
+        ),
+        (
+            {
+                **_GOOD_OUTPUT,
+                "action": "handoff",
+                "reply_text": "",
+                "risk_level": "high",
+                "reply_visibility": "public",
+            },
+            ReplyAction.HANDOFF,
+            Visibility.PUBLIC,
+            RiskLevel.HIGH,
+        ),
+    ],
+    ids=["valid-draft", "valid-high-risk-handoff"],
+)
+@pytest.mark.asyncio
+async def test_valid_action_combinations_parse(
+    output, expected_action, expected_visibility, expected_risk
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response(json.dumps(output))
+
+    decision = await _client(handler).decide(_CTX)
+
+    assert decision.action is expected_action
+    assert decision.reply_visibility is expected_visibility
+    assert decision.risk_level is expected_risk
+
+
 @pytest.mark.asyncio
 async def test_首次坏json第二次好_恰好重试一次():
     calls = {"n": 0}

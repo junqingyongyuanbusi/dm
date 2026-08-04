@@ -75,11 +75,12 @@ async def test_human_active_forces_ignore():
     assert "HUMAN_ACTIVE" in d.reason_codes
 
 
-async def test_draft_only_downgrades_auto_reply_to_draft():
+async def test_draft_only_downgrades_auto_reply_to_private_draft():
     d = await run_decision_pipeline(
         _snap(state="BOT_DRAFT_ONLY"), llm=StubLLMClient(), killswitch=_OpenSwitch()
     )
     assert d.action is ReplyAction.DRAFT
+    assert d.reply_visibility is Visibility.PRIVATE
 
 
 async def test_killswitch_forces_draft():
@@ -119,6 +120,19 @@ async def test_verbatim_reply_returns_template_text_without_llm():
     assert d.reply_text == "Hello! Welcome to our trading community. How can we help you today?"
     assert d.source == "knowledge"
     assert "KNOWLEDGE_VERBATIM" in d.reason_codes
+
+
+async def test_verbatim_auto_reply_with_pii_is_blocked_by_final_guard():
+    d = await run_decision_pipeline(
+        _snap(text="contact details"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        verbatim_reply="Email alice@example.com",
+    )
+
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reply_text is None
+    assert "GUARD_PII_LEAK" in d.reason_codes
 
 
 async def test_risk_word_beats_verbatim_template():
@@ -201,6 +215,41 @@ async def test_non_automation_states_do_not_call_llm(state):
     )
     assert d.action is ReplyAction.IGNORE
     assert d.reason_codes == (state,)
+
+
+async def test_private_safe_auto_reply_becomes_public_before_guard():
+    class _PrivateLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Safe customer reply",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(_snap(), llm=_PrivateLLM(), killswitch=_OpenSwitch())
+
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_visibility is Visibility.PUBLIC
+    assert decision.reason_codes == ("AUTO_REPLY_VISIBILITY_PUBLIC",)
+
+
+async def test_private_auto_reply_with_pii_hands_off_on_any_channel():
+    class _PrivatePiiLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Email alice@example.com",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(_snap(), llm=_PrivatePiiLLM(), killswitch=_OpenSwitch())
+
+    assert decision.reply_visibility is Visibility.PUBLIC
+    assert decision.action is ReplyAction.HANDOFF
+    assert "AUTO_REPLY_VISIBILITY_PUBLIC" in decision.reason_codes
+    assert "GUARD_PII_LEAK" in decision.reason_codes
 
 
 @pytest.mark.parametrize(

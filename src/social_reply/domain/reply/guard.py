@@ -2,7 +2,7 @@ import re
 from dataclasses import replace
 
 from social_reply.domain.platform_accounts import PLATFORM_CAPABILITY_SPECS
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 
 # 账户号/长数字串、邮箱——公开回复禁止回显，发送给外部 LLM 前也需脱敏。
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
@@ -30,6 +30,7 @@ def _downgrade(decision: ReplyDecision, code: str) -> ReplyDecision:
     return replace(
         decision,
         action=ReplyAction.HANDOFF,
+        reply_text=None,
         reason_codes=decision.reason_codes + (code,),
         source="guard",
     )
@@ -43,7 +44,7 @@ def run_final_guard(decision: ReplyDecision, platform: str) -> ReplyDecision:
     text = decision.reply_text or ""
     if not text.strip():
         return _downgrade(decision, "GUARD_EMPTY")
-    if decision.reply_visibility is Visibility.PUBLIC and _has_pii(text):
+    if _has_pii(text):
         return _downgrade(decision, "GUARD_PII_LEAK")
     if len(text) > _MAX_TEXT_LENGTH.get(platform, _DEFAULT_MAX):
         return _downgrade(decision, "GUARD_TOO_LONG")

@@ -258,14 +258,17 @@ async def test_facebook_comment_webhook_sends_only_public_child_reply(session, m
     assert conversation.channel_type == "comment"
     assert decision.action == "auto_reply"
     assert decision.reply_visibility == "public"
-    assert "FACEBOOK_COMMENT_PUBLIC" in decision.reason_codes
+    assert "FACEBOOK_COMMENT_PUBLIC" not in decision.reason_codes
     assert outbox.destination_type == "meta_public_comment"
     assert outbox.status == "SENT"
     assert outbox.platform_message_id == "facebook-reply-1"
     assert outbox.payload["target"] == {"kind": "comment", "comment_id": "comment-1"}
     assert sent == [{"target": outbox.payload["target"], "text": outbox.payload["text"]}]
-    assert await session.scalar(
-        select(func.count())
-        .select_from(models.OutboxMessage)
-        .where(models.OutboxMessage.destination_type == "meta_private_reply")
-    ) == 0
+    assert (
+        await session.scalar(
+            select(func.count())
+            .select_from(models.OutboxMessage)
+            .where(models.OutboxMessage.destination_type == "meta_private_reply")
+        )
+        == 0
+    )
