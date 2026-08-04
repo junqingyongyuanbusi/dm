@@ -32,6 +32,7 @@ async def run_decision_pipeline(
     knowledge: tuple[str, ...] = (),
     require_knowledge: bool = False,
     verbatim_reply: str | None = None,
+    approved_official_contact_reply: str | None = None,
     history: tuple[tuple[str, str], ...] = (),
     persona: str | None = None,
 ) -> ReplyDecision:
@@ -125,7 +126,11 @@ async def run_decision_pipeline(
         )
 
     # 输出侧闸门
-    decision = run_final_guard(decision, snapshot.platform)
+    decision = run_final_guard(
+        decision,
+        snapshot.platform,
+        approved_official_contact_reply=approved_official_contact_reply,
+    )
 
     # 草稿降级必须是管线的最后一步：任何把 action 改回 AUTO_REPLY 的兜底都要排在它前面，
     # 否则决策会以 auto_reply 落库——BOT_DRAFT_ONLY 下既不外发，也进不了 admin 待审队列。

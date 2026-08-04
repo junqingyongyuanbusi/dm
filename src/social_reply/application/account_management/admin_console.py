@@ -55,9 +55,9 @@ from social_reply.application.message_delivery.intents import (
     create_or_get_outbox_intent,
 )
 from social_reply.application.reply_decision.persona import (
-    PERSONA_MAX_CHARS,
+    compile_voice_preferences,
     load_persona,
-    validate_persona,
+    parse_voice_preferences,
 )
 from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL, FEISHU_GROUP_MODE
 from social_reply.domain.automation.state_machine import (
@@ -2132,14 +2132,15 @@ async def discard_draft(request: Request, decision_id: uuid.UUID) -> Response:
 # ---------- 知识库 ----------
 
 _KB_BANNERS = {
-    "added": ("ok", "知识条目已添加并完成向量化。"),
+    "added": ("ok", "知识条目已添加为草稿并完成向量化；明确发布前不会参与检索。"),
     "duplicate": ("err", "内容重复：相同问答已存在。"),
     "embed_failed": ("err", "向量化失败：请检查 Embedding 服务配置后重试。"),
-    "toggled": ("ok", "状态已更新。"),
+    "status_changed": ("ok", "知识条目状态已更新并记录审计。"),
+    "classification_changed": ("ok", "官方联系方式分类已更新并记录审计。"),
     "deleted": ("ok", "条目已删除。"),
     "import_bad_csv": (
         "err",
-        "CSV 无效：需 UTF-8 编码，必需列 question,reply，最多 2000 行。",
+        "CSV 无效：需 UTF-8 编码，必需列 question,reply；is_official_contact 仅接受 true/false/1/0/yes/no。",
     ),
     "import_too_large": ("err", "文件过大：请上传不超过 2MB 的 CSV。"),
 }
@@ -2152,6 +2153,26 @@ def _query_int(request: Request, name: str) -> int:
         return max(0, int(request.query_params.get(name) or 0))
     except ValueError:
         return 0
+
+
+def _knowledge_actions(doc: models.KnowledgeDocument, csrf: str) -> str:
+    status_target = "draft" if doc.status == "published" else "published"
+    status_label = "下架" if doc.status == "published" else "明确发布"
+    if doc.status == "draft":
+        official_target = "false" if doc.is_official_contact else "true"
+        official_label = "取消官方分类" if doc.is_official_contact else "分类为官方联系方式"
+        classification = (
+            f'<form class="inline" method="post" '
+            f'action="/admin/knowledge/{doc.id}/official-contact">'
+            f'<input type="hidden" name="csrf_token" value="{csrf}">'
+            f'<input type="hidden" name="target" value="{official_target}">'
+            f'<button class="btn-sm btn-ghost">{official_label}</button></form>'
+        )
+    else:
+        classification = '<span class="muted">先下架再更改分类</span>'
+    return f"""<form class="inline" method="post" action="/admin/knowledge/{doc.id}/status"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{status_target}"><button class="btn-sm btn-ghost">{status_label}</button></form>
+{classification}
+<form class="inline" method="post" action="/admin/knowledge/{doc.id}/delete"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-danger" onclick="return confirm('确认删除该知识条目？此操作不可恢复。')">删除</button></form>"""
 
 
 @router.get("/knowledge", response_class=HTMLResponse)
@@ -2190,29 +2211,31 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
             f"<tr><td>{html.escape((d.question or '')[:40])}</td>"
             f"<td class='muted'>{html.escape((d.reply or '')[:48])}</td>"
             f"<td class='muted'>{html.escape(d.category or '—')}</td>"
+            f"<td>{'是' if d.is_official_contact else '否'}</td>"
             f"<td>{_pill(d.status)}</td>"
-            f"""<td><form class="inline" method="post" action="/admin/knowledge/{d.id}/status"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">{"下架" if d.status == "published" else "上架"}</button></form>
-<form class="inline" method="post" action="/admin/knowledge/{d.id}/delete"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-danger" onclick="return confirm('确认删除该知识条目？此操作不可恢复。')">删除</button></form></td></tr>"""
+            f"<td>{_knowledge_actions(d, csrf)}</td></tr>"
             for d in docs
         )
-        or "<tr><td colspan='5' class='muted'>知识库为空</td></tr>"
+        or "<tr><td colspan='6' class='muted'>知识库为空</td></tr>"
     )
     add_form = f"""<details class="collapse"><summary>新增知识条目</summary><div class="inner">
 <form method="post" action="/admin/knowledge/add"><input type="hidden" name="csrf_token" value="{csrf}">
 {_tenant_input(principal)}{_input("question", "触发问题（用户会怎么问）")}
 <label for="f-kb-reply">标准回复（命中后原文发送）</label><textarea id="f-kb-reply" name="reply" required></textarea>
 {_input("category", "分类（可选）", required=False)}{_input("brand_id", "Brand（默认 default）", required=False)}
-<button class="btn-block">添加并向量化</button></form></div></details>"""
+<label><input type="checkbox" name="is_official_contact" value="true"> 这是已审核的官方联系方式模板</label>
+<p class="hint">新条目始终保存为草稿，明确发布前不会参与检索或发送。</p>
+<button class="btn-block">添加草稿并向量化</button></form></div></details>"""
     import_form = f"""<details class="collapse"><summary>批量导入 CSV</summary><div class="inner">
 <form method="post" action="/admin/knowledge/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{csrf}">
 {_tenant_input(principal)}{_input("brand_id", "Brand（默认 default）", required=False)}
 <label for="f-kb-csv">CSV 文件</label><input id="f-kb-csv" type="file" name="file" accept=".csv" required>
-<p class="hint">必需列 question,reply；可选 brand_id,platform,category。UTF-8 编码，最多 2000 行 / 2MB。</p>
-<button class="btn-block">上传并导入</button></form></div></details>"""
-    body = f"""<h1>知识库</h1><p class="lede">回复模板管理：命中即原文直答；下架条目不参与检索。</p>{banner}
+<p class="hint">必需列 question,reply；可选 brand_id,platform,category,is_official_contact。布尔值仅接受 true/false/1/0/yes/no（不区分大小写）；空白为 false。所有导入行均为草稿，明确发布前不会参与检索。UTF-8 编码，最多 2000 行 / 2MB。</p>
+<button class="btn-block">上传并导入草稿</button></form></div></details>"""
+    body = f"""<h1>知识库</h1><p class="lede">回复模板管理：新建和导入默认草稿；只有经过明确发布的条目才参与检索。</p>{banner}
 {add_form}
 {import_form}
-<section class="card"><h2>模板列表</h2><p class="hint">共 {len(docs)} 条（最多显示 200）。</p><div class="tablewrap"><table><thead><tr><th>问题</th><th>回复</th><th>分类</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
+<section class="card"><h2>模板列表</h2><p class="hint">共 {len(docs)} 条（最多显示 200）。官方联系方式必须先分类、复核，再明确发布。</p><div class="tablewrap"><table><thead><tr><th>问题</th><th>回复</th><th>分类</th><th>官方联系方式</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
     response = HTMLResponse(
         _page("知识库", body, active="knowledge", show_users=principal.is_superadmin)
     )
@@ -2231,6 +2254,10 @@ async def knowledge_add(request: Request) -> Response:
         raise HTTPException(status_code=403, detail="tenant_access_denied")
     question = (form.get("question") or "").strip()
     reply = (form.get("reply") or "").strip()
+    official_value = (form.get("is_official_contact") or "").strip().casefold()
+    if official_value not in {"", "true"}:
+        raise HTTPException(status_code=422, detail="invalid_is_official_contact")
+    is_official_contact = official_value == "true"
     if not question or not reply:
         raise HTTPException(status_code=422, detail="question_and_reply_required")
     content = f"问：{question}\n答：{reply}"
@@ -2268,6 +2295,8 @@ async def knowledge_add(request: Request) -> Response:
             category=(form.get("category") or "").strip() or None,
             question=question,
             reply=reply,
+            status="draft",
+            is_official_contact=is_official_contact,
             source_file="admin-console",
         )
         session.add(doc)
@@ -2283,6 +2312,25 @@ async def knowledge_add(request: Request) -> Response:
                 embedding=embedding,
             )
         )
+        if is_official_contact:
+            session.add(
+                models.AuditLog(
+                    tenant_id=tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action="SET_KNOWLEDGE_OFFICIAL_CONTACT",
+                    subject_type="knowledge_document",
+                    subject_id=str(doc.id),
+                    detail={
+                        "from": False,
+                        "to": True,
+                        "brand": doc.brand_id,
+                        "platform": doc.platform,
+                        "status": "draft",
+                        "content_hash": content_hash,
+                    },
+                )
+            )
         await session.commit()
     return RedirectResponse("/admin/knowledge?notice=added", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -2334,6 +2382,7 @@ async def knowledge_import(request: Request) -> Response:
             embedder=embedder,
             tenant_id=tenant_id,
             brand_id_default=brand_id_default,
+            actor=principal.actor,
         )
     except ValueError:
         return RedirectResponse(
@@ -2351,20 +2400,112 @@ async def knowledge_import(request: Request) -> Response:
 
 
 @router.post("/knowledge/{doc_id}/status")
-async def knowledge_toggle(request: Request, doc_id: uuid.UUID) -> Response:
+async def knowledge_set_status(request: Request, doc_id: uuid.UUID) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    target = (form.get("target") or "").strip()
+    if target not in {"draft", "published"}:
+        raise HTTPException(status_code=422, detail="invalid_knowledge_status")
     async with get_session_factory()() as session:
-        doc = await session.get(models.KnowledgeDocument, doc_id)
-        if doc is None or doc.tenant_id not in principal.allowed_tenants:
+        doc = (
+            await session.execute(
+                select(models.KnowledgeDocument)
+                .where(
+                    models.KnowledgeDocument.id == doc_id,
+                    models.KnowledgeDocument.tenant_id.in_(principal.allowed_tenants),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if doc is None:
             raise HTTPException(status_code=404, detail="knowledge_not_found")
-        doc.status = "draft" if doc.status == "published" else "published"
+        previous = doc.status
+        if previous != target:
+            doc.status = target
+            await session.execute(
+                models.AuditLog.__table__.insert().values(
+                    tenant_id=doc.tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action=(
+                        "PUBLISH_KNOWLEDGE" if target == "published" else "UNPUBLISH_KNOWLEDGE"
+                    ),
+                    subject_type="knowledge_document",
+                    subject_id=str(doc.id),
+                    detail={
+                        "from": previous,
+                        "to": target,
+                        "brand": doc.brand_id,
+                        "platform": doc.platform,
+                        "is_official_contact": doc.is_official_contact,
+                    },
+                )
+            )
         await session.commit()
     return RedirectResponse(
-        "/admin/knowledge?notice=toggled", status_code=status.HTTP_303_SEE_OTHER
+        "/admin/knowledge?notice=status_changed", status_code=status.HTTP_303_SEE_OTHER
+    )
+
+
+@router.post("/knowledge/{doc_id}/official-contact")
+async def knowledge_set_official_contact(request: Request, doc_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    target_value = (form.get("target") or "").strip()
+    if target_value not in {"true", "false"}:
+        raise HTTPException(status_code=422, detail="invalid_official_contact_target")
+    target = target_value == "true"
+    async with get_session_factory()() as session:
+        doc = (
+            await session.execute(
+                select(models.KnowledgeDocument)
+                .where(
+                    models.KnowledgeDocument.id == doc_id,
+                    models.KnowledgeDocument.tenant_id.in_(principal.allowed_tenants),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if doc is None:
+            raise HTTPException(status_code=404, detail="knowledge_not_found")
+        if doc.status != "draft":
+            raise HTTPException(status_code=409, detail="unpublish_before_classification")
+        previous = doc.is_official_contact
+        if previous != target:
+            content_hash = await session.scalar(
+                select(models.KnowledgeChunk.content_hash).where(
+                    models.KnowledgeChunk.document_id == doc.id
+                )
+            )
+            doc.is_official_contact = target
+            await session.execute(
+                models.AuditLog.__table__.insert().values(
+                    tenant_id=doc.tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action="SET_KNOWLEDGE_OFFICIAL_CONTACT",
+                    subject_type="knowledge_document",
+                    subject_id=str(doc.id),
+                    detail={
+                        "from": previous,
+                        "to": target,
+                        "brand": doc.brand_id,
+                        "platform": doc.platform,
+                        "status": doc.status,
+                        "content_hash": content_hash,
+                    },
+                )
+            )
+        await session.commit()
+    return RedirectResponse(
+        "/admin/knowledge?notice=classification_changed",
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
@@ -2389,13 +2530,33 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
 # ---------- 提示词品牌表达偏好 ----------
 
 _PROMPT_BANNERS = {
-    "saved": ("ok", "品牌语气/本地化偏好已保存，下一条决策立即生效。"),
-    "persona_required": ("err", "品牌语气/本地化偏好不能为空。"),
-    "persona_too_long": (
-        "err",
-        f"品牌语气/本地化偏好过长：可编辑段最多 {PERSONA_MAX_CHARS} 字符。",
-    ),
+    "saved": ("ok", "结构化品牌语气偏好已保存，下一条 LLM 决策立即生效。"),
+    "voice_preferences_invalid": ("err", "品牌语气偏好无效，请只选择页面提供的选项。"),
 }
+
+_VOICE_OPTIONS = {
+    "tone": (("professional", "专业"), ("warm", "温暖"), ("formal", "正式")),
+    "length": (("concise", "简洁"), ("balanced", "均衡")),
+    "empathy": (("standard", "标准"), ("high", "高同理心")),
+    "emoji": (("never", "不使用"), ("sparingly", "少量使用")),
+}
+_VOICE_LABELS = {
+    "tone": "语气",
+    "length": "篇幅",
+    "empathy": "同理心",
+    "emoji": "Emoji",
+}
+
+
+def _voice_select(name: str, current: str) -> str:
+    options = "".join(
+        f'<option value="{value}"{" selected" if value == current else ""}>{label}</option>'
+        for value, label in _VOICE_OPTIONS[name]
+    )
+    return (
+        f'<label for="f-{name}">{_VOICE_LABELS[name]}</label>'
+        f'<select id="f-{name}" name="{name}" required>{options}</select>'
+    )
 
 
 def _prompt_tenant(principal: Principal, requested: str) -> str:
@@ -2429,22 +2590,26 @@ async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -
     trial = ""
     if request.query_params.get("trial"):
         trial = _render_trial(request)
-    body = f"""<h1>提示词</h1><p class="lede">只编辑品牌语气、风格与本地化表达偏好；WikiFX 身份、领域事实边界、动作含义和安全规则由系统固定，不可修改。</p>{banner}
-<section class="card"><h2>品牌语气/本地化偏好 {origin}</h2>
-<p class="hint">可编辑段只影响需要 LLM 生成回复时的品牌声音、语气和本地化表达。知识库原文直答不经过它。{PERSONA_MAX_CHARS} 字符限制仅适用于此可编辑段，不是完整模型上下文限制。</p>
+    preferences = resolved.preferences
+    voice_fields = "".join(
+        _voice_select(name, getattr(preferences, name).value) for name in _VOICE_OPTIONS
+    )
+    body = f"""<h1>提示词</h1><p class="lede">只选择有限的品牌语气偏好；后台不接受任意系统指令。WikiFX 身份、领域事实边界、动作含义和安全规则由系统固定，不可修改。</p>{banner}
+<section class="card"><h2>结构化品牌语气偏好 {origin}</h2>
+<p class="hint">这些选项只影响需要 LLM 生成回复时的代码内置表达条款。知识库原文直答不经过它；无法添加自由文本或覆盖安全契约。</p>
 <form method="post" action="/admin/prompt/save"><input type="hidden" name="csrf_token" value="{csrf}">
 <input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
 <input type="hidden" name="brand_id" value="{html.escape(brand)}">
-<label for="f-persona">品牌语气/本地化偏好（可编辑段最多 {PERSONA_MAX_CHARS} 字符）</label>
-<textarea id="f-persona" name="persona" rows="10" required>{html.escape(resolved.text)}</textarea>
-<button class="btn-block">保存</button></form></section>
+{voice_fields}
+<button class="btn-block">保存</button></form>
+<details class="collapse"><summary>查看代码编译后的语气条款</summary><div class="inner"><pre class="thread" style="white-space:pre-wrap">{html.escape(resolved.text)}</pre></div></details></section>
 
 <section class="card"><h2>系统固定追加</h2>
-<p class="hint">以下不可变契约始终拼在可编辑段之后，后台无法删除或覆盖；严格六字段 schema 也由代码控制。</p>
+<p class="hint">以下不可变契约始终拼在代码编译的语气条款之后，后台无法删除或覆盖；严格六字段 schema 也由代码控制。</p>
 <pre class="thread" style="white-space:pre-wrap">{html.escape(CONTRACT_PROMPT)}</pre></section>
 
 <section class="card"><h2>试运行</h2>
-<p class="hint">用当前保存的人设跑一次真实 LLM 调用，只看结果，不写库、不建 outbox、不发送。</p>
+<p class="hint">用当前保存并由代码编译的语气偏好跑一次真实 LLM 调用，只看结果，不写库、不建 outbox、不发送。</p>
 <form method="post" action="/admin/prompt/trial"><input type="hidden" name="csrf_token" value="{csrf}">
 <input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
 <input type="hidden" name="brand_id" value="{html.escape(brand)}">
@@ -2488,12 +2653,28 @@ async def prompt_save(request: Request) -> Response:
     _require_csrf(request, form)
     tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
     brand = (form.get("brand_id") or "default").strip() or "default"
+    allowed_fields = {
+        "csrf_token",
+        "tenant_id",
+        "brand_id",
+        "tone",
+        "length",
+        "empathy",
+        "emoji",
+    }
     try:
-        persona = validate_persona(form.get("persona") or "")
-    except ValueError as exc:
-        return RedirectResponse(
-            f"/admin/prompt?notice={exc}", status_code=status.HTTP_303_SEE_OTHER
+        if set(form) - allowed_fields:
+            raise ValueError("voice_preferences_invalid")
+        preferences = parse_voice_preferences(
+            {name: form.get(name) or "" for name in ("tone", "length", "empathy", "emoji")}
         )
+    except ValueError:
+        return RedirectResponse(
+            "/admin/prompt?notice=voice_preferences_invalid",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    persona = compile_voice_preferences(preferences)
+    voice_preferences = preferences.to_dict()
     async with get_session_factory()() as session:
         row = (
             await session.execute(
@@ -2510,6 +2691,7 @@ async def prompt_save(request: Request) -> Response:
                     tenant_id=tenant,
                     brand_id=brand,
                     persona=persona,
+                    voice_preferences=voice_preferences,
                     revision=revision,
                     updated_by=principal.actor,
                 )
@@ -2517,6 +2699,7 @@ async def prompt_save(request: Request) -> Response:
         else:
             revision = row.revision + 1
             row.persona = persona
+            row.voice_preferences = voice_preferences
             row.revision = revision
             row.updated_by = principal.actor
         await session.execute(
@@ -2527,7 +2710,10 @@ async def prompt_save(request: Request) -> Response:
                 action="SET_REPLY_PERSONA",
                 subject_type="reply_prompt",
                 subject_id=f"{tenant}:{brand}",
-                detail={"revision": revision, "chars": len(persona)},
+                detail={
+                    "revision": revision,
+                    "voice_preferences": voice_preferences,
+                },
             )
         )
         await session.commit()

@@ -25,6 +25,7 @@ class KnowledgeHit:
     chunk_id: uuid.UUID
     content_hash: str
     verbatim_safe: bool = True  # True 才允许原文直答；RRF 词法命中项为 False
+    is_official_contact: bool = False
 
 
 def normalize_question(value: str) -> str:
@@ -51,6 +52,7 @@ async def retrieve_exact_knowledge(
                 KnowledgeChunk.content,
                 KnowledgeChunk.content_hash,
                 KnowledgeDocument.reply,
+                KnowledgeDocument.is_official_contact,
             )
             .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
             .where(
@@ -74,6 +76,7 @@ async def retrieve_exact_knowledge(
         similarity=1.0,
         chunk_id=row.id,
         content_hash=row.content_hash,
+        is_official_contact=row.is_official_contact,
     )
 
 
@@ -99,6 +102,7 @@ async def retrieve_knowledge(
             KnowledgeChunk.content,
             KnowledgeChunk.content_hash,
             KnowledgeDocument.reply,
+            KnowledgeDocument.is_official_contact,
             distance.label("distance"),
         )
         .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
@@ -125,6 +129,7 @@ async def retrieve_knowledge(
             similarity=1.0 - row.distance,
             chunk_id=row.id,
             content_hash=row.content_hash,
+            is_official_contact=row.is_official_contact,
         )
         for row in rows
     ]
@@ -142,8 +147,8 @@ async def _retrieve_lexical(
     brand_id: str,
     platform: str,
     limit: int,
-) -> list[tuple[uuid.UUID, str, str, str]]:
-    """词法（tsvector）检索：按 question_tsv 匹配 query，返回 (chunk_id, content, hash, reply)。
+) -> list[tuple[uuid.UUID, str, str, str, bool]]:
+    """Lexically retrieve published chunks and their official-contact classification.
 
     'simple' 分词器与建索引一致；plainto_tsquery 把用户输入按空白切词做 AND，
     专有名词（pip/broker/品牌名）等关键词命中是向量的补充。无匹配返回空。
@@ -158,6 +163,7 @@ async def _retrieve_lexical(
             KnowledgeChunk.content,
             KnowledgeChunk.content_hash,
             KnowledgeDocument.reply,
+            KnowledgeDocument.is_official_contact,
         )
         .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
         .where(
@@ -174,7 +180,7 @@ async def _retrieve_lexical(
         .limit(limit)
     )
     rows = (await session.execute(stmt)).all()
-    return [(r.id, r.content, r.content_hash, r.reply) for r in rows]
+    return [(r.id, r.content, r.content_hash, r.reply, r.is_official_contact) for r in rows]
 
 
 async def retrieve_hybrid_knowledge(
@@ -226,11 +232,16 @@ async def retrieve_hybrid_knowledge(
         meta[hit.chunk_id] = hit
         best_similarity[hit.chunk_id] = max(best_similarity.get(hit.chunk_id, 0.0), hit.similarity)
 
-    for rank, (cid, content, chash, reply) in enumerate(lexical):
+    for rank, (cid, content, chash, reply, is_official_contact) in enumerate(lexical):
         scores[cid] = scores.get(cid, 0.0) + 1.0 / (_RRF_K + rank)
         if cid not in meta:
             meta[cid] = KnowledgeHit(
-                content=content, reply=reply, similarity=0.0, chunk_id=cid, content_hash=chash
+                content=content,
+                reply=reply,
+                similarity=0.0,
+                chunk_id=cid,
+                content_hash=chash,
+                is_official_contact=is_official_contact,
             )
             best_similarity.setdefault(cid, 0.0)
 
@@ -248,6 +259,7 @@ async def retrieve_hybrid_knowledge(
                 chunk_id=cid,
                 content_hash=base.content_hash,
                 verbatim_safe=sim >= min_similarity,
+                is_official_contact=base.is_official_contact,
             )
         )
     return results

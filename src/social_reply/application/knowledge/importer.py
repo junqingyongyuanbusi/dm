@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from social_reply.domain.knowledge.embeddings import EmbeddingClient
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.infrastructure.database.models import KnowledgeChunk, KnowledgeDocument
+from social_reply.infrastructure.database.models import AuditLog, KnowledgeChunk, KnowledgeDocument
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +35,20 @@ class _Row:
     brand_id: str
     platform: str | None
     category: str | None
+    is_official_contact: bool
     content: str  # 展示/LLM 上下文（问+答），也是幂等 content_hash 的来源
     embed_text: str  # 实际送去 embedding 的文本（非对称：仅 question）
     content_hash: str
+
+
+def parse_optional_bool(value: str | None) -> bool:
+    """Parse an optional strict CSV boolean; blank values are false."""
+    normalized = (value or "").strip().casefold()
+    if normalized in {"", "false", "0", "no"}:
+        return False
+    if normalized in {"true", "1", "yes"}:
+        return True
+    raise ValueError(f"is_official_contact must be true/false, got {value!r}")
 
 
 def _parse_rows(f: TextIO, brand_id_default: str) -> tuple[list[_Row], int]:
@@ -64,6 +75,7 @@ def _parse_rows(f: TextIO, brand_id_default: str) -> tuple[list[_Row], int]:
                 brand_id=(raw.get("brand_id") or "").strip() or brand_id_default,
                 platform=(raw.get("platform") or "").strip() or None,
                 category=(raw.get("category") or "").strip() or None,
+                is_official_contact=parse_optional_bool(raw.get("is_official_contact")),
                 content=content,
                 # 非对称嵌入：只 embed 问题，与用户 query 同分布；答案不参与向量
                 embed_text=question,
@@ -82,6 +94,7 @@ async def import_knowledge_rows(
     embedder: EmbeddingClient,
     tenant_id: str = "default",
     brand_id_default: str = "default",
+    actor: str = "knowledge-import",
 ) -> ImportReport:
     """导入回复模板（文本流）：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
     rows, blank = _parse_rows(f, brand_id_default)
@@ -126,6 +139,8 @@ async def import_knowledge_rows(
                 category=row.category,
                 question=row.question,
                 reply=row.reply,
+                status="draft",
+                is_official_contact=row.is_official_contact,
                 source_file=source_name,
             )
             session.add(doc)
@@ -141,6 +156,25 @@ async def import_knowledge_rows(
                     embedding=embedding,
                 )
             )
+            if row.is_official_contact:
+                session.add(
+                    AuditLog(
+                        tenant_id=tenant_id,
+                        category="admin_action",
+                        actor=actor,
+                        action="SET_KNOWLEDGE_OFFICIAL_CONTACT",
+                        subject_type="knowledge_document",
+                        subject_id=str(doc.id),
+                        detail={
+                            "from": False,
+                            "to": True,
+                            "brand": row.brand_id,
+                            "platform": row.platform,
+                            "status": "draft",
+                            "content_hash": row.content_hash,
+                        },
+                    )
+                )
         await session.commit()
 
     return ImportReport(
@@ -157,6 +191,7 @@ async def import_knowledge_csv(
     embedder: EmbeddingClient,
     tenant_id: str = "default",
     brand_id_default: str = "default",
+    actor: str = "knowledge-import",
 ) -> ImportReport:
     """导入回复模板 CSV 文件：打开路径后委托 import_knowledge_rows"""
     path = Path(path)
@@ -167,4 +202,5 @@ async def import_knowledge_csv(
             embedder=embedder,
             tenant_id=tenant_id,
             brand_id_default=brand_id_default,
+            actor=actor,
         )

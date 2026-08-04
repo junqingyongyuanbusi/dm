@@ -36,7 +36,12 @@ def _downgrade(decision: ReplyDecision, code: str) -> ReplyDecision:
     )
 
 
-def run_final_guard(decision: ReplyDecision, platform: str) -> ReplyDecision:
+def run_final_guard(
+    decision: ReplyDecision,
+    platform: str,
+    *,
+    approved_official_contact_reply: str | None = None,
+) -> ReplyDecision:
     """纯确定性输出闸门；任一项失败降级为 handoff 并记录 reason_code。
     仅对 auto_reply 生效——其它 action 原样返回。"""
     if decision.action is not ReplyAction.AUTO_REPLY:
@@ -45,7 +50,13 @@ def run_final_guard(decision: ReplyDecision, platform: str) -> ReplyDecision:
     if not text.strip():
         return _downgrade(decision, "GUARD_EMPTY")
     if _has_pii(text):
-        return _downgrade(decision, "GUARD_PII_LEAK")
+        approved_contact = (
+            decision.source == "knowledge"
+            and approved_official_contact_reply is not None
+            and text.strip() == approved_official_contact_reply.strip()
+        )
+        if not approved_contact:
+            return _downgrade(decision, "GUARD_PII_LEAK")
     if len(text) > _MAX_TEXT_LENGTH.get(platform, _DEFAULT_MAX):
         return _downgrade(decision, "GUARD_TOO_LONG")
     return decision

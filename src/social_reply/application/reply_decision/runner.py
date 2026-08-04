@@ -301,11 +301,17 @@ async def run_and_persist_decision(
         # 模板直答：必须基于「相似度最高」的命中判断，不能用 RRF 序的 hits[0]——
         # RRF 分最高 ≠ 相似度最高，否则会误发词法命中的错模板，或漏发真正强命中的向量项。
         # 仅精确匹配或达阈值向量命中（verbatim_safe）才原文外发；词法-only/低相似度只作 LLM 上下文。
-        verbatim = None
+        selected_verbatim_hit: KnowledgeHit | None = None
         if hits and settings.knowledge_verbatim_reply:
             top_by_similarity = max(hits, key=lambda h: h.similarity)
             if top_by_similarity.verbatim_safe:
-                verbatim = top_by_similarity.reply
+                selected_verbatim_hit = top_by_similarity
+        verbatim = selected_verbatim_hit.reply if selected_verbatim_hit is not None else None
+        approved_official_contact_reply = (
+            selected_verbatim_hit.reply
+            if selected_verbatim_hit is not None and selected_verbatim_hit.is_official_contact
+            else None
+        )
         require_knowledge = settings.knowledge_retrieval_enabled and settings.require_knowledge
         needs_llm_history = (
             should_retrieve and verbatim is None and not (require_knowledge and not hits)
@@ -322,6 +328,7 @@ async def run_and_persist_decision(
             knowledge=tuple(h.content for h in hits),
             require_knowledge=require_knowledge,
             verbatim_reply=verbatim,
+            approved_official_contact_reply=approved_official_contact_reply,
             history=history,
             persona=persona.text,
         )
