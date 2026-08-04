@@ -44,7 +44,23 @@ def upgrade() -> None:
             "IF EXISTS (SELECT 1 FROM knowledge_documents "
             "WHERE status NOT IN ('draft', 'published')) THEN "
             "RAISE EXCEPTION 'unknown knowledge_documents.status values'; "
+            "END IF; "
+            "IF EXISTS (SELECT 1 FROM outbox_messages "
+            "WHERE actor_kind = 'BOT' AND origin_kind = 'DECISION' "
+            "AND status = 'SENDING') THEN "
+            "RAISE EXCEPTION 'active bot decision outboxes must drain before prompt governance'; "
             "END IF; END $$"
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE outbox_messages "
+            "SET status = 'NEEDS_REVIEW', "
+            "last_error_code = 'PROMPT_GOVERNANCE_ROLLOUT', "
+            "last_error_message = 'Queued before prompt governance upgrade', "
+            "next_attempt_at = NULL, locked_at = NULL, locked_by = NULL "
+            "WHERE actor_kind = 'BOT' AND origin_kind = 'DECISION' "
+            "AND status IN ('PENDING', 'FAILED')"
         )
     )
 

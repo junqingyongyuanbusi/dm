@@ -74,6 +74,7 @@ from social_reply.domain.platform_accounts import capability_text_limit
 from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
+from social_reply.domain.reply.voice import VoiceEmoji, VoiceEmpathy, VoiceLength, VoiceTone
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -2517,10 +2518,23 @@ _PROMPT_BANNERS = {
 }
 
 _VOICE_OPTIONS = {
-    "tone": (("professional", "专业"), ("warm", "温暖"), ("formal", "正式")),
-    "length": (("concise", "简洁"), ("balanced", "均衡")),
-    "empathy": (("standard", "标准"), ("high", "高同理心")),
-    "emoji": (("never", "不使用"), ("sparingly", "少量使用")),
+    "tone": (
+        (VoiceTone.PROFESSIONAL.value, "专业"),
+        (VoiceTone.WARM.value, "温暖"),
+        (VoiceTone.FORMAL.value, "正式"),
+    ),
+    "length": (
+        (VoiceLength.CONCISE.value, "简洁"),
+        (VoiceLength.BALANCED.value, "均衡"),
+    ),
+    "empathy": (
+        (VoiceEmpathy.STANDARD.value, "标准"),
+        (VoiceEmpathy.HIGH.value, "高同理心"),
+    ),
+    "emoji": (
+        (VoiceEmoji.NEVER.value, "不使用"),
+        (VoiceEmoji.SPARINGLY.value, "少量使用"),
+    ),
 }
 _VOICE_LABELS = {
     "tone": "语气",

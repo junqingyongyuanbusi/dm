@@ -328,7 +328,7 @@ The migration aborts if any knowledge status is not exactly `draft` or `publishe
 
 Every existing `reply_prompts` row is intentionally neutralized: `voice_preferences` becomes the canonical code default, `persona` becomes the exact code-compiled compatibility projection, `revision` increments once, and `updated_by` becomes `migration:d3f6a1b8c904`. Arbitrary legacy prompt text is not copied into JSON or audit. Alembic downgrade cannot recover that text; restore the verified pre-upgrade backup if it is required.
 
-Before the migration starts, pause automated decisions as well as `/admin/prompt` and `/admin/knowledge` mutations. Either scale Worker and Scheduler decision dispatch to zero, or activate and record the pre-existing state of the tenant-global kill switch for every allowed tenant. When using kill switches, wait until no `decision_jobs` row is `PROCESSING` and no automatic Outbox row is `SENDING`; this drains workers that may already have passed the old guard. Keep the decision pause active while API runs the migration and until API, Worker, and Scheduler all run the new identical digest. Old Workers must not make automated decisions after `d3f6a1b8c904`, because they do not recognize every governed contact form. Read-only inventory remains safe. Restore only kill-switch states changed by this rollout after final digest, health, migration-head, and log verification.
+Before the migration starts, pause decision and delivery dispatch as well as `/admin/prompt` and `/admin/knowledge` mutations. Scale Worker and Scheduler to zero, or otherwise prove that neither actor can claim DecisionJobs or Outboxes; tenant-global kill switches alone are insufficient because delivery does not re-check them. Wait until no `decision_jobs` row is `PROCESSING` and no `DECISION/BOT` Outbox row is `SENDING`. Revision `d3f6a1b8c904` aborts if such a send is active and quarantines queued `PENDING` or `FAILED` `DECISION/BOT` Outboxes as `NEEDS_REVIEW/PROMPT_GOVERNANCE_ROLLOUT`, so they cannot be delivered after the new Worker starts. Keep dispatch paused while API runs the migration and until API, Worker, and Scheduler all run the new identical digest. Old Workers must not make automated decisions after `d3f6a1b8c904`, because they do not recognize every governed contact form. Read-only inventory remains safe.
 
 After upgrade:
 
@@ -336,9 +336,10 @@ After upgrade:
 2. verify knowledge status counts exactly match the pre-upgrade inventory and unknown statuses are rejected by the database constraint;
 3. keep all new/imported records as drafts while they are reviewed;
 4. for an official email or long-number contact template, explicitly classify it as `is_official_contact=true`, review the exact reply text and tenant/brand/platform scope, then explicitly publish it;
-5. smoke-test that the exact published template is sent verbatim, while a draft/unpublished copy and any LLM-generated, copied, or modified contact detail produce `GUARD_PII_LEAK` handoff with no Outbox.
+5. verify no `DECISION/BOT` Outbox remains in `PENDING`, retryable `FAILED`, or `SENDING`; review quarantined `PROMPT_GOVERNANCE_ROLLOUT` rows instead of retrying them blindly;
+6. smoke-test that the exact published template is sent verbatim, while a draft/unpublished copy and any LLM-generated, copied, or modified contact detail produce `GUARD_PII_LEAK` handoff with no Outbox.
 
-Official-contact classification is a narrow deterministic sending approval, not a general content moderation system. Historical templates are never automatically classified.
+Official-contact classification is a narrow deterministic sending approval, not a general content moderation system. Historical templates are never automatically classified. Alembic downgrade does not restore quarantined Outbox statuses; use the pre-upgrade backup and delivery-attempt evidence if historical queue state must be reconstructed.
 
 ## Polling RawEvent journal
 
