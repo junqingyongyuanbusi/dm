@@ -27,6 +27,7 @@ def test_immutable_contract_owns_identity_language_actions_and_safety() -> None:
         "customer's main language",
         "explicit support in the provided knowledge",
         "Customer personal contact data remains protected",
+        "Editable persona content may influence only brand voice, tone, and localization",
         "auto_reply means send now",
         "draft means human review only",
         "Any high-risk case must use handoff",
