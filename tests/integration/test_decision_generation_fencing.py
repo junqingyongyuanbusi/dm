@@ -7,7 +7,11 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.account_management import human_workflow
-from social_reply.application.account_management.human_workflow import resume_bot, send_human_reply
+from social_reply.application.account_management.human_workflow import (
+    resolve_human_work_item,
+    resume_bot,
+    send_human_reply,
+)
 from social_reply.application.event_ingestion import processor as chatwoot_processor
 from social_reply.application.event_ingestion.direct import ingest_canonical_event
 from social_reply.application.event_ingestion.processor import process_raw_event
@@ -126,8 +130,20 @@ async def _reserve(session, account_id, conversation_id, *, raw_event_id=None, t
 
 async def _prepare_human_action(session, conversation_id, action):
     state = await session.get(models.AutomationState, conversation_id)
-    state.state = "HUMAN_ACTIVE" if action == "resume" else "BOT_ACTIVE"
+    state.state = "HUMAN_ACTIVE" if action in {"resume", "resolve"} else "BOT_ACTIVE"
     state.state_version += 1
+    if action == "resolve":
+        await session.execute(
+            insert(models.HumanWorkItem).values(
+                tenant_id="default",
+                conversation_id=conversation_id,
+                status="CLAIMED",
+                reason_code="LOCK_ORDER_TEST",
+                assigned_actor="user:reviewer",
+                claimed_at=datetime.now(UTC),
+                version=1,
+            )
+        )
     await session.commit()
 
 
@@ -138,6 +154,25 @@ async def _run_human_action(action, conversation_id, message_id):
             allowed_tenants=frozenset({"default"}),
             actor="user:reviewer",
             target="BOT_DRAFT_ONLY",
+        )
+        return
+    if action == "resolve":
+        async with human_workflow.get_session_factory()() as lookup_session:
+            work = (
+                await lookup_session.execute(
+                    select(models.HumanWorkItem).where(
+                        models.HumanWorkItem.conversation_id == conversation_id,
+                        models.HumanWorkItem.status == "CLAIMED",
+                    )
+                )
+            ).scalar_one()
+            work_item_id, expected_version = work.id, work.version
+        await resolve_human_work_item(
+            work_item_id=work_item_id,
+            allowed_tenants=frozenset({"default"}),
+            actor="user:reviewer",
+            expected_version=expected_version,
+            allow_override=False,
         )
         return
     await send_human_reply(
@@ -155,7 +190,16 @@ async def _run_human_action(action, conversation_id, message_id):
 async def _assert_human_action(session, conversation_id, action):
     session.expire_all()
     state = await session.get(models.AutomationState, conversation_id)
-    assert state.state == ("BOT_DRAFT_ONLY" if action == "resume" else "HUMAN_ACTIVE")
+    assert state.state == ("BOT_DRAFT_ONLY" if action in {"resume", "resolve"} else "HUMAN_ACTIVE")
+    if action == "resolve":
+        work = (
+            await session.execute(
+                select(models.HumanWorkItem).where(
+                    models.HumanWorkItem.conversation_id == conversation_id
+                )
+            )
+        ).scalar_one()
+        assert work.status == "RESOLVED"
     if action == "reply":
         manual_outbox = (
             await session.execute(
@@ -451,7 +495,7 @@ async def test_chatwoot_ingestion_commits_new_generation_while_older_llm_is_bloc
     assert [decision.decision_job_id for decision in decisions] == [jobs[1].id]
 
 
-@pytest.mark.parametrize("human_action", ["resume", "reply"])
+@pytest.mark.parametrize("human_action", ["resume", "resolve", "reply"])
 async def test_chatwoot_ingestion_cannot_deadlock_with_human_action(
     session, monkeypatch, human_action
 ):
@@ -755,7 +799,7 @@ async def test_direct_ingestion_takes_conversation_lock_before_raw_event_locks(
     assert set(rows) == {"PROCESSED", "DECISION_PENDING"}
 
 
-@pytest.mark.parametrize("human_action", ["resume", "reply"])
+@pytest.mark.parametrize("human_action", ["resume", "resolve", "reply"])
 async def test_generation_reservation_cannot_deadlock_with_human_action(
     session, monkeypatch, human_action
 ):
@@ -819,7 +863,7 @@ async def test_generation_reservation_cannot_deadlock_with_human_action(
     await _assert_human_action(session, conversation_id, human_action)
 
 
-@pytest.mark.parametrize("human_action", ["resume", "reply"])
+@pytest.mark.parametrize("human_action", ["resume", "resolve", "reply"])
 async def test_generation_finalization_cannot_deadlock_with_human_action(
     session, monkeypatch, human_action
 ):

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import UTC, datetime
 
@@ -6,7 +7,6 @@ from sqlalchemy import func, insert, select, text
 
 from social_reply.application.account_management.human_workflow import (
     HumanWorkflowConflict,
-    HumanWorkflowError,
     claim_human_work_item,
     ensure_open_human_work_item,
     resolve_human_work_item,
@@ -21,7 +21,12 @@ from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 pytestmark = pytest.mark.integration
 
 
-async def _seed_conversation(session, *, platform: str = "telegram") -> tuple[uuid.UUID, ...]:
+async def _seed_conversation(
+    session,
+    *,
+    platform: str = "telegram",
+    automation_default: str = "BOT_ACTIVE",
+) -> tuple[uuid.UUID, ...]:
     account_id, contact_id, conversation_id, message_id, work_id, bot_outbox_id = (
         uuid.uuid4() for _ in range(6)
     )
@@ -60,7 +65,7 @@ async def _seed_conversation(session, *, platform: str = "telegram") -> tuple[uu
                 "max_text_length": 4000 if is_feishu else 1000,
                 **({"mentions": True} if is_feishu else {}),
             },
-            automation_default="BOT_ACTIVE",
+            automation_default=automation_default,
             status="active",
         )
     )
@@ -311,27 +316,32 @@ async def test_manual_reply_delivers_without_reply_decision(session, monkeypatch
     assert state.last_human_message_at is not None
 
 
-async def test_resolve_then_resume_requires_closed_work_item(session):
-    _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
-        session
+@pytest.mark.parametrize("account_policy", ["BOT_ACTIVE", "BOT_DRAFT_ONLY"])
+async def test_claim_and_resolve_restore_account_policy(session, account_policy):
+    _account_id, conversation_id, _message_id, work_id, bot_outbox_id = await _seed_conversation(
+        session, automation_default=account_policy
     )
-    with pytest.raises(HumanWorkflowConflict, match="still_open"):
-        await resume_bot(
-            conversation_id=conversation_id,
-            allowed_tenants=frozenset({"tenant-a"}),
-            actor="user:alice",
-            target="BOT_DRAFT_ONLY",
-        )
 
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        user_id=None,
+        expected_version=1,
+    )
     session.expire_all()
     work = await session.get(models.HumanWorkItem, work_id)
     state = await session.get(models.AutomationState, conversation_id)
-    work.status = "CLAIMED"
-    work.assigned_actor = "user:alice"
-    work.claimed_at = datetime.now(UTC)
-    work.version = 2
-    state.state = "HUMAN_ACTIVE"
-    await session.commit()
+    stale_outbox = await session.get(models.OutboxMessage, bot_outbox_id)
+    assert (work.status, work.version, work.assigned_actor) == ("CLAIMED", 2, "user:alice")
+    assert (state.state, state.state_version, state.human_agent_id) == (
+        "HUMAN_ACTIVE",
+        3,
+        "user:alice",
+    )
+    assert state.state_changed_reason == "human_work_claimed"
+    assert stale_outbox.status == "CANCELLED"
+
     await resolve_human_work_item(
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
@@ -339,6 +349,66 @@ async def test_resolve_then_resume_requires_closed_work_item(session):
         expected_version=2,
         allow_override=False,
     )
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    assert (work.status, work.version) == ("RESOLVED", 3)
+    assert (state.state, state.state_version, state.human_agent_id) == (
+        account_policy,
+        4,
+        None,
+    )
+    assert state.state_changed_reason == "human_work_resolved_account_policy"
+    audits = (
+        (
+            await session.execute(
+                select(models.AuditLog.action).where(
+                    models.AuditLog.subject_id.in_([str(work_id), str(conversation_id)])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert audits.count("CLAIM") == 1
+    assert audits.count("HUMAN_ACTIVE") == 1
+    assert audits.count("RESOLVE") == 1
+    assert audits.count(account_policy) == 1
+
+
+async def test_resolve_legacy_handoff_pending_restores_policy(session):
+    _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session
+    )
+    work = await session.get(models.HumanWorkItem, work_id)
+    work.status = "CLAIMED"
+    work.assigned_actor = "user:alice"
+    work.claimed_at = datetime.now(UTC)
+    work.version = 2
+    await session.commit()
+
+    await resolve_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        expected_version=2,
+        allow_override=False,
+    )
+    session.expire_all()
+    state = await session.get(models.AutomationState, conversation_id)
+    assert state.state == "BOT_ACTIVE"
+    assert state.human_agent_id is None
+
+
+async def test_resume_supports_resolved_legacy_handoff_pending(session):
+    _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session
+    )
+    work = await session.get(models.HumanWorkItem, work_id)
+    work.status = "RESOLVED"
+    work.resolved_at = datetime.now(UTC)
+    await session.commit()
+
     await resume_bot(
         conversation_id=conversation_id,
         allowed_tenants=frozenset({"tenant-a"}),
@@ -348,6 +418,203 @@ async def test_resolve_then_resume_requires_closed_work_item(session):
     session.expire_all()
     state = await session.get(models.AutomationState, conversation_id)
     assert state.state == "BOT_DRAFT_ONLY"
+
+
+async def test_concurrent_claim_exactly_one_succeeds(session):
+    _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session
+    )
+
+    async def claim(actor: str):
+        return await claim_human_work_item(
+            work_item_id=work_id,
+            allowed_tenants=frozenset({"tenant-a"}),
+            actor=actor,
+            user_id=None,
+            expected_version=1,
+        )
+
+    results = await asyncio.gather(
+        claim("user:alice"),
+        claim("user:bob"),
+        return_exceptions=True,
+    )
+    assert sum(result is None for result in results) == 1
+    conflicts = [result for result in results if isinstance(result, HumanWorkflowConflict)]
+    assert len(conflicts) == 1
+    assert str(conflicts[0]) == "human_work_item_version_conflict"
+
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    assert work.status == "CLAIMED"
+    assert work.assigned_actor in {"user:alice", "user:bob"}
+    assert state.state == "HUMAN_ACTIVE"
+    assert state.human_agent_id == work.assigned_actor
+
+
+async def test_handoff_lifecycle_does_not_change_sibling_conversation(session):
+    account_id, first_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(session)
+    contact_id, second_id = uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="tenant-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            external_user_id="user-2",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=second_id,
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"telegram:{account_id}:user-2",
+        )
+    )
+    await session.execute(
+        insert(models.AutomationState).values(
+            conversation_id=second_id,
+            state="BOT_DRAFT_ONLY",
+            state_version=7,
+            state_changed_reason="sibling_unchanged",
+        )
+    )
+    await session.commit()
+
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        user_id=None,
+        expected_version=1,
+    )
+    await resolve_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        expected_version=2,
+        allow_override=False,
+    )
+
+    session.expire_all()
+    first = await session.get(models.AutomationState, first_id)
+    second = await session.get(models.AutomationState, second_id)
+    assert first.state == "BOT_ACTIVE"
+    assert (second.state, second.state_version, second.state_changed_reason) == (
+        "BOT_DRAFT_ONLY",
+        7,
+        "sibling_unchanged",
+    )
+
+
+async def test_claim_preserves_explicit_human_active_mode_and_transfers_attribution(session):
+    _account_id, conversation_id, _message_id, work_id, bot_outbox_id = await _seed_conversation(
+        session
+    )
+    state = await session.get(models.AutomationState, conversation_id)
+    state.state = "HUMAN_ACTIVE"
+    state.human_agent_id = "user:manual-owner"
+    state.state_changed_reason = "admin_manual"
+    await session.commit()
+
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        user_id=None,
+        expected_version=1,
+    )
+
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    outbox = await session.get(models.OutboxMessage, bot_outbox_id)
+    assert (work.status, work.assigned_actor, work.version) == ("CLAIMED", "user:alice", 2)
+    assert (
+        state.state,
+        state.state_version,
+        state.human_agent_id,
+        state.state_changed_reason,
+    ) == ("HUMAN_ACTIVE", 3, "user:alice", "human_work_claimed")
+    assert outbox.status == "CANCELLED"
+
+
+@pytest.mark.parametrize("drift_state", ["BOT_COOLDOWN", "CLOSED"])
+async def test_claim_fails_closed_for_explicit_terminal_drift(session, drift_state):
+    _account_id, conversation_id, _message_id, work_id, bot_outbox_id = await _seed_conversation(
+        session
+    )
+    state = await session.get(models.AutomationState, conversation_id)
+    state.state = drift_state
+    await session.commit()
+
+    with pytest.raises(HumanWorkflowConflict, match="not_handoff_pending"):
+        await claim_human_work_item(
+            work_item_id=work_id,
+            allowed_tenants=frozenset({"tenant-a"}),
+            actor="user:alice",
+            user_id=None,
+            expected_version=1,
+        )
+
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    outbox = await session.get(models.OutboxMessage, bot_outbox_id)
+    assert (work.status, work.version) == ("WAITING", 1)
+    assert (state.state, state.state_version) == (drift_state, 2)
+    assert outbox.status == "PENDING"
+
+
+async def test_version_and_assignee_failures_preserve_state(session):
+    _account_id, conversation_id, _message_id, work_id, bot_outbox_id = await _seed_conversation(
+        session
+    )
+    with pytest.raises(HumanWorkflowConflict, match="version_conflict"):
+        await claim_human_work_item(
+            work_item_id=work_id,
+            allowed_tenants=frozenset({"tenant-a"}),
+            actor="user:alice",
+            user_id=None,
+            expected_version=99,
+        )
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    outbox = await session.get(models.OutboxMessage, bot_outbox_id)
+    assert (work.status, work.version) == ("WAITING", 1)
+    assert (state.state, state.state_version) == ("HANDOFF_PENDING", 2)
+    assert outbox.status == "PENDING"
+
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        user_id=None,
+        expected_version=1,
+    )
+    with pytest.raises(HumanWorkflowConflict, match="assigned_to_another_user"):
+        await resolve_human_work_item(
+            work_item_id=work_id,
+            allowed_tenants=frozenset({"tenant-a"}),
+            actor="user:bob",
+            expected_version=2,
+            allow_override=False,
+        )
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    assert (work.status, work.version) == ("CLAIMED", 2)
+    assert (state.state, state.state_version, state.human_agent_id) == (
+        "HUMAN_ACTIVE",
+        3,
+        "user:alice",
+    )
 
 
 async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, monkeypatch):
@@ -425,22 +692,26 @@ async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, mo
     )
 
 
-async def test_resume_bot_active_respects_meta_release_gate(session):
+async def test_resolve_meta_bot_active_policy_falls_back_to_draft(session):
     _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
         session, platform="facebook"
     )
-    session.expire_all()
-    work = await session.get(models.HumanWorkItem, work_id)
-    state = await session.get(models.AutomationState, conversation_id)
-    work.status = "RESOLVED"
-    work.resolved_at = state.updated_at
-    state.state = "HUMAN_ACTIVE"
-    await session.commit()
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        user_id=None,
+        expected_version=1,
+    )
+    await resolve_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        expected_version=2,
+        allow_override=False,
+    )
 
-    with pytest.raises(HumanWorkflowError, match="meta_requires_bot_draft_only"):
-        await resume_bot(
-            conversation_id=conversation_id,
-            allowed_tenants=frozenset({"tenant-a"}),
-            actor="user:alice",
-            target="BOT_ACTIVE",
-        )
+    session.expire_all()
+    state = await session.get(models.AutomationState, conversation_id)
+    assert state.state == "BOT_DRAFT_ONLY"
+    assert state.state_changed_reason == "human_work_resolved_platform_fallback"

@@ -91,31 +91,73 @@ async def ensure_open_human_work_item(
     return work
 
 
-async def _load_work_for_actor(
+async def _lock_work_context(
     session: AsyncSession,
     *,
     work_item_id: uuid.UUID,
     allowed_tenants: frozenset[str],
-) -> models.HumanWorkItem:
-    work = (
+) -> tuple[
+    models.Conversation,
+    models.PlatformAccount,
+    models.HumanWorkItem,
+    models.AutomationState,
+]:
+    identity = (
         await session.execute(
-            select(models.HumanWorkItem)
-            .where(
+            select(
+                models.HumanWorkItem.conversation_id,
+                models.HumanWorkItem.tenant_id,
+            ).where(
                 models.HumanWorkItem.id == work_item_id,
                 models.HumanWorkItem.tenant_id.in_(allowed_tenants),
             )
+        )
+    ).one_or_none()
+    if identity is None:
+        raise HumanWorkflowError("human_work_item_not_found")
+
+    await acquire_conversation_delivery_xact_lock(session, identity.conversation_id)
+    conversation = (
+        await session.execute(
+            select(models.Conversation)
+            .where(models.Conversation.id == identity.conversation_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if conversation is None:
+        raise HumanWorkflowError("conversation_not_found")
+    if identity.tenant_id != conversation.tenant_id:
+        raise HumanWorkflowConflict("human_work_item_tenant_mismatch")
+    if conversation.tenant_id not in allowed_tenants:
+        raise HumanWorkflowError("conversation_not_found")
+
+    account = (
+        await session.execute(
+            select(models.PlatformAccount)
+            .where(models.PlatformAccount.id == conversation.platform_account_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if account is None or account.tenant_id != conversation.tenant_id:
+        raise HumanWorkflowError("conversation_account_scope_mismatch")
+
+    work = (
+        await session.execute(
+            select(models.HumanWorkItem)
+            .where(models.HumanWorkItem.id == work_item_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
     if work is None:
         raise HumanWorkflowError("human_work_item_not_found")
-    conversation_tenant_id = await session.scalar(
-        select(models.Conversation.tenant_id).where(models.Conversation.id == work.conversation_id)
-    )
-    if conversation_tenant_id is None:
-        raise HumanWorkflowError("conversation_not_found")
-    require_work_conversation_tenant(work, conversation_tenant_id=conversation_tenant_id)
-    return work
+    require_work_conversation_tenant(work, conversation_tenant_id=conversation.tenant_id)
+    if work.conversation_id != conversation.id:
+        raise HumanWorkflowConflict("human_work_item_scope_mismatch")
+
+    state = await session.get(models.AutomationState, conversation.id, with_for_update=True)
+    if state is None:
+        raise HumanWorkflowError("automation_state_not_found")
+    return conversation, account, work, state
 
 
 async def claim_human_work_item(
@@ -127,17 +169,46 @@ async def claim_human_work_item(
     expected_version: int,
 ) -> None:
     async with get_session_factory()() as session:
-        work = await _load_work_for_actor(
+        conversation, _account, work, state = await _lock_work_context(
             session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
         )
         if work.status != "WAITING" or work.version != expected_version:
             raise HumanWorkflowConflict("human_work_item_version_conflict")
+        if state.state not in {"HANDOFF_PENDING", "HUMAN_ACTIVE"}:
+            raise HumanWorkflowConflict("conversation_not_handoff_pending")
+
         now = datetime.now(UTC)
         work.status = "CLAIMED"
         work.assigned_user_id = user_id
         work.assigned_actor = actor
         work.claimed_at = now
         work.version += 1
+        source = state.state
+        state.state = "HUMAN_ACTIVE"
+        state.state_version += 1
+        state.human_agent_id = actor
+        state.state_changed_reason = "human_work_claimed"
+        session.add(
+            models.AuditLog(
+                tenant_id=conversation.tenant_id,
+                category="state_transition",
+                actor=actor,
+                action="HUMAN_ACTIVE",
+                subject_type="conversation",
+                subject_id=str(conversation.id),
+                detail={"reason": "human_work_claimed", "source": source},
+            )
+        )
+        await session.execute(
+            update(models.OutboxMessage)
+            .where(
+                models.OutboxMessage.conversation_id == conversation.id,
+                models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
+                models.OutboxMessage.actor_kind == OutboxActor.BOT,
+                models.OutboxMessage.origin_kind == OutboxOrigin.DECISION,
+            )
+            .values(status="CANCELLED", last_error_code="TAKEOVER")
+        )
         session.add(
             models.AuditLog(
                 tenant_id=work.tenant_id,
@@ -168,25 +239,56 @@ async def resolve_human_work_item(
     allow_override: bool,
 ) -> None:
     async with get_session_factory()() as session:
-        work = await _load_work_for_actor(
+        conversation, account, work, state = await _lock_work_context(
             session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
         )
         if work.version != expected_version:
             raise HumanWorkflowConflict("human_work_item_version_conflict")
         _require_assignee(work, actor=actor, allow_override=allow_override)
+        if state.state not in {"HANDOFF_PENDING", "HUMAN_ACTIVE"}:
+            raise HumanWorkflowConflict("conversation_not_human_active")
+        if account.automation_default not in {"BOT_DRAFT_ONLY", "BOT_ACTIVE"}:
+            raise HumanWorkflowError("account_automation_default_invalid")
+
+        target = account.automation_default
+        reason = "human_work_resolved_account_policy"
+        if not get_settings().meta_automation_default_allowed(account.platform, target):
+            target = "BOT_DRAFT_ONLY"
+            reason = "human_work_resolved_platform_fallback"
+
+        source = state.state
         work.status = "RESOLVED"
         work.resolved_at = datetime.now(UTC)
         work.version += 1
-        session.add(
-            models.AuditLog(
-                tenant_id=work.tenant_id,
-                category="human_work",
-                actor=actor,
-                action="RESOLVE",
-                subject_type="human_work_item",
-                subject_id=str(work.id),
-                detail={"conversation_id": str(work.conversation_id)},
-            )
+        state.state = target
+        state.state_version += 1
+        state.human_agent_id = None
+        state.state_changed_reason = reason
+        session.add_all(
+            [
+                models.AuditLog(
+                    tenant_id=work.tenant_id,
+                    category="human_work",
+                    actor=actor,
+                    action="RESOLVE",
+                    subject_type="human_work_item",
+                    subject_id=str(work.id),
+                    detail={"conversation_id": str(work.conversation_id)},
+                ),
+                models.AuditLog(
+                    tenant_id=conversation.tenant_id,
+                    category="state_transition",
+                    actor=actor,
+                    action=target,
+                    subject_type="conversation",
+                    subject_id=str(conversation.id),
+                    detail={
+                        "reason": reason,
+                        "source": source,
+                        "account_policy": account.automation_default,
+                    },
+                ),
+            ]
         )
         await session.commit()
 
@@ -232,21 +334,27 @@ async def resume_bot(
                 open_work, conversation_tenant_id=conversation.tenant_id
             )
             raise HumanWorkflowConflict("human_work_item_still_open")
-        changed = await session.execute(
-            update(models.AutomationState)
-            .where(
-                models.AutomationState.conversation_id == conversation_id,
-                models.AutomationState.state.in_(["HUMAN_ACTIVE", "BOT_COOLDOWN"]),
-            )
-            .values(
-                state=target,
-                state_version=models.AutomationState.state_version + 1,
-                human_agent_id=None,
-                state_changed_reason="human_work_resumed",
-            )
-        )
-        if changed.rowcount != 1:
+
+        state = await session.get(models.AutomationState, conversation_id, with_for_update=True)
+        if state is None or state.state not in {
+            "HANDOFF_PENDING",
+            "HUMAN_ACTIVE",
+            "BOT_COOLDOWN",
+        }:
             raise HumanWorkflowConflict("conversation_not_human_active")
+        if state.state == "HANDOFF_PENDING":
+            resolved_work_exists = await session.scalar(
+                select(models.HumanWorkItem.id).where(
+                    models.HumanWorkItem.conversation_id == conversation_id,
+                    models.HumanWorkItem.status == "RESOLVED",
+                )
+            )
+            if resolved_work_exists is None:
+                raise HumanWorkflowConflict("conversation_not_human_active")
+        state.state = target
+        state.state_version += 1
+        state.human_agent_id = None
+        state.state_changed_reason = "human_work_resumed"
         session.add(
             models.AuditLog(
                 tenant_id=conversation.tenant_id,

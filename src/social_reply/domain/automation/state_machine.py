@@ -35,6 +35,7 @@ _ALLOWED: dict[AutomationStateEnum, set[AutomationStateEnum]] = {
     },
     AutomationStateEnum.HANDOFF_PENDING: {
         AutomationStateEnum.HUMAN_ACTIVE,
+        AutomationStateEnum.BOT_DRAFT_ONLY,
         AutomationStateEnum.BOT_ACTIVE,
         AutomationStateEnum.CLOSED,
     },
