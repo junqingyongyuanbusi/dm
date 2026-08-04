@@ -2136,6 +2136,17 @@ async def discard_draft(request: Request, decision_id: uuid.UUID) -> Response:
 
 # ---------- 知识库 ----------
 
+
+def _log_knowledge_exception(message: str, exc: Exception) -> None:
+    sanitized = RuntimeError("exception details redacted")
+    logger.exception(
+        "%s: exception_type=%s",
+        message,
+        type(exc).__name__,
+        exc_info=(RuntimeError, sanitized, exc.__traceback__),
+    )
+
+
 _KB_BANNERS = {
     "added": ("ok", "知识条目已添加为草稿并完成向量化；明确发布前不会参与检索。"),
     "duplicate": ("err", "内容重复：相同问答已存在。"),
@@ -2282,18 +2293,19 @@ async def knowledge_add(request: Request) -> Response:
             tenant_id=tenant_id,
             content_hashes=[draft.content_hash],
         )
-        if existing:
-            return RedirectResponse(
-                "/admin/knowledge?notice=duplicate", status_code=status.HTTP_303_SEE_OTHER
-            )
-        try:
-            embedder = _get_embedder()
-            embedding = (await embedder.embed([draft.embed_text]))[0]
-        except Exception:
-            logger.exception("Knowledge manual add embedding failed")
-            return RedirectResponse(
-                "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
-            )
+    if existing:
+        return RedirectResponse(
+            "/admin/knowledge?notice=duplicate", status_code=status.HTTP_303_SEE_OTHER
+        )
+    try:
+        embedder = _get_embedder()
+        embedding = (await embedder.embed([draft.embed_text]))[0]
+    except Exception as exc:
+        _log_knowledge_exception("Knowledge manual add embedding failed", exc)
+        return RedirectResponse(
+            "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
+        )
+    async with get_session_factory()() as session:
         await persist_knowledge_draft(
             session,
             draft,
@@ -2357,8 +2369,8 @@ async def knowledge_import(request: Request) -> Response:
         return RedirectResponse(
             "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
         )
-    except Exception:
-        logger.exception("Knowledge CSV import failed")
+    except Exception as exc:
+        _log_knowledge_exception("Knowledge CSV import failed", exc)
         return RedirectResponse(
             "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
         )

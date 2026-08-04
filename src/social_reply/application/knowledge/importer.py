@@ -95,32 +95,33 @@ async def import_knowledge_rows(
         brand_id_default=brand_id_default,
         source_name=source_name,
     )
-    # 版本以 embedder 自身为准（Fake 记 fake-sha256），保证入库版本与实际向量来源一致
+    # Persist the version reported by the client that produced the vectors.
     embedding_version = embedder.version
 
+    hashes = [row.content_hash for row in rows]
     async with get_session_factory()() as session:
-        # 幂等：已存在的 content_hash 直接 skip，不重复扣 embedding 费
-        hashes = [row.content_hash for row in rows]
         existing = await existing_content_hashes(
             session, tenant_id=tenant_id, content_hashes=hashes
         )
-        # CSV 内部重复也去重（保留首条）
-        seen: set[str] = set()
-        new_rows: list[KnowledgeDraft] = []
-        skipped = 0
-        for row in rows:
-            if row.content_hash in existing or row.content_hash in seen:
-                skipped += 1
-                continue
-            seen.add(row.content_hash)
-            new_rows.append(row)
 
-        # ≤100 条一批调用 embeddings，按顺序对齐（非对称：只 embed 问题）
-        embeddings: list[list[float]] = []
-        for i in range(0, len(new_rows), _EMBED_BATCH_SIZE):
-            batch = new_rows[i : i + _EMBED_BATCH_SIZE]
-            embeddings.extend(await embedder.embed([r.embed_text for r in batch]))
+    # Deduplicate within the CSV while preserving the first row.
+    seen: set[str] = set()
+    new_rows: list[KnowledgeDraft] = []
+    skipped = 0
+    for row in rows:
+        if row.content_hash in existing or row.content_hash in seen:
+            skipped += 1
+            continue
+        seen.add(row.content_hash)
+        new_rows.append(row)
 
+    # Embed questions in ordered batches of at most 100.
+    embeddings: list[list[float]] = []
+    for i in range(0, len(new_rows), _EMBED_BATCH_SIZE):
+        batch = new_rows[i : i + _EMBED_BATCH_SIZE]
+        embeddings.extend(await embedder.embed([r.embed_text for r in batch]))
+
+    async with get_session_factory()() as session:
         for row, embedding in zip(new_rows, embeddings, strict=True):
             await persist_knowledge_draft(
                 session,

@@ -94,6 +94,8 @@ def run_final_guard(
     text = decision.reply_text or ""
     if not text.strip():
         return _downgrade(decision, "GUARD_EMPTY")
+    if len(text) > _MAX_TEXT_LENGTH.get(platform, _DEFAULT_MAX):
+        return _downgrade(decision, "GUARD_TOO_LONG")
     if _has_contact_like(text):
         approved_contact = (
             decision.source == "knowledge"
@@ -102,6 +104,4 @@ def run_final_guard(
         )
         if not approved_contact:
             return _downgrade(decision, "GUARD_PII_LEAK")
-    if len(text) > _MAX_TEXT_LENGTH.get(platform, _DEFAULT_MAX):
-        return _downgrade(decision, "GUARD_TOO_LONG")
     return decision
