@@ -1787,6 +1787,38 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
     assert audit.detail["content_hash"] == chunk.content_hash
 
 
+async def test_duplicate_manual_knowledge_skips_embedding(migrated_db, monkeypatch):
+    from social_reply.application.reply_decision import runner
+    from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
+
+    monkeypatch.setattr(runner, "_embedder", FakeEmbeddingClient())
+    payload = {
+        "tenant_id": "default",
+        "question": "duplicate question",
+        "reply": "duplicate reply",
+    }
+    async with _app_client() as client:
+        csrf = await _login(client)
+        added = await client.post(
+            "/admin/knowledge/add",
+            data={"csrf_token": csrf, **payload},
+        )
+        assert "notice=added" in added.headers["location"]
+
+        class _FailIfCalledEmbeddingClient(FakeEmbeddingClient):
+            async def embed(self, texts):
+                raise AssertionError("duplicate knowledge must not be embedded")
+
+        monkeypatch.setattr(runner, "_embedder", _FailIfCalledEmbeddingClient())
+        duplicate = await client.post(
+            "/admin/knowledge/add",
+            data={"csrf_token": csrf, **payload},
+        )
+
+    assert duplicate.status_code == 303
+    assert "notice=duplicate" in duplicate.headers["location"]
+
+
 async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatch):
     from social_reply.application.reply_decision import runner
     from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient

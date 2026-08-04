@@ -1,17 +1,19 @@
 """回复模板 CSV 导入：content_hash 幂等 + 批量 embedding"""
 
 import csv
-import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from sqlalchemy import select
-
+from social_reply.application.knowledge.drafts import (
+    KnowledgeDraft,
+    build_knowledge_draft,
+    existing_content_hashes,
+    persist_knowledge_draft,
+)
 from social_reply.domain.knowledge.embeddings import EmbeddingClient
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.infrastructure.database.models import AuditLog, KnowledgeChunk, KnowledgeDocument
 
 logger = logging.getLogger(__name__)
 
@@ -28,19 +30,6 @@ class ImportReport:
     total: int  # CSV 有效数据行数（含空行）
 
 
-@dataclass(frozen=True)
-class _Row:
-    question: str
-    reply: str
-    brand_id: str
-    platform: str | None
-    category: str | None
-    is_official_contact: bool
-    content: str  # 展示/LLM 上下文（问+答），也是幂等 content_hash 的来源
-    embed_text: str  # 实际送去 embedding 的文本（非对称：仅 question）
-    content_hash: str
-
-
 def parse_optional_bool(value: str | None) -> bool:
     """Parse an optional strict CSV boolean; blank values are false."""
     normalized = (value or "").strip().casefold()
@@ -51,14 +40,20 @@ def parse_optional_bool(value: str | None) -> bool:
     raise ValueError(f"is_official_contact must be true/false, got {value!r}")
 
 
-def _parse_rows(f: TextIO, brand_id_default: str) -> tuple[list[_Row], int]:
+def _parse_rows(
+    f: TextIO,
+    *,
+    tenant_id: str,
+    brand_id_default: str,
+    source_name: str,
+) -> tuple[list[KnowledgeDraft], int]:
     """解析 CSV，返回 (有效行, 空行数)；表头缺失或超行数抛 ValueError"""
     reader = csv.DictReader(f)
     headers = set(reader.fieldnames or [])
     missing = _REQUIRED_HEADERS - headers
     if missing:
         raise ValueError(f"CSV 表头缺少必需列: {'、'.join(sorted(missing))}（必需 question,reply）")
-    rows: list[_Row] = []
+    rows: list[KnowledgeDraft] = []
     blank = 0
     for raw in reader:
         question = (raw.get("question") or "").strip()
@@ -67,19 +62,16 @@ def _parse_rows(f: TextIO, brand_id_default: str) -> tuple[list[_Row], int]:
             blank += 1
             logger.warning("跳过空行（question/reply 为空）: %r", raw)
             continue
-        content = f"问：{question}\n答：{reply}"
         rows.append(
-            _Row(
+            build_knowledge_draft(
+                tenant_id=tenant_id,
                 question=question,
                 reply=reply,
                 brand_id=(raw.get("brand_id") or "").strip() or brand_id_default,
                 platform=(raw.get("platform") or "").strip() or None,
                 category=(raw.get("category") or "").strip() or None,
                 is_official_contact=parse_optional_bool(raw.get("is_official_contact")),
-                content=content,
-                # 非对称嵌入：只 embed 问题，与用户 query 同分布；答案不参与向量
-                embed_text=question,
-                content_hash=hashlib.sha256(content.encode()).hexdigest(),
+                source_file=source_name,
             )
         )
     if len(rows) + blank > MAX_IMPORT_ROWS:
@@ -97,26 +89,24 @@ async def import_knowledge_rows(
     actor: str = "knowledge-import",
 ) -> ImportReport:
     """导入回复模板（文本流）：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
-    rows, blank = _parse_rows(f, brand_id_default)
+    rows, blank = _parse_rows(
+        f,
+        tenant_id=tenant_id,
+        brand_id_default=brand_id_default,
+        source_name=source_name,
+    )
     # 版本以 embedder 自身为准（Fake 记 fake-sha256），保证入库版本与实际向量来源一致
     embedding_version = embedder.version
 
     async with get_session_factory()() as session:
         # 幂等：已存在的 content_hash 直接 skip，不重复扣 embedding 费
-        hashes = [r.content_hash for r in rows]
-        existing = set(
-            (
-                await session.execute(
-                    select(KnowledgeChunk.content_hash).where(
-                        KnowledgeChunk.tenant_id == tenant_id,
-                        KnowledgeChunk.content_hash.in_(hashes),
-                    )
-                )
-            ).scalars()
+        hashes = [row.content_hash for row in rows]
+        existing = await existing_content_hashes(
+            session, tenant_id=tenant_id, content_hashes=hashes
         )
         # CSV 内部重复也去重（保留首条）
         seen: set[str] = set()
-        new_rows: list[_Row] = []
+        new_rows: list[KnowledgeDraft] = []
         skipped = 0
         for row in rows:
             if row.content_hash in existing or row.content_hash in seen:
@@ -132,49 +122,13 @@ async def import_knowledge_rows(
             embeddings.extend(await embedder.embed([r.embed_text for r in batch]))
 
         for row, embedding in zip(new_rows, embeddings, strict=True):
-            doc = KnowledgeDocument(
-                tenant_id=tenant_id,
-                brand_id=row.brand_id,
-                platform=row.platform,
-                category=row.category,
-                question=row.question,
-                reply=row.reply,
-                status="draft",
-                is_official_contact=row.is_official_contact,
-                source_file=source_name,
+            await persist_knowledge_draft(
+                session,
+                row,
+                embedding_version=embedding_version,
+                embedding=embedding,
+                actor=actor,
             )
-            session.add(doc)
-            await session.flush()
-            session.add(
-                KnowledgeChunk(
-                    tenant_id=tenant_id,
-                    document_id=doc.id,
-                    content=row.content,
-                    embed_text=row.embed_text,
-                    content_hash=row.content_hash,
-                    embedding_version=embedding_version,
-                    embedding=embedding,
-                )
-            )
-            if row.is_official_contact:
-                session.add(
-                    AuditLog(
-                        tenant_id=tenant_id,
-                        category="admin_action",
-                        actor=actor,
-                        action="SET_KNOWLEDGE_OFFICIAL_CONTACT",
-                        subject_type="knowledge_document",
-                        subject_id=str(doc.id),
-                        detail={
-                            "from": False,
-                            "to": True,
-                            "brand": row.brand_id,
-                            "platform": row.platform,
-                            "status": "draft",
-                            "content_hash": row.content_hash,
-                        },
-                    )
-                )
         await session.commit()
 
     return ImportReport(

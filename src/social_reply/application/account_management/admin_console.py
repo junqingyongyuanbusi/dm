@@ -3,7 +3,6 @@
 与 admin.py 共享服务端会话与 CSRF；全部查询和写操作按当前 Principal 租户范围过滤。
 """
 
-import hashlib
 import json
 import logging
 import uuid
@@ -44,6 +43,12 @@ from social_reply.application.account_management.jobs import provisioning_job_is
 from social_reply.application.account_management.oauth.common import notice
 from social_reply.application.account_management.service import enable_xchat_for_account
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.application.knowledge.drafts import (
+    build_knowledge_draft,
+    existing_content_hashes,
+    persist_knowledge_draft,
+)
+from social_reply.application.knowledge.importer import import_knowledge_rows
 from social_reply.application.message_delivery.contracts import (
     build_direct_reply_destination,
 )
@@ -2260,77 +2265,42 @@ async def knowledge_add(request: Request) -> Response:
     is_official_contact = official_value == "true"
     if not question or not reply:
         raise HTTPException(status_code=422, detail="question_and_reply_required")
-    content = f"问：{question}\n答：{reply}"
-    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    draft = build_knowledge_draft(
+        tenant_id=tenant_id,
+        question=question,
+        reply=reply,
+        brand_id=(form.get("brand_id") or "").strip() or "default",
+        category=(form.get("category") or "").strip() or None,
+        is_official_contact=is_official_contact,
+        source_file="admin-console",
+    )
     from social_reply.application.reply_decision.runner import _get_embedder
 
-    try:
-        embedder = _get_embedder()
-        embedding = (await embedder.embed([question]))[0]
-    except Exception:
-        return RedirectResponse(
-            "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
-        )
     async with get_session_factory()() as session:
-        exists = (
-            await session.execute(
-                select(models.KnowledgeChunk.id)
-                .join(
-                    models.KnowledgeDocument,
-                    models.KnowledgeChunk.document_id == models.KnowledgeDocument.id,
-                )
-                .where(
-                    models.KnowledgeDocument.tenant_id == tenant_id,
-                    models.KnowledgeChunk.content_hash == content_hash,
-                )
-            )
-        ).first()
-        if exists:
+        existing = await existing_content_hashes(
+            session,
+            tenant_id=tenant_id,
+            content_hashes=[draft.content_hash],
+        )
+        if existing:
             return RedirectResponse(
                 "/admin/knowledge?notice=duplicate", status_code=status.HTTP_303_SEE_OTHER
             )
-        doc = models.KnowledgeDocument(
-            tenant_id=tenant_id,
-            brand_id=(form.get("brand_id") or "").strip() or "default",
-            category=(form.get("category") or "").strip() or None,
-            question=question,
-            reply=reply,
-            status="draft",
-            is_official_contact=is_official_contact,
-            source_file="admin-console",
-        )
-        session.add(doc)
-        await session.flush()
-        session.add(
-            models.KnowledgeChunk(
-                tenant_id=tenant_id,
-                document_id=doc.id,
-                content=content,
-                embed_text=question,
-                content_hash=content_hash,
-                embedding_version=embedder.version,
-                embedding=embedding,
+        try:
+            embedder = _get_embedder()
+            embedding = (await embedder.embed([draft.embed_text]))[0]
+        except Exception:
+            logger.exception("Knowledge manual add embedding failed")
+            return RedirectResponse(
+                "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
             )
+        await persist_knowledge_draft(
+            session,
+            draft,
+            embedding_version=embedder.version,
+            embedding=embedding,
+            actor=principal.actor,
         )
-        if is_official_contact:
-            session.add(
-                models.AuditLog(
-                    tenant_id=tenant_id,
-                    category="admin_action",
-                    actor=principal.actor,
-                    action="SET_KNOWLEDGE_OFFICIAL_CONTACT",
-                    subject_type="knowledge_document",
-                    subject_id=str(doc.id),
-                    detail={
-                        "from": False,
-                        "to": True,
-                        "brand": doc.brand_id,
-                        "platform": doc.platform,
-                        "status": "draft",
-                        "content_hash": content_hash,
-                    },
-                )
-            )
         await session.commit()
     return RedirectResponse("/admin/knowledge?notice=added", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -2371,7 +2341,6 @@ async def knowledge_import(request: Request) -> Response:
     source_name = (str(filename or "").strip() or "import.csv")[:256]
     import io
 
-    from social_reply.application.knowledge.importer import import_knowledge_rows
     from social_reply.application.reply_decision.runner import _get_embedder
 
     try:
@@ -2389,6 +2358,7 @@ async def knowledge_import(request: Request) -> Response:
             "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
         )
     except Exception:
+        logger.exception("Knowledge CSV import failed")
         return RedirectResponse(
             "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
         )
