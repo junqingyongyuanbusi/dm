@@ -42,7 +42,6 @@ __all__ = [
     "load_persona",
     "parse_voice_preferences",
     "prompt_version_label",
-    "validate_persona",
 ]
 
 
@@ -90,16 +89,6 @@ async def load_persona(session: AsyncSession, tenant_id: str, brand_id: str) -> 
 def prompt_version_label(base: str, persona: ResolvedPersona) -> str:
     """Include the effective preference revision in reply_decisions.prompt_version."""
     return base if persona.is_default else f"{base}#r{persona.revision}"
-
-
-def validate_persona(text: str) -> str:
-    """Backward-compatible invariant helper for code-compiled persona text."""
-    cleaned = text.strip()
-    if not cleaned:
-        raise ValueError("persona_required")
-    if len(cleaned) > PERSONA_MAX_CHARS:
-        raise ValueError("persona_too_long")
-    return cleaned
 
 
 def parse_voice_preferences(value: dict[str, Any]) -> VoicePreferences:

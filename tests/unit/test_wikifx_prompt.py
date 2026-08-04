@@ -1,6 +1,6 @@
 import pytest
 
-from social_reply.application.reply_decision.persona import PERSONA_MAX_CHARS, validate_persona
+from social_reply.application.reply_decision.persona import PERSONA_MAX_CHARS
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.domain.reply.openai_client import (
     _RESPONSE_SCHEMA,
@@ -37,7 +37,7 @@ _CONTRACT_PROMPT_ANCHORS = (
 
 
 def test_default_persona_fits_the_editable_segment_budget() -> None:
-    assert validate_persona(DEFAULT_PERSONA) == DEFAULT_PERSONA
+    assert DEFAULT_PERSONA.strip() == DEFAULT_PERSONA
     assert len(DEFAULT_PERSONA) < PERSONA_MAX_CHARS
 
 

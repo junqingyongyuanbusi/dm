@@ -59,7 +59,7 @@ def test_voice_preferences_reject_invalid_enums_missing_fields_and_extras():
 
 def test_voice_preferences_json_and_compiler_are_deterministic():
     encoded = DEFAULT_VOICE_PREFERENCES.to_json()
-    decoded = VoicePreferences.from_json(encoded)
+    decoded = VoicePreferences.model_validate_json(encoded)
     assert decoded == DEFAULT_VOICE_PREFERENCES
     assert decoded.to_json() == encoded
     assert compile_voice_preferences(decoded) == DEFAULT_PERSONA

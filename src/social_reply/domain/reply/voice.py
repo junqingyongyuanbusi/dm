@@ -49,10 +49,6 @@ class VoicePreferences(BaseModel):
     def from_dict(cls, value: object) -> "VoicePreferences":
         return cls.model_validate(value)
 
-    @classmethod
-    def from_json(cls, value: str | bytes) -> "VoicePreferences":
-        return cls.model_validate_json(value)
-
 
 DEFAULT_VOICE_PREFERENCES = VoicePreferences(
     tone=VoiceTone.PROFESSIONAL,

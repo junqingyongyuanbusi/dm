@@ -314,12 +314,12 @@ ORDER BY status;
 SELECT id, tenant_id, brand_id, platform, reply
 FROM knowledge_documents
 WHERE status = 'published'
-  AND (reply ~ '[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]{2,}'
+  AND (reply ~ '[[:alnum:]._%+-]+@[[:alnum:].-]+[.][[:alpha:]]{2,}'
        OR reply ~ '(^|[^0-9])[0-9]([[:space:].-]*[0-9]){5,}([^0-9]|$)'
-       OR reply ~* '(https?://|www\\.)'
+       OR reply ~* '(https?://|www[.])'
        OR reply ~* '(^|[^[:alnum:]_.+@-])@[[:alnum:]_]'
        OR reply ~* '(telegram|whatsapp|wechat|line|skype|qq|feishu|lark|微信|飞书)'
-       OR reply ~* '(hotline|phone|tel|客服|热线|电话).{0,16}[0-9]{3,5}');
+       OR reply ~* '(hotline|phone|tel|客服|热线|电话).{0,16}[+]?[0-9]{3,5}');
 ```
 
 Treat every PII-looking published template in the pre-upgrade inventory as unclassified. After upgrade, repeat the query with `is_official_contact` in the selected columns and retain both exports in the rollout record.

@@ -1,8 +1,5 @@
-import uuid
-
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
@@ -11,22 +8,11 @@ from tests.integration.migration_support import (
     temporary_database,
 )
 
-from social_reply.shared.config import get_settings
-
 pytestmark = pytest.mark.integration
 
 
 async def test_platform_account_migration_rejects_incompatible_capability():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_contract_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
+    async with temporary_database("social_reply_contract") as (_database_name, database_url):
         await assert_alembic_succeeds(database_url, "upgrade", "f3a6c1d8e250")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -46,17 +32,6 @@ async def test_platform_account_migration_rejects_incompatible_capability():
         result = await run_alembic(database_url, "upgrade", "head")
         assert result.returncode != 0
         assert "capability violates the application contract" in (result.stdout + result.stderr)
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname=:name AND pid <> pg_backend_pid()"
-                ),
-                {"name": database_name},
-            )
-            await connection.execute(text(f'DROP DATABASE IF EXISTS "{database_name}"'))
-        await admin_engine.dispose()
 
 
 async def test_meta_route_migration_rejects_cross_family_collision():
