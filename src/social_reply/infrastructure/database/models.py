@@ -672,6 +672,10 @@ class DeliveryAttempt(Base):
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
     __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'published')",
+            name="ck_knowledge_documents_status",
+        ),
         # 词法检索（BM25 近似）：question 的 tsvector GIN 索引，用于混合检索的关键词一路，
         # 补向量对专有名词（pip/broker/品牌名）召回不足的短板。'simple' 分词器不做词干/停用词，
         # 对多语言与短模板更稳（避免 english 词干把 "pips"→"pip" 误并或丢词）。
@@ -692,7 +696,10 @@ class KnowledgeDocument(Base):
     question_tsv: Mapped[str] = mapped_column(
         TSVECTOR, Computed("to_tsvector('simple', question)", persisted=True)
     )
-    status: Mapped[str] = mapped_column(String(16), default="published")
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default=text("'draft'"))
+    is_official_contact: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     source_file: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -739,8 +746,23 @@ class ReplyPrompt(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(String(64), index=True)
     brand_id: Mapped[str] = mapped_column(String(64), default="default")
+    # Compatibility projection for old Workers. New code compiles this from voice_preferences
+    # and never executes database persona text as instructions.
     persona: Mapped[str] = mapped_column(Text)
-    # 每次保存自增，写进 reply_decisions.prompt_version，用于回溯某条回复出自哪版人设。
+    voice_preferences: Mapped[dict[str, str]] = mapped_column(
+        JSONB,
+        default=lambda: {
+            "tone": "professional",
+            "length": "concise",
+            "empathy": "standard",
+            "emoji": "never",
+        },
+        server_default=text(
+            '\'{"tone":"professional","length":"concise",'
+            '"empathy":"standard","emoji":"never"}\'::jsonb'
+        ),
+    )
+    # Every save increments this and records it in reply_decisions.prompt_version.
     revision: Mapped[int] = mapped_column(Integer, default=1)
     updated_by: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(

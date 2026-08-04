@@ -18,8 +18,8 @@ class LLMContext:
     # 同会话历史消息（按时间升序），元素为 (role, text)：
     # role ∈ {"user", "assistant"}，不含当前这条。默认空 → 单轮行为不变。
     history: tuple[tuple[str, str], ...] = ()
-    # 租户在后台编辑的品牌语气、风格与本地化偏好。None → 使用代码内置默认偏好。
-    # WikiFX 身份、领域事实边界、动作语义与安全规则由 CONTRACT_PROMPT 固定追加。
+    # Code-compiled text from finite tenant voice preferences. None uses compiled defaults.
+    # Database free text is never executed; identity, action semantics, and safety stay immutable.
     persona: str | None = None
 
 
