@@ -328,7 +328,21 @@ The migration aborts if any knowledge status is not exactly `draft` or `publishe
 
 Every existing `reply_prompts` row is intentionally neutralized: `voice_preferences` becomes the canonical code default, `persona` becomes the exact code-compiled compatibility projection, `revision` increments once, and `updated_by` becomes `migration:d3f6a1b8c904`. Arbitrary legacy prompt text is not copied into JSON or audit. Alembic downgrade cannot recover that text; restore the verified pre-upgrade backup if it is required.
 
-Before the migration starts, pause decision and delivery dispatch as well as `/admin/prompt` and `/admin/knowledge` mutations. Scale Worker and Scheduler to zero, or otherwise prove that neither actor can claim DecisionJobs or Outboxes; tenant-global kill switches alone are insufficient because delivery does not re-check them. Wait until no `decision_jobs` row is `PROCESSING` and no `DECISION/BOT` Outbox row is `SENDING`. Revision `d3f6a1b8c904` aborts if such a send is active and quarantines queued `PENDING` or `FAILED` `DECISION/BOT` Outboxes as `NEEDS_REVIEW/PROMPT_GOVERNANCE_ROLLOUT`, so they cannot be delivered after the new Worker starts. Keep dispatch paused while API runs the migration and until API, Worker, and Scheduler all run the new identical digest. Old Workers must not make automated decisions after `d3f6a1b8c904`, because they do not recognize every governed contact form. Read-only inventory remains safe.
+Before the migration starts, pause decision and delivery dispatch as well as `/admin/prompt` and `/admin/knowledge` mutations. Scale Worker and Scheduler to zero; tenant-global kill switches alone are insufficient because delivery does not re-check them. Record the current region and replica counts first, then run the equivalent of:
+
+```bash
+railway scale --environment production --service worker us-east4-eqdc4a=0
+railway scale --environment production --service scheduler us-east4-eqdc4a=0
+```
+
+Wait until no `decision_jobs` row is `PROCESSING` and no `DECISION/BOT` Outbox row is `SENDING`. Revision `d3f6a1b8c904` aborts if such a send is active and quarantines queued `PENDING` or `FAILED` `DECISION/BOT` Outboxes as `NEEDS_REVIEW/PROMPT_GOVERNANCE_ROLLOUT`. With both roles still at zero replicas, run `scripts/publish_railway_release.sh`; the script retains the prior digest, promotes the immutable SHA image, migrates and verifies API first, then creates the target Worker and Scheduler deployments. After the script succeeds, restore the recorded capacities against the target deployments:
+
+```bash
+railway scale --environment production --service worker us-east4-eqdc4a=1
+railway scale --environment production --service scheduler us-east4-eqdc4a=1
+```
+
+Do not resume admin mutations until Worker and Scheduler processes are running, all three roles report `SUCCESS` at the same target digest, migration head and `/healthz` are correct, and role logs are clean. If the release script cannot verify a zero-replica deployment, stop and use a reported manual fallback: deploy API from the already-promoted immutable digest, restore and deploy Worker, then restore and deploy Scheduler while preserving every digest, health, rollback, and deployment-ID invariant in this runbook. Old Workers must never make automated decisions after `d3f6a1b8c904`. Replace the example region and replica values with the recorded Railway topology rather than assuming them in another environment.
 
 After upgrade:
 

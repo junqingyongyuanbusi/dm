@@ -38,7 +38,7 @@ def test_public_reply_with_pii_downgraded_to_handoff():
 def test_approved_official_contact_template_passes_only_verbatim_from_knowledge(template):
     decision = ReplyDecision(
         action=ReplyAction.AUTO_REPLY,
-        reply_text=f"  {template}  ",
+        reply_text=template,
         source="knowledge",
     )
     assert (
@@ -51,7 +51,15 @@ def test_approved_official_contact_template_passes_only_verbatim_from_knowledge(
     )
 
 
-def test_approved_contact_exemption_rejects_llm_copy_and_modified_text():
+@pytest.mark.parametrize(
+    "modified_text",
+    (
+        "Please use Official support: support@example.com",
+        " Official support: support@example.com",
+        "Official support: support@example.com ",
+    ),
+)
+def test_approved_contact_exemption_rejects_llm_copy_and_modified_text(modified_text):
     template = "Official support: support@example.com"
     llm_copy = ReplyDecision(
         action=ReplyAction.AUTO_REPLY,
@@ -60,7 +68,7 @@ def test_approved_contact_exemption_rejects_llm_copy_and_modified_text():
     )
     modified = ReplyDecision(
         action=ReplyAction.AUTO_REPLY,
-        reply_text=f"Please use {template}",
+        reply_text=modified_text,
         source="knowledge",
     )
     assert (
@@ -124,8 +132,13 @@ def test_private_draft_with_pii_keeps_review_behavior():
         "Visit support.example.com",
         "Follow @WikiFXSupport",
         "Telegram ID: wikifx_support",
-        "Feishu ID: wikifx_support",
-        "飞书账号：wikifx_support",
+        "Phone: +12345",
+        "tel:+12345",
+        "WhatsApp: +12345",
+        "Telegram ID: +12345",
+        "Feishu ID: +12345",
+        "Lark ID: +12345",
+        "飞书账号：+12345",
         "微信号：wikifx123",
         "Customer service hotline: 12345",
         "Customer service number is 12345",

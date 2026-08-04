@@ -21,7 +21,7 @@ _MESSAGING_ID = re.compile(
     r"|messenger|discord|viber|kakao\s*talk|kakaotalk|feishu|lark|微信|微訊|飞书|飛書)"
     r"\s*(?:(?:id|user(?:name)?|handle|number|no\.?|账号|帳號|号码|號碼|号|號)"
     r"\s*[:：]?\s*|[:：]\s*)"
-    r"@?[A-Z0-9][A-Z0-9_.+-]{1,63}"
+    r"(?:@|\+)?[A-Z0-9][A-Z0-9_.+-]{1,63}"
 )
 _SERVICE_NUMBER_CONTEXT = (
     r"(?:customer\s+service(?:\s+(?:line|number))?"
@@ -37,8 +37,8 @@ _SHORT_SERVICE_NUMBER = re.compile(
     rf"{_SERVICE_NUMBER_CONTEXT}"
     rf"\s*(?:(?:number|no\.?|号码|號碼|号|號)\s*)?"
     rf"(?:us\s+|me\s+)?(?:(?:is|at|on)\s+|(?:为|為|是)\s*)?[:：]?\s*"
-    rf"(?<!\d)\d{{3,5}}(?!\d)"
-    rf"|(?<!\d)\d{{3,5}}(?!\d)\s*"
+    rf"(?<!\d)\+?\d{{3,5}}(?!\d)"
+    rf"|(?<!\d)\+?\d{{3,5}}(?!\d)\s*"
     rf"(?:customer\s+service|service\s+(?:hotline|line)|support\s+(?:hotline|line)"
     rf"|hotline|客服热线|客服熱線|服务热线|服務熱線)"
     rf")"
@@ -101,7 +101,7 @@ def run_final_guard(
         approved_contact = (
             decision.source == "knowledge"
             and approved_official_contact_reply is not None
-            and text.strip() == approved_official_contact_reply.strip()
+            and text == approved_official_contact_reply
         )
         if not approved_contact:
             return _downgrade(decision, "GUARD_PII_LEAK")
