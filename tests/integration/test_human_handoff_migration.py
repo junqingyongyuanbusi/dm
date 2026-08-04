@@ -1,6 +1,4 @@
 import asyncio
-import uuid
-from contextlib import asynccontextmanager
 
 import pytest
 from migrations.versions.a9d4e6f2b713_repair_human_handoff_lifecycle import (
@@ -9,37 +7,14 @@ from migrations.versions.a9d4e6f2b713_repair_human_handoff_lifecycle import (
     _REPAIR_RESOLVED_HANDOFFS,
 )
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
-from tests.integration.migration_support import assert_alembic_succeeds
-
-from social_reply.shared.config import get_settings
+from tests.integration.migration_support import assert_alembic_succeeds, temporary_database
 
 pytestmark = pytest.mark.integration
 
 
-@asynccontextmanager
-async def _temporary_database(prefix):
-    base_url = make_url(get_settings().database_url)
-    database_name = f"{prefix}_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-    try:
-        yield database_name, database_url
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()
-
-
 async def test_human_handoff_repair_downgrade_and_reupgrade():
-    async with _temporary_database("social_reply_handoff") as (_database_name, database_url):
+    async with temporary_database("social_reply_handoff") as (_database_name, database_url):
         await assert_alembic_succeeds(database_url, "upgrade", "f8a1c3d5e702")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -230,7 +205,7 @@ async def test_human_handoff_repair_downgrade_and_reupgrade():
 
 
 async def test_human_handoff_repair_waits_for_committed_account_policy():
-    async with _temporary_database("social_reply_handoff_policy") as (
+    async with temporary_database("social_reply_handoff_policy") as (
         _database_name,
         database_url,
     ):

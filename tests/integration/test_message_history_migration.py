@@ -5,7 +5,11 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
-from tests.integration.migration_support import assert_alembic_succeeds, run_alembic
+from tests.integration.migration_support import (
+    assert_alembic_succeeds,
+    run_alembic,
+    temporary_database,
+)
 
 from social_reply.shared.config import get_settings
 
@@ -56,16 +60,7 @@ async def test_platform_account_migration_rejects_incompatible_capability():
 
 
 async def test_meta_route_migration_rejects_cross_family_collision():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_meta_route_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
+    async with temporary_database("social_reply_meta_route") as (_database_name, database_url):
         await assert_alembic_succeeds(database_url, "upgrade", "c5a8e2f4d901")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -85,25 +80,13 @@ async def test_meta_route_migration_rejects_cross_family_collision():
         result = await run_alembic(database_url, "upgrade", "head")
         assert result.returncode != 0
         assert "cross-family Meta webhook public_id collision" in (result.stdout + result.stderr)
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()
 
 
 async def test_human_work_hardening_repairs_legacy_rows():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_human_work_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
+    async with temporary_database("social_reply_human_work") as (
+        _database_name,
+        database_url,
+    ):
         await assert_alembic_succeeds(database_url, "upgrade", "a1c4e8b7f302")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -265,25 +248,10 @@ async def test_human_work_hardening_repairs_legacy_rows():
         assert rows[4].assigned_actor is None
         assert rows[4].claimed_at is None
         assert rows[4].version == 2
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()
 
 
 async def test_message_history_migration_backfills_and_round_trips():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_history_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
+    async with temporary_database("social_reply_history") as (_database_name, database_url):
         await assert_alembic_succeeds(database_url, "upgrade", "e7b2c4d9a610")
         engine = create_async_engine(database_url)
         seed_statements = (
@@ -472,9 +440,3 @@ async def test_message_history_migration_backfills_and_round_trips():
             ).one()
         await engine.dispose()
         assert tuple(counts) == (3, 1, 3)
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()

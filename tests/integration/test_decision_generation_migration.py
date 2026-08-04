@@ -4,12 +4,9 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
-from tests.integration.migration_support import assert_alembic_succeeds
-
-from social_reply.shared.config import get_settings
+from tests.integration.migration_support import assert_alembic_succeeds, temporary_database
 
 pytestmark = pytest.mark.integration
 _BASE_REVISION = "b8e1d4f7a2c3"
@@ -17,24 +14,6 @@ _FENCING_REVISION = "c2f4a6d8e901"
 _ACCOUNT_ID = uuid.UUID("10000000-0000-0000-0000-000000000001")
 _CONTACT_ID = uuid.UUID("10000000-0000-0000-0000-000000000002")
 _CONVERSATION_ID = uuid.UUID("10000000-0000-0000-0000-000000000003")
-
-
-async def _create_database(prefix: str):
-    base_url = make_url(get_settings().database_url)
-    database_name = f"{prefix}_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-    return database_name, database_url, admin_engine
-
-
-async def _drop_database(database_name: str, admin_engine) -> None:
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)'))
-    await admin_engine.dispose()
 
 
 async def _seed_scope(connection) -> None:
@@ -201,10 +180,10 @@ async def _insert_legacy_decision(
 
 
 async def test_generation_migration_backfill_triggers_and_downgrade():
-    database_name, database_url, admin_engine = await _create_database(
-        "social_reply_generation_migration"
-    )
-    try:
+    async with temporary_database("social_reply_generation_migration") as (
+        _database_name,
+        database_url,
+    ):
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         orphan_message_id = uuid.uuid4()
@@ -769,15 +748,13 @@ async def test_generation_migration_backfill_triggers_and_downgrade():
         assert remaining_columns == set()
         assert remaining_indexes == 0
         assert remaining_check == 0
-    finally:
-        await _drop_database(database_name, admin_engine)
 
 
 async def test_reply_decision_trigger_rejects_stale_overlapping_transaction():
-    database_name, database_url, admin_engine = await _create_database(
-        "social_reply_decision_commit_race"
-    )
-    try:
+    async with temporary_database("social_reply_decision_commit_race") as (
+        _database_name,
+        database_url,
+    ):
         await assert_alembic_succeeds(database_url, "upgrade", _FENCING_REVISION)
         engine = create_async_engine(database_url)
         old_message_id = uuid.uuid4()
@@ -900,8 +877,6 @@ async def test_reply_decision_trigger_rejects_stale_overlapping_transaction():
         assert tuple(stale_counts) == (0, 0)
         assert old_status == "SUPERSEDED"
         assert new_generation == 2
-    finally:
-        await _drop_database(database_name, admin_engine)
 
 
 async def _insert_current_job(connection, *, job_id: uuid.UUID, message_id: uuid.UUID) -> None:
@@ -927,10 +902,10 @@ async def _insert_current_job(connection, *, job_id: uuid.UUID, message_id: uuid
 
 
 async def test_migration_cancellation_waits_for_delivery_advisory_lock():
-    database_name, database_url, admin_engine = await _create_database(
-        "social_reply_generation_race"
-    )
-    try:
+    async with temporary_database("social_reply_generation_race") as (
+        _database_name,
+        database_url,
+    ):
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         old_message_id, new_message_id = uuid.uuid4(), uuid.uuid4()
@@ -987,5 +962,3 @@ async def test_migration_cancellation_waits_for_delivery_advisory_lock():
             ).scalar_one()
         await engine.dispose()
         assert status == "SENT"
-    finally:
-        await _drop_database(database_name, admin_engine)

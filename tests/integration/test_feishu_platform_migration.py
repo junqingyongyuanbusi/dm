@@ -2,12 +2,13 @@ import uuid
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
-from tests.integration.migration_support import assert_alembic_succeeds, run_alembic
-
-from social_reply.shared.config import get_settings
+from tests.integration.migration_support import (
+    assert_alembic_succeeds,
+    run_alembic,
+    temporary_database,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -18,16 +19,7 @@ _FEISHU_ACCOUNT_ID = "00000000-0000-0000-0000-00000000fe15"
 
 
 async def test_feishu_platform_constraint_upgrade_and_fail_closed_downgrade():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_feishu_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
+    async with temporary_database("social_reply_feishu") as (_database_name, database_url):
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         await assert_alembic_succeeds(database_url, "upgrade", _FEISHU_REVISION)
         engine = create_async_engine(database_url)
@@ -95,25 +87,13 @@ async def test_feishu_platform_constraint_upgrade_and_fail_closed_downgrade():
         await engine.dispose()
         assert revision == _HEAD_REVISION
         assert "feishu" in new_definition
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()
 
 
 async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_feishu_dedup_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
+    async with temporary_database("social_reply_feishu_dedup") as (
+        _database_name,
+        database_url,
+    ):
         await assert_alembic_succeeds(database_url, "upgrade", "head")
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
@@ -174,28 +154,16 @@ async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
         await engine.dispose()
         assert revision == _HEAD_REVISION
         assert index_count == 1
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()
 
 
 async def test_feishu_dedup_migration_recovers_invalid_concurrent_index():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_feishu_invalid_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    account_id = uuid.uuid4()
-    first_raw_id = uuid.uuid4()
-    second_raw_id = uuid.uuid4()
-    try:
+    async with temporary_database("social_reply_feishu_invalid") as (
+        _database_name,
+        database_url,
+    ):
+        account_id = uuid.uuid4()
+        first_raw_id = uuid.uuid4()
+        second_raw_id = uuid.uuid4()
         await assert_alembic_succeeds(database_url, "upgrade", _FEISHU_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -288,9 +256,3 @@ async def test_feishu_dedup_migration_recovers_invalid_concurrent_index():
                     {"id": uuid.uuid4(), "account_id": account_id},
                 )
         await engine.dispose()
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()
