@@ -104,7 +104,7 @@ async def test_legacy_persona_text_is_never_executed(session, migrated_db):
 
 @pytest.mark.parametrize("malformed", [None, {}, {"tone": "hostile"}, ["professional"]])
 async def test_malformed_database_preferences_fail_closed_to_compiled_defaults(
-    session, migrated_db, malformed
+    session, migrated_db, malformed, caplog
 ):
     await session.execute(
         insert(models.ReplyPrompt).values(
@@ -120,6 +120,8 @@ async def test_malformed_database_preferences_fail_closed_to_compiled_defaults(
     assert resolved.text == DEFAULT_PERSONA
     assert resolved.preferences == DEFAULT_VOICE_PREFERENCES
     assert resolved.revision == 2
+    assert "Invalid voice preferences; using defaults" in caplog.text
+    assert "legacy arbitrary instructions" not in caplog.text
 
 
 async def test_voice_preferences_are_scoped_per_tenant(session, migrated_db):

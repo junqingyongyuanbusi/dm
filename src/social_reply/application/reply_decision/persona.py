@@ -1,5 +1,6 @@
 """Resolve code-owned brand voice preferences for reply generation."""
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,8 @@ from social_reply.domain.reply.voice import (
     compile_voice_preferences,
 )
 from social_reply.infrastructure.database import models
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CANONICAL_VOICE_PREFERENCES",
@@ -67,7 +70,15 @@ async def load_persona(session: AsyncSession, tenant_id: str, brand_id: str) -> 
         return ResolvedPersona(text=DEFAULT_PERSONA, revision=None)
     try:
         preferences = VoicePreferences.from_dict(row.voice_preferences)
-    except (ValidationError, TypeError, ValueError):
+    except (ValidationError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Invalid voice preferences; using defaults: tenant=%s brand=%s revision=%s "
+            "exception_type=%s",
+            tenant_id,
+            brand_id,
+            row.revision,
+            type(exc).__name__,
+        )
         preferences = DEFAULT_VOICE_PREFERENCES
     return ResolvedPersona(
         text=compile_voice_preferences(preferences),

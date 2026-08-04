@@ -35,7 +35,8 @@ _SERVICE_NUMBER_CONTEXT = (
 _SHORT_SERVICE_NUMBER = re.compile(
     rf"(?ix)(?:"
     rf"{_SERVICE_NUMBER_CONTEXT}"
-    rf"\s*(?:(?:number|no\.?|号码|號碼|号|號)\s*)?[:：]?\s*"
+    rf"\s*(?:(?:number|no\.?|号码|號碼|号|號)\s*)?"
+    rf"(?:us\s+|me\s+)?(?:(?:is|at|on)\s+|(?:为|為|是)\s*)?[:：]?\s*"
     rf"(?<!\d)\d{{3,5}}(?!\d)"
     rf"|(?<!\d)\d{{3,5}}(?!\d)\s*"
     rf"(?:customer\s+service|service\s+(?:hotline|line)|support\s+(?:hotline|line)"

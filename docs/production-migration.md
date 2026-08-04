@@ -315,7 +315,11 @@ SELECT id, tenant_id, brand_id, platform, reply
 FROM knowledge_documents
 WHERE status = 'published'
   AND (reply ~ '[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]{2,}'
-       OR reply ~ '(^|[^0-9])[0-9]([[:space:].-]*[0-9]){5,}([^0-9]|$)');
+       OR reply ~ '(^|[^0-9])[0-9]([[:space:].-]*[0-9]){5,}([^0-9]|$)'
+       OR reply ~* '(https?://|www\\.)'
+       OR reply ~* '(^|[^[:alnum:]_.+@-])@[[:alnum:]_]'
+       OR reply ~* '(telegram|whatsapp|wechat|line|skype|qq|feishu|lark|微信|飞书)'
+       OR reply ~* '(hotline|phone|tel|客服|热线|电话).{0,16}[0-9]{3,5}');
 ```
 
 Treat every PII-looking published template in the pre-upgrade inventory as unclassified. After upgrade, repeat the query with `is_official_contact` in the selected columns and retain both exports in the rollout record.
@@ -324,7 +328,7 @@ The migration aborts if any knowledge status is not exactly `draft` or `publishe
 
 Every existing `reply_prompts` row is intentionally neutralized: `voice_preferences` becomes the canonical code default, `persona` becomes the exact code-compiled compatibility projection, `revision` increments once, and `updated_by` becomes `migration:d3f6a1b8c904`. Arbitrary legacy prompt text is not copied into JSON or audit. Alembic downgrade cannot recover that text; restore the verified pre-upgrade backup if it is required.
 
-During the API mixed-version window, pause all `/admin/prompt` and `/admin/knowledge` mutations, including save, add, import, publish, unpublish, and delete. Keep the pause until all API instances run the new image; old Workers may continue because new admin saves dual-write only code-generated compatibility text. Read-only inventory is safe. API, Worker, and Scheduler must still converge to one image digest before the rollout is complete.
+Before the migration starts, pause automated decisions as well as `/admin/prompt` and `/admin/knowledge` mutations. Either scale Worker and Scheduler decision dispatch to zero, or activate and record the pre-existing state of the tenant-global kill switch for every allowed tenant. When using kill switches, wait until no `decision_jobs` row is `PROCESSING` and no automatic Outbox row is `SENDING`; this drains workers that may already have passed the old guard. Keep the decision pause active while API runs the migration and until API, Worker, and Scheduler all run the new identical digest. Old Workers must not make automated decisions after `d3f6a1b8c904`, because they do not recognize every governed contact form. Read-only inventory remains safe. Restore only kill-switch states changed by this rollout after final digest, health, migration-head, and log verification.
 
 After upgrade:
 
