@@ -68,7 +68,7 @@ async def load_persona(session: AsyncSession, tenant_id: str, brand_id: str) -> 
     if row is None:
         return ResolvedPersona(text=DEFAULT_PERSONA, revision=None)
     try:
-        preferences = VoicePreferences.from_dict(row.voice_preferences)
+        preferences = VoicePreferences.model_validate(row.voice_preferences)
     except (ValidationError, TypeError, ValueError) as exc:
         logger.warning(
             "Invalid voice preferences; using defaults: tenant=%s brand=%s revision=%s "
@@ -96,6 +96,6 @@ def parse_voice_preferences(value: dict[str, Any]) -> VoicePreferences:
     if set(value) != VOICE_PREFERENCE_FIELDS:
         raise ValueError("voice_preferences_invalid")
     try:
-        return VoicePreferences.from_dict(value)
+        return VoicePreferences.model_validate(value)
     except (ValidationError, TypeError, ValueError) as exc:
         raise ValueError("voice_preferences_invalid") from exc
