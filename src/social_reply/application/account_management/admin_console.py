@@ -1141,7 +1141,7 @@ async def inbox_page(request: Request) -> Response:
                 f"<td class='muted'>{html.escape(work.assigned_actor or str(work.assigned_user_id or '未认领'))}</td>"
                 "<td>"
                 + (
-                    f'<form class="inline" method="post" action="/admin/work-items/{work.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work.version}"><button class="btn-sm">认领</button></form>'
+                    f'<form class="inline" method="post" action="/admin/work-items/{work.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work.version}"><button class="btn-sm">认领并接管</button></form>'
                     if work.status == "WAITING"
                     else ""
                 )
@@ -1669,20 +1669,25 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         if work_item is not None
         else "—"
     )
+    effective_policy = account.automation_default
+    if not get_settings().meta_automation_default_allowed(account.platform, effective_policy):
+        effective_policy = "BOT_DRAFT_ONLY"
+    policy_label = "自动回复" if effective_policy == "BOT_ACTIVE" else "草稿模式"
     work_actions = ""
     if work_item is not None and work_item.status == "WAITING":
-        work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm">认领</button></form>"""
+        work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm">认领并接管</button></form>"""
     if (
         work_item is not None
         and work_item.status == "CLAIMED"
         and (principal.is_superadmin or work_item.assigned_actor == principal.actor)
     ):
-        work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/resolve"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm btn-ghost">解决</button></form>"""
+        work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/resolve"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm btn-ghost">解决并恢复{policy_label}</button></form>"""
     if (
         work_item is not None
         and work_item.status == "RESOLVED"
         and cur_state
         in {
+            "HANDOFF_PENDING",
             "HUMAN_ACTIVE",
             "BOT_COOLDOWN",
         }
@@ -3049,7 +3054,7 @@ async def accounts_page(request: Request) -> Response:
         selected_panel = f"""<section class="channel-setup" id="channel-setup">
 {_channel_setup_head("feishu", "连接企业自建应用 Bot")}
 <form class="channel-form" method="post" action="/admin/connect/feishu">{common}{_input("app_id", "App ID")}{_input("app_secret", "App Secret", secret=True)}{_input("verification_token", "Verification Token", secret=True)}{_input("encrypt_key", "Encrypt Key", secret=True)}<input type="hidden" name="api_base_url" value="{FEISHU_API_BASE_URL}"><input type="hidden" name="group_mode" value="{FEISHU_GROUP_MODE}"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><button class="btn-block">连接 Feishu</button></form></section>"""
-    account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>新会话默认</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
+    account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>账号自动化策略</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:
         body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>

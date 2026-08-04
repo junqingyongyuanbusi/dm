@@ -21,12 +21,17 @@ delivery exceptions, conversation automation state, or manual-reply provenance.
 
 Every human mutation is tenant-scoped, audited and durable:
 
-- **claim** requires a `WAITING` item and its expected optimistic `version`, records the user/actor,
-  and advances the version; ordinary users cannot later mutate another user's claim;
-- **resolve** requires a current `CLAIMED` version and ownership, unless a superadmin explicitly
-  overrides it; it closes the work item but does not silently resume automation;
-- **resume** is a separate conversation action, allowed only after no open work remains, and requires
-  an explicit target of `BOT_DRAFT_ONLY` or `BOT_ACTIVE` subject to deployment/platform gates;
+- **claim and take over** requires a `WAITING` item and its expected optimistic `version`; one
+  conversation-locked transaction assigns the user/actor, moves the item to `CLAIMED`, moves the
+  normal `HANDOFF_PENDING` state to `HUMAN_ACTIVE`, advances both versions, writes both audits, and
+  cancels only pending or failed `DECISION/BOT` Outboxes for that conversation;
+- **resolve and restore account policy** requires a current `CLAIMED` version and ownership, unless a
+  superadmin explicitly overrides it; one transaction resolves the item and restores the current
+  `PlatformAccount.automation_default`, with a safe `BOT_DRAFT_ONLY` fallback when the deployment's
+  Meta release gate disallows a stored `BOT_ACTIVE` target;
+- **resume** remains a compatibility/exception action after no open work remains. It can explicitly
+  recover stranded legacy `HANDOFF_PENDING`, `HUMAN_ACTIVE`, or `BOT_COOLDOWN` states to
+  `BOT_DRAFT_ONLY` or permitted `BOT_ACTIVE`; normal resolved work does not need this second click;
 - **manual reply** binds to an explicit inbound `Message` target, creates or claims the work item,
   moves the conversation to `HUMAN_ACTIVE`, and commits a `MANUAL_REPLY/ADMIN_HUMAN` Outbox carrying
   `actor_id` and `reply_to_message_id`.
@@ -75,7 +80,7 @@ Failed jobs retain only the encrypted staging envelope for controlled retry, use
 - WhatsApp: a Meta `PlatformApp` plus one account per `phone_number_id`.
 - X: deployment-level OAuth Consumer App credentials, a tenant-shared `PlatformApp` webhook route, and one `PlatformAccount` per authorized user. Events route by `for_user_id`; legacy account-level webhook secrets remain readable during migration.
 
-Each account owns tenant, brand, external ID, route ID, credential reference, capabilities, automation mode, config version, and lifecycle status.
+Each account owns tenant, brand, external ID, route ID, credential reference, capabilities, account-wide automation policy, config version, and lifecycle status. `PlatformAccount.automation_default` applies across the account's conversations as their initialization and post-human-work restore target; changing or handling one conversation does not rewrite sibling conversation state.
 
 ## Shared reply behavior
 

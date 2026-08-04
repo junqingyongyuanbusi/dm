@@ -66,7 +66,7 @@ create a table, rewrite account rows or change existing credentials. Dropping an
 check constraint takes a PostgreSQL table lock, so apply it through the API migration owner during a
 quiet rollout window and do not run an ad hoc concurrent migration.
 
-Current head `f8a1c3d5e702` follows `e4b7c2d9a610` and creates the unique partial index
+Revision `f8a1c3d5e702` follows `e4b7c2d9a610` and creates the unique partial index
 `uq_raw_events_feishu_webhook_external_event` on
 `raw_events(platform_account_id, external_event_id)` where `source='feishu'`,
 `ingress_kind='webhook'`, and `external_event_id IS NOT NULL`. The ingress value is the sanitized,
@@ -113,7 +113,7 @@ database backup. After all Feishu rows are absent, downgrade restores the previo
 platform constraint.
 
 Roll out the Feishu-capable code with `FEISHU_ENABLED=false` on API, Worker and Scheduler. Confirm all
-three roles run the same immutable image digest and the database is at `f8a1c3d5e702`. Enablement is
+three roles run the same immutable image digest and the database is at the unique current head `a9d4e6f2b713`. Enablement is
 then a coordinated release operation: stop or replace API, Worker and Scheduler so all three receive
 `FEISHU_ENABLED=true` and the same health interval on that one digest. Do not expose ingress on a new
 API while an old Worker or Scheduler remains.
@@ -238,6 +238,55 @@ The migration is expand-only for the running application. Database rollback stil
 normal verified pre-release backup because removing work items and provenance loses operator audit
 context even though an Alembic downgrade is mechanically available.
 
+Revision `a9d4e6f2b713` is a data-only lifecycle repair directly after `f8a1c3d5e702`. It acquires the
+same conversation delivery advisory locks as runtime claim/resolve, in deterministic Conversation ID
+order, before changing affected rows. It repairs:
+
+- open `CLAIMED` work paired with `HANDOFF_PENDING`, `BOT_ACTIVE`, or `BOT_DRAFT_ONLY` to
+  `HUMAN_ACTIVE`, using the assigned actor as `human_agent_id`;
+- open `WAITING` work paired with `BOT_ACTIVE` or `BOT_DRAFT_ONLY` to `HANDOFF_PENDING`;
+- `HANDOFF_PENDING` with no open work and at least one `RESOLVED` item to the owning account's current
+  `automation_default`, clearing human attribution. Because Alembic has no runtime deployment
+  settings, stored Meta `BOT_ACTIVE` policy is conservatively repaired to `BOT_DRAFT_ONLY`;
+- pending or failed `DECISION/BOT` Outboxes for conversations that still have open work to
+  `CANCELLED/TAKEOVER`.
+
+The repair deliberately does not rewrite `CLOSED`, `BOT_COOLDOWN`, or resolved `HUMAN_ACTIVE` rows.
+Every changed automation row increments `state_version` and records a migration-specific
+`state_changed_reason`. Inventory the four repair classes and record counts before upgrade; after
+upgrade, verify no open work remains paired with a bot state and no claimed work remains paired with
+`HANDOFF_PENDING`:
+
+```sql
+SELECT w.status, s.state, count(*)
+FROM human_work_items AS w
+JOIN automation_states AS s ON s.conversation_id = w.conversation_id
+WHERE w.status IN ('WAITING', 'CLAIMED')
+GROUP BY w.status, s.state
+ORDER BY w.status, s.state;
+
+SELECT count(*) AS stranded_resolved_handoff
+FROM automation_states AS s
+WHERE s.state = 'HANDOFF_PENDING'
+  AND EXISTS (
+      SELECT 1 FROM human_work_items AS w
+      WHERE w.conversation_id = s.conversation_id AND w.status = 'RESOLVED'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM human_work_items AS w
+      WHERE w.conversation_id = s.conversation_id AND w.status IN ('WAITING', 'CLAIMED')
+  );
+```
+
+This migration accompanies an API behavior change: claim now means active human takeover, and
+resolve now restores the account policy in the same transaction. During a mixed-version rollout,
+pause Admin claim/resolve actions until the API migration owner and every API instance run the new
+image. Worker and Scheduler retain the same durable paused-message behavior: inbound messages during
+`HANDOFF_PENDING` or `HUMAN_ACTIVE` persist terminal ignore decisions and are never replayed after
+resolve. The Alembic downgrade to `f8a1c3d5e702` is explicitly a data no-op and cannot reconstruct
+prior inconsistent state; downgrade/re-upgrade is safe but irreversible. Restore the verified backup
+if the pre-repair data itself must be recovered.
+
 ## Polling RawEvent journal
 
 Revision `d6b8f0a2c431` adds tenant/account/stream/conversation/occurrence metadata to `raw_events` and preserves Legacy X DM plus XChat polling occurrences before normalization or decryption side effects. It also persists external conversation and event metadata on `normalized_events`.
@@ -319,7 +368,7 @@ cancels only their pending or failed bot decision outboxes with `STALE_CONVERSAT
 
 The required revision order is `f6c2a9d81b40` (human inbox and Outbox provenance), then
 `b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing), then
-`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication). Do not cherry-pick only the final revision.
+`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication), then `a9d4e6f2b713` (human handoff lifecycle repair). Do not cherry-pick only the final revision.
 Upgrade through `f6c2a9d81b40`, then run the Human operations
 inventory above and record repair counts before applying `b8e1d4f7a2c3`. Before the fencing step,
 inventory active DecisionJobs by conversation/status, pending or failed `DECISION/BOT` Outboxes tied

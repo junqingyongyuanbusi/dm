@@ -113,18 +113,33 @@ The built-in Admin and PostgreSQL inbox are the native operations path; they do 
 Chatwoot:
 
 ```text
-HANDOFF / unsupported attachment -> HumanWorkItem(WAITING or CLAIMED) -> claim / resolve / resume
-DRAFT                         -> ReplyDecision(DRAFT) -> explicit approval
-Delivery exception            -> OutboxMessage(NEEDS_REVIEW) -> explicit retry
-Manual reply / draft approval -> explicit inbound Message target -> provenance-bearing OutboxMessage
-                               -> account-scoped sender -> outbound Message(source_outbox_id)
+HANDOFF / unsupported attachment -> HumanWorkItem(WAITING) + HANDOFF_PENDING
+claim                          -> HumanWorkItem(CLAIMED) + HUMAN_ACTIVE
+resolve                        -> HumanWorkItem(RESOLVED) + current account automation policy
+legacy exception               -> explicit resume to BOT_DRAFT_ONLY or BOT_ACTIVE
+DRAFT                          -> ReplyDecision(DRAFT) -> explicit approval
+Delivery exception             -> OutboxMessage(NEEDS_REVIEW) -> explicit retry
+Manual reply / draft approval  -> explicit inbound Message target -> provenance-bearing OutboxMessage
+                                -> account-scoped sender -> outbound Message(source_outbox_id)
 ```
 
-Only one open `WAITING` or `CLAIMED` work item exists per conversation. Ordinary administrators may
-mutate a claimed item only while they own it; superadmin override remains explicit and audited. A
-manual reply creates or claims the work, moves the conversation to `HUMAN_ACTIVE`, cancels pending or
-failed bot-decision Outboxes, and records `actor_id` plus `reply_to_message_id`. Bot decisions use
-`DECISION/BOT`, approved drafts use `DRAFT_APPROVAL/ADMIN_HUMAN`, and manual sends use
+`PlatformAccount.automation_default` is the account-wide policy and restore target shared by many
+conversations; a `HumanWorkItem` is conversation-local. Only one open `WAITING` or `CLAIMED` item
+exists per conversation. Claim and resolve use the conversation delivery advisory lock before row
+locks, so they serialize with inbound generation reservation and send-time checks. Claim atomically
+moves `WAITING/HANDOFF_PENDING` to `CLAIMED/HUMAN_ACTIVE`, assigns the actor, advances both versions,
+audits both mutations, and cancels only pending or failed `DECISION/BOT` Outboxes for that
+conversation. Resolve atomically closes the item and restores the account's current policy, clearing
+human attribution and using `BOT_DRAFT_ONLY` when the deployment's Meta gate disallows a stored
+`BOT_ACTIVE` policy. Normal resolution therefore needs no separate resume action; resume remains for
+stranded legacy `HANDOFF_PENDING`, `HUMAN_ACTIVE`, or `BOT_COOLDOWN` states without open work.
+
+Inbound messages captured while `HANDOFF_PENDING` or `HUMAN_ACTIVE` still persist their `Message`,
+`DecisionJob`, and terminal `ReplyDecision(ignore)` and create no bot Outbox. Those completed jobs
+are never reconsidered after resolve; only a later newly ingested message snapshots the restored
+policy. A manual reply creates or claims work, moves the conversation to `HUMAN_ACTIVE`, cancels
+pending or failed bot-decision Outboxes, and records `actor_id` plus `reply_to_message_id`. Bot
+decisions use `DECISION/BOT`, approved drafts use `DRAFT_APPROVAL/ADMIN_HUMAN`, and manual sends use
 `MANUAL_REPLY/ADMIN_HUMAN`, so the Outbox row is the durable provenance bridge from operator action
 to outbound history. Direct-platform delivery is independent of Chatwoot; accounts deliberately
 using a Chatwoot destination still require their persisted conversation mapping.

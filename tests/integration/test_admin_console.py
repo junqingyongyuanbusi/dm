@@ -154,6 +154,9 @@ async def test_console_pages_render_after_login(migrated_db):
             resp = await client.get(path)
             assert resp.status_code == 200, path
             assert marker in resp.text
+            if path == "/admin/accounts":
+                assert "账号自动化策略" in resp.text
+                assert "新会话默认" not in resp.text
 
 
 async def test_navigation_does_not_poll_inbox_counts(migrated_db):
@@ -857,6 +860,43 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
     assert captured["work_item_id"] == work_item_id
     assert captured["expected_version"] == 1
     assert captured["idempotency_key"] == key_match.group(1)
+
+
+async def test_claim_and_resolve_copy_matches_one_click_handoff_lifecycle(session, migrated_db):
+    now = datetime.now(UTC)
+    _account_id, conversation_id, _message_id, work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="lifecycle-copy",
+        display_name="Lifecycle customer",
+        work_created_at=now - timedelta(minutes=10),
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        waiting = await client.get(f"/admin/conversations/{conversation_id}")
+        assert "认领并接管" in waiting.text
+        claimed_response = await client.post(
+            f"/admin/work-items/{work_item_id}/claim",
+            data={"csrf_token": csrf, "version": "1"},
+        )
+        assert claimed_response.status_code == 303
+        claimed = await client.get(f"/admin/conversations/{conversation_id}")
+        assert "解决并恢复草稿模式" in claimed.text
+        resolved_response = await client.post(
+            f"/admin/work-items/{work_item_id}/resolve",
+            data={"csrf_token": csrf, "version": "2"},
+        )
+        assert resolved_response.status_code == 303
+        resolved = await client.get(f"/admin/conversations/{conversation_id}")
+
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_item_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    assert work.status == "RESOLVED"
+    assert state.state == "BOT_DRAFT_ONLY"
+    assert "恢复为草稿" not in resolved.text
+    assert "恢复自动" not in resolved.text
 
 
 async def test_conversation_detail_uses_latest_200_messages_for_reply_target(session, migrated_db):

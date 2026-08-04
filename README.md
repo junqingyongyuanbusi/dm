@@ -225,6 +225,8 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 
 PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Scheduler 会恢复带版本化 dispatch contract 的新 RawEvent、DecisionJob 和 Outbox；历史缺少安全重建参数的 `PENDING` RawEvent 不会被猜测执行。Worker 提交 Outbox 后仍走低延迟 Fast Path。
 
+账号的 `PlatformAccount.automation_default` 是跨多个会话使用的账号级自动化策略；单个 `HumanWorkItem` 只影响自己的会话。转人工先进入 `WAITING/HANDOFF_PENDING`，认领会在同一锁定事务中进入 `CLAIMED/HUMAN_ACTIVE` 并取消该会话尚未发送的决策型 Bot Outbox。解决工作项会在一次操作中恢复账号当前策略（Meta 自动外发门禁不允许时安全回落到 `BOT_DRAFT_ONLY`），无需再点击恢复。等待或人工处理中收到的消息仍会持久化为 `ignore` 决策且不会在解决后补发；只有解决后的下一条新消息按恢复后的账号策略处理。其他会话不受影响。
+
 ## 文档
 
 - [运行架构](docs/architecture.md)
@@ -249,7 +251,7 @@ DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
 REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 6 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `f8a1c3d5e702`。当前 Feishu 专用测试文件的精确收集数以 `pytest --collect-only` 为准；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `a9d4e6f2b713`。当前 Feishu 专用测试文件的精确收集数以 `pytest --collect-only` 为准；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
 
 ## X 贴文评论自动回复
 

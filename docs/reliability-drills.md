@@ -18,6 +18,7 @@ uv run pytest -q \
   tests/integration/test_outbox_sweep.py \
   tests/integration/test_takeover_cancels_outbox.py \
   tests/integration/test_human_operations.py \
+  tests/integration/test_human_handoff_migration.py \
   tests/integration/test_message_history_migration.py \
   tests/integration/test_admin_console.py \
   tests/integration/test_schema.py \
@@ -67,6 +68,9 @@ uv run alembic check
 | Feishu provider ordering | An older message callback is delayed until a newer message in the same conversation has completed ingestion | `event.message.create_time` is compared under the conversation advisory lock; the older occurrence remains normalized with `stale_provider_order` but cannot reserve a generation or create Message, DecisionJob or Outbox work. |
 | Feishu callback security | Signature is stale/replayed, a required `X-Lark-*` header is invalid, or token/App ID/AES validation fails | Request is rejected and no RawEvent is stored; a valid URL-verification challenge remains side-effect free. |
 | HumanWork tenant migration | Legacy work tenant or claim attribution disagrees with the Conversation tenant | Tenant ownership is repaired; invalid claims return to `WAITING`, assignment fields clear, and `version` advances so stale inbox mutations fail. |
+| Human handoff lifecycle migration | Open work and conversation state drift, or resolved legacy handoff state remains stranded | Deterministic conversation locks repair claimed work to `HUMAN_ACTIVE`, waiting work to `HANDOFF_PENDING`, resolved stranded handoff to the account policy with conservative Meta draft fallback, and pending/failed decision Bot Outboxes are cancelled. `CLOSED`, `BOT_COOLDOWN`, and resolved `HUMAN_ACTIVE` remain unchanged; downgrade/re-upgrade is data-idempotent. |
+| Human claim/resolve race | Two operators claim together, or resolve overlaps inbound generation reservation | Exactly one version-CAS claim succeeds. The shared conversation advisory lock prevents deadlock and yields one ordered state/generation result; sibling conversations on the same account remain unchanged. |
+| Inbound during human work | Messages arrive in `WAITING/HANDOFF_PENDING` or `CLAIMED/HUMAN_ACTIVE`, then work resolves | Each inbound persists a completed `DecisionJob` and `ReplyDecision(ignore)` with no bot Outbox. Resolve restores the current account policy in one click; old ignored jobs never rerun and only the next new inbound can create normal bot work. |
 | Local inbox manual send | Operator replies from the built-in inbox to an explicit inbound target | A tenant-scoped claim/create and `HUMAN_ACTIVE` transition commit with a `MANUAL_REPLY/ADMIN_HUMAN` Outbox; successful delivery writes an outbound `Message.source_outbox_id` without requiring a ReplyDecision. Direct accounts need no Chatwoot mapping; Chatwoot-routed accounts still fail closed without one. |
 | Outbox | First broker dispatch in a sweep fails | Later durable rows are still dispatched; the failed row remains eligible for the next sweep. |
 | Outbox | A newer inbound arrives while an older bot decision is pending or failed | Only stale `DECISION/BOT` rows become `CANCELLED/STALE_CONVERSATION_INPUT`; manual replies and draft approvals survive, and delivery rechecks generation before provider I/O. |
@@ -94,7 +98,7 @@ A drill run is acceptable only when all of these remain true:
 - Business-event and Outbox idempotency prevent duplicate durable effects under at-least-once
   dispatch.
 - An automated public send cannot begin after `HUMAN_ACTIVE` takeover has committed or after its decision generation becomes stale.
-- Local human work, explicit reply targets and manual-send provenance remain durable and tenant-scoped; direct-account operations do not require Chatwoot, while configured Chatwoot destinations still require their mapping.
+- Local human work, explicit reply targets and manual-send provenance remain durable and tenant-scoped. Account automation policy is the restore target, work items affect one conversation only, and ignored inbound work is never retroactively decided; direct-account operations do not require Chatwoot, while configured Chatwoot destinations still require their mapping.
 - Ambiguous external-send outcomes stop in an operator-visible state instead of being retried.
 - Feature flags pause accepted durable work without consuming attempts and recover it after a
   coordinated API, Worker, and Scheduler restart; Feishu URL-verification remains available while
