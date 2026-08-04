@@ -18,7 +18,7 @@ _HANDLE = re.compile(r"(?i)(?<![A-Z0-9_.+@-])@[A-Z0-9_][A-Z0-9_.-]{0,31}(?![A-Z0
 _MESSAGING_ID = re.compile(
     r"(?ix)"
     r"(?:whats\s*app|we\s*chat|wechat|weixin|telegram|signal|skype|line|qq"
-    r"|messenger|discord|viber|kakao\s*talk|kakaotalk|微信|微訊)"
+    r"|messenger|discord|viber|kakao\s*talk|kakaotalk|feishu|lark|微信|微訊|飞书|飛書)"
     r"\s*(?:(?:id|user(?:name)?|handle|number|no\.?|账号|帳號|号码|號碼|号|號)"
     r"\s*[:：]?\s*|[:：]\s*)"
     r"@?[A-Z0-9][A-Z0-9_.+-]{1,63}"

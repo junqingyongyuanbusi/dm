@@ -124,6 +124,8 @@ def test_private_draft_with_pii_keeps_review_behavior():
         "Visit support.example.com",
         "Follow @WikiFXSupport",
         "Telegram ID: wikifx_support",
+        "Feishu ID: wikifx_support",
+        "飞书账号：wikifx_support",
         "微信号：wikifx123",
         "Customer service hotline: 12345",
         "请致电 1234",
