@@ -571,7 +571,7 @@ async def test_claim_fails_closed_for_explicit_terminal_drift(session, drift_sta
     assert outbox.status == "PENDING"
 
 
-async def test_version_and_assignee_failures_preserve_state(session):
+async def test_claim_version_failure_preserves_state(session):
     _account_id, conversation_id, _message_id, work_id, bot_outbox_id = await _seed_conversation(
         session
     )
@@ -583,6 +583,7 @@ async def test_version_and_assignee_failures_preserve_state(session):
             user_id=None,
             expected_version=99,
         )
+
     session.expire_all()
     work = await session.get(models.HumanWorkItem, work_id)
     state = await session.get(models.AutomationState, conversation_id)
@@ -591,6 +592,11 @@ async def test_version_and_assignee_failures_preserve_state(session):
     assert (state.state, state.state_version) == ("HANDOFF_PENDING", 2)
     assert outbox.status == "PENDING"
 
+
+async def test_resolve_assignee_failure_preserves_state(session):
+    _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session
+    )
     await claim_human_work_item(
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
@@ -606,6 +612,7 @@ async def test_version_and_assignee_failures_preserve_state(session):
             expected_version=2,
             allow_override=False,
         )
+
     session.expire_all()
     work = await session.get(models.HumanWorkItem, work_id)
     state = await session.get(models.AutomationState, conversation_id)

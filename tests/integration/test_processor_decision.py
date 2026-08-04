@@ -18,6 +18,30 @@ from social_reply.infrastructure.database import models
 pytestmark = pytest.mark.integration
 
 
+async def _assert_ignored_message(session, chatwoot_message_id, reason_code):
+    message = (
+        await session.execute(
+            select(models.Message).where(models.Message.chatwoot_message_id == chatwoot_message_id)
+        )
+    ).scalar_one()
+    job = (
+        await session.execute(
+            select(models.DecisionJob).where(models.DecisionJob.message_id == message.id)
+        )
+    ).scalar_one()
+    decision = (
+        await session.execute(
+            select(models.ReplyDecision).where(models.ReplyDecision.message_id == message.id)
+        )
+    ).scalar_one()
+    assert job.status == "COMPLETED"
+    assert decision.action == "ignore"
+    assert decision.reason_codes == [reason_code]
+    assert decision.outbox_id is None
+    assert await count_rows(session, models.OutboxMessage) == 0
+    return message, job
+
+
 async def test_bot_active_inbound_fast_path_sends_outbox(session):
     await seed_chatwoot_account(session, "BOT_ACTIVE")
     await process_raw_event(await seed_raw_event(session, chatwoot_payload()))
@@ -63,28 +87,7 @@ async def test_inbound_during_handoff_stays_ignored_and_only_new_post_resolve_me
     await process_raw_event(
         await seed_raw_event(session, chatwoot_payload(id=56, content="还在吗？"))
     )
-    waiting_message = (
-        await session.execute(
-            select(models.Message).where(models.Message.chatwoot_message_id == 56)
-        )
-    ).scalar_one()
-    waiting_job = (
-        await session.execute(
-            select(models.DecisionJob).where(models.DecisionJob.message_id == waiting_message.id)
-        )
-    ).scalar_one()
-    waiting_decision = (
-        await session.execute(
-            select(models.ReplyDecision).where(
-                models.ReplyDecision.message_id == waiting_message.id
-            )
-        )
-    ).scalar_one()
-    assert waiting_job.status == "COMPLETED"
-    assert waiting_decision.action == "ignore"
-    assert waiting_decision.reason_codes == ["HANDOFF_PENDING"]
-    assert waiting_decision.outbox_id is None
-    assert await count_rows(session, models.OutboxMessage) == 0
+    waiting_message, waiting_job = await _assert_ignored_message(session, 56, "HANDOFF_PENDING")
 
     await claim_human_work_item(
         work_item_id=work.id,
@@ -96,28 +99,7 @@ async def test_inbound_during_handoff_stays_ignored_and_only_new_post_resolve_me
     await process_raw_event(
         await seed_raw_event(session, chatwoot_payload(id=57, content="我补充一下"))
     )
-    claimed_message = (
-        await session.execute(
-            select(models.Message).where(models.Message.chatwoot_message_id == 57)
-        )
-    ).scalar_one()
-    claimed_job = (
-        await session.execute(
-            select(models.DecisionJob).where(models.DecisionJob.message_id == claimed_message.id)
-        )
-    ).scalar_one()
-    claimed_decision = (
-        await session.execute(
-            select(models.ReplyDecision).where(
-                models.ReplyDecision.message_id == claimed_message.id
-            )
-        )
-    ).scalar_one()
-    assert claimed_job.status == "COMPLETED"
-    assert claimed_decision.action == "ignore"
-    assert claimed_decision.reason_codes == ["HUMAN_ACTIVE"]
-    assert claimed_decision.outbox_id is None
-    assert await count_rows(session, models.OutboxMessage) == 0
+    claimed_message, claimed_job = await _assert_ignored_message(session, 57, "HUMAN_ACTIVE")
     ignored_message_ids = [waiting_message.id, claimed_message.id]
 
     await resolve_human_work_item(
