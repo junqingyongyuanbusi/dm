@@ -307,18 +307,17 @@ XAA 的完整事件枚举里没有任何回复/评论专用事件（只有 `post
 
 ## 提示词人设（后台可配）
 
-`/admin/prompt` 编辑 LLM 人设段（语言、语气、身份），保存后**下一条决策立即生效**，无需重启或发版。
+`/admin/prompt` 编辑 LLM 人设/领域策略段（语言、语气、身份和业务侧决策偏好），保存后**下一条决策立即生效**，无需重启或发版。
 
 人设存 PostgreSQL 而非环境变量：Worker 跑决策、API 跑后台，两个进程必须看到同一份内容；
 每次决策直读也免去多 Worker 的缓存失效问题。
 
-**只有人设段可编辑。** 动作语义（何时 auto_reply / handoff / draft / ignore）与安全不变量
-（不回显 PII、防提示词注入、`handoff/ignore 时 reply_text 置空`）由代码固定追加，页面上以只读形式
-展示。这些内容是结构化输出契约的一部分——删掉任何一行都会静默废掉防注入，或让 `json_schema`
-校验开始失败（决策全部降级转人工）。
+**只有人设/领域策略段可编辑。** 严格的六字段输出 schema、动作交叉约束与安全不变量
+（不回显 PII、防提示词注入、`handoff/ignore` 的 `reply_text` 为空）由代码固定追加，页面上以只读形式
+展示；租户人设不能删除或覆盖它们。模型输出未通过严格 schema 校验时，决策会安全降级转人工。
 
 - 作用域按 `(tenant_id, brand_id)`；未配置的租户回落到代码内置默认人设。
-- 每次保存 `revision` 自增，并写进 `reply_decisions.prompt_version`（形如 `v0-stub#r7`），
+- 每次保存 `revision` 自增，并写进 `reply_decisions.prompt_version`（形如 `v1-wikifx-multilingual#r7`），
   可回溯某条回复出自哪一版人设。变更记入 `audit_logs`（`action=SET_REPLY_PERSONA`）。
 - **试运行**:页面内可用当前人设跑一次真实 LLM 调用，只回显 action/回复/置信度，
   不写 `reply_decisions`、不建 outbox、不发送。发给模型前同样做 PII 脱敏。

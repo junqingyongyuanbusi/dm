@@ -74,6 +74,7 @@ def test_testing_true_默认值可用() -> None:
     assert settings.openai_base_url == "https://api.openai.com/v1"
     assert settings.openai_model == "gpt-4o-mini"
     assert settings.openai_timeout_seconds == 30.0
+    assert settings.prompt_version == "v1-wikifx-multilingual"
     assert settings.x_legacy_dm_enabled is True
     assert settings.x_activity_enabled is True
     assert settings.xchat_enabled is True

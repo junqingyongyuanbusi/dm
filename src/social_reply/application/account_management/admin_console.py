@@ -2386,12 +2386,12 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
     )
 
 
-# ---------- 提示词人设 ----------
+# ---------- 提示词人设/领域策略 ----------
 
 _PROMPT_BANNERS = {
-    "saved": ("ok", "人设已保存，下一条决策立即生效。"),
-    "persona_required": ("err", "人设不能为空。"),
-    "persona_too_long": ("err", f"人设过长：最多 {PERSONA_MAX_CHARS} 字符。"),
+    "saved": ("ok", "人设/领域策略已保存，下一条决策立即生效。"),
+    "persona_required": ("err", "人设/领域策略不能为空。"),
+    "persona_too_long": ("err", f"人设/领域策略过长：最多 {PERSONA_MAX_CHARS} 字符。"),
 }
 
 
@@ -2426,18 +2426,18 @@ async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -
     trial = ""
     if request.query_params.get("trial"):
         trial = _render_trial(request)
-    body = f"""<h1>提示词</h1><p class="lede">编辑 LLM 人设段；动作语义与安全约束由系统固定追加，不可修改。</p>{banner}
-<section class="card"><h2>人设 {origin}</h2>
-<p class="hint">决定语言、语气与身份。知识库命中并原文直答时不经过它——它只影响需要 LLM 生成的回复。</p>
+    body = f"""<h1>提示词</h1><p class="lede">编辑 LLM 人设/领域策略；严格输出 schema、动作交叉约束与安全规则由系统固定追加，不可修改。</p>{banner}
+<section class="card"><h2>人设/领域策略 {origin}</h2>
+<p class="hint">决定语言、语气、身份和业务侧决策偏好。知识库命中并原文直答时不经过它——它只影响需要 LLM 生成的回复。</p>
 <form method="post" action="/admin/prompt/save"><input type="hidden" name="csrf_token" value="{csrf}">
 <input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
 <input type="hidden" name="brand_id" value="{html.escape(brand)}">
-<label for="f-persona">人设内容（最多 {PERSONA_MAX_CHARS} 字符）</label>
+<label for="f-persona">人设/领域策略内容（最多 {PERSONA_MAX_CHARS} 字符）</label>
 <textarea id="f-persona" name="persona" rows="10" required>{html.escape(resolved.text)}</textarea>
 <button class="btn-block">保存</button></form></section>
 
 <section class="card"><h2>系统固定追加</h2>
-<p class="hint">以下内容始终拼在人设之后，后台无法编辑。删掉它们会让防注入失效或结构化输出校验开始失败。</p>
+<p class="hint">以下不可变安全契约始终拼在人设之后，后台无法删除或覆盖；严格六字段 schema 也由代码控制。</p>
 <pre class="thread" style="white-space:pre-wrap">{html.escape(CONTRACT_PROMPT)}</pre></section>
 
 <section class="card"><h2>试运行</h2>

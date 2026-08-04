@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     tenant_id: str = "default"
     # Literal 收紧：配错 provider 在进程启动即报错，而非每条消息决策丢失
     llm_provider: Literal["stub", "openai"] = "stub"
-    prompt_version: str = "v0-stub"
+    prompt_version: str = "v1-wikifx-multilingual"
     chatwoot_base_url: str = "http://localhost:3000"
     chatwoot_api_token: str = "dev-local-token"
     # 控制面：CONTROL_API_KEY 仅供服务间调用；浏览器管理员使用签名会话。
