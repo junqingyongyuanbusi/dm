@@ -24,6 +24,10 @@ from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from social_reply.domain.platform_accounts import ACTIVE_ACCOUNT_STATUS
+from social_reply.domain.reply.voice import (
+    CANONICAL_VOICE_PREFERENCES,
+    CANONICAL_VOICE_PREFERENCES_JSON,
+)
 
 
 class Base(DeclarativeBase):
@@ -751,16 +755,8 @@ class ReplyPrompt(Base):
     persona: Mapped[str] = mapped_column(Text)
     voice_preferences: Mapped[dict[str, str]] = mapped_column(
         JSONB,
-        default=lambda: {
-            "tone": "professional",
-            "length": "concise",
-            "empathy": "standard",
-            "emoji": "never",
-        },
-        server_default=text(
-            '\'{"tone":"professional","length":"concise",'
-            '"empathy":"standard","emoji":"never"}\'::jsonb'
-        ),
+        default=lambda: CANONICAL_VOICE_PREFERENCES.copy(),
+        server_default=text(f"'{CANONICAL_VOICE_PREFERENCES_JSON}'::jsonb"),
     )
     # Every save increments this and records it in reply_decisions.prompt_version.
     revision: Mapped[int] = mapped_column(Integer, default=1)

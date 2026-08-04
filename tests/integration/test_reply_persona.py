@@ -13,6 +13,7 @@ from social_reply.application.reply_decision.persona import (
     prompt_version_label,
 )
 from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
+from social_reply.domain.reply.voice import CANONICAL_VOICE_PREFERENCES_JSON
 from social_reply.infrastructure.database import models
 
 pytestmark = pytest.mark.integration
@@ -65,6 +66,13 @@ def test_voice_preferences_json_and_compiler_are_deterministic():
     assert compile_voice_preferences(decoded) == DEFAULT_PERSONA
     assert "professional, calm" in DEFAULT_PERSONA
     assert "Do not use emoji" in DEFAULT_PERSONA
+
+
+def test_reply_prompt_orm_defaults_follow_domain_canonical_voice() -> None:
+    column = models.ReplyPrompt.__table__.c.voice_preferences
+
+    assert column.default.arg(None) == DEFAULT_VOICE_PREFERENCES.to_dict()
+    assert column.server_default.arg.text == f"'{CANONICAL_VOICE_PREFERENCES_JSON}'::jsonb"
 
 
 async def test_missing_row_falls_back_to_compiled_defaults(session, migrated_db):
@@ -281,7 +289,7 @@ async def test_trial_uses_compiled_preferences_without_persisting_or_sending(
 
     class _CaptureLLM:
         async def decide(self, context):
-            seen["persona"] = context.persona
+            seen["voice_preferences"] = context.voice_preferences
             seen["text"] = context.text
             return ReplyDecision(
                 action=ReplyAction.AUTO_REPLY,
@@ -318,8 +326,7 @@ async def test_trial_uses_compiled_preferences_without_persisting_or_sending(
         )
     assert response.status_code == 303
     assert "action=auto_reply" in response.headers["location"]
-    assert seen["persona"] == compile_voice_preferences(preferences)
-    assert "arbitrary legacy text" not in seen["persona"]
+    assert seen["voice_preferences"] == preferences
     session.expire_all()
     assert (await session.execute(select(models.ReplyDecision))).first() is None
     assert (await session.execute(select(models.OutboxMessage))).first() is None

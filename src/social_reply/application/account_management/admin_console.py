@@ -2742,7 +2742,7 @@ async def prompt_trial(request: Request) -> Response:
             LLMContext(
                 text=redact_pii(text),
                 conversation_key=f"trial:{tenant}",
-                persona=resolved.text,
+                voice_preferences=resolved.preferences,
             )
         )
     except Exception:

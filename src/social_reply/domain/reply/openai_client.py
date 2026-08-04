@@ -4,7 +4,6 @@ import logging
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from social_reply.application.reply_decision.persona import DEFAULT_PERSONA
 from social_reply.domain.reply.decision import (
     ReplyAction,
     ReplyDecision,
@@ -13,6 +12,11 @@ from social_reply.domain.reply.decision import (
 )
 from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMContext
+from social_reply.domain.reply.voice import (
+    DEFAULT_VOICE_PREFERENCES,
+    VoicePreferences,
+    compile_voice_preferences,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +73,11 @@ _KNOWLEDGE_HEADER = (
 )
 
 
-def _build_system_prompt(knowledge: tuple[str, ...], persona: str | None = None) -> str:
-    """Build code-compiled voice preferences, the immutable contract, and quoted knowledge data."""
-    head = (persona or "").strip() or DEFAULT_PERSONA
+def _build_system_prompt(
+    knowledge: tuple[str, ...], voice_preferences: VoicePreferences | None = None
+) -> str:
+    """Compile typed voice preferences and append the contract and quoted knowledge data."""
+    head = compile_voice_preferences(voice_preferences or DEFAULT_VOICE_PREFERENCES)
     base = f"{head}\n{CONTRACT_PROMPT}"
     if not knowledge:
         return base
@@ -188,7 +194,10 @@ class OpenAILLMClient:
         # system → 历史多轮（user/assistant 交替）→ 当前用户消息。
         # 历史让模型理解指代与上文；结构化输出契约不受影响。
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": _build_system_prompt(context.knowledge, context.persona)}
+            {
+                "role": "system",
+                "content": _build_system_prompt(context.knowledge, context.voice_preferences),
+            }
         ]
         for role, text in context.history:
             if role not in {"user", "assistant"}:

@@ -5,6 +5,7 @@ from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visib
 from social_reply.domain.reply.guard import redact_pii, run_final_guard
 from social_reply.domain.reply.llm import LLMClient, LLMContext
 from social_reply.domain.reply.rules import apply_rules
+from social_reply.domain.reply.voice import VoicePreferences
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,7 @@ async def run_decision_pipeline(
     verbatim_reply: str | None = None,
     approved_official_contact_reply: str | None = None,
     history: tuple[tuple[str, str], ...] = (),
-    persona: str | None = None,
+    voice_preferences: VoicePreferences | None = None,
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
@@ -97,7 +98,7 @@ async def run_decision_pipeline(
                 conversation_key=snapshot.conversation_key,
                 knowledge=knowledge,
                 history=safe_history,
-                persona=persona,
+                voice_preferences=voice_preferences,
             )
         )
         if knowledge:

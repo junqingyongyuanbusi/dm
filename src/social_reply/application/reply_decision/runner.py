@@ -25,8 +25,9 @@ from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbe
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
-from social_reply.domain.reply.openai_client import DEFAULT_PERSONA, OpenAILLMClient
+from social_reply.domain.reply.openai_client import OpenAILLMClient
 from social_reply.domain.reply.rules import apply_rules
+from social_reply.domain.reply.voice import DEFAULT_PERSONA
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
     acquire_conversation_delivery_xact_lock,
@@ -330,7 +331,7 @@ async def run_and_persist_decision(
             verbatim_reply=verbatim,
             approved_official_contact_reply=approved_official_contact_reply,
             history=history,
-            persona=persona.text,
+            voice_preferences=persona.preferences,
         )
     async with get_session_factory()() as session:
         if decision_job_id is not None:

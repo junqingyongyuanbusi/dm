@@ -5,6 +5,7 @@ from social_reply.application.reply_decision.pipeline import DecisionSnapshot, r
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.llm import StubLLMClient
+from social_reply.domain.reply.voice import DEFAULT_VOICE_PREFERENCES
 
 
 class _OpenSwitch:
@@ -61,10 +62,12 @@ async def test_llm_context_redacts_current_and_history_pii():
         llm=_CaptureLLM(),
         killswitch=_OpenSwitch(),
         history=(("user", "手机号 138 0013 8000"),),
+        voice_preferences=DEFAULT_VOICE_PREFERENCES,
     )
     context = captured["context"]
     assert context.text == "邮箱 [REDACTED_EMAIL]"
     assert context.history == (("user", "手机号 [REDACTED_NUMBER]"),)
+    assert context.voice_preferences == DEFAULT_VOICE_PREFERENCES
 
 
 async def test_human_active_forces_ignore():

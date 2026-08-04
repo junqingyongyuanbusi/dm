@@ -7,6 +7,7 @@ from social_reply.domain.reply.decision import (
     RiskLevel,
     Visibility,
 )
+from social_reply.domain.reply.voice import VoicePreferences
 
 
 @dataclass(frozen=True)
@@ -18,9 +19,13 @@ class LLMContext:
     # 同会话历史消息（按时间升序），元素为 (role, text)：
     # role ∈ {"user", "assistant"}，不含当前这条。默认空 → 单轮行为不变。
     history: tuple[tuple[str, str], ...] = ()
-    # Code-compiled text from finite tenant voice preferences. None uses compiled defaults.
-    # Database free text is never executed; identity, action semantics, and safety stay immutable.
-    persona: str | None = None
+    voice_preferences: VoicePreferences | None = None
+
+    def __post_init__(self) -> None:
+        if self.voice_preferences is not None and not isinstance(
+            self.voice_preferences, VoicePreferences
+        ):
+            raise TypeError("voice_preferences_must_be_typed")
 
 
 class LLMClient(Protocol):
