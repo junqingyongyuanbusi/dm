@@ -1,16 +1,16 @@
-import uuid
-
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
-from tests.integration.migration_support import assert_alembic_succeeds, run_alembic
+from tests.integration.migration_support import (
+    assert_alembic_succeeds,
+    run_alembic,
+    temporary_database,
+)
 
 from social_reply.application.reply_decision.persona import (
     CANONICAL_VOICE_PREFERENCES,
     DEFAULT_PERSONA,
 )
-from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
 
@@ -18,28 +18,8 @@ _BASE_REVISION = "a9d4e6f2b713"
 _HEAD_REVISION = "d3f6a1b8c904"
 
 
-async def _create_database(prefix: str) -> tuple[str, object]:
-    base_url = make_url(get_settings().database_url)
-    database_name = f"{prefix}_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-    return database_url, admin_engine
-
-
-async def _drop_database(database_url: str, admin_engine) -> None:
-    database_name = make_url(database_url).database
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)'))
-    await admin_engine.dispose()
-
-
 async def test_historical_data_upgrade_downgrade_and_reupgrade():
-    database_url, admin_engine = await _create_database("social_reply_governance")
-    try:
+    async with temporary_database("social_reply_governance") as (_database_name, database_url):
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -158,13 +138,13 @@ async def test_historical_data_upgrade_downgrade_and_reupgrade():
         assert prompt_after_reupgrade.persona == DEFAULT_PERSONA
         assert prompt_after_reupgrade.voice_preferences == CANONICAL_VOICE_PREFERENCES
         assert prompt_after_reupgrade.revision == 6
-    finally:
-        await _drop_database(database_url, admin_engine)
 
 
 async def test_unknown_historical_knowledge_status_aborts_migration():
-    database_url, admin_engine = await _create_database("social_reply_governance_invalid")
-    try:
+    async with temporary_database("social_reply_governance_invalid") as (
+        _database_name,
+        database_url,
+    ):
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -199,5 +179,3 @@ async def test_unknown_historical_knowledge_status_aborts_migration():
         await engine.dispose()
         assert revision == _BASE_REVISION
         assert added_columns == set()
-    finally:
-        await _drop_database(database_url, admin_engine)
