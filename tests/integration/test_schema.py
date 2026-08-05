@@ -25,6 +25,10 @@ EXPECTED_TABLES = {
     "sync_gaps",
     "automation_states",
     "human_work_items",
+    "tenant_feishu_handoff_configs",
+    "feishu_handoff_operators",
+    "handoff_notification_intents",
+    "feishu_card_action_receipts",
     "outbox_messages",
     "audit_logs",
     "provisioning_jobs",
@@ -161,6 +165,54 @@ async def test_platform_sync_tables_have_constraints_and_indexes(migrated_db):
         "ix_sync_gaps_retry",
         "uq_sync_gaps_active_checkpoint",
     } <= gap_indexes
+
+
+async def test_feishu_handoff_notification_schema(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        work_columns = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='human_work_items'"
+                )
+            )
+        }
+        intent_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='handoff_notification_intents'"
+                )
+            )
+        }
+        intent_indexes = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE tablename='handoff_notification_intents'"
+                )
+            )
+        }
+    assert {"resolved_actor", "resolution_evidence", "resolution_outbox_id"} <= work_columns
+    assert {
+        "ck_handoff_notification_intents_status",
+        "ck_handoff_notification_intents_card_state",
+        "ck_handoff_notification_intents_revisions",
+        "ck_handoff_notification_intents_sending_lease",
+        "fk_handoff_notification_intents_tenant_work",
+        "fk_handoff_notification_intents_tenant_conversation",
+        "fk_handoff_notification_intents_tenant_config",
+        "fk_handoff_notification_intents_tenant_account",
+    } <= intent_constraints
+    assert {
+        "ix_handoff_notification_intents_due",
+        "ix_handoff_notification_intents_tenant_status",
+        "ix_handoff_notification_intents_provider_message",
+    } <= intent_indexes
 
 
 async def test_admin_health_indexes_exist(migrated_db):

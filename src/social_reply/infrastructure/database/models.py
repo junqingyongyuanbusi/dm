@@ -46,6 +46,7 @@ class AdminUser(Base):
     __table_args__ = (
         UniqueConstraint("username"),
         UniqueConstraint("tenant_id"),
+        UniqueConstraint("tenant_id", "id", name="uq_admin_users_tenant_id_id"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     username: Mapped[str] = mapped_column(String(128))
@@ -114,6 +115,7 @@ class PlatformAccount(Base):
     __table_args__ = (
         UniqueConstraint("platform", "public_id"),
         UniqueConstraint("tenant_id", "platform", "external_account_id"),
+        UniqueConstraint("tenant_id", "id", name="uq_platform_accounts_tenant_id_id"),
         CheckConstraint(
             "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x', 'feishu')",
             name="ck_platform_accounts_platform",
@@ -462,6 +464,13 @@ class HumanWorkItem(Base):
             "status <> 'CLAIMED' OR (assigned_actor IS NOT NULL AND claimed_at IS NOT NULL)",
             name="ck_human_work_items_claimed_assignment",
         ),
+        CheckConstraint(
+            "resolution_evidence IS NULL OR resolution_evidence IN "
+            "('REPLY_CORE_CONFIRMED', 'FEISHU_OPERATOR_ATTESTED', "
+            "'ADMIN_OPERATOR_ATTESTED', 'SUPERVISOR_OVERRIDE')",
+            name="ck_human_work_items_resolution_evidence",
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_human_work_items_tenant_id_id"),
         ForeignKeyConstraint(
             ["tenant_id", "conversation_id"],
             ["conversations.tenant_id", "conversations.id"],
@@ -496,7 +505,243 @@ class HumanWorkItem(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_actor: Mapped[str | None] = mapped_column(Text)
+    resolution_evidence: Mapped[str | None] = mapped_column(Text)
+    resolution_outbox_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "outbox_messages.id",
+            name="fk_human_work_items_resolution_outbox_id",
+            ondelete="SET NULL",
+        )
+    )
     version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class TenantFeishuHandoffConfig(Base):
+    __tablename__ = "tenant_feishu_handoff_configs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id"),
+        UniqueConstraint("tenant_id", "id", name="uq_tenant_feishu_handoff_configs_tenant_id_id"),
+        CheckConstraint("config_version >= 1", name="ck_feishu_handoff_configs_version"),
+        CheckConstraint(
+            "length(btrim(destination_chat_id)) > 0",
+            name="ck_feishu_handoff_configs_chat_id",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_feishu_handoff_configs_tenant_account",
+            ondelete="CASCADE",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    feishu_platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    destination_chat_id: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    config_version: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    card_locale: Mapped[str] = mapped_column(Text, default="zh_cn", server_default=text("'zh_cn'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class FeishuHandoffOperator(Base):
+    __tablename__ = "feishu_handoff_operators"
+    __table_args__ = (
+        UniqueConstraint(
+            "feishu_platform_account_id",
+            "operator_open_id",
+            name="uq_feishu_handoff_operators_account_open_id",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'DISABLED')",
+            name="ck_feishu_handoff_operators_status",
+        ),
+        CheckConstraint(
+            "length(btrim(operator_open_id)) > 0",
+            name="ck_feishu_handoff_operators_open_id",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_feishu_handoff_operators_tenant_account",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "admin_user_id"],
+            ["admin_users.tenant_id", "admin_users.id"],
+            name="fk_feishu_handoff_operators_tenant_admin_user",
+        ),
+        Index("ix_feishu_handoff_operators_tenant_status", "tenant_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    feishu_platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    operator_open_id: Mapped[str] = mapped_column(Text)
+    display_name: Mapped[str | None] = mapped_column(Text)
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    can_claim: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    can_resolve: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    status: Mapped[str] = mapped_column(Text, default="ACTIVE", server_default=text("'ACTIVE'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class HandoffNotificationIntent(Base):
+    __tablename__ = "handoff_notification_intents"
+    __table_args__ = (
+        UniqueConstraint("public_id"),
+        UniqueConstraint("human_work_item_id"),
+        UniqueConstraint("provider_uuid"),
+        UniqueConstraint("tenant_id", "id", name="uq_handoff_notification_intents_tenant_id_id"),
+        CheckConstraint(
+            "status IN ('BLOCKED_CONFIG', 'PENDING', 'SENDING', 'SYNCED', "
+            "'FAILED', 'NEEDS_REVIEW', 'CANCELLED')",
+            name="ck_handoff_notification_intents_status",
+        ),
+        CheckConstraint(
+            "desired_card_state IN ('WAITING', 'CLAIMED', 'RESOLVED', 'CANCELLED')",
+            name="ck_handoff_notification_intents_card_state",
+        ),
+        CheckConstraint(
+            "desired_revision >= 1 AND delivered_revision >= 0 "
+            "AND delivered_revision <= desired_revision",
+            name="ck_handoff_notification_intents_revisions",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_handoff_notification_intents_attempt_count",
+        ),
+        CheckConstraint(
+            "(status = 'SENDING') = "
+            "(claim_token IS NOT NULL AND claim_expires_at IS NOT NULL "
+            "AND sending_revision IS NOT NULL)",
+            name="ck_handoff_notification_intents_sending_lease",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "human_work_item_id"],
+            ["human_work_items.tenant_id", "human_work_items.id"],
+            name="fk_handoff_notification_intents_tenant_work",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "conversation_id"],
+            ["conversations.tenant_id", "conversations.id"],
+            name="fk_handoff_notification_intents_tenant_conversation",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "notification_config_id"],
+            ["tenant_feishu_handoff_configs.tenant_id", "tenant_feishu_handoff_configs.id"],
+            name="fk_handoff_notification_intents_tenant_config",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_handoff_notification_intents_tenant_account",
+        ),
+        Index(
+            "ix_handoff_notification_intents_due",
+            "status",
+            "next_attempt_at",
+            "created_at",
+        ),
+        Index(
+            "ix_handoff_notification_intents_tenant_status",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
+        Index("ix_handoff_notification_intents_provider_message", "provider_message_id"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    public_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(Text)
+    human_work_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    notification_config_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    config_version: Mapped[int | None] = mapped_column(Integer)
+    feishu_platform_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    destination_chat_id: Mapped[str | None] = mapped_column(Text)
+    provider_uuid: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=uuid.uuid4)
+    provider_message_id: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        Text, default="BLOCKED_CONFIG", server_default=text("'BLOCKED_CONFIG'")
+    )
+    desired_card_state: Mapped[str] = mapped_column(
+        Text, default="WAITING", server_default=text("'WAITING'")
+    )
+    desired_revision: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    delivered_revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    action_nonce: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=uuid.uuid4)
+    sending_revision: Mapped[int | None] = mapped_column(Integer)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(Text)
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FeishuCardActionReceipt(Base):
+    __tablename__ = "feishu_card_action_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "feishu_platform_account_id",
+            "provider_event_id",
+            name="uq_feishu_card_action_receipts_account_event",
+        ),
+        CheckConstraint(
+            "action IN ('CLAIM', 'RESOLVE')",
+            name="ck_feishu_card_action_receipts_action",
+        ),
+        CheckConstraint(
+            "outcome IN ('PROCESSING', 'SUCCEEDED', 'CONFLICT', 'UNAUTHORIZED', 'MAINTENANCE')",
+            name="ck_feishu_card_action_receipts_outcome",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_feishu_card_action_receipts_tenant_account",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "notification_intent_id"],
+            ["handoff_notification_intents.tenant_id", "handoff_notification_intents.id"],
+            name="fk_feishu_card_action_receipts_tenant_intent",
+        ),
+        Index(
+            "ix_feishu_card_action_receipts_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    feishu_platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    provider_event_id: Mapped[str] = mapped_column(Text)
+    notification_intent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    operator_open_id: Mapped[str | None] = mapped_column(Text)
+    action: Mapped[str] = mapped_column(Text)
+    request_digest: Mapped[str] = mapped_column(String(64))
+    outcome: Mapped[str] = mapped_column(
+        Text, default="PROCESSING", server_default=text("'PROCESSING'")
+    )
+    response_payload: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class OutboxMessage(Base):

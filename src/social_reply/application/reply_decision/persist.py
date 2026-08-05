@@ -7,6 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from social_reply.application.account_management.human_workflow import (
     ensure_open_human_work_item,
 )
+from social_reply.application.handoff_notifications.service import (
+    ensure_handoff_notification_intent,
+)
 from social_reply.application.message_delivery.intents import (
     OutboxActor,
     OutboxOrigin,
@@ -141,12 +144,13 @@ async def persist_decision(
                 current.state = AutomationStateEnum.HANDOFF_PENDING
                 current.state_version += 1
                 current.state_changed_reason = reason_code
-            await ensure_open_human_work_item(
+            work = await ensure_open_human_work_item(
                 session,
                 tenant_id=account.tenant_id,
                 conversation_id=conversation_id,
                 reason_code=reason_code,
             )
+            await ensure_handoff_notification_intent(session, work=work)
 
     if message_type is not None:
         if direct_delivery and message_id is None:
