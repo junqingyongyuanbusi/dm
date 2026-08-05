@@ -71,6 +71,61 @@ async def _route_values(
     }
 
 
+async def lock_handoff_notification_action(
+    session: AsyncSession,
+    *,
+    work: models.HumanWorkItem,
+    notification_public_id: uuid.UUID,
+    expected_card_revision: int,
+    expected_action_nonce: uuid.UUID,
+) -> models.HandoffNotificationIntent:
+    intent = await session.scalar(
+        select(models.HandoffNotificationIntent)
+        .where(models.HandoffNotificationIntent.human_work_item_id == work.id)
+        .with_for_update()
+    )
+    if intent is None:
+        raise HandoffNotificationError("handoff_notification_intent_not_found")
+    if intent.tenant_id != work.tenant_id or intent.conversation_id != work.conversation_id:
+        raise HandoffNotificationError("handoff_notification_intent_scope_mismatch")
+    if (
+        intent.public_id != notification_public_id
+        or intent.desired_revision != expected_card_revision
+        or intent.action_nonce != expected_action_nonce
+    ):
+        raise HandoffNotificationError("handoff_notification_action_stale")
+    return intent
+
+
+async def advance_handoff_notification_for_work(
+    session: AsyncSession,
+    *,
+    work: models.HumanWorkItem,
+) -> models.HandoffNotificationIntent | None:
+    intent = await session.scalar(
+        select(models.HandoffNotificationIntent)
+        .where(models.HandoffNotificationIntent.human_work_item_id == work.id)
+        .with_for_update()
+    )
+    if intent is None:
+        return None
+    if intent.tenant_id != work.tenant_id or intent.conversation_id != work.conversation_id:
+        raise HandoffNotificationError("handoff_notification_intent_scope_mismatch")
+    card_state = _card_state(work.status)
+    if card_state == intent.desired_card_state:
+        return intent
+    intent.desired_card_state = card_state
+    intent.desired_revision += 1
+    intent.action_nonce = uuid.uuid4()
+    intent.next_attempt_at = None
+    if intent.status != "SENDING":
+        if intent.provider_message_id is not None:
+            intent.status = "PENDING"
+        elif card_state in {"RESOLVED", "CANCELLED"}:
+            intent.status = "CANCELLED"
+    return intent
+
+
 async def refresh_handoff_notification_route(
     session: AsyncSession,
     *,

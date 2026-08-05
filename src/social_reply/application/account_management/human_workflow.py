@@ -5,6 +5,10 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.handoff_notifications.service import (
+    advance_handoff_notification_for_work,
+    lock_handoff_notification_action,
+)
 from social_reply.application.message_delivery.intents import (
     OutboxActor,
     OutboxIdempotencyConflict,
@@ -160,6 +164,88 @@ async def _lock_work_context(
     return conversation, account, work, state
 
 
+async def claim_human_work_item_in_session(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    allowed_tenants: frozenset[str],
+    actor: str,
+    user_id: uuid.UUID | None,
+    expected_version: int,
+    notification_public_id: uuid.UUID | None = None,
+    expected_card_revision: int | None = None,
+    expected_action_nonce: uuid.UUID | None = None,
+) -> tuple[
+    models.Conversation,
+    models.PlatformAccount,
+    models.HumanWorkItem,
+    models.AutomationState,
+]:
+    conversation, account, work, state = await _lock_work_context(
+        session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
+    )
+    if notification_public_id is not None:
+        if expected_card_revision is None or expected_action_nonce is None:
+            raise HumanWorkflowError("handoff_notification_action_fence_incomplete")
+        await lock_handoff_notification_action(
+            session,
+            work=work,
+            notification_public_id=notification_public_id,
+            expected_card_revision=expected_card_revision,
+            expected_action_nonce=expected_action_nonce,
+        )
+    if work.status != "WAITING" or work.version != expected_version:
+        raise HumanWorkflowConflict("human_work_item_version_conflict")
+    if state.state not in {"HANDOFF_PENDING", "HUMAN_ACTIVE"}:
+        raise HumanWorkflowConflict("conversation_not_handoff_pending")
+
+    now = datetime.now(UTC)
+    work.status = "CLAIMED"
+    work.assigned_user_id = user_id
+    work.assigned_actor = actor
+    work.claimed_at = now
+    work.version += 1
+    source = state.state
+    state.state = "HUMAN_ACTIVE"
+    state.state_version += 1
+    state.human_agent_id = actor
+    state.state_changed_reason = "human_work_claimed"
+    session.add(
+        models.AuditLog(
+            tenant_id=conversation.tenant_id,
+            category="state_transition",
+            actor=actor,
+            action="HUMAN_ACTIVE",
+            subject_type="conversation",
+            subject_id=str(conversation.id),
+            detail={"reason": "human_work_claimed", "source": source},
+        )
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(
+            models.OutboxMessage.conversation_id == conversation.id,
+            models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
+            models.OutboxMessage.actor_kind == OutboxActor.BOT,
+            models.OutboxMessage.origin_kind == OutboxOrigin.DECISION,
+        )
+        .values(status="CANCELLED", last_error_code="TAKEOVER")
+    )
+    await advance_handoff_notification_for_work(session, work=work)
+    session.add(
+        models.AuditLog(
+            tenant_id=work.tenant_id,
+            category="human_work",
+            actor=actor,
+            action="CLAIM",
+            subject_type="human_work_item",
+            subject_id=str(work.id),
+            detail={"conversation_id": str(work.conversation_id)},
+        )
+    )
+    return conversation, account, work, state
+
+
 async def claim_human_work_item(
     *,
     work_item_id: uuid.UUID,
@@ -169,56 +255,13 @@ async def claim_human_work_item(
     expected_version: int,
 ) -> None:
     async with get_session_factory()() as session:
-        conversation, _account, work, state = await _lock_work_context(
-            session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
-        )
-        if work.status != "WAITING" or work.version != expected_version:
-            raise HumanWorkflowConflict("human_work_item_version_conflict")
-        if state.state not in {"HANDOFF_PENDING", "HUMAN_ACTIVE"}:
-            raise HumanWorkflowConflict("conversation_not_handoff_pending")
-
-        now = datetime.now(UTC)
-        work.status = "CLAIMED"
-        work.assigned_user_id = user_id
-        work.assigned_actor = actor
-        work.claimed_at = now
-        work.version += 1
-        source = state.state
-        state.state = "HUMAN_ACTIVE"
-        state.state_version += 1
-        state.human_agent_id = actor
-        state.state_changed_reason = "human_work_claimed"
-        session.add(
-            models.AuditLog(
-                tenant_id=conversation.tenant_id,
-                category="state_transition",
-                actor=actor,
-                action="HUMAN_ACTIVE",
-                subject_type="conversation",
-                subject_id=str(conversation.id),
-                detail={"reason": "human_work_claimed", "source": source},
-            )
-        )
-        await session.execute(
-            update(models.OutboxMessage)
-            .where(
-                models.OutboxMessage.conversation_id == conversation.id,
-                models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
-                models.OutboxMessage.actor_kind == OutboxActor.BOT,
-                models.OutboxMessage.origin_kind == OutboxOrigin.DECISION,
-            )
-            .values(status="CANCELLED", last_error_code="TAKEOVER")
-        )
-        session.add(
-            models.AuditLog(
-                tenant_id=work.tenant_id,
-                category="human_work",
-                actor=actor,
-                action="CLAIM",
-                subject_type="human_work_item",
-                subject_id=str(work.id),
-                detail={"conversation_id": str(work.conversation_id)},
-            )
+        await claim_human_work_item_in_session(
+            session,
+            work_item_id=work_item_id,
+            allowed_tenants=allowed_tenants,
+            actor=actor,
+            user_id=user_id,
+            expected_version=expected_version,
         )
         await session.commit()
 
@@ -230,6 +273,106 @@ def _require_assignee(work: models.HumanWorkItem, *, actor: str, allow_override:
         raise HumanWorkflowConflict("human_work_item_assigned_to_another_user")
 
 
+async def resolve_human_work_item_in_session(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    allowed_tenants: frozenset[str],
+    actor: str,
+    expected_version: int,
+    allow_override: bool,
+    resolution_evidence: str,
+    resolution_outbox_id: uuid.UUID | None = None,
+    notification_public_id: uuid.UUID | None = None,
+    expected_card_revision: int | None = None,
+    expected_action_nonce: uuid.UUID | None = None,
+) -> tuple[
+    models.Conversation,
+    models.PlatformAccount,
+    models.HumanWorkItem,
+    models.AutomationState,
+]:
+    if resolution_evidence not in {
+        "REPLY_CORE_CONFIRMED",
+        "FEISHU_OPERATOR_ATTESTED",
+        "ADMIN_OPERATOR_ATTESTED",
+        "SUPERVISOR_OVERRIDE",
+    }:
+        raise HumanWorkflowError("resolution_evidence_invalid")
+    conversation, account, work, state = await _lock_work_context(
+        session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
+    )
+    if notification_public_id is not None:
+        if expected_card_revision is None or expected_action_nonce is None:
+            raise HumanWorkflowError("handoff_notification_action_fence_incomplete")
+        await lock_handoff_notification_action(
+            session,
+            work=work,
+            notification_public_id=notification_public_id,
+            expected_card_revision=expected_card_revision,
+            expected_action_nonce=expected_action_nonce,
+        )
+    if work.version != expected_version:
+        raise HumanWorkflowConflict("human_work_item_version_conflict")
+    _require_assignee(work, actor=actor, allow_override=allow_override)
+    if state.state not in {"HANDOFF_PENDING", "HUMAN_ACTIVE"}:
+        raise HumanWorkflowConflict("conversation_not_human_active")
+    if account.automation_default not in {"BOT_DRAFT_ONLY", "BOT_ACTIVE"}:
+        raise HumanWorkflowError("account_automation_default_invalid")
+
+    target = account.automation_default
+    reason = "human_work_resolved_account_policy"
+    if not get_settings().meta_automation_default_allowed(account.platform, target):
+        target = "BOT_DRAFT_ONLY"
+        reason = "human_work_resolved_platform_fallback"
+
+    source = state.state
+    work.status = "RESOLVED"
+    work.resolved_at = datetime.now(UTC)
+    work.resolved_actor = actor
+    work.resolution_evidence = resolution_evidence
+    work.resolution_outbox_id = resolution_outbox_id
+    work.version += 1
+    state.state = target
+    state.state_version += 1
+    state.human_agent_id = None
+    state.state_changed_reason = reason
+    await advance_handoff_notification_for_work(session, work=work)
+    session.add_all(
+        [
+            models.AuditLog(
+                tenant_id=work.tenant_id,
+                category="human_work",
+                actor=actor,
+                action="RESOLVE",
+                subject_type="human_work_item",
+                subject_id=str(work.id),
+                detail={
+                    "conversation_id": str(work.conversation_id),
+                    "resolution_evidence": resolution_evidence,
+                    "resolution_outbox_id": (
+                        str(resolution_outbox_id) if resolution_outbox_id else None
+                    ),
+                },
+            ),
+            models.AuditLog(
+                tenant_id=conversation.tenant_id,
+                category="state_transition",
+                actor=actor,
+                action=target,
+                subject_type="conversation",
+                subject_id=str(conversation.id),
+                detail={
+                    "reason": reason,
+                    "source": source,
+                    "account_policy": account.automation_default,
+                },
+            ),
+        ]
+    )
+    return conversation, account, work, state
+
+
 async def resolve_human_work_item(
     *,
     work_item_id: uuid.UUID,
@@ -237,58 +380,19 @@ async def resolve_human_work_item(
     actor: str,
     expected_version: int,
     allow_override: bool,
+    resolution_evidence: str = "ADMIN_OPERATOR_ATTESTED",
+    resolution_outbox_id: uuid.UUID | None = None,
 ) -> None:
     async with get_session_factory()() as session:
-        conversation, account, work, state = await _lock_work_context(
-            session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
-        )
-        if work.version != expected_version:
-            raise HumanWorkflowConflict("human_work_item_version_conflict")
-        _require_assignee(work, actor=actor, allow_override=allow_override)
-        if state.state not in {"HANDOFF_PENDING", "HUMAN_ACTIVE"}:
-            raise HumanWorkflowConflict("conversation_not_human_active")
-        if account.automation_default not in {"BOT_DRAFT_ONLY", "BOT_ACTIVE"}:
-            raise HumanWorkflowError("account_automation_default_invalid")
-
-        target = account.automation_default
-        reason = "human_work_resolved_account_policy"
-        if not get_settings().meta_automation_default_allowed(account.platform, target):
-            target = "BOT_DRAFT_ONLY"
-            reason = "human_work_resolved_platform_fallback"
-
-        source = state.state
-        work.status = "RESOLVED"
-        work.resolved_at = datetime.now(UTC)
-        work.version += 1
-        state.state = target
-        state.state_version += 1
-        state.human_agent_id = None
-        state.state_changed_reason = reason
-        session.add_all(
-            [
-                models.AuditLog(
-                    tenant_id=work.tenant_id,
-                    category="human_work",
-                    actor=actor,
-                    action="RESOLVE",
-                    subject_type="human_work_item",
-                    subject_id=str(work.id),
-                    detail={"conversation_id": str(work.conversation_id)},
-                ),
-                models.AuditLog(
-                    tenant_id=conversation.tenant_id,
-                    category="state_transition",
-                    actor=actor,
-                    action=target,
-                    subject_type="conversation",
-                    subject_id=str(conversation.id),
-                    detail={
-                        "reason": reason,
-                        "source": source,
-                        "account_policy": account.automation_default,
-                    },
-                ),
-            ]
+        await resolve_human_work_item_in_session(
+            session,
+            work_item_id=work_item_id,
+            allowed_tenants=allowed_tenants,
+            actor=actor,
+            expected_version=expected_version,
+            allow_override=allow_override,
+            resolution_evidence=resolution_evidence,
+            resolution_outbox_id=resolution_outbox_id,
         )
         await session.commit()
 
@@ -461,6 +565,7 @@ async def send_human_reply(
                 state.state_version += 1
                 state.human_agent_id = actor
                 state.state_changed_reason = "admin_human_reply"
+            await advance_handoff_notification_for_work(session, work=work)
 
         if outbox_id is None:
             await session.execute(

@@ -133,10 +133,15 @@ def _encrypted_request(payload: dict, *, signature_transform: Callable[[str], st
     }
 
 
-def _app(*, feishu_enabled=True):
+def _app(*, feishu_enabled=True, handoff_notifications_enabled=False):
     from apps.api.main import create_app
 
-    settings = get_settings().model_copy(update={"feishu_enabled": feishu_enabled})
+    settings = get_settings().model_copy(
+        update={
+            "feishu_enabled": feishu_enabled,
+            "feishu_handoff_notifications_enabled": handoff_notifications_enabled,
+        }
+    )
     return create_app(settings)
 
 
@@ -647,3 +652,393 @@ async def test_group_mention_reaches_decision_job_and_draft_without_outbound(ses
     assert decision.message_id == message.id
     assert decision.action == "draft"
     assert (await session.execute(select(models.OutboxMessage))).first() is None
+
+
+async def _seed_card_work(session, feishu_account_id, *operator_open_ids):
+    customer_account_id = uuid.uuid4()
+    contact_id = uuid.uuid4()
+    conversation_id = uuid.uuid4()
+    message_id = uuid.uuid4()
+    work_id = uuid.uuid4()
+    config_id = uuid.uuid4()
+    intent_id = uuid.uuid4()
+    public_id = uuid.uuid4()
+    action_nonce = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=customer_account_id,
+            tenant_id="tenant-feishu",
+            brand_id="brand-feishu",
+            platform="telegram",
+            name="Customer channel",
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "max_text_length": 4096},
+            automation_default="BOT_ACTIVE",
+            status="active",
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="tenant-feishu",
+            platform="telegram",
+            platform_account_id=customer_account_id,
+            external_user_id="customer-1",
+            display_name="Customer",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            tenant_id="tenant-feishu",
+            brand_id="brand-feishu",
+            platform="telegram",
+            platform_account_id=customer_account_id,
+            contact_id=contact_id,
+            conversation_key=f"telegram:{conversation_id}",
+            channel_type="dm",
+        )
+    )
+    await session.execute(
+        insert(models.AutomationState).values(
+            conversation_id=conversation_id,
+            state="HANDOFF_PENDING",
+            state_version=2,
+            state_changed_reason="RISK_WORD",
+        )
+    )
+    await session.execute(
+        insert(models.Message).values(
+            id=message_id,
+            conversation_id=conversation_id,
+            direction="inbound",
+            sender_type="contact",
+            text="I need a human",
+            reply_target={"chat_id": "customer-1"},
+        )
+    )
+    await session.execute(
+        insert(models.HumanWorkItem).values(
+            id=work_id,
+            tenant_id="tenant-feishu",
+            conversation_id=conversation_id,
+            status="WAITING",
+            reason_code="RISK_WORD",
+            version=1,
+        )
+    )
+    await session.execute(
+        insert(models.TenantFeishuHandoffConfig).values(
+            id=config_id,
+            tenant_id="tenant-feishu",
+            feishu_platform_account_id=feishu_account_id,
+            destination_chat_id="oc_support",
+            enabled=True,
+            config_version=1,
+        )
+    )
+    await session.execute(
+        insert(models.HandoffNotificationIntent).values(
+            id=intent_id,
+            public_id=public_id,
+            tenant_id="tenant-feishu",
+            human_work_item_id=work_id,
+            conversation_id=conversation_id,
+            notification_config_id=config_id,
+            config_version=1,
+            feishu_platform_account_id=feishu_account_id,
+            destination_chat_id="oc_support",
+            provider_uuid=uuid.uuid4(),
+            provider_message_id="om_card",
+            status="SYNCED",
+            desired_card_state="WAITING",
+            desired_revision=1,
+            delivered_revision=1,
+            action_nonce=action_nonce,
+            attempt_count=1,
+        )
+    )
+    operator_ids = []
+    for open_id in operator_open_ids:
+        operator_id = uuid.uuid4()
+        operator_ids.append(operator_id)
+        await session.execute(
+            insert(models.FeishuHandoffOperator).values(
+                id=operator_id,
+                tenant_id="tenant-feishu",
+                feishu_platform_account_id=feishu_account_id,
+                operator_open_id=open_id,
+                display_name=f"Agent {open_id}",
+                can_claim=True,
+                can_resolve=True,
+                status="ACTIVE",
+            )
+        )
+    await session.commit()
+    return intent_id, work_id, public_id, action_nonce, operator_ids
+
+
+def _card_action_payload(
+    *,
+    event_id,
+    operator_open_id,
+    public_id,
+    action_nonce,
+    action,
+    work_version,
+    card_revision,
+):
+    return {
+        "schema": "2.0",
+        "header": {
+            "event_id": event_id,
+            "event_type": "card.action.trigger",
+            "create_time": str(int(time.time() * 1000)),
+            "token": _VERIFY_TOKEN,
+            "app_id": _APP_ID,
+            "tenant_key": "provider-tenant-key",
+        },
+        "event": {
+            "operator": {"open_id": operator_open_id},
+            "token": "card-update-token-must-not-be-stored",
+            "open_message_id": "om_card",
+            "action": {
+                "tag": "button",
+                "value": {
+                    "contract_version": 1,
+                    "notification_id": str(public_id),
+                    "action": action,
+                    "expected_work_version": work_version,
+                    "expected_card_revision": card_revision,
+                    "action_nonce": str(action_nonce),
+                },
+            },
+        },
+    }
+
+
+async def test_card_action_claim_is_atomic_and_duplicate_event_is_idempotent(session):
+    feishu_account_id = await _seed_account(session)
+    intent_id, work_id, public_id, nonce, operator_ids = await _seed_card_work(
+        session,
+        feishu_account_id,
+        "ou_agent",
+    )
+    payload = _card_action_payload(
+        event_id="evt_card_claim",
+        operator_open_id="ou_agent",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    body, headers = _encrypted_request(payload)
+    app = _app(handoff_notifications_enabled=True)
+
+    first = await _post(app, "/webhooks/feishu/fs_primary", content=body, headers=headers)
+    duplicate = await _post(app, "/webhooks/feishu/fs_primary", content=body, headers=headers)
+
+    assert first.status_code == duplicate.status_code == 200
+    assert first.json() == duplicate.json()
+    assert first.json()["toast"]["type"] == "success"
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    intent = await session.get(models.HandoffNotificationIntent, intent_id)
+    state = await session.get(models.AutomationState, work.conversation_id)
+    assert work.status == "CLAIMED"
+    assert work.version == 2
+    assert work.assigned_actor == f"feishu_operator:{operator_ids[0]}"
+    assert state.state == "HUMAN_ACTIVE"
+    assert intent.status == "PENDING"
+    assert intent.desired_card_state == "CLAIMED"
+    assert intent.desired_revision == 2
+    assert (
+        await session.execute(select(func.count()).select_from(models.FeishuCardActionReceipt))
+    ).scalar_one() == 1
+    assert (
+        await session.execute(select(func.count()).select_from(models.RawEvent))
+    ).scalar_one() == 0
+
+
+async def test_card_action_resolve_restores_account_policy_and_records_attestation(session):
+    feishu_account_id = await _seed_account(session)
+    intent_id, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
+        session,
+        feishu_account_id,
+        "ou_agent",
+    )
+    app = _app(handoff_notifications_enabled=True)
+    claim_payload = _card_action_payload(
+        event_id="evt_card_claim_2",
+        operator_open_id="ou_agent",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    claim_body, claim_headers = _encrypted_request(claim_payload)
+    claim = await _post(
+        app,
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=claim_body,
+        headers=claim_headers,
+    )
+    assert claim.json()["toast"]["type"] == "success"
+
+    session.expire_all()
+    claimed_work = await session.get(models.HumanWorkItem, work_id)
+    claimed_intent = await session.get(models.HandoffNotificationIntent, intent_id)
+    resolve_payload = _card_action_payload(
+        event_id="evt_card_resolve",
+        operator_open_id="ou_agent",
+        public_id=public_id,
+        action_nonce=claimed_intent.action_nonce,
+        action="resolve",
+        work_version=claimed_work.version,
+        card_revision=claimed_intent.desired_revision,
+    )
+    resolve_body, resolve_headers = _encrypted_request(resolve_payload)
+    resolved = await _post(
+        app,
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=resolve_body,
+        headers=resolve_headers,
+    )
+
+    assert resolved.status_code == 200
+    assert resolved.json()["toast"]["type"] == "success"
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    intent = await session.get(models.HandoffNotificationIntent, intent_id)
+    state = await session.get(models.AutomationState, work.conversation_id)
+    assert work.status == "RESOLVED"
+    assert work.resolution_evidence == "FEISHU_OPERATOR_ATTESTED"
+    assert work.resolved_actor == work.assigned_actor
+    assert state.state == "BOT_ACTIVE"
+    assert intent.status == "PENDING"
+    assert intent.desired_card_state == "RESOLVED"
+    assert intent.desired_revision == 3
+
+
+async def test_card_action_rejects_unlisted_operator_without_mutating_work(session):
+    feishu_account_id = await _seed_account(session)
+    _intent_id, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
+        session,
+        feishu_account_id,
+    )
+    payload = _card_action_payload(
+        event_id="evt_card_unauthorized",
+        operator_open_id="ou_unlisted",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    body, headers = _encrypted_request(payload)
+    response = await _post(
+        _app(handoff_notifications_enabled=True),
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["toast"]["type"] == "error"
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    receipt = (await session.execute(select(models.FeishuCardActionReceipt))).scalar_one()
+    assert work.status == "WAITING"
+    assert receipt.outcome == "UNAUTHORIZED"
+
+
+async def test_card_action_non_assignee_cannot_resolve_claimed_work(session):
+    feishu_account_id = await _seed_account(session)
+    intent_id, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
+        session,
+        feishu_account_id,
+        "ou_agent_1",
+        "ou_agent_2",
+    )
+    app = _app(handoff_notifications_enabled=True)
+    claim_payload = _card_action_payload(
+        event_id="evt_card_claim_owner",
+        operator_open_id="ou_agent_1",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    claim_body, claim_headers = _encrypted_request(claim_payload)
+    claim = await _post(
+        app,
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=claim_body,
+        headers=claim_headers,
+    )
+    assert claim.json()["toast"]["type"] == "success"
+
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    intent = await session.get(models.HandoffNotificationIntent, intent_id)
+    resolve_payload = _card_action_payload(
+        event_id="evt_card_wrong_resolver",
+        operator_open_id="ou_agent_2",
+        public_id=public_id,
+        action_nonce=intent.action_nonce,
+        action="resolve",
+        work_version=work.version,
+        card_revision=intent.desired_revision,
+    )
+    resolve_body, resolve_headers = _encrypted_request(resolve_payload)
+    resolve = await _post(
+        app,
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=resolve_body,
+        headers=resolve_headers,
+    )
+
+    assert resolve.status_code == 200
+    assert resolve.json()["toast"]["type"] == "warning"
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    state = await session.get(models.AutomationState, work.conversation_id)
+    assert work.status == "CLAIMED"
+    assert work.resolution_evidence is None
+    assert state.state == "HUMAN_ACTIVE"
+
+
+async def test_card_action_feature_off_returns_maintenance_without_mutation(session):
+    feishu_account_id = await _seed_account(session)
+    _intent_id, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
+        session,
+        feishu_account_id,
+        "ou_agent",
+    )
+    payload = _card_action_payload(
+        event_id="evt_card_maintenance",
+        operator_open_id="ou_agent",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    body, headers = _encrypted_request(payload)
+    response = await _post(
+        _app(handoff_notifications_enabled=False),
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["toast"]["type"] == "warning"
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    receipt = (await session.execute(select(models.FeishuCardActionReceipt))).scalar_one()
+    assert work.status == "WAITING"
+    assert receipt.outcome == "MAINTENANCE"

@@ -6,9 +6,8 @@ from datetime import UTC, datetime, timedelta
 import httpx
 from sqlalchemy import select
 
-from social_reply.application.handoff_notifications.cards import (
-    HandoffCardSnapshot,
-    render_handoff_card,
+from social_reply.application.handoff_notifications.projection import (
+    render_current_handoff_card,
 )
 from social_reply.application.handoff_notifications.service import (
     refresh_handoff_notification_route,
@@ -61,58 +60,6 @@ def _work_card_state(work_status: str) -> str:
     if work_status in {"WAITING", "CLAIMED", "RESOLVED", "CANCELLED"}:
         return work_status
     raise ValueError("human_work_item_status_invalid")
-
-
-async def _load_card_snapshot(
-    session,
-    *,
-    intent: models.HandoffNotificationIntent,
-    conversation: models.Conversation,
-    work: models.HumanWorkItem,
-    state: models.AutomationState,
-) -> HandoffCardSnapshot:
-    customer_account = await session.get(models.PlatformAccount, conversation.platform_account_id)
-    contact = await session.get(models.Contact, conversation.contact_id)
-    latest_message = await session.scalar(
-        select(models.Message.text)
-        .where(
-            models.Message.conversation_id == conversation.id,
-            models.Message.direction == "inbound",
-        )
-        .order_by(models.Message.history_seq.desc())
-        .limit(1)
-    )
-    if (
-        customer_account is None
-        or customer_account.tenant_id != intent.tenant_id
-        or contact is None
-        or contact.tenant_id != intent.tenant_id
-    ):
-        raise ValueError("handoff_card_scope_mismatch")
-    settings = get_settings()
-    return HandoffCardSnapshot(
-        notification_public_id=str(intent.public_id),
-        action_nonce=str(intent.action_nonce),
-        work_version=work.version,
-        card_revision=intent.desired_revision,
-        card_state=intent.desired_card_state,
-        platform=conversation.platform,
-        account_name=customer_account.name,
-        channel_type=conversation.channel_type,
-        contact_label=contact.display_name or contact.external_user_id,
-        reason_code=work.reason_code,
-        latest_message=latest_message or "",
-        work_created_at=work.created_at,
-        due_at=work.due_at,
-        rendered_at=datetime.now(UTC),
-        assigned_actor=work.assigned_actor,
-        claimed_at=work.claimed_at,
-        resolved_at=work.resolved_at,
-        restored_automation_state=state.state if work.status == "RESOLVED" else None,
-        conversation_url=(
-            f"{settings.public_base_url.rstrip('/')}/admin/conversations/{conversation.id}"
-        ),
-    )
 
 
 async def _claim_notification(intent_id: uuid.UUID) -> ClaimedNotification | str:
@@ -246,14 +193,12 @@ async def _claim_notification(intent_id: uuid.UUID) -> ClaimedNotification | str
         claim_token = uuid.uuid4()
         attempt_count = intent.attempt_count + 1
         sending_revision = intent.desired_revision
-        card = render_handoff_card(
-            await _load_card_snapshot(
-                session,
-                intent=intent,
-                conversation=conversation,
-                work=work,
-                state=state,
-            )
+        card = await render_current_handoff_card(
+            session,
+            intent=intent,
+            conversation=conversation,
+            work=work,
+            state=state,
         )
         intent.status = "SENDING"
         intent.claim_token = claim_token
