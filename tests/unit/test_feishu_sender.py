@@ -240,3 +240,86 @@ async def test_token_acquisition_rejection_is_retryable_before_reply_dispatch():
     with pytest.raises(RetryableSendError, match="FEISHU_API_10003"):
         await client.send_text(target=_target(), text="hello")
     await client.aclose()
+
+
+async def test_create_interactive_card_uses_chat_id_and_serialized_content():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "tenant_access_token": "tenant", "expire": 7200},
+            )
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "om_card"}})
+
+    client = FeishuClient(
+        app_id="cli_12345678",
+        app_secret="app-secret",
+        transport=httpx.MockTransport(handler),
+    )
+    card = {"schema": "2.0", "body": {"elements": []}}
+    message_id = await client.create_interactive_card(
+        chat_id="oc_support",
+        card=card,
+        provider_uuid="11111111-1111-1111-1111-111111111111",
+    )
+    await client.aclose()
+
+    assert message_id == "om_card"
+    create = requests[1]
+    assert create.method == "POST"
+    assert create.url.path == "/open-apis/im/v1/messages"
+    assert create.url.params["receive_id_type"] == "chat_id"
+    body = json.loads(create.content)
+    assert body == {
+        "receive_id": "oc_support",
+        "msg_type": "interactive",
+        "content": json.dumps(card, ensure_ascii=False, separators=(",", ":")),
+        "uuid": "11111111-1111-1111-1111-111111111111",
+    }
+
+
+async def test_update_interactive_card_patches_existing_provider_message():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "tenant_access_token": "tenant", "expire": 7200},
+            )
+        return httpx.Response(200, json={"code": 0, "data": {}})
+
+    client = FeishuClient(
+        app_id="cli_12345678",
+        app_secret="app-secret",
+        transport=httpx.MockTransport(handler),
+    )
+    card = {"schema": "2.0", "header": {"template": "green"}}
+    await client.update_interactive_card(message_id="om_card", card=card)
+    await client.aclose()
+
+    update = requests[1]
+    assert update.method == "PATCH"
+    assert update.url.path == "/open-apis/im/v1/messages/om_card"
+    assert json.loads(update.content) == {
+        "content": json.dumps(card, ensure_ascii=False, separators=(",", ":"))
+    }
+
+
+async def test_create_interactive_card_rejects_provider_uuid_over_fifty_characters():
+    client = FeishuClient(
+        app_id="cli_12345678",
+        app_secret="app-secret",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    )
+    with pytest.raises(PermanentSendError, match="FEISHU_API_UUID_INVALID"):
+        await client.create_interactive_card(
+            chat_id="oc_support",
+            card={"schema": "2.0"},
+            provider_uuid="x" * 51,
+        )
+    await client.aclose()

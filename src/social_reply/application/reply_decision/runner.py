@@ -333,6 +333,7 @@ async def run_and_persist_decision(
             history=history,
             voice_preferences=persona.preferences,
         )
+    handoff_notification_ids: list[uuid.UUID] = []
     async with get_session_factory()() as session:
         if decision_job_id is not None:
             if decision_generation is None or claim_token is None:
@@ -387,6 +388,7 @@ async def run_and_persist_decision(
             decision_job_id=decision_job_id,
             decision_generation=decision_generation,
             decision_claim_token=claim_token,
+            handoff_notification_ids=handoff_notification_ids,
         )
         if decision_job_id is not None:
             completed = await session.execute(
@@ -416,6 +418,19 @@ async def run_and_persist_decision(
 
                 await aggregate_raw_event_decisions(session, raw_event_id)
         await session.commit()
+    if settings.feishu_handoff_notifications_enabled:
+        from social_reply.application.handoff_notifications.sender import (
+            dispatch_handoff_notification,
+        )
+
+        for notification_id in handoff_notification_ids:
+            try:
+                await dispatch_handoff_notification(notification_id)
+            except Exception:  # noqa: BLE001 - Scheduler recovers the durable PENDING intent
+                logger.exception(
+                    "Feishu handoff notification dispatch failed intent_id=%s",
+                    notification_id,
+                )
     decision_ms = (time.perf_counter() - started) * 1000
     if outbox_id is not None:
         # Fast Path：事务提交后立即认领并投递，绕过 Redis/Dramatiq 的排队延迟。

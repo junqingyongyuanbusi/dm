@@ -83,6 +83,8 @@ def test_build_specs_registers_feishu_health_in_inspection_lane():
         for spec in scheduler._build_sweep_specs(
             _settings(
                 feishu_enabled=True,
+                feishu_handoff_notifications_enabled=True,
+                feishu_handoff_sweep_interval_seconds=4.5,
                 feishu_health_check_interval_seconds=701,
                 scheduler_inspection_warn_after_seconds=44,
             )
@@ -92,6 +94,9 @@ def test_build_specs_registers_feishu_health_in_inspection_lane():
     assert feishu.lane == "inspection"
     assert feishu.interval_seconds == 701
     assert feishu.warn_after_seconds == 44
+    handoff = specs["sweep_handoff_notifications"]
+    assert handoff.lane == "core"
+    assert handoff.interval_seconds == 4.5
 
 
 def test_build_specs_omits_disabled_integrations():

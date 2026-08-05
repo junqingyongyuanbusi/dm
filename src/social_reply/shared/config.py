@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     instagram_messaging_enabled: bool = True
     whatsapp_enabled: bool = True
     feishu_enabled: bool = False
+    feishu_handoff_notifications_enabled: bool = False
+    feishu_handoff_sweep_interval_seconds: float = Field(default=3, ge=0.5, le=60)
+    feishu_handoff_sender_lease_seconds: int = Field(default=30, ge=5, le=600)
+    feishu_handoff_max_attempts: int = Field(default=8, ge=1, le=100)
     # Meta 发布范围默认是「人工审核后才外发」。只有部署方完成 App Review 并显式接受
     # 自动回复的合规责任后，才能把 Meta 账号提升为 BOT_ACTIVE。
     meta_auto_reply_enabled: bool = False

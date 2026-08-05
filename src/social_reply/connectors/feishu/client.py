@@ -1,7 +1,7 @@
 import asyncio
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -14,6 +14,8 @@ from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
 _TOKEN_INVALID_CODE = 99991663
 _RATE_LIMIT_CODES = frozenset({99991400})
 _MAX_REPLY_BODY_BYTES = 20 * 1024
+_MAX_CARD_BODY_BYTES = 100 * 1024
+_MAX_PROVIDER_UUID_CHARS = 50
 
 
 @dataclass(frozen=True)
@@ -185,31 +187,10 @@ class FeishuClient:
             raise PermanentSendError("FEISHU_API_REQUEST_TOO_LARGE")
         return encoded
 
-    async def _send_reply(
+    async def _authenticated_request(
         self,
-        *,
-        target: Mapping[str, Any],
-        body: bytes,
-        token: str,
+        request: Callable[[str], Awaitable[httpx.Response]],
     ) -> tuple[httpx.Response, dict[str, Any] | None, int | None]:
-        message_id = str(target["message_id"])
-        response = await self._client.post(
-            f"/open-apis/im/v1/messages/{quote(message_id, safe='')}/reply",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json; charset=utf-8",
-            },
-            content=body,
-        )
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        code = payload.get("code") if isinstance(payload, dict) else None
-        return response, payload, code if type(code) is int else None
-
-    async def send_text(self, *, target: dict, text: str) -> str:
-        body = self._reply_body(target=target, text=text)
         try:
             token, _expire, token_generation = await self._tenant_access_token()
         except (httpx.ConnectError, httpx.ConnectTimeout):
@@ -219,7 +200,13 @@ class FeishuClient:
             raise RetryableSendError(code) from exc
 
         for refresh_attempt in range(2):
-            response, payload, code = await self._send_reply(target=target, body=body, token=token)
+            response = await request(token)
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            code = payload.get("code") if isinstance(payload, dict) else None
+            code = code if type(code) is int else None
             if code == _TOKEN_INVALID_CODE and refresh_attempt == 0:
                 try:
                     token, _expire, token_generation = await self._tenant_access_token(
@@ -235,26 +222,125 @@ class FeishuClient:
                     )
                     raise RetryableSendError(error_code) from exc
                 continue
-            if response.status_code == 429 or code in _RATE_LIMIT_CODES:
-                raise RetryableSendError(f"FEISHU_API_{code or 429}")
-            if response.status_code >= 500:
-                raise httpx.HTTPStatusError(
-                    "Feishu reply server error",
-                    request=response.request,
-                    response=response,
-                )
-            if response.status_code >= 400:
-                raise PermanentSendError(f"FEISHU_API_{code or f'HTTP_{response.status_code}'}")
-            if code is None or payload is None:
-                raise FeishuClientError("FEISHU_INVALID_RESPONSE", retryable=False)
-            if code != 0:
-                raise PermanentSendError(f"FEISHU_API_{code}")
-            data = payload.get("data")
-            provider_message_id = data.get("message_id") if isinstance(data, dict) else None
-            if not isinstance(provider_message_id, str) or not provider_message_id.strip():
-                raise FeishuClientError("FEISHU_MESSAGE_ID_MISSING", retryable=False)
-            return provider_message_id.strip()
+            return response, payload, code
         raise PermanentSendError(f"FEISHU_API_{_TOKEN_INVALID_CODE}")
+
+    @staticmethod
+    def _response_payload(
+        response: httpx.Response,
+        payload: dict[str, Any] | None,
+        code: int | None,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        if response.status_code == 429 or code in _RATE_LIMIT_CODES:
+            raise RetryableSendError(f"FEISHU_API_{code or 429}")
+        if response.status_code >= 500:
+            raise httpx.HTTPStatusError(
+                f"Feishu {operation} server error",
+                request=response.request,
+                response=response,
+            )
+        if response.status_code >= 400:
+            raise PermanentSendError(f"FEISHU_API_{code or f'HTTP_{response.status_code}'}")
+        if code is None or payload is None:
+            raise FeishuClientError("FEISHU_INVALID_RESPONSE", retryable=False)
+        if code != 0:
+            raise PermanentSendError(f"FEISHU_API_{code}")
+        return payload
+
+    @staticmethod
+    def _provider_message_id(payload: Mapping[str, Any]) -> str:
+        data = payload.get("data")
+        provider_message_id = data.get("message_id") if isinstance(data, dict) else None
+        if not isinstance(provider_message_id, str) or not provider_message_id.strip():
+            raise FeishuClientError("FEISHU_MESSAGE_ID_MISSING", retryable=False)
+        return provider_message_id.strip()
+
+    @staticmethod
+    def _card_body(card: Mapping[str, Any], *, provider_uuid: str | None = None) -> bytes:
+        content = json.dumps(card, ensure_ascii=False, separators=(",", ":"))
+        body: dict[str, Any] = {"content": content}
+        if provider_uuid is not None:
+            if not provider_uuid.strip() or len(provider_uuid) > _MAX_PROVIDER_UUID_CHARS:
+                raise PermanentSendError("FEISHU_API_UUID_INVALID")
+            body["uuid"] = provider_uuid
+        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > _MAX_CARD_BODY_BYTES:
+            raise PermanentSendError("FEISHU_API_REQUEST_TOO_LARGE")
+        return encoded
+
+    async def send_text(self, *, target: dict, text: str) -> str:
+        body = self._reply_body(target=target, text=text)
+        message_id = str(target["message_id"])
+        response, payload, code = await self._authenticated_request(
+            lambda token: self._client.post(
+                f"/open-apis/im/v1/messages/{quote(message_id, safe='')}/reply",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                content=body,
+            )
+        )
+        parsed = self._response_payload(response, payload, code, operation="reply")
+        return self._provider_message_id(parsed)
+
+    async def create_interactive_card(
+        self,
+        *,
+        chat_id: str,
+        card: Mapping[str, Any],
+        provider_uuid: str,
+    ) -> str:
+        if not chat_id.strip():
+            raise PermanentSendError("FEISHU_HANDOFF_CHAT_ID_INVALID")
+        card_body = json.loads(self._card_body(card, provider_uuid=provider_uuid))
+        body = json.dumps(
+            {
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                **card_body,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(body) > _MAX_CARD_BODY_BYTES:
+            raise PermanentSendError("FEISHU_API_REQUEST_TOO_LARGE")
+        response, payload, code = await self._authenticated_request(
+            lambda token: self._client.post(
+                "/open-apis/im/v1/messages",
+                params={"receive_id_type": "chat_id"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                content=body,
+            )
+        )
+        parsed = self._response_payload(response, payload, code, operation="card create")
+        return self._provider_message_id(parsed)
+
+    async def update_interactive_card(
+        self,
+        *,
+        message_id: str,
+        card: Mapping[str, Any],
+    ) -> None:
+        if not message_id.strip():
+            raise PermanentSendError("FEISHU_MESSAGE_ID_MISSING")
+        body = self._card_body(card)
+        response, payload, code = await self._authenticated_request(
+            lambda token: self._client.patch(
+                f"/open-apis/im/v1/messages/{quote(message_id, safe='')}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                content=body,
+            )
+        )
+        self._response_payload(response, payload, code, operation="card update")
 
     async def aclose(self) -> None:
         await self._client.aclose()

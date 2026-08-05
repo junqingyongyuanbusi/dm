@@ -68,6 +68,7 @@ async def persist_decision(
     decision_job_id: uuid.UUID | None = None,
     decision_generation: int | None = None,
     decision_claim_token: uuid.UUID | None = None,
+    handoff_notification_ids: list[uuid.UUID] | None = None,
 ) -> uuid.UUID | None:
     """在调用方事务内写 reply_decisions（永远写）+ 按 action 落地副作用。
     auto_reply/draft → 写 outbox（auto_reply 受 state_version CAS 守护，defense 1）。
@@ -150,7 +151,9 @@ async def persist_decision(
                 conversation_id=conversation_id,
                 reason_code=reason_code,
             )
-            await ensure_handoff_notification_intent(session, work=work)
+            notification = await ensure_handoff_notification_intent(session, work=work)
+            if handoff_notification_ids is not None and notification.status == "PENDING":
+                handoff_notification_ids.append(notification.id)
 
     if message_type is not None:
         if direct_delivery and message_id is None:

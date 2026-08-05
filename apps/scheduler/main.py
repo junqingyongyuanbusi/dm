@@ -22,6 +22,9 @@ from social_reply.application.event_ingestion.xchat_recovery import sweep_xchat_
 from social_reply.application.event_ingestion.xchat_subscription import (
     ensure_xchat_subscriptions,
 )
+from social_reply.application.handoff_notifications.sweep import (
+    sweep_handoff_notifications,
+)
 from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision.jobs import sweep_decision_jobs
 from social_reply.infrastructure.queue.actor_loop import submit_on_actor_loop
@@ -87,6 +90,16 @@ def _build_sweep_specs(settings: Settings) -> tuple[SweepSpec, ...]:
             sweep_outbox,
         ),
     ]
+    if settings.feishu_enabled and settings.feishu_handoff_notifications_enabled:
+        specs.append(
+            SweepSpec(
+                "sweep_handoff_notifications",
+                "core",
+                settings.feishu_handoff_sweep_interval_seconds,
+                core_warn_after,
+                sweep_handoff_notifications,
+            )
+        )
     if settings.xchat_enabled:
         specs.append(
             SweepSpec(

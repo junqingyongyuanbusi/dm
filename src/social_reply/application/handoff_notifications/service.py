@@ -30,11 +30,19 @@ async def _route_values(
     )
     if config is None:
         return {
+            "notification_config_id": None,
+            "config_version": None,
+            "feishu_platform_account_id": None,
+            "destination_chat_id": None,
             "status": "BLOCKED_CONFIG",
             "last_error_code": "FEISHU_HANDOFF_ROUTE_MISSING",
         }
     if not config.enabled:
         return {
+            "notification_config_id": None,
+            "config_version": None,
+            "feishu_platform_account_id": None,
+            "destination_chat_id": None,
             "status": "BLOCKED_CONFIG",
             "last_error_code": "FEISHU_HANDOFF_ROUTE_DISABLED",
         }
@@ -46,6 +54,10 @@ async def _route_values(
         or account.status != ACTIVE_ACCOUNT_STATUS
     ):
         return {
+            "notification_config_id": None,
+            "config_version": None,
+            "feishu_platform_account_id": None,
+            "destination_chat_id": None,
             "status": "BLOCKED_CONFIG",
             "last_error_code": "FEISHU_HANDOFF_ACCOUNT_INVALID",
         }
@@ -57,6 +69,23 @@ async def _route_values(
         "status": "PENDING",
         "last_error_code": None,
     }
+
+
+async def refresh_handoff_notification_route(
+    session: AsyncSession,
+    *,
+    intent: models.HandoffNotificationIntent,
+) -> bool:
+    if intent.provider_message_id is not None:
+        return False
+    route_values = await _route_values(session, tenant_id=intent.tenant_id)
+    for field, value in route_values.items():
+        setattr(intent, field, value)
+    if route_values["status"] == "PENDING":
+        intent.next_attempt_at = None
+        intent.last_error_message = None
+        return True
+    return False
 
 
 async def ensure_handoff_notification_intent(
