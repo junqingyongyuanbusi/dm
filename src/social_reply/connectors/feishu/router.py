@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import secrets
 from datetime import UTC, datetime
 from typing import Any
@@ -33,6 +34,8 @@ from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
@@ -56,18 +59,25 @@ async def _verified_payload(account, request: Request) -> tuple[dict[str, Any], 
 
     header = payload.get("header")
     if not isinstance(header, dict):
+        logger.warning(
+            "feishu callback rejected account=%s missing_header encrypted=%s",
+            account.public_id,
+            isinstance(encrypted, str),
+        )
         raise FeishuSecurityError()
     # Event-subscription callbacks (e.g. im.message.receive_v1) are delivered
-    # encrypted and authenticate via the X-Lark-Signature over the raw body.
-    # Interactive-card action callbacks (card.action.trigger) are plain JSON and
-    # Feishu authenticates them with the Verification Token only, no body signature.
+    # encrypted and authenticated via the X-Lark-Signature over the raw body.
+    # Interactive-card action callbacks (card.action.trigger) carry no X-Lark
+    # signature even when the body is encrypted; Feishu authenticates them with
+    # the Verification Token only.
     is_card_action = header.get("event_type") == "card.action.trigger"
-    if isinstance(encrypted, str):
-        timestamp = request.headers.get("X-Lark-Request-Timestamp")
-        nonce = request.headers.get("X-Lark-Request-Nonce")
-        signature = request.headers.get("X-Lark-Signature")
-        if not all((timestamp, nonce, signature)):
-            raise FeishuSecurityError()
+    timestamp = request.headers.get("X-Lark-Request-Timestamp")
+    nonce = request.headers.get("X-Lark-Request-Nonce")
+    signature = request.headers.get("X-Lark-Signature")
+    signed = bool(timestamp and nonce and signature)
+    if is_card_action:
+        pass  # no signature required for card actions
+    elif isinstance(encrypted, str) and signed:
         verify_signature(
             timestamp=timestamp,
             nonce=nonce,
@@ -75,14 +85,48 @@ async def _verified_payload(account, request: Request) -> tuple[dict[str, Any], 
             encrypt_key=encrypt_key,
             body=body,
         )
-    elif not is_card_action:
+    else:
+        logger.warning(
+            "feishu callback rejected account=%s encrypted=%s signed=%s event_type=%s",
+            account.public_id,
+            isinstance(encrypted, str),
+            signed,
+            header.get("event_type"),
+        )
         raise FeishuSecurityError()
 
-    verify_token(header.get("token"), expected=verification_token)
+    if not (
+        (
+            isinstance(header.get("token"), str)
+            and secrets.compare_digest(header.get("token"), verification_token)
+        )
+        or (
+            isinstance(payload.get("token"), str)
+            and secrets.compare_digest(payload.get("token"), verification_token)
+        )
+    ):
+        logger.warning(
+            "feishu token rejected account=%s event_type=%s encoded=%s signed=%s",
+            account.public_id,
+            header.get("event_type"),
+            isinstance(encrypted, str),
+            signed,
+        )
+        raise FeishuSecurityError()
     header_app_id = header.get("app_id")
     if not isinstance(header_app_id, str) or not secrets.compare_digest(header_app_id, app_id):
+        logger.warning(
+            "feishu app_id rejected account=%s event_type=%s",
+            account.public_id,
+            header.get("event_type"),
+        )
         raise FeishuSecurityError()
     if nonblank_string_or_none(header.get("event_id")) is None:
+        logger.warning(
+            "feishu callback rejected account=%s missing_event_id event_type=%s",
+            account.public_id,
+            header.get("event_type"),
+        )
         raise FeishuSecurityError()
     return payload, body
 
