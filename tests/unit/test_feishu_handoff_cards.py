@@ -34,7 +34,7 @@ def _snapshot(**updates) -> HandoffCardSnapshot:
 
 
 def _actions(card: dict) -> list[dict]:
-    return card["body"]["elements"][1]["actions"]
+    return [element for element in card["body"]["elements"][1:] if element["tag"] == "button"]
 
 
 def test_waiting_card_redacts_customer_data_and_emits_versioned_claim_action():

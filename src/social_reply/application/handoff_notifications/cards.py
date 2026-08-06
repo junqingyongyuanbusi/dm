@@ -158,10 +158,7 @@ def render_handoff_card(snapshot: HandoffCardSnapshot) -> dict[str, object]:
             "title": {"tag": "plain_text", "content": title},
             "template": template,
         },
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": "\n".join(lines)},
-                {"tag": "action", "actions": actions},
-            ]
-        },
+        # Feishu card V2 removed the <action> module: buttons must be standalone
+        # body elements (as top-level element modules) or the card is rejected.
+        "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines)}, *actions]},
     }
