@@ -44,35 +44,40 @@ async def _verified_payload(account, request: Request) -> tuple[dict[str, Any], 
     body = await _read_limited_body(request)
     envelope = parse_json_object(body)
     encrypted = envelope.get("encrypt")
-    timestamp = request.headers.get("X-Lark-Request-Timestamp")
-    nonce = request.headers.get("X-Lark-Request-Nonce")
-    signature = request.headers.get("X-Lark-Signature")
-    signature_headers = (timestamp, nonce, signature)
-    signature_verified = False
-    if isinstance(encrypted, str):
-        if any(signature_headers):
-            if not all(signature_headers):
-                raise FeishuSecurityError()
-            verify_signature(
-                timestamp=timestamp,
-                nonce=nonce,
-                signature=signature,
-                encrypt_key=encrypt_key,
-                body=body,
-            )
-            signature_verified = True
-        payload = decrypt_payload(encrypted, encrypt_key=encrypt_key)
-    else:
-        payload = envelope
+    payload = (
+        decrypt_payload(encrypted, encrypt_key=encrypt_key)
+        if isinstance(encrypted, str)
+        else envelope
+    )
 
     if _is_url_verification(payload):
         verify_token(payload.get("token"), expected=verification_token)
         return payload, body
-    if not isinstance(encrypted, str) or not signature_verified:
-        raise FeishuSecurityError()
+
     header = payload.get("header")
     if not isinstance(header, dict):
         raise FeishuSecurityError()
+    # Event-subscription callbacks (e.g. im.message.receive_v1) are delivered
+    # encrypted and authenticate via the X-Lark-Signature over the raw body.
+    # Interactive-card action callbacks (card.action.trigger) are plain JSON and
+    # Feishu authenticates them with the Verification Token only, no body signature.
+    is_card_action = header.get("event_type") == "card.action.trigger"
+    if isinstance(encrypted, str):
+        timestamp = request.headers.get("X-Lark-Request-Timestamp")
+        nonce = request.headers.get("X-Lark-Request-Nonce")
+        signature = request.headers.get("X-Lark-Signature")
+        if not all((timestamp, nonce, signature)):
+            raise FeishuSecurityError()
+        verify_signature(
+            timestamp=timestamp,
+            nonce=nonce,
+            signature=signature,
+            encrypt_key=encrypt_key,
+            body=body,
+        )
+    elif not is_card_action:
+        raise FeishuSecurityError()
+
     verify_token(header.get("token"), expected=verification_token)
     header_app_id = header.get("app_id")
     if not isinstance(header_app_id, str) or not secrets.compare_digest(header_app_id, app_id):

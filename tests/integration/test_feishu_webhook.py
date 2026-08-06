@@ -861,6 +861,53 @@ async def test_card_action_claim_is_atomic_and_duplicate_event_is_idempotent(ses
     ).scalar_one() == 0
 
 
+async def test_plaintext_card_action_is_authenticated_by_verification_token(session):
+    # Feishu delivers interactive-card actions as plain JSON authenticated by the
+    # Verification Token (header.token), without an encrypt wrapper or X-Lark
+    # signature. A plaintext claim must be accepted on both callback routes.
+    feishu_account_id = await _seed_account(session)
+    _, work_id, public_id, nonce, operator_ids = await _seed_card_work(
+        session,
+        feishu_account_id,
+        "ou_agent",
+    )
+    payload = _card_action_payload(
+        event_id="evt_plain_claim",
+        operator_open_id="ou_agent",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    app = _app(handoff_notifications_enabled=True)
+    by_base = await _post(app, "/webhooks/feishu/fs_primary", json_body=payload)
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    assert by_base.status_code == 200
+    assert by_base.json()["toast"]["type"] == "success"
+    assert work.status == "CLAIMED"
+    assert work.assigned_actor == f"feishu_operator:{operator_ids[0]}"
+
+    # A plaintext card action with a mismatched Verification Token is rejected
+    # at verification, before any receipt is written or state is changed.
+    bad_payload = _card_action_payload(
+        event_id="evt_plain_bad",
+        operator_open_id="ou_agent",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    bad_payload["header"]["token"] = "not-the-token"
+    bad = await _post(app, "/webhooks/feishu/fs_primary/card-actions", json_body=bad_payload)
+    assert bad.status_code == 401
+    assert (
+        await session.execute(select(func.count()).select_from(models.FeishuCardActionReceipt))
+    ).scalar_one() == 1
+
+
 async def test_card_action_resolve_restores_account_policy_and_records_attestation(session):
     feishu_account_id = await _seed_account(session)
     intent_id, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
