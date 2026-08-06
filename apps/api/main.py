@@ -7,6 +7,9 @@ from fastapi.staticfiles import StaticFiles
 
 from social_reply.application.account_management.admin import router as admin_router
 from social_reply.application.account_management.admin_console import router as admin_console_router
+from social_reply.application.account_management.feishu_handoff_admin import (
+    router as feishu_handoff_admin_router,
+)
 from social_reply.application.account_management.oauth import router as oauth_router
 from social_reply.application.account_management.router import router as account_management_router
 from social_reply.application.account_management.users import router as admin_users_router
@@ -106,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(admin_router)
     app.include_router(admin_console_router)
+    app.include_router(feishu_handoff_admin_router)
     app.include_router(admin_users_router)
     app.include_router(oauth_router)
     app.include_router(account_management_router)

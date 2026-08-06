@@ -181,8 +181,14 @@ Token 和 Encrypt Key；Control API 等价入口为
 `${PUBLIC_BASE_URL}/webhooks/feishu/{public_id}`，在飞书开放平台手工订阅
 `im.message.receive_v1`，完成 URL verification，并发布应用。账号固定从 `BOT_DRAFT_ONLY`
 开始；草稿 smoke 通过后，再在 `/admin/accounts` 明确点击「切为自动」进入 `BOT_ACTIVE`。
-私信和群内明确 `@Bot` 的文本消息受支持；普通群消息与 `@所有人` 不在范围内。完整操作步骤见
-[Feishu operator runbook](docs/feishu-integration.md)。
+私信和群内明确 `@Bot` 的文本消息受支持；普通群消息与 `@所有人` 不在范围内。
+
+人工接管卡片使用独立的 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` 暗发布开关。在
+`/admin/feishu-handoff` 选择客服群、维护 app-scoped operator `open_id` allowlist，并把页面显示的
+Card Action Callback 配置为 `card.action.trigger` 回调；测试卡片到达后，API、Worker、Scheduler
+必须同时启用该开关。新的 HANDOFF 会在同一事务中留下持久化通知意图，客服可在飞书卡片接单，
+并用“已回复，恢复 Bot”解决工单。该动作是客服声明；需要可验证发送证据时，应通过本地 Inbox
+手动回复。完整操作步骤见 [Feishu operator runbook](docs/feishu-integration.md)。
 
 ### 连接 X
 
@@ -251,7 +257,7 @@ DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
 REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 6 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `d3f6a1b8c904`。当前 Feishu 专用测试文件的精确收集数以 `pytest --collect-only` 为准；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `b7e4c2d9a615`。当前 Feishu 专用测试文件的精确收集数以 `pytest --collect-only` 为准；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
 
 ## X 贴文评论自动回复
 

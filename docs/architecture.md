@@ -41,6 +41,7 @@ PostgreSQL owns:
 - webhook `RawEvent` rows and normalized event deduplication;
 - contacts, conversations, messages and automation state;
 - local operations inbox state in `HumanWorkItem`, including tenant-scoped claim ownership and optimistic versioning;
+- Feishu handoff routes, operator authorization, notification intents and card-action receipts;
 - `ProvisioningJob`, `DecisionJob`, `ReplyDecision` and `OutboxMessage` state;
 - immutable Outbox origin, actor and explicit reply-target provenance for bot decisions, draft approvals and manual replies;
 - delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps.
@@ -114,6 +115,7 @@ Chatwoot:
 
 ```text
 HANDOFF / unsupported attachment -> HumanWorkItem(WAITING) + HANDOFF_PENDING
+                                 -> HandoffNotificationIntent(PENDING or BLOCKED_CONFIG)
 claim                          -> HumanWorkItem(CLAIMED) + HUMAN_ACTIVE
 resolve                        -> HumanWorkItem(RESOLVED) + current account automation policy
 legacy exception               -> explicit resume to BOT_DRAFT_ONLY or BOT_ACTIVE
@@ -143,6 +145,17 @@ decisions use `DECISION/BOT`, approved drafts use `DRAFT_APPROVAL/ADMIN_HUMAN`, 
 `MANUAL_REPLY/ADMIN_HUMAN`, so the Outbox row is the durable provenance bridge from operator action
 to outbound history. Direct-platform delivery is independent of Chatwoot; accounts deliberately
 using a Chatwoot destination still require their persisted conversation mapping.
+
+When Feishu handoff notifications are enabled, the HANDOFF persistence transaction also creates or
+reuses one `HandoffNotificationIntent` per work item. Missing or disabled routing does not roll back
+the customer handoff: it leaves a durable `BLOCKED_CONFIG` notification for Scheduler recovery.
+Worker creates or updates a minimized schema-2.0 card in the configured support chat; notification
+leases, claim tokens, desired revisions and provider message IDs remain PostgreSQL state. Card claim
+and resolve callbacks use the same session-scoped work-item transactions as Admin, require a
+Tenant/app-scoped operator allowlist, and persist an idempotent receipt keyed by Feishu callback
+`event_id`. A card resolve records `FEISHU_OPERATOR_ATTESTED`; it proves the operator declaration,
+not delivery of an external social-platform reply. A local Admin manual reply can instead retain
+Reply Core Outbox delivery evidence.
 
 ## Chatwoot bridge
 
@@ -248,12 +261,20 @@ sanitized `READY`, `BOT_NOT_ACTIVE`, `BOT_ID_MISMATCH`, `CREDENTIAL_INVALID` or 
 inspection lane is separate from durable core recovery and cannot serialize RawEvent, DecisionJob or
 Outbox recovery.
 
+Handoff cards use the same enterprise self-built application credentials but a separate
+`/webhooks/feishu/{public_id}/card-actions` protocol and `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED`
+gate. Card callbacks repeat signature, encryption, Verification Token, App ID, timestamp and body
+size validation, then perform only a bounded PostgreSQL transaction. They do not call Feishu, Redis
+or the LLM on the three-second acknowledgement path. Card creation uses a stable UUID, but ambiguous
+creation after Feishu's one-hour deduplication window becomes `NEEDS_REVIEW`; deterministic updates
+by provider message ID remain retryable.
+
 ## Scheduler lanes
 
 Scheduler runs due sweeps independently rather than as one serial cycle:
 
-- the **core recovery lane** owns ProvisioningJob, initial RawEvent, DecisionJob, Outbox and XChat
-  recovery;
+- the **core recovery lane** owns ProvisioningJob, initial RawEvent, DecisionJob, Outbox, Feishu
+  handoff-notification and XChat recovery;
 - the **inspection lane** owns Chatwoot reconciliation, X polling/subscription/webhook inspection,
   Meta health reconciliation and Feishu account health inspection.
 
@@ -293,6 +314,7 @@ durable job boundary rather than directly mutating account rows.
 - A newer inbound cancels only unsent bot-decision Outboxes, and send-time generation validation is the final stale-input fence.
 - Decisions and Outbox intent are committed together.
 - Local human claims, explicit reply targets and manual/draft Outbox provenance remain tenant-scoped and durable without Chatwoot.
+- Feishu handoff routing, operator authorization, card revisions and callback idempotency remain tenant- and app-scoped in PostgreSQL.
 - Public sending rechecks takeover state immediately before network I/O.
 - Direct sending rechecks tenant, account status, route/platform compatibility, capability, text
   limit and delivery window.
@@ -317,8 +339,8 @@ These public systems informed semantics only; Social Reply does not add them as 
 
 ## Deployment invariants
 
-- API, Worker, and Scheduler must receive the same feature flags, including `FEISHU_ENABLED`, and
-  the same `PLATFORM_SECRET_KEYS`.
+- API, Worker, and Scheduler must receive the same feature flags, including `FEISHU_ENABLED` and
+  `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED`, and the same `PLATFORM_SECRET_KEYS`.
 - Only API performs migration; Worker and Scheduler start after the database reaches head.
 - PostgreSQL and Redis are private infrastructure endpoints. Only API is exposed through the public
   ingress/tunnel.

@@ -115,6 +115,7 @@ The built-in administration surface provides:
 - superadmin-only tenant-wide automation kill switch; tenant users retain account-level controls for their own accounts;
 - PostgreSQL-backed runtime health summary on `/admin`, covering ingestion recovery, decision jobs, Outbox, provisioning, active X sync gaps, and disabled accounts with oldest backlog age;
 - an operations inbox at `/admin/inbox` for human handoff, draft review, and delivery exceptions, with direct-message versus public-interaction filtering and oldest-wait ordering;
+- Feishu handoff routing at `/admin/feishu-handoff`, including one support-chat route per Tenant, an explicit app-scoped operator allowlist, a non-customer-data test card, and read-only notification failure visibility;
 - a conversation archive at `/admin/conversations`, where direct messages and public comments/mentions are separated while every reply remains bound to an explicit inbound message target;
 - read-only runtime diagnostics at `/admin/health`; draft approval and delivery retry remain inbox workflows instead of being duplicated across diagnostic pages;
 - platform account and provisioning-job overview;
@@ -147,6 +148,28 @@ administrator must explicitly use the account action on `/admin/accounts` to cha
 `BOT_ACTIVE`; the mutation is tenant-scoped and audited as `SET_AUTOMATION_DEFAULT`. This explicit
 post-provisioning promotion is separate from Feishu's deployment feature gate and does not imply
 that production credentials or a live provider E2E are present.
+
+### Feishu handoff notification contract
+
+The handoff notification plane reuses a Tenant's existing Feishu enterprise self-built application
+credentials but does not grant all Feishu users access to work items. `/admin/feishu-handoff`
+selects one active Feishu account and one support group `chat_id` per Tenant, then maintains an
+explicit `open_id` allowlist with independent claim and resolve permissions. Route, operator and
+test-card mutations are tenant-scoped, CSRF-protected and audited.
+
+The page displays the account-specific Card Action Callback URL. Operators must configure Feishu to
+deliver `card.action.trigger` callbacks to that URL separately from `im.message.receive_v1`, publish
+the app version, add the Bot to the support group and enable
+`FEISHU_HANDOFF_NOTIFICATIONS_ENABLED` on API, Worker and Scheduler only after the test card arrives.
+Unknown or ambiguous test-card creation is reported as indeterminate and must not be retried until
+the support group has been checked.
+
+A new HANDOFF remains valid if notification routing is absent: Reply Core records a durable
+`BLOCKED_CONFIG` intent and Scheduler can recover it after configuration. Claim and resolve card
+actions use the same work-item versions and account-policy restoration as Admin. By default only the
+claimant may resolve. The “已回复，恢复 Bot” action records `FEISHU_OPERATOR_ATTESTED`; it is an
+operator declaration because Reply Core cannot verify an external social-platform reply. Use the
+local inbox manual reply when durable Outbox delivery evidence is required.
 
 Production deployments should put `/admin` behind an identity-aware proxy or replace the local administrator login with OIDC/MFA. The service API and data-plane webhooks remain separate.
 

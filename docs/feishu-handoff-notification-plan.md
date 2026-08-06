@@ -1158,3 +1158,15 @@ implementation complete, release blocked
 8. Notification feature 初始默认关闭。
 9. resolve 恢复账号当前策略，不强制自动回复。
 10. 人工期间消息不进行任何 retroactive Bot reply。
+
+## 实施状态
+
+方案已按本计划完成代码实现，并在隔离环境 `handoff-dev-0805` 完成 Railway 验证：
+
+- 持久层：迁移 `b7e4c2d9a615` + 通知路由/客服/意图/回调回执表（commit 2fbb1f9，1044 项通过）。
+- 卡片投递与恢复：卡片渲染、create/update、fenced sender、Worker actor、Scheduler 恢复（commit 910732d，1054 项通过）。
+- 卡片动作回调：共享 session 级 claim/resolve、权限、幂等回执、resolution evidence（commit a0d9215，1059 项通过）。
+- 管理面与可观测性：`/admin/feishu-handoff` 路由、客服 allowlist、显式测试卡片、通知异常可见性、环境模板与运行文档（56 focused + 1063 全量通过）。
+- 最终完整门禁：Ruff、Alembic upgrade/check/heads、compileall、1063 项 pytest 全通过。
+
+「提交推送并发布生产」阶段按 AGENTS.md 的完成门禁执行：推送到 `dev`、等待 CI、发布一个镜像 digest、并协调部署 API/Worker/Scheduler 且配置生产 handoff 通知后再启用。

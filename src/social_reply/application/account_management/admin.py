@@ -93,6 +93,14 @@ def _secure_cookie(request: Request) -> bool:
     )
 
 
+def _ensure_csrf(response: Response, request: Request, csrf: str) -> Response:
+    if not request.cookies.get(_CSRF_COOKIE):
+        response.set_cookie(
+            _CSRF_COOKIE, csrf, httponly=False, samesite="lax", secure=_secure_cookie(request)
+        )
+    return response
+
+
 async def _form(request: Request) -> dict[str, str]:
     body = (await request.body()).decode()
     return {key: values[-1] for key, values in parse_qs(body, keep_blank_values=True).items()}
@@ -105,6 +113,15 @@ def _require_csrf(request: Request, form: dict[str, str]) -> None:
         raise HTTPException(status_code=403, detail="invalid_csrf_token")
 
 
+def tenant_id_or_default(principal: Principal, requested: str) -> str:
+    tenant = (requested or "").strip() or principal.tenant_id or ""
+    if not tenant:
+        tenant = sorted(principal.allowed_tenants)[0]
+    if tenant not in principal.allowed_tenants:
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    return tenant
+
+
 _NAV_ITEMS = (
     ("overview", "/admin", "总览"),
     ("inbox", "/admin/inbox", "收件箱"),
@@ -112,6 +129,7 @@ _NAV_ITEMS = (
     ("knowledge", "/admin/knowledge", "知识库"),
     ("prompt", "/admin/prompt", "提示词"),
     ("accounts", "/admin/accounts", "账号"),
+    ("handoff", "/admin/feishu-handoff", "人工通知"),
     ("health", "/admin/health", "系统健康"),
 )
 
@@ -261,6 +279,8 @@ label{{display:block;font-size:13px;font-weight:500;color:var(--text);margin:14p
 input,select,textarea{{width:100%;padding:10px 12px;font-size:16px;font-family:var(--sans);color:var(--text);background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-md);min-height:44px;transition:border-color .18s,box-shadow .18s}}
 textarea{{min-height:88px;resize:vertical}}
 input:focus,select:focus,textarea:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(193,95,60,.14)}}
+.check{{display:flex;align-items:center;gap:9px;font-weight:400}}
+.check input{{width:auto;min-height:0;margin:0}}
 button{{display:inline-block;padding:10px 18px;min-height:42px;font-size:14.5px;font-weight:500;font-family:var(--sans);color:#fff;background:var(--accent);border:0;border-radius:var(--r-md);cursor:pointer;transition:background .18s}}
 button:hover{{background:var(--accent-hover)}}
 button.btn-block{{width:100%;margin-top:20px;min-height:44px;font-size:15px}}
@@ -279,6 +299,7 @@ details.collapse>.inner{{padding:0 24px 24px}}
 .banner{{padding:12px 16px;border-radius:var(--r-md);font-size:14px;margin-bottom:18px}}
 .banner.err{{background:var(--err-bg);color:var(--err-fg)}}
 .banner.ok{{background:var(--ok-bg);color:var(--ok-fg)}}
+.banner.warn{{background:var(--warn-bg);color:var(--warn-fg)}}
 .banner.info{{background:var(--info-bg);color:var(--info-fg)}}
 a{{color:var(--link)}}
 :focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}

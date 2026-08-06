@@ -124,13 +124,20 @@ created them.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FEISHU_ENABLED` | `false` | Feishu provisioning, normal-event dispatch, health inspection and sending |
+| `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED` | `false` | Durable handoff-card creation, updates, card actions and recovery |
 | `FEISHU_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler credential/Bot health cadence; range 60-86400 |
+| `FEISHU_HANDOFF_SWEEP_INTERVAL_SECONDS` | `3` | Scheduler handoff-notification recovery cadence; range 0.5-60 |
+| `FEISHU_HANDOFF_SENDER_LEASE_SECONDS` | `30` | Notification sender lease; range 5-600 |
+| `FEISHU_HANDOFF_MAX_ATTEMPTS` | `8` | Maximum automatic attempts for deterministic card delivery failures; range 1-100 |
 
 API, Worker and Scheduler must receive the same values, and configuration changes take effect only
 after all three roles restart on one flag-aware image. The environment templates keep
 `FEISHU_ENABLED=false`. Prepare the self-built application Bot first, deploy the flag-aware image
 with Feishu disabled, then enable all three roles together, provision the account and configure the
-returned account-specific Callback URL. The provider API origin is fixed at
+returned account-specific Callback URL. Handoff cards use a second dark-launch gate: keep
+`FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` until `/admin/feishu-handoff` has a validated support
+chat and operator allowlist and the Feishu console delivers `card.action.trigger` callbacks to the
+account-specific Card Action Callback URL. The provider API origin is fixed at
 `https://open.feishu.cn` rather than configured by an environment variable.
 
 The Feishu webhook route is always registered. While the feature is disabled, plaintext or encrypted

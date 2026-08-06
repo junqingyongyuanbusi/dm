@@ -420,6 +420,46 @@ Revision `da4e19c7b203` adds `admin_users` and `admin_sessions`. Revision `e7b2c
 - Ordinary users are created at `/admin/users`, have exactly one Tenant, and must change their initial password on first login.
 - Back up `admin_users` before downgrading this revision; downgrade removes both user and session tables.
 
+## Feishu handoff notification rollout
+
+Revision `b7e4c2d9a615` follows `d3f6a1b8c904`. It adds Tenant Feishu handoff routes, app-scoped
+operator authorization, durable notification intents, idempotent card-action receipts and explicit
+HumanWorkItem resolution evidence. The migration is additive and does not create notifications for
+historical open work.
+
+Before upgrade, take and verify a PostgreSQL backup. Deploy API, Worker and Scheduler with
+`FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` and identical sender lease, retry and sweep settings.
+After API migrates the database, require all three roles to reach one image digest and confirm the
+unique Alembic head is `b7e4c2d9a615`. Do not enable callbacks while an old API can still receive a
+card action or an old Worker/Scheduler is running.
+
+Configure one Tenant at a time:
+
+1. Open `/admin/feishu-handoff`, select the existing active and `READY` Feishu account, enter the
+   support-group `chat_id`, save the route, and add each authorized support user's app-scoped
+   `open_id` with explicit claim/resolve permissions.
+2. In the Feishu developer console, register the page's account-specific
+   `/webhooks/feishu/{public_id}/card-actions` URL for `card.action.trigger`. This is separate from
+   the `im.message.receive_v1` event subscription. Complete callback verification, publish the app
+   version and add the Bot to the support group.
+3. Send exactly one Admin test card. If the result is reported as ambiguous, inspect the group before
+   trying again. The test card creates no HumanWorkItem and contains no customer data.
+4. Set `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=true` on API, Worker and Scheduler without deploying
+   different values, then redeploy all three roles to one verified digest. Confirm the Scheduler
+   registers the handoff recovery sweep.
+5. Trigger one controlled HANDOFF. Verify one card is created, an allowed operator can claim it,
+   another operator cannot resolve claimant-owned work, the claimant can choose “已回复，恢复 Bot”,
+   and the next new customer message follows the account's current automation policy. Verify the
+   HumanWorkItem resolution evidence is `FEISHU_OPERATOR_ATTESTED` and no historical message is
+   retroactively answered.
+
+For rollback, first set `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` on all three roles and redeploy
+one digest. Existing customer handoffs and Admin inbox workflows continue; notification intents and
+receipts remain durable but no card action may mutate work while the gate is off. Prefer leaving the
+additive schema in place. Downgrading below `b7e4c2d9a615` destroys notification history and
+HumanWorkItem resolution evidence and is permitted only after exporting those rows, disabling the
+feature on every role and replacing all new code with the prior image.
+
 ## Message history context
 
 Revision `f3a6c1d8e250` adds a database-generated `messages.history_seq`, the `messages.source_outbox_id` provenance key, and a `(conversation_id, history_seq)` index. During the migration it briefly locks `messages` and `outbox_messages`, backfills already-confirmed `SENT` text Outbox rows as outbound conversation facts, and assigns the combined timeline a deterministic order. Take a database backup first and deploy the API migrator before starting the new Worker/Scheduler versions.
@@ -436,7 +476,7 @@ cancels only their pending or failed bot decision outboxes with `STALE_CONVERSAT
 
 The required revision order is `f6c2a9d81b40` (human inbox and Outbox provenance), then
 `b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing), then
-`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication), then `a9d4e6f2b713` (human handoff lifecycle repair), then `d3f6a1b8c904` (structured voice and draft-first knowledge governance). Do not cherry-pick only the final revision.
+`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication), then `a9d4e6f2b713` (human handoff lifecycle repair), then `d3f6a1b8c904` (structured voice and draft-first knowledge governance), then `b7e4c2d9a615` (Feishu handoff notifications and resolution evidence). Do not cherry-pick only the final revision.
 Upgrade through `f6c2a9d81b40`, then run the Human operations
 inventory above and record repair counts before applying `b8e1d4f7a2c3`. Before the fencing step,
 inventory active DecisionJobs by conversation/status, pending or failed `DECISION/BOT` Outboxes tied

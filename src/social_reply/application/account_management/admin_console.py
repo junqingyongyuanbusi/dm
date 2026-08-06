@@ -17,16 +17,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import and_, desc, func, or_, select, update
 
 from social_reply.application.account_management.admin import (
-    _CSRF_COOKIE,
     _csrf,
+    _ensure_csrf,
     _form,
     _input,
     _page,
     _pill,
     _require_csrf,
-    _secure_cookie,
     _web_principal,
     html,
+    tenant_id_or_default,
 )
 from social_reply.application.account_management.auth import Principal
 from social_reply.application.account_management.human_workflow import (
@@ -92,14 +92,6 @@ router = APIRouter(prefix="/admin", tags=["admin-console"])
 
 def _fmt(dt: datetime | None) -> str:
     return dt.strftime("%m-%d %H:%M") if dt else "—"
-
-
-def _ensure_csrf(response: Response, request: Request, csrf: str) -> Response:
-    if not request.cookies.get(_CSRF_COOKIE):
-        response.set_cookie(
-            _CSRF_COOKIE, csrf, httponly=False, samesite="lax", secure=_secure_cookie(request)
-        )
-    return response
 
 
 def _tenant_input(principal: Principal) -> str:
@@ -2569,12 +2561,7 @@ def _voice_select(name: str, current: str) -> str:
 
 
 def _prompt_tenant(principal: Principal, requested: str) -> str:
-    tenant = (requested or "").strip() or (principal.tenant_id or "")
-    if not tenant:
-        tenant = sorted(principal.allowed_tenants)[0]
-    if tenant not in principal.allowed_tenants:
-        raise HTTPException(status_code=403, detail="tenant_access_denied")
-    return tenant
+    return tenant_id_or_default(principal, requested)
 
 
 @router.get("/prompt", response_class=HTMLResponse)

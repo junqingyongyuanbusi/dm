@@ -13,6 +13,7 @@
 - 群普通消息、`@所有人` / group-all 监听：不支持，不应申请或配置
 - 出站：回复原私信消息或原群消息；线程消息保持 thread/root 范围
 - 应用模型：一个 Tenant 下一个企业自建应用 Bot 对应一个账号级 `PlatformAccount`，不创建共享 `PlatformApp`
+- 人工通知：同一应用 Bot 可向一个配置的客服群发送交互卡片；客服权限使用显式 app-scoped `open_id` allowlist
 
 飞书官方参考：
 
@@ -38,10 +39,14 @@ API、Worker、Scheduler 必须运行同一个镜像 digest，并使用相同配
 
 ```env
 FEISHU_ENABLED=true
+FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false
 FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
+FEISHU_HANDOFF_SWEEP_INTERVAL_SECONDS=3
+FEISHU_HANDOFF_SENDER_LEASE_SECONDS=30
+FEISHU_HANDOFF_MAX_ATTEMPTS=8
 ```
 
-先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库 head 为 `d3f6a1b8c904` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
+先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库 head 为 `b7e4c2d9a615` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。人工通知保持独立的 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false`，直到客服群、operator allowlist、Card Action Callback 和测试卡片全部验证。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
 
 ## 在 Admin 创建账号
 
@@ -71,6 +76,29 @@ FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 5. 订阅事件 `im.message.receive_v1`。
 6. 发布应用版本，使权限和事件订阅在目标企业生效。
 7. 将应用 Bot 添加到需要测试的群。群内只有明确 `@Bot` 的消息会进入决策链；不要把自定义群机器人 webhook 当作 Callback URL。
+
+## 配置人工接管卡片
+
+消息接入通过后，再单独配置客服群。该功能不使用自定义群机器人 webhook，也不会把所有群成员自动授权为客服：
+
+1. 登录 `${PUBLIC_BASE_URL}/admin/feishu-handoff`，选择已经 active 且健康为 `READY` 的 Feishu 账号。
+2. 填写客服群的 `chat_id` 并保存路由。一个 Tenant 第一版只配置一个通知账号和一个客服群。
+3. 逐个添加客服的 app-scoped `open_id`，分别授予接单和解决权限。只在群里并不代表有权限。
+4. 复制页面显示的 Card Action Callback：
+
+   ```text
+   ${PUBLIC_BASE_URL}/webhooks/feishu/{public_id}/card-actions
+   ```
+
+5. 在飞书开放平台单独配置 `card.action.trigger` 交互卡片回调，完成 URL verification，并发布应用版本。它与 `im.message.receive_v1` 事件订阅是两个控制台能力，即使 URL 同源也必须分别确认。
+6. 把 Bot 加入客服群，点击一次“发送测试卡片”。测试卡片不创建工单，也不包含客户数据。若页面显示结果未知，先检查客服群，不能立即重复点击。
+7. 测试卡片到达后，在 API、Worker、Scheduler 同时设置 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=true` 并协调重启到同一个 digest。
+8. 触发一条受控 HANDOFF，确认只出现一张卡片；授权客服可接单，非认领人不能解决，认领人点击“已回复，恢复 Bot”后，下一条新客户消息按账号当前 automation policy 处理。
+
+卡片中的消息摘要经过长度限制和联系方式脱敏。解决动作记录
+`FEISHU_OPERATOR_ATTESTED`，代表客服声明已经在原社交平台回复；Reply Core 无法验证外部
+手工发送。需要可验证证据时，应从 `/admin/inbox` 发送 manual reply，使 Outbox 和 outbound
+Message 保留在 PostgreSQL。
 
 ## Draft-first smoke checklist
 
@@ -102,6 +130,12 @@ FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 
 正常消息必须使用加密 envelope，并通过 `X-Lark-*` 签名、时间窗口、Verification Token、App ID 和 AES 解密检查，同时提供非空 `header.event_id` 和有效的 `event.message.create_time`。失效、重放、签名错误或账号不匹配的请求不会创建 `RawEvent`。同一账号的已验证回调按 `header.event_id` 在 RawEvent ingress 去重；该键不是 `message_id`，并且在 `FEISHU_ENABLED=false` 时同样生效。`message.create_time` 是同会话 provider 顺序的事实时间，header `create_time` 只保留为元数据；严格更旧的延迟消息只保存带 `stale_provider_order` disposition 的 NormalizedEvent，不创建 Message、generation、DecisionJob 或 Outbox。已验证的正常事件在功能关闭时仍返回 ACK，但只保存去除敏感 token 的 sanitized `IGNORED_AT_INGRESS` 证据，不会进入决策或发送。
 
+交互卡片动作重复使用同一套签名、时间窗口、Verification Token、App ID、AES 和 body-size
+校验，但用 `header.event_id` 写入独立的持久化 callback receipt。重复请求返回第一次已保存的
+响应，不重复接单或解决。动作还必须匹配通知 public ID、卡片 revision、work version、nonce、
+Tenant、Feishu app 和 operator allowlist。三秒回调路径只执行短 PostgreSQL 事务，不调用 Feishu、
+Redis 或 LLM；卡片更新由 Worker 异步完成。
+
 **Secret warning:** App Secret、Verification Token 和 Encrypt Key 都按生产密钥处理。只通过 TLS Admin/Control API 提交；不要写入文档、工单、聊天、截图、shell history、Git、日志或飞书消息。Social Reply 使用 `PLATFORM_SECRET_KEYS` 加密 durable staging 和最终 PostgreSQL credential bundle；丢失该密钥集会使已有账号凭证不可读。
 
 ## Provider 与错误处理
@@ -113,9 +147,23 @@ FEISHU_HEALTH_CHECK_INTERVAL_SECONDS=600
 - HTTP 429 / provider rate-limit 可重试；明确的 provider 4xx 拒绝进入 `NEEDS_REVIEW` 并保留 sanitized code。
 - connect error/connect timeout 可安全重试；read timeout、未知 post-dispatch 错误、响应格式异常或 provider 5xx 视为 `NEEDS_REVIEW/AMBIGUOUS_SEND`，不会盲目重试造成重复回复。
 - `FEISHU_ENABLED=false` 时发送暂停为 `NEEDS_REVIEW/FEISHU_DISABLED`，不消耗尝试；协调重新启用后由 durable sweep 恢复。
+- HANDOFF 即使缺少客服群配置也保持成功，同时创建 `BLOCKED_CONFIG` 通知；补齐配置后 Scheduler 可恢复尚未解决的工单。
+- 卡片 create 使用稳定 UUID，但 Feishu 去重窗口只有一小时。create 的未知 post-dispatch 结果进入 `NEEDS_REVIEW/AMBIGUOUS_CARD_CREATE`，不会在窗口外盲目重试；已有 provider message ID 的 PATCH update 可以安全恢复。
 
 ## Pause and rollback
 
-紧急暂停时，在 API、Worker、Scheduler 上同时设置 `FEISHU_ENABLED=false` 并协调重启到同一 digest。该操作暂停 provisioning、正常事件 dispatch、health 和发送，但保留账号、加密凭证、Callback 身份、RawEvent 和 Outbox；URL verification 仍可用。不要通过删除凭证来实现临时暂停。
+只暂停人工通知时，在 API、Worker、Scheduler 上同时设置
+`FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` 并协调重启到同一 digest。现有客户 HANDOFF 和
+本地 Admin Inbox 继续工作；卡片创建、更新和动作 mutation 停止，通知意图与 receipt 保留。
 
-代码回滚必须同时考虑数据库：从 `d3f6a1b8c904` downgrade 到 `f8a1c3d5e702` 是不可逆的人工作业生命周期数据 no-op；再 downgrade 到 `e4b7c2d9a610` 才会移除 Feishu RawEvent 去重索引；继续 downgrade `e4b7c2d9a610` 时，任何 Feishu `PlatformAccount` 存在都会被拒绝。若必须回到不识别 Feishu 的旧代码，先保持 Feishu 禁用并按 `docs/production-migration.md` 执行已审核的账号移除/重建或数据库备份恢复方案。镜像回滚不等于数据库回滚，API、Worker、Scheduler 最终仍必须收敛到同一个 digest。
+暂停整个 Feishu 平台时，在三个角色上同时设置 `FEISHU_ENABLED=false`。该操作暂停
+provisioning、正常事件 dispatch、health、客户发送和人工卡片，但保留账号、加密凭证、Callback
+身份、RawEvent、Outbox 和通知意图；URL verification 仍可用。不要通过删除凭证实现临时暂停。
+
+代码回滚必须同时考虑数据库：优先保留 additive `b7e4c2d9a615` schema 并只回滚镜像和关闭人工
+通知。Downgrade 到 `d3f6a1b8c904` 会删除通知路由、operator、intent、receipt 和 HumanWorkItem
+resolution evidence，必须先导出。继续从 `d3f6a1b8c904` downgrade 到 `f8a1c3d5e702` 是不可逆的
+人工作业生命周期数据 no-op；再 downgrade 到 `e4b7c2d9a610` 才会移除 Feishu RawEvent 去重索引；
+继续 downgrade `e4b7c2d9a610` 时，任何 Feishu `PlatformAccount` 存在都会被拒绝。若必须回到不识别
+Feishu 的旧代码，先保持 Feishu 禁用并按 `docs/production-migration.md` 执行已审核的账号移除/重建
+或数据库备份恢复方案。镜像回滚不等于数据库回滚，API、Worker、Scheduler 最终仍必须收敛到同一 digest。
