@@ -238,8 +238,7 @@ async def _finalize_success(
                     models.HandoffNotificationIntent.id == claimed.intent_id,
                     models.HandoffNotificationIntent.status == "SENDING",
                     models.HandoffNotificationIntent.claim_token == claimed.claim_token,
-                    models.HandoffNotificationIntent.sending_revision
-                    == claimed.sending_revision,
+                    models.HandoffNotificationIntent.sending_revision == claimed.sending_revision,
                 )
                 .with_for_update()
             )
@@ -378,9 +377,7 @@ async def deliver_handoff_notification(intent_id: str) -> str:
             claimed,
             status="NEEDS_REVIEW",
             error_code=(
-                "AMBIGUOUS_CARD_CREATE"
-                if claimed.provider_message_id is None
-                else _safe_error(exc)
+                "AMBIGUOUS_CARD_CREATE" if claimed.provider_message_id is None else _safe_error(exc)
             ),
         )
 

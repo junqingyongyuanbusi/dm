@@ -149,9 +149,7 @@ async def ensure_handoff_notification_intent(
     work: models.HumanWorkItem,
 ) -> models.HandoffNotificationIntent:
     conversation_tenant = await session.scalar(
-        select(models.Conversation.tenant_id).where(
-            models.Conversation.id == work.conversation_id
-        )
+        select(models.Conversation.tenant_id).where(models.Conversation.id == work.conversation_id)
     )
     if conversation_tenant is None:
         raise HandoffNotificationError("conversation_not_found")

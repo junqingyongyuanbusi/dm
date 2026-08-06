@@ -150,16 +150,11 @@ async def handle_feishu_card_action(
     parsed = parse_card_action(event)
     async with get_session_factory()() as session:
         account = await session.get(models.PlatformAccount, account_id)
-        if (
-            account is None
-            or account.tenant_id != tenant_id
-            or account.platform != "feishu"
-        ):
+        if account is None or account.tenant_id != tenant_id or account.platform != "feishu":
             raise FeishuCardActionError("feishu_card_account_scope_mismatch")
         intent = await session.scalar(
             select(models.HandoffNotificationIntent).where(
-                models.HandoffNotificationIntent.public_id
-                == parsed.notification_public_id
+                models.HandoffNotificationIntent.public_id == parsed.notification_public_id
             )
         )
         intent_id = intent.id if intent is not None and intent.tenant_id == tenant_id else None

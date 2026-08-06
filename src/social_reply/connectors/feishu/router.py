@@ -106,9 +106,7 @@ async def _card_action_response(
 ) -> JSONResponse:
     header = payload.get("header")
     if not isinstance(header, dict) or header.get("event_type") != "card.action.trigger":
-        return JSONResponse(
-            {"toast": {"type": "error", "content": "不支持的飞书卡片回调"}}
-        )
+        return JSONResponse({"toast": {"type": "error", "content": "不支持的飞书卡片回调"}})
     provider_event_id = nonblank_string_or_none(header.get("event_id"))
     if provider_event_id is None:
         raise HTTPException(status_code=401, detail="invalid_feishu_request")
@@ -214,9 +212,7 @@ async def feishu_card_actions(public_id: str, request: Request) -> Response:
         account,
         payload,
         body,
-        feature_enabled=(
-            settings.feishu_enabled and settings.feishu_handoff_notifications_enabled
-        ),
+        feature_enabled=(settings.feishu_enabled and settings.feishu_handoff_notifications_enabled),
     )
 
 
