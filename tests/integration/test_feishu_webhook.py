@@ -908,6 +908,39 @@ async def test_plaintext_card_action_is_authenticated_by_verification_token(sess
     ).scalar_one() == 1
 
 
+async def test_card_action_accepts_json_string_encoded_button_value(session):
+    feishu_account_id = await _seed_account(session)
+    _, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
+        session,
+        feishu_account_id,
+        "ou_agent",
+    )
+    payload = _card_action_payload(
+        event_id="evt_str_value",
+        operator_open_id="ou_agent",
+        public_id=public_id,
+        action_nonce=nonce,
+        action="claim",
+        work_version=1,
+        card_revision=1,
+    )
+    # Feishu delivers the interactive button value as a JSON string in some
+    # configs; parse_card_action must accept both dict and string-encoded forms.
+    payload["event"]["action"]["value"] = json.dumps(
+        payload["event"]["action"]["value"], ensure_ascii=False
+    )
+    response = await _post(
+        _app(handoff_notifications_enabled=True),
+        "/webhooks/feishu/fs_primary/card-actions",
+        json_body=payload,
+    )
+    assert response.status_code == 200
+    assert response.json()["toast"]["type"] == "success"
+    session.expire_all()
+    work = await session.get(models.HumanWorkItem, work_id)
+    assert work.status == "CLAIMED"
+
+
 async def test_card_action_resolve_restores_account_policy_and_records_attestation(session):
     feishu_account_id = await _seed_account(session)
     intent_id, work_id, public_id, nonce, _operator_ids = await _seed_card_work(

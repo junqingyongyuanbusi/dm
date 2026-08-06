@@ -169,7 +169,12 @@ async def _card_action_response(
                 event=payload.get("event"),
                 feature_enabled=feature_enabled,
             )
-    except FeishuCardActionError:
+    except FeishuCardActionError as exc:
+        logger.warning(
+            "feishu card action invalid account=%s reason=%s",
+            account.public_id,
+            exc,
+        )
         response = {"toast": {"type": "error", "content": "卡片操作参数无效"}}
     except TimeoutError:
         response = {"toast": {"type": "warning", "content": "系统繁忙，请稍后重试"}}

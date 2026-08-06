@@ -1,4 +1,5 @@
 import hashlib
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -49,6 +50,14 @@ def parse_card_action(event: object) -> ParsedCardAction:
         raise FeishuCardActionError("feishu_card_event_invalid")
     operator_open_id = operator.get("open_id")
     value = action_data.get("value")
+    # Feishu delivers the interactive button value back as either an object or a
+    # JSON-encoded string depending on how the card was authored.
+    if isinstance(value, str):
+        try:
+            parsed_value = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise FeishuCardActionError("feishu_card_event_invalid") from exc
+        value = parsed_value
     if (
         not isinstance(operator_open_id, str)
         or not operator_open_id.strip()
