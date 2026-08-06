@@ -83,7 +83,7 @@ FEISHU_HANDOFF_MAX_ATTEMPTS=8
 
 1. 登录 `${PUBLIC_BASE_URL}/admin/feishu-handoff`，选择已经 active 且健康为 `READY` 的 Feishu 账号。
 2. 填写客服群的 `chat_id` 并保存路由。一个 Tenant 第一版只配置一个通知账号和一个客服群。
-3. 逐个添加客服的 app-scoped `open_id`，分别授予接单和解决权限。只在群里并不代表有权限。
+3. 逐个添加客服的 app-scoped `open_id`，分别授予认领和解决权限。只在群里并不代表有权限。
 4. 复制页面显示的 Card Action Callback：
 
    ```text
@@ -93,7 +93,7 @@ FEISHU_HANDOFF_MAX_ATTEMPTS=8
 5. 在飞书开放平台单独配置 `card.action.trigger` 交互卡片回调，完成 URL verification，并发布应用版本。它与 `im.message.receive_v1` 事件订阅是两个控制台能力，即使 URL 同源也必须分别确认。
 6. 把 Bot 加入客服群，点击一次“发送测试卡片”。测试卡片不创建工单，也不包含客户数据。若页面显示结果未知，先检查客服群，不能立即重复点击。
 7. 测试卡片到达后，在 API、Worker、Scheduler 同时设置 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=true` 并协调重启到同一个 digest。
-8. 触发一条受控 HANDOFF，确认只出现一张卡片；授权客服可接单，非认领人不能解决，认领人点击“已回复，恢复 Bot”后，下一条新客户消息按账号当前 automation policy 处理。
+8. 触发一条受控 HANDOFF，确认只出现一张卡片；授权客服可认领，非认领人不能解决，认领人点击“已回复，恢复 Bot”后，下一条新客户消息按账号当前 automation policy 处理。
 
 卡片中的消息摘要经过长度限制和联系方式脱敏。解决动作记录
 `FEISHU_OPERATOR_ATTESTED`，代表客服声明已经在原社交平台回复；Reply Core 无法验证外部
@@ -132,7 +132,7 @@ Message 保留在 PostgreSQL。
 
 交互卡片动作重复使用同一套签名、时间窗口、Verification Token、App ID、AES 和 body-size
 校验，但用 `header.event_id` 写入独立的持久化 callback receipt。重复请求返回第一次已保存的
-响应，不重复接单或解决。动作还必须匹配通知 public ID、卡片 revision、work version、nonce、
+响应，不重复认领或解决。动作还必须匹配通知 public ID、卡片 revision、work version、nonce、
 Tenant、Feishu app 和 operator allowlist。三秒回调路径只执行短 PostgreSQL 事务，不调用 Feishu、
 Redis 或 LLM；卡片更新由 Worker 异步完成。
 

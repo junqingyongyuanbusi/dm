@@ -924,8 +924,9 @@ async def test_card_action_accepts_json_string_encoded_button_value(session):
         work_version=1,
         card_revision=1,
     )
-    # Feishu delivers the interactive button value as a JSON string in some
-    # configs; parse_card_action must accept both dict and string-encoded forms.
+    # Current card callback schema places the message id under context and may
+    # deliver the button value as a JSON string. Both forms must be accepted.
+    payload["event"]["context"] = {"open_message_id": payload["event"].pop("open_message_id")}
     payload["event"]["action"]["value"] = json.dumps(
         payload["event"]["action"]["value"], ensure_ascii=False
     )

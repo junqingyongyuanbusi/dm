@@ -13,7 +13,7 @@
 flowchart LR
     A[AI 判定需要人工] --> B[仅暂停当前会话 Bot]
     B --> C[发送飞书提醒卡片]
-    C --> D[客服点击接单]
+    C --> D[客服点击认领]
     D --> E[客服在 Reply Core 或社媒回复]
     E --> F[客服点击已回复，恢复 Bot]
     F --> G[下一条新客户消息按账号策略处理]
@@ -38,10 +38,10 @@ flowchart LR
 - AI、规则和 Final Guard 可以产生 `HANDOFF`。
 - HANDOFF 会把 Conversation 切换为 `HANDOFF_PENDING`。
 - HANDOFF 会创建唯一开放的 `HumanWorkItem(status=WAITING)`。
-- 接单会把工作项切换为 `CLAIMED`，并把 Conversation 切换为 `HUMAN_ACTIVE`。
-- 接单会取消该 Conversation 尚未发送的 Bot Decision Outbox。
+- 认领会把工作项切换为 `CLAIMED`，并把 Conversation 切换为 `HUMAN_ACTIVE`。
+- 认领会取消该 Conversation 尚未发送的 Bot Decision Outbox。
 - 解决工作项会恢复账号当前的 `automation_default`。
-- 本地 Admin Inbox 支持接单、人工回复和解决。
+- 本地 Admin Inbox 支持认领、人工回复和解决。
 - Feishu 已支持企业自建应用、签名/AES 校验、消息事件接收和文本回复。
 - Worker 和 Scheduler 已有 PostgreSQL-backed Outbox、lease、重试和恢复模式。
 
@@ -411,7 +411,7 @@ stateDiagram-v2
 - 配置缺失或 disabled：intent 为 `BLOCKED_CONFIG`。
 - 不因为没有飞书通知而阻止本地 Admin Inbox 展示工单。
 
-### 7.2 接单事务
+### 7.2 认领事务
 
 Admin 和 Feishu callback 必须调用同一个 session 内 claim 服务。
 
@@ -447,7 +447,7 @@ Admin 和 Feishu callback 必须调用同一个 session 内 claim 服务。
 并发规则：
 
 - 第一个持锁且版本匹配的 operator 成功。
-- 后续点击返回“已由其他客服接单”，不得返回 500。
+- 后续点击返回“已由其他客服认领”，不得返回 500。
 - 旧卡片仍可展示，但 action 必须重新读取 PostgreSQL 当前状态。
 
 ### 7.3 已回复并恢复 Bot 事务
@@ -501,20 +501,20 @@ Admin 和 Feishu callback 必须调用同一个 session 内 claim 服务。
 
 操作：
 
-- `接单`
+- `认领`
 
 ### 8.2 CLAIMED 卡片
 
 标题：
 
 ```text
-已由客服接单
+已由客服认领
 ```
 
 内容增加：
 
-- 接单客服。
-- 接单时间。
+- 认领客服。
+- 认领时间。
 - 当前会话状态 `HUMAN_ACTIVE`。
 
 操作：
@@ -620,9 +620,9 @@ POST /webhooks/feishu/{public_id}/card-actions
 示例：
 
 ```text
-你没有该 Tenant 的接单权限
-该工单已由其他客服接单
-仅当前接单客服可以恢复 Bot
+你没有该 Tenant 的认领权限
+该工单已由其他客服认领
+仅当前认领客服可以恢复 Bot
 该卡片已经过期，已显示最新状态
 该工单已经完成
 ```
@@ -724,7 +724,7 @@ desired_revision > sending_revision
 status = SYNCED
 ```
 
-这样可以防止卡片创建期间发生接单或解决导致状态更新丢失。
+这样可以防止卡片创建期间发生认领或解决导致状态更新丢失。
 
 ### 11.3 错误分类
 
@@ -793,7 +793,7 @@ Scheduler core lane 新增 notification sweep：
 - 发送测试卡片。
 - Operator `open_id` 管理。
 - Operator 显示名称。
-- 接单权限。
+- 认领权限。
 - 解决权限。
 - Operator 启用/禁用。
 - 最近通知失败和 `NEEDS_REVIEW` 列表。
@@ -944,7 +944,7 @@ human_work_resolution_evidence_total
 - [ ] 实现 operator allowlist。
 - [ ] 实现 action receipt 幂等。
 - [ ] 实现 nonce、work version 和 card revision 校验。
-- [ ] 实现接单 callback。
+- [ ] 实现认领 callback。
 - [ ] 实现已回复恢复 callback。
 - [ ] 实现业务冲突 HTTP 200 toast。
 - [ ] 实现 callback duration 测试。
@@ -993,7 +993,7 @@ human_work_resolution_evidence_total
 - [ ] 配置缺失不会回滚 HANDOFF。
 - [ ] 重复 HANDOFF 只有一个 intent。
 - [ ] 同账号其他 Conversation 不暂停。
-- [ ] 两名 operator 并发接单只有一个成功。
+- [ ] 两名 operator 并发认领只有一个成功。
 - [ ] 重复 callback 返回相同响应。
 - [ ] 旧 nonce 和旧 version 无法改变状态。
 - [ ] 非 claimant 无法 resolve。
@@ -1015,7 +1015,7 @@ human_work_resolution_evidence_total
 3. 确认只有一个 WAITING HumanWorkItem。
 4. 确认只有一个 notification intent。
 5. 确认客服群只收到一张卡片。
-6. 两名测试 operator 同时点击接单，确认只有一人成功。
+6. 两名测试 operator 同时点击认领，确认只有一人成功。
 7. 确认 Conversation 变为 `HUMAN_ACTIVE`。
 8. 确认卡片更新为 CLAIMED。
 9. 客服完成测试回复。
@@ -1086,7 +1086,7 @@ FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false
 - [ ] HANDOFF、HumanWorkItem 和 notification intent 原子提交。
 - [ ] 飞书故障不影响本地工单和 Bot 暂停。
 - [ ] 每个 HumanWorkItem 最多一张逻辑卡片。
-- [ ] 多人并发接单只有一个成功。
+- [ ] 多人并发认领只有一个成功。
 - [ ] 只有当前 assignee 可以通过飞书 resolve。
 - [ ] 旧卡片、重复 callback 和重放 nonce 不重复修改状态。
 - [ ] resolve 恢复账号最新 `automation_default`。

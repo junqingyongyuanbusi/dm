@@ -238,12 +238,12 @@ async def feishu_handoff_page(request: Request) -> Response:
             '<label for="f-operator-name">显示名称</label>',
             '<input id="f-operator-name" name="display_name" maxlength="100">',
             '<label class="check"><input type="checkbox" name="can_claim" ',
-            'value="true" checked>允许接单</label>',
+            'value="true" checked>允许认领</label>',
             '<label class="check"><input type="checkbox" name="can_resolve" ',
             'value="true" checked>允许解决并恢复 Bot</label>',
             '<button class="btn-block">保存客服权限</button></form>',
             '<div class="tablewrap"><table><thead><tr><th>名称</th><th>App</th>',
-            "<th>Open ID</th><th>接单</th><th>解决</th><th>状态</th><th>操作</th>",
+            "<th>Open ID</th><th>认领</th><th>解决</th><th>状态</th><th>操作</th>",
             f"</tr></thead><tbody>{operator_rows}</tbody></table></div></section>",
         )
     )

@@ -45,7 +45,9 @@ def parse_card_action(event: object) -> ParsedCardAction:
         raise FeishuCardActionError("feishu_card_event_invalid")
     operator = event.get("operator")
     action_data = event.get("action")
-    open_message_id = event.get("open_message_id")
+    context = event.get("context")
+    context_message_id = context.get("open_message_id") if isinstance(context, dict) else None
+    open_message_id = context_message_id or event.get("open_message_id")
     if not isinstance(operator, dict) or not isinstance(action_data, dict):
         raise FeishuCardActionError("feishu_card_event_invalid")
     operator_open_id = operator.get("open_id")
@@ -274,7 +276,7 @@ async def handle_feishu_card_action(
                     expected_card_revision=parsed.expected_card_revision,
                     expected_action_nonce=parsed.action_nonce,
                 )
-                toast = "接单成功"
+                toast = "认领成功"
             else:
                 conversation, _account, work, state = await resolve_human_work_item_in_session(
                     session,

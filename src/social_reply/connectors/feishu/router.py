@@ -170,10 +170,25 @@ async def _card_action_response(
                 feature_enabled=feature_enabled,
             )
     except FeishuCardActionError as exc:
+        event = payload.get("event")
+        operator = event.get("operator") if isinstance(event, dict) else None
+        action = event.get("action") if isinstance(event, dict) else None
+        context = event.get("context") if isinstance(event, dict) else None
         logger.warning(
-            "feishu card action invalid account=%s reason=%s",
+            "feishu card action invalid account=%s reason=%s event_keys=%s "
+            "operator_keys=%s action_keys=%s context_keys=%s value_type=%s "
+            "open_message_id_type=%s context_message_id_type=%s",
             account.public_id,
             exc,
+            sorted(event) if isinstance(event, dict) else [],
+            sorted(operator) if isinstance(operator, dict) else [],
+            sorted(action) if isinstance(action, dict) else [],
+            sorted(context) if isinstance(context, dict) else [],
+            type(action.get("value")).__name__ if isinstance(action, dict) else "missing",
+            type(event.get("open_message_id")).__name__ if isinstance(event, dict) else "missing",
+            type(context.get("open_message_id")).__name__
+            if isinstance(context, dict)
+            else "missing",
         )
         response = {"toast": {"type": "error", "content": "卡片操作参数无效"}}
     except TimeoutError:

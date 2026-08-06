@@ -86,7 +86,7 @@ def render_handoff_card(snapshot: HandoffCardSnapshot) -> dict[str, object]:
         title = "新的人工接管请求"
         template = "orange"
     elif state == "CLAIMED":
-        title = "已由客服接单"
+        title = "已由客服认领"
         template = "blue"
     elif state == "RESOLVED":
         title = "已处理"
@@ -109,7 +109,7 @@ def render_handoff_card(snapshot: HandoffCardSnapshot) -> dict[str, object]:
     if snapshot.due_at is not None:
         lines.append(f"**SLA 时间**：{snapshot.due_at.isoformat(timespec='minutes')}")
     if state in {"CLAIMED", "RESOLVED"}:
-        lines.append(f"**接单客服**：{_markdown(snapshot.assigned_actor or '未知', limit=100)}")
+        lines.append(f"**认领客服**：{_markdown(snapshot.assigned_actor or '未知', limit=100)}")
     if state == "RESOLVED":
         restored = snapshot.restored_automation_state or "账号当前策略"
         lines.extend(
@@ -125,7 +125,7 @@ def render_handoff_card(snapshot: HandoffCardSnapshot) -> dict[str, object]:
             0,
             {
                 "tag": "button",
-                "text": {"tag": "plain_text", "content": "接单"},
+                "text": {"tag": "plain_text", "content": "认领"},
                 "type": "primary",
                 "value": _action_value(snapshot, "claim"),
             },

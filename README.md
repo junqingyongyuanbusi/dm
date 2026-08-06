@@ -186,7 +186,7 @@ Token 和 Encrypt Key；Control API 等价入口为
 人工接管卡片使用独立的 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` 暗发布开关。在
 `/admin/feishu-handoff` 选择客服群、维护 app-scoped operator `open_id` allowlist，并把页面显示的
 Card Action Callback 配置为 `card.action.trigger` 回调；测试卡片到达后，API、Worker、Scheduler
-必须同时启用该开关。新的 HANDOFF 会在同一事务中留下持久化通知意图，客服可在飞书卡片接单，
+必须同时启用该开关。新的 HANDOFF 会在同一事务中留下持久化通知意图，客服可在飞书卡片认领，
 并用“已回复，恢复 Bot”解决工单。该动作是客服声明；需要可验证发送证据时，应通过本地 Inbox
 手动回复。完整操作步骤见 [Feishu operator runbook](docs/feishu-integration.md)。
 

@@ -46,7 +46,7 @@ def test_waiting_card_redacts_customer_data_and_emits_versioned_claim_action():
     assert "customer@example.com" not in content
     assert "\\*urgent\\*" in content
     claim = _actions(card)[0]
-    assert claim["text"]["content"] == "接单"
+    assert claim["text"]["content"] == "认领"
     assert claim["value"] == {
         "contract_version": 1,
         "notification_id": "11111111-1111-1111-1111-111111111111",
