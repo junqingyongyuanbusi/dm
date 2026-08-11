@@ -194,6 +194,8 @@ async def provision_direct_account(
     platform_app_id: uuid.UUID | None = None,
     preserve_existing_webhook_secret: bool = False,
     status: str | None = None,
+    provisioning_job_id: uuid.UUID | None = None,
+    provisioning_attempt_count: int | None = None,
 ) -> tuple[uuid.UUID, str]:
     """幂等创建/更新直连账号；每个账号拥有独立凭证目录。"""
     platform = account_platform(platform).value
@@ -255,7 +257,24 @@ async def provision_direct_account(
             )
         ),
     }
+    if (provisioning_job_id is None) != (provisioning_attempt_count is None):
+        raise ValueError("provisioning_claim_fence_incomplete")
+
     async with get_session_factory()() as session:
+        if provisioning_job_id is not None:
+            claim = (
+                await session.execute(
+                    select(models.ProvisioningJob.id)
+                    .where(
+                        models.ProvisioningJob.id == provisioning_job_id,
+                        models.ProvisioningJob.status == "PROCESSING",
+                        models.ProvisioningJob.attempt_count == provisioning_attempt_count,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if claim is None:
+                raise ValueError("provisioning_claim_lost")
         statement = pg_insert(models.PlatformAccount).values(**values)
         update_values = {
             key: value

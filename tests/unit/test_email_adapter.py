@@ -5,6 +5,15 @@ from datetime import UTC, datetime
 from email.message import EmailMessage
 
 from social_reply.connectors.email.adapter import EmailInboundAdapter
+from social_reply.connectors.email.contracts import (
+    MAX_ATTACHMENT_CONTENT_TYPE_CHARS,
+    MAX_ATTACHMENT_FILENAME_CHARS,
+    MAX_ATTACHMENTS,
+    MAX_MESSAGE_ID_BYTES,
+    MAX_REFERENCES_CHARS,
+    MAX_SENDER_NAME_CHARS,
+    MAX_SUBJECT_CHARS,
+)
 from social_reply.domain.messages.canonical import ChannelType
 
 
@@ -54,9 +63,9 @@ def test_email_adapter_normalizes_plain_text_message():
     event = events[0]
     assert event.platform == "email"
     assert event.platform_account_key == "account-1"
-    assert event.external_event_id == "msg-1@example.com"
+    assert event.external_event_id == "11:5"
     assert event.external_user_id == "alice@example.com"
-    assert event.conversation_key == "email:account-1:alice@example.com"
+    assert event.conversation_key == "email:account-1:alice@example.com:msg-1@example.com"
     assert event.channel_type is ChannelType.DM
     assert event.text == "退款咨询\n\n你好，请问怎么退款？"
     assert event.external_conversation_id == "msg-1@example.com"
@@ -68,6 +77,7 @@ def test_email_adapter_normalizes_plain_text_message():
         "subject": "退款咨询",
         "message_id": "<msg-1@example.com>",
         "references": "",
+        "thread_root": "msg-1@example.com",
     }
     assert event.attachments == []
 
@@ -85,11 +95,52 @@ def test_email_adapter_threads_replies_by_references():
 
     assert status == "PENDING"
     event = events[0]
-    # 线程根 = References 首项；同一发件人仍聚合到同一会话键。
+    # 线程根 = References 首项，并参与会话隔离。
     assert event.external_conversation_id == "msg-1@example.com"
-    assert event.conversation_key == "email:account-1:alice@example.com"
+    assert event.conversation_key == "email:account-1:alice@example.com:msg-1@example.com"
     assert event.reply_target["references"] == "<msg-1@example.com> <msg-2@corp.com>"
     assert event.reply_target["message_id"] == "<msg-3@example.com>"
+    assert event.reply_target["thread_root"] == "msg-1@example.com"
+
+
+def test_email_adapter_uses_in_reply_to_when_references_are_missing():
+    raw = _eml(
+        message_id="<msg-3@example.com>",
+        headers={"In-Reply-To": "<msg-2@corp.com>"},
+    )
+
+    events, status = _adapter().normalize_message(raw, uid=7, uidvalidity=11)
+
+    assert status == "PENDING"
+    event = events[0]
+    assert event.external_conversation_id == "msg-2@corp.com"
+    assert event.conversation_key == "email:account-1:alice@example.com:msg-2@corp.com"
+    assert event.reply_target["thread_root"] == "msg-2@corp.com"
+
+
+def test_email_adapter_message_id_cannot_deduplicate_distinct_imap_occurrences():
+    first, _ = _adapter().normalize_message(
+        _eml(message_id="<sender-controlled@example.com>"), uid=7, uidvalidity=11
+    )
+    second, _ = _adapter().normalize_message(
+        _eml(message_id="<sender-controlled@example.com>"), uid=8, uidvalidity=11
+    )
+
+    assert first[0].external_event_id == "11:7"
+    assert second[0].external_event_id == "11:8"
+    assert first[0].conversation_key == second[0].conversation_key
+    assert first[0].reply_target["message_id"] == "<sender-controlled@example.com>"
+
+
+def test_email_adapter_isolates_threads_for_the_same_account_and_sender():
+    first, _ = _adapter().normalize_message(
+        _eml(message_id="<thread-a@example.com>"), uid=7, uidvalidity=11
+    )
+    second, _ = _adapter().normalize_message(
+        _eml(message_id="<thread-b@example.com>"), uid=8, uidvalidity=11
+    )
+
+    assert first[0].conversation_key != second[0].conversation_key
 
 
 def test_email_adapter_uppercase_sender_addresses_are_normalized():
@@ -100,9 +151,24 @@ def test_email_adapter_uppercase_sender_addresses_are_normalized():
     assert status == "PENDING"
     event = events[0]
     assert event.external_user_id == "alice.wang@example.com"
-    assert event.conversation_key == "email:account-1:alice.wang@example.com"
-    assert event.reply_target["to"] == "alice.wang@example.com"
+    assert event.conversation_key == "email:account-1:alice.wang@example.com:msg-1@example.com"
+    assert event.reply_target["to"] == "Alice.Wang@example.com"
     assert event.reply_target["to_name"] is None
+
+
+def test_email_adapter_rejects_invalid_or_oversized_sender_addresses():
+    for sender in (
+        "alice example.com",
+        "alice@@example.com",
+        "alice@!!!",
+        "alice..smith@example.com",
+        f"{'a' * 65}@example.com",
+        f"alice@{'d' * 64}.example.com",
+    ):
+        raw = f"From: {sender}\r\nTo: support@corp.com\r\n\r\nhello\r\n".encode()
+        events, status = _adapter().normalize_message(raw, uid=7, uidvalidity=11)
+        assert events == [], sender
+        assert status == "EMAIL_SCHEMA_UNSUPPORTED", sender
 
 
 # ---------------------------------------------------------------------------
@@ -160,23 +226,51 @@ def test_email_adapter_ignores_system_senders():
 
 
 def test_email_adapter_ignores_system_return_paths():
-    for return_path in ("<>", "<mailer-daemon@example.net>", "<bounces@example.net>"):
+    for return_path in (
+        "<>",
+        "<mailer-daemon@example.net>",
+        "<bounces@example.net>",
+        "<MAILER-DAEMON@Example.NET>",
+    ):
         raw = _eml(headers={"Return-Path": return_path})
         events, status = _adapter().normalize_message(raw, uid=13, uidvalidity=11)
         assert events == [], return_path
         assert status == "IGNORED_SYSTEM_SENDER", return_path
 
 
+def test_email_adapter_separates_delivery_address_from_casefolded_identity():
+    upper, upper_status = _adapter().normalize_message(
+        _eml(from_addr="Alice@Example.COM", from_name=None),
+        uid=14,
+        uidvalidity=11,
+    )
+    lower, lower_status = _adapter().normalize_message(
+        _eml(from_addr="alice@example.com", from_name=None),
+        uid=15,
+        uidvalidity=11,
+    )
+
+    assert upper_status == lower_status == "PENDING"
+    assert upper[0].external_user_id == lower[0].external_user_id == "alice@example.com"
+    assert upper[0].reply_target["to"] == "Alice@example.com"
+    assert lower[0].reply_target["to"] == "alice@example.com"
+    assert upper[0].conversation_key == lower[0].conversation_key
+
+
 def test_email_adapter_ignores_mail_from_self():
     raw = _eml(from_addr="Support@Corp.com", from_name=None)
-    events, status = _adapter().normalize_message(raw, uid=14, uidvalidity=11)
+    events, status = _adapter(self_address=" Support@Corp.COM. ").normalize_message(
+        raw, uid=14, uidvalidity=11
+    )
     assert events == []
     assert status == "IGNORED_SELF"
 
 
 def test_email_adapter_ignores_internal_domain_by_default():
     raw = _eml(from_addr="colleague@corp.com", from_name=None)
-    events, status = _adapter().normalize_message(raw, uid=15, uidvalidity=11)
+    events, status = _adapter(self_address="support@Corp.COM.").normalize_message(
+        raw, uid=15, uidvalidity=11
+    )
     assert events == []
     assert status == "IGNORED_INTERNAL"
 
@@ -271,8 +365,60 @@ def test_email_adapter_missing_message_id_gets_deterministic_fallback():
     first, status_a = _adapter().normalize_message(_eml(message_id=None), uid=21, uidvalidity=11)
     second, status_b = _adapter().normalize_message(_eml(message_id=None), uid=21, uidvalidity=11)
     assert status_a == status_b == "PENDING"
-    assert first[0].external_event_id == second[0].external_event_id
-    assert first[0].external_event_id  # 非空
+    assert first[0].external_event_id == second[0].external_event_id == "11:21"
+    assert first[0].external_conversation_id == second[0].external_conversation_id
+    assert first[0].reply_target["message_id"] == second[0].reply_target["message_id"]
+
+
+def test_email_adapter_bounds_untrusted_headers_and_attachment_metadata():
+    oversized_message_id = f"<{'m' * (MAX_MESSAGE_ID_BYTES + 100)}@attacker.example>"
+    oversized_reference = f"<{'r' * (MAX_MESSAGE_ID_BYTES + 100)}@attacker.example>"
+    message = EmailMessage()
+    message["From"] = f"{'N' * (MAX_SENDER_NAME_CHARS + 100)} <alice@example.com>"
+    message["To"] = "support@corp.com"
+    message["Subject"] = "S" * (MAX_SUBJECT_CHARS + 100)
+    message["Message-ID"] = oversized_message_id
+    message["References"] = f"{oversized_reference} <later@example.com>"
+    message["In-Reply-To"] = "<ignored@example.com>"
+    message.set_content("hello")
+    for index in range(MAX_ATTACHMENTS + 5):
+        message.add_attachment(
+            b"x",
+            maintype="application",
+            subtype="octet-stream",
+            filename=f"{index}-{'f' * (MAX_ATTACHMENT_FILENAME_CHARS + 100)}.bin",
+        )
+
+    first, status = _adapter().normalize_message(bytes(message), uid=24, uidvalidity=11)
+    second, _ = _adapter().normalize_message(bytes(message), uid=99, uidvalidity=12)
+    isolated, _ = _adapter(account_id="account-2").normalize_message(
+        bytes(message), uid=24, uidvalidity=11
+    )
+
+    assert status == "PENDING"
+    event = first[0]
+    assert event.external_event_id == "11:24"
+    assert event.external_event_id != second[0].external_event_id
+    assert event.external_event_id == isolated[0].external_event_id
+    assert event.external_conversation_id == second[0].external_conversation_id
+    assert event.external_conversation_id != isolated[0].external_conversation_id
+    assert len(event.external_event_id.encode()) <= MAX_MESSAGE_ID_BYTES
+    assert len(event.external_conversation_id.encode()) <= MAX_MESSAGE_ID_BYTES
+    assert len(event.conversation_key.encode()) < 1400
+    assert oversized_message_id not in str(event.reply_target)
+    assert oversized_reference not in str(event.reply_target)
+    assert len(event.reply_target["message_id"].encode()) <= MAX_MESSAGE_ID_BYTES + 2
+    assert len(event.reply_target["references"]) <= MAX_REFERENCES_CHARS
+    assert event.reply_target["thread_root"] == event.external_conversation_id
+    assert event.reply_target["thread_root"] != event.external_event_id
+    assert len(event.reply_target["to_name"]) == MAX_SENDER_NAME_CHARS
+    assert len(event.reply_target["subject"]) == MAX_SUBJECT_CHARS
+    assert len(event.attachments) == MAX_ATTACHMENTS
+    assert all(
+        len(attachment["filename"]) <= MAX_ATTACHMENT_FILENAME_CHARS
+        and len(attachment["content_type"]) <= MAX_ATTACHMENT_CONTENT_TYPE_CHARS
+        for attachment in event.attachments
+    )
 
 
 def test_email_adapter_collects_attachment_metadata_only():

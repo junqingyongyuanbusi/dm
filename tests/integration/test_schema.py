@@ -279,6 +279,82 @@ async def test_platform_account_contract_rejects_invalid_rows(session, overrides
     await session.rollback()
 
 
+async def test_platform_account_contract_accepts_email(session):
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="email",
+            name="email-contract",
+            status="active",
+            capability={"dm": True, "max_text_length": 4000},
+        )
+    )
+    await session.commit()
+    assert (await session.get(models.PlatformAccount, account_id)).platform == "email"
+
+
+async def test_email_checkpoint_scope_and_uidvalidity_gap_contract(session):
+    account_id = uuid.uuid4()
+    checkpoint_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="email",
+            name="email-sync-contract",
+            status="active",
+            capability={"dm": True, "max_text_length": 4000},
+        )
+    )
+    await session.execute(
+        insert(models.PlatformCheckpoint).values(
+            id=checkpoint_id,
+            tenant_id="default",
+            platform_account_id=account_id,
+            stream="EMAIL_IMAP",
+            scope_key="",
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.PlatformCheckpoint).values(
+                id=uuid.uuid4(),
+                tenant_id="default",
+                platform_account_id=account_id,
+                stream="EMAIL_IMAP",
+                scope_key="INBOX",
+            )
+        )
+        await session.commit()
+    await session.rollback()
+
+    run_id = uuid.uuid4()
+    await session.execute(
+        insert(models.SyncRun).values(
+            id=run_id,
+            checkpoint_id=checkpoint_id,
+            claim_token=uuid.uuid4(),
+            mode="POLL",
+            status="GAPPED",
+        )
+    )
+    await session.execute(
+        insert(models.SyncGap).values(
+            checkpoint_id=checkpoint_id,
+            sync_run_id=run_id,
+            gap_type="EMAIL_UIDVALIDITY_CHANGED",
+            status="OPEN",
+        )
+    )
+    await session.commit()
+
+
 async def test_platform_account_contract_accepts_feishu(session):
     account_id = uuid.uuid4()
     await session.execute(
@@ -412,6 +488,7 @@ async def test_delivery_attempts_and_outbox_index(migrated_db):
         }
     assert {"id", "outbox_id", "attempt_no", "outcome", "error_code", "created_at"} <= cols
     assert any("conversation" in name and "status" in name for name in idx)
+    assert "ix_outbox_email_bot_sent_account_time" in idx
 
 
 async def test_all_core_tables_exist(migrated_db):

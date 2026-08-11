@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import delete, select
 
 from social_reply.application.account_management.auth import (
@@ -25,6 +26,10 @@ from social_reply.application.account_management.jobs import (
     requires_secret_resubmission,
     retry_provisioning_job,
     submit_provisioning_job,
+)
+from social_reply.application.account_management.router import (
+    EmailAccountRequest,
+    _validate_email_request_after_gates,
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
@@ -244,10 +249,10 @@ tbody tr:hover{{background:#F7F5EF}}
 .channel-section{{margin:0 0 24px}}
 .channel-heading{{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:12px}}
 .channel-heading p{{margin:0;color:var(--muted);font-size:13.5px}}
-.channel-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}}
+.channel-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}}
 .channel-tile{{min-width:0;min-height:112px;padding:14px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);text-decoration:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;text-align:center;transition:border-color .18s,background .18s,box-shadow .18s,transform .18s}}
 .channel-tile:hover{{color:var(--text);border-color:var(--border-strong);background:#F7F5EF;transform:translateY(-1px)}}
-.channel-tile[aria-current="page"]{{border-color:var(--accent);box-shadow:0 0 0 2px rgba(193,95,60,.12);background:var(--accent-tint)}}
+.channel-tile[aria-current="true"]{{border-color:var(--accent);box-shadow:0 0 0 2px rgba(193,95,60,.12);background:var(--accent-tint)}}
 .channel-tile.disabled{{opacity:.56;cursor:not-allowed;background:var(--surface-2);transform:none}}
 .channel-icon{{width:42px;height:42px;display:grid;place-items:center}}
 .channel-icon img{{display:block;width:36px;height:36px;object-fit:contain}}
@@ -260,6 +265,8 @@ tbody tr:hover{{background:#F7F5EF}}
 .channel-setup-head h2{{font-family:var(--sans);font-size:18px;margin:0}}
 .channel-setup-head p{{color:var(--muted);font-size:13px;margin:1px 0 0}}
 .channel-form{{max-width:680px;padding-top:4px}}
+.channel-form-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 14px}}
+.channel-form-grid .span-2{{grid-column:1/-1}}
 .channel-meta{{display:grid;grid-template-columns:140px minmax(0,1fr);gap:7px 12px;margin:16px 0 4px;font-size:13px}}
 .channel-meta dt{{color:var(--muted)}}
 .channel-meta dd{{margin:0;min-width:0;overflow-wrap:anywhere}}
@@ -315,7 +322,7 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 @media (prefers-reduced-motion:reduce){{*{{transition:none!important}}}}
 @media (max-width:900px){{.filters{{grid-template-columns:repeat(2,minmax(0,1fr))}} .detail-grid{{grid-template-columns:1fr}}}}
 @media (max-width:820px){{.channel-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
-@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}} .queue-tabs{{grid-template-columns:1fr}}}}
+@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-form-grid{{grid-template-columns:1fr}} .channel-form-grid .span-2{{grid-column:auto}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}} .queue-tabs{{grid-template-columns:1fr}}}}
 @media (max-width:520px){{.channel-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}} .channel-tile{{min-height:104px}} .channel-heading{{align-items:flex-start;flex-direction:column;gap:2px}} .channel-meta{{grid-template-columns:1fr;gap:1px}} .channel-meta dd{{margin-bottom:7px}}}}
 </style></head><body>
 <header><span class="brand">Reply Core<small>Control Plane</small></span>{nav_bar}<nav>{logout}</nav></header>
@@ -559,17 +566,34 @@ def _input(
     required: bool = True,
     value: str = "",
     readonly: bool = False,
+    input_type: str | None = None,
+    inputmode: str | None = None,
+    min: int | str | None = None,
+    max: int | str | None = None,
+    autocomplete: str | None = None,
 ) -> str:
     field_id = f"f-{name}-{secrets.token_hex(3)}"  # 同名字段出现在多个表单，id 需唯一
-    required_attr = "required" if required else ""
-    input_type = "password" if secret else "text"
-    value_attr = f' value="{html.escape(value, quote=True)}"' if value else ""
-    readonly_attr = "readonly" if readonly else ""
-    return (
-        f'<label for="{field_id}">{html.escape(label)}</label>'
-        f'<input id="{field_id}" type="{input_type}" name="{name}"{value_attr} '
-        f"{required_attr} {readonly_attr}>"
-    )
+    resolved_type = input_type or ("password" if secret else "text")
+    attributes = [
+        f'id="{field_id}"',
+        f'type="{html.escape(resolved_type, quote=True)}"',
+        f'name="{html.escape(name, quote=True)}"',
+    ]
+    if value:
+        attributes.append(f'value="{html.escape(value, quote=True)}"')
+    if required:
+        attributes.append("required")
+    if readonly:
+        attributes.append("readonly")
+    for attribute, attribute_value in (
+        ("inputmode", inputmode),
+        ("min", min),
+        ("max", max),
+        ("autocomplete", autocomplete),
+    ):
+        if attribute_value is not None:
+            attributes.append(f'{attribute}="{html.escape(str(attribute_value), quote=True)}"')
+    return f'<label for="{field_id}">{html.escape(label)}</label><input {" ".join(attributes)}>'
 
 
 _STATUS_TONES = {
@@ -649,6 +673,35 @@ async def _submit_form(
     settings = get_settings()
     if not settings.platform_integration_enabled(platform):
         raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
+    if platform == "email":
+        allowed_fields = set(EmailAccountRequest.model_fields) | {"csrf_token"}
+        if set(form) - allowed_fields:
+            raise HTTPException(status_code=422, detail="invalid_email_account_form_fields")
+        email_values = {key: value for key, value in form.items() if key != "csrf_token"}
+        for optional_field in (
+            "name",
+            "public_id",
+            "idempotency_key",
+            "from_name",
+            "smtp_port",
+        ):
+            if not (email_values.get(optional_field) or "").strip():
+                email_values.pop(optional_field, None)
+        try:
+            email_request = EmailAccountRequest.model_validate(email_values)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail="invalid_email_account_form") from exc
+        _validate_email_request_after_gates(
+            email_request,
+            allowed_hosts=settings.email_allowed_hosts,
+        )
+        validated_form = {"csrf_token": form.get("csrf_token", "")}
+        for key, value in email_request.model_dump().items():
+            if value is not None:
+                validated_form[key] = (
+                    value.get_secret_value() if isinstance(value, SecretStr) else value
+                )
+        form = validated_form
     if platform == "x" and (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
         raise HTTPException(status_code=422, detail="xchat_disabled")
     if platform == "feishu":
@@ -721,6 +774,11 @@ async def admin_connect_feishu(request: Request) -> Response:
     return await _submit_form(request, "feishu")
 
 
+@router.post("/connect/email")
+async def admin_connect_email(request: Request) -> Response:
+    return await _submit_form(request, "email")
+
+
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
 async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
     principal = await _web_principal(request)
@@ -738,10 +796,16 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
         data["status"] = "PROCESSING"
     retry = ""
     if job.status in {"FAILED", "NEEDS_ACTION"} and requires_secret_resubmission(job):
-        retry = (
-            '<p class="muted">该任务的一次性凭证已清除。'
-            '<a href="/admin/accounts">返回账号页重新提交 PIN 或凭证</a>。</p>'
-        )
+        if job.platform == "email":
+            retry = (
+                '<p class="muted">该 Email 任务的暂存密码已清除。'
+                '<a href="/admin/accounts">返回账号页重新提交 Email 账号和密码</a>。</p>'
+            )
+        else:
+            retry = (
+                '<p class="muted">该任务的一次性凭证已清除。'
+                '<a href="/admin/accounts">返回账号页重新提交 PIN 或凭证</a>。</p>'
+            )
     elif job.status in {"FAILED", "NEEDS_ACTION"} and not auto_retry:
         retry = f"""<form method="post" action="/admin/jobs/{job.id}/retry" style="max-width:200px"><input type="hidden" name="csrf_token" value="{csrf}"><button>重试任务</button></form>"""
     refresh_note = '<p class="muted">任务运行中，页面每 4 秒自动刷新。</p>' if in_flight else ""
@@ -779,6 +843,8 @@ async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
         job = await session.get(models.ProvisioningJob, job_id)
     if job is None or job.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
+    if requires_secret_resubmission(job):
+        raise HTTPException(status_code=409, detail="provisioning_secret_resubmission_required")
     if not get_settings().platform_integration_enabled(job.platform):
         raise HTTPException(status_code=503, detail=f"{job.platform}_integration_disabled")
     try:

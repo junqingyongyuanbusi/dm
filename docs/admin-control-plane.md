@@ -76,6 +76,9 @@ Failed jobs retain only the encrypted staging envelope for controlled retry, use
 - Feishu: one tenant-scoped direct `PlatformAccount` for one enterprise self-built application Bot;
   App ID is the external account identity, the account owns all four credentials and its webhook
   route, and no `PlatformApp` is created.
+- Email: one tenant-scoped direct `PlatformAccount` per mailbox; the account owns encrypted login
+  credentials plus IMAP/SMTP/threading configuration, has no webhook, and no `PlatformApp` is
+  created. New accounts are always provisioned as `BOT_DRAFT_ONLY`.
 - Facebook/Instagram: one Meta `PlatformApp`, multiple Page/Professional Account rows. App secrets sign webhook bodies and generate `appsecret_proof`; account tokens remain account-scoped. Facebook Login Instagram rows belong to family `meta` and require a Page ID; standalone Instagram Login rows belong to family `instagram` and forbid a Page ID. Shared webhook public IDs are unique across both families.
 - WhatsApp: a Meta `PlatformApp` plus one account per `phone_number_id`.
 - X: deployment-level OAuth Consumer App credentials, a tenant-shared `PlatformApp` webhook route, and one `PlatformAccount` per authorized user. Events route by `for_user_id`; legacy account-level webhook secrets remain readable during migration.
@@ -95,6 +98,7 @@ Supported destination commands:
 - `meta_private_reply`
 - `feishu_p2p_reply`
 - `feishu_group_reply`
+- `email_reply`
 - `whatsapp_session_message`
 - `x_dm`
 - `x_chat_message`
@@ -119,7 +123,7 @@ The built-in administration surface provides:
 - a conversation archive at `/admin/conversations`, where direct messages and public comments/mentions are separated while every reply remains bound to an explicit inbound message target;
 - read-only runtime diagnostics at `/admin/health`; draft approval and delivery retry remain inbox workflows instead of being duplicated across diagnostic pages;
 - platform account and provisioning-job overview;
-- Telegram, Facebook, Instagram, WhatsApp, Feishu, and X connection forms;
+- Telegram, Facebook, Instagram, WhatsApp, Feishu, Email, and X connection forms;
 - asynchronous job status and retry;
 - account enable/disable and health checks, including separate Messaging/Comments status plus app-level and account-level subscription state; Meta accounts can only use `BOT_ACTIVE` when the deployment sets `META_AUTO_REPLY_ENABLED=true`, and every change is written to `audit_logs` as `SET_AUTOMATION_DEFAULT`; when `META_COMMENT_REPLY_ENABLED=true` too, newly authorized Facebook and Instagram accounts enable comments, still start as `BOT_DRAFT_ONLY`, validate account-targeted comment permissions, and install the required App/account webhook fields;
 - finite LLM voice controls at `/admin/prompt`: administrators select only tone, length, empathy, and emoji enums. Saves dual-write canonical `voice_preferences` JSON and a code-compiled compatibility `persona`, bump the revision recorded in `reply_decisions.prompt_version`, and audit structured values as `SET_REPLY_PERSONA`; arbitrary system instructions are not accepted, and dry-run uses only compiled text without persisting a decision or Outbox;
@@ -127,6 +131,24 @@ The built-in administration surface provides:
 - no account-creation CLI requirement.
 
 OAuth states contain the initiating server-side session ID and tenant. Callbacks revalidate that session and its current tenant permissions before exchanging credentials or creating a provisioning job, so logout, expiry, password change, or tenant revocation invalidates an in-flight authorization.
+
+### Email provisioning contract
+
+A tenant administrator can submit an Email account through `/admin/accounts` or
+`POST /api/v1/platform-accounts/email`. The request separates the mailbox address, IMAP/SMTP hosts,
+ports, mailbox, TLS mode and policy fields from encrypted username/password secrets. Both the API
+schema and Worker provisioning path require `BOT_DRAFT_ONLY` and reject hosts absent from
+`EMAIL_ALLOWED_HOSTS` before any DNS or provider connection.
+
+Provisioning performs an IMAP SSL login plus readonly mailbox selection and an authenticated SMTP
+SSL or strict STARTTLS probe without sending a message. An omitted SMTP port defaults from the
+selected security mode (SSL 465, STARTTLS 587), while an explicit valid port is preserved. Admin
+shows this as the latest “接入探测” result and time: it is only a credential access validation, not
+continuous monitoring or a periodic Email health reconciler. Repository tests use fake clients and
+do not establish a real provider connection. Administrator-provided credentials must
+still pass Phase 0 and the draft-only real smoke in `docs/email-integration.md` before any account is
+promoted. Automatic sending additionally requires `EMAIL_ENABLED=true` and
+`EMAIL_AUTO_REPLY_ENABLED=true` on API, Worker and Scheduler.
 
 ### Feishu provisioning contract
 

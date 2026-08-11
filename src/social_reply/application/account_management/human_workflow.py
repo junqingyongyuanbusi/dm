@@ -322,7 +322,7 @@ async def resolve_human_work_item_in_session(
 
     target = account.automation_default
     reason = "human_work_resolved_account_policy"
-    if not get_settings().meta_automation_default_allowed(account.platform, target):
+    if not get_settings().automation_default_allowed(account.platform, target):
         target = "BOT_DRAFT_ONLY"
         reason = "human_work_resolved_platform_fallback"
 
@@ -423,8 +423,8 @@ async def resume_bot(
         account = await session.get(models.PlatformAccount, conversation.platform_account_id)
         if account is None or account.tenant_id != conversation.tenant_id:
             raise HumanWorkflowError("conversation_account_scope_mismatch")
-        if not get_settings().meta_automation_default_allowed(account.platform, target):
-            raise HumanWorkflowError("meta_requires_bot_draft_only")
+        if not get_settings().automation_default_allowed(account.platform, target):
+            raise HumanWorkflowError("automation_default_not_allowed")
         open_work = (
             await session.execute(
                 select(models.HumanWorkItem).where(

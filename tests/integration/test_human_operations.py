@@ -7,6 +7,7 @@ from sqlalchemy import func, insert, select, text
 
 from social_reply.application.account_management.human_workflow import (
     HumanWorkflowConflict,
+    HumanWorkflowError,
     claim_human_work_item,
     ensure_open_human_work_item,
     resolve_human_work_item,
@@ -697,6 +698,85 @@ async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, mo
         )
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    "settings_update",
+    [
+        {"email_enabled": False, "email_auto_reply_enabled": True},
+        {"email_enabled": True, "email_auto_reply_enabled": False},
+    ],
+)
+async def test_email_resume_rejects_bot_active_but_allows_draft(
+    session, monkeypatch, settings_update
+):
+    from social_reply.application.account_management import human_workflow
+
+    settings = human_workflow.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(human_workflow, "get_settings", lambda: settings)
+    _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session, platform="email", automation_default="BOT_ACTIVE"
+    )
+    work = await session.get(models.HumanWorkItem, work_id)
+    work.status = "RESOLVED"
+    work.resolved_at = datetime.now(UTC)
+    await session.commit()
+
+    with pytest.raises(HumanWorkflowError, match="automation_default_not_allowed"):
+        await resume_bot(
+            conversation_id=conversation_id,
+            allowed_tenants=frozenset({"tenant-a"}),
+            actor="user:alice",
+            target="BOT_ACTIVE",
+        )
+
+    await resume_bot(
+        conversation_id=conversation_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        target="BOT_DRAFT_ONLY",
+    )
+    session.expire_all()
+    state = await session.get(models.AutomationState, conversation_id)
+    assert state.state == "BOT_DRAFT_ONLY"
+
+
+@pytest.mark.parametrize(
+    "settings_update",
+    [
+        {"email_enabled": False, "email_auto_reply_enabled": True},
+        {"email_enabled": True, "email_auto_reply_enabled": False},
+    ],
+)
+async def test_resolve_email_bot_active_policy_falls_back_to_draft(
+    session, monkeypatch, settings_update
+):
+    from social_reply.application.account_management import human_workflow
+
+    settings = human_workflow.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(human_workflow, "get_settings", lambda: settings)
+    _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
+        session, platform="email", automation_default="BOT_ACTIVE"
+    )
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        user_id=None,
+        expected_version=1,
+    )
+    await resolve_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=frozenset({"tenant-a"}),
+        actor="user:alice",
+        expected_version=2,
+        allow_override=False,
+    )
+
+    session.expire_all()
+    state = await session.get(models.AutomationState, conversation_id)
+    assert state.state == "BOT_DRAFT_ONLY"
+    assert state.state_changed_reason == "human_work_resolved_platform_fallback"
 
 
 async def test_resolve_meta_bot_active_policy_falls_back_to_draft(session):

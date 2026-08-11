@@ -419,6 +419,40 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
     assert "post-1" in mention_detail.text
 
 
+async def test_email_platform_filter_is_available_across_inbox_and_conversations(
+    session, migrated_db
+):
+    await _seed_inbox_conversation(
+        session,
+        suffix="email-filter",
+        display_name="Email filter customer",
+        work_created_at=datetime.now(UTC),
+        platform="email",
+        channel_type="dm",
+        reply_target={
+            "kind": "email_reply",
+            "message_id": "<message@example.com>",
+            "to": ["customer@example.com"],
+        },
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        inbox = await client.get("/admin/inbox", params={"platform": "email"})
+        conversations = await client.get("/admin/conversations", params={"platform": "email"})
+        counts = await client.get("/admin/inbox/counts", params={"platform": "email"})
+
+    assert inbox.status_code == 200
+    assert conversations.status_code == 200
+    assert counts.status_code == 200
+    assert '<option value="email" selected>email</option>' in inbox.text
+    assert '<option value="email" selected>email</option>' in conversations.text
+    assert "Email filter customer" in inbox.text
+    assert "Email filter customer" in conversations.text
+    assert counts.json()["human"] == 1
+
+
 async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db):
     now = datetime.now(UTC)
     account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
@@ -1045,7 +1079,7 @@ async def test_draft_edit_records_final_text_and_outbox_provenance(
     assert outbox.actor_kind == "ADMIN_HUMAN"
 
 
-async def test_accounts_page_renders_six_channel_tiles(migrated_db, monkeypatch):
+async def test_accounts_page_renders_seven_channel_tiles(migrated_db, monkeypatch):
     from social_reply.application.account_management import admin_console
 
     settings = admin_console.get_settings().model_copy(
@@ -1057,6 +1091,7 @@ async def test_accounts_page_renders_six_channel_tiles(migrated_db, monkeypatch)
             "meta_auto_reply_enabled": True,
             "whatsapp_enabled": True,
             "feishu_enabled": True,
+            "email_enabled": True,
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
@@ -1067,6 +1102,10 @@ async def test_accounts_page_renders_six_channel_tiles(migrated_db, monkeypatch)
     assert response.status_code == 200
     html = response.text
     assert "添加渠道" in html
+    assert f"{len(admin_console._CHANNEL_LABELS)} 个平台" in html
+    assert html.count('class="channel-tile"') == len(admin_console._CHANNEL_LABELS)
+    assert 'role="list"' not in html
+    assert 'role="listitem"' not in html
     for channel, label in (
         ("x", "X"),
         ("facebook", "Facebook"),
@@ -1074,6 +1113,7 @@ async def test_accounts_page_renders_six_channel_tiles(migrated_db, monkeypatch)
         ("telegram", "Telegram"),
         ("whatsapp", "WhatsApp"),
         ("feishu", "Feishu"),
+        ("email", "Email"),
     ):
         assert f'data-channel="{channel}"' in html
         assert f"/static/channel-icons/{channel}.svg" in html
@@ -1154,6 +1194,281 @@ async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypa
     assert 'name="encrypt_key"' in feishu_page.text
     assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in feishu_page.text
     assert 'name="group_mode" value="mentions_only"' in feishu_page.text
+
+
+async def test_accounts_page_renders_email_connection_form_and_icon(migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"email_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get("/admin/accounts?connect=email")
+        icon = await client.get("/static/channel-icons/email.svg")
+
+    assert page.status_code == 200
+    assert icon.status_code == 200
+    assert "<svg" in icon.text and "<path" in icon.text
+    assert 'data-channel="email"' in page.text
+    assert "/static/channel-icons/email.svg" in page.text
+    assert 'action="/admin/connect/email"' in page.text
+    for label in (
+        "Email Address",
+        "From Name（可选）",
+        "Username",
+        "Password",
+        "IMAP Host",
+        "IMAP Port",
+        "SMTP Host",
+        "SMTP Port（留空按加密方式默认）",
+        "SMTP Security",
+        "Mailbox",
+        "同域内部邮件",
+    ):
+        assert label in page.text
+    assert 'data-channel="email" aria-current="true"' in page.text
+    assert 'aria-current="page"' not in page.text
+    assert 'role="listitem"' not in page.text
+    assert re.search(
+        r'<input[^>]+type="email"[^>]+name="email_address"[^>]+autocomplete="email"[^>]*>',
+        page.text,
+    )
+    assert 'name="username" required autocomplete="username"' in page.text
+    assert 'name="imap_host" value="imap.larksuite.com"' in page.text
+    assert re.search(
+        r'<input[^>]+type="number"[^>]+name="imap_port"[^>]+value="993"[^>]+'
+        r'inputmode="numeric"[^>]+min="1"[^>]+max="65535"[^>]*>',
+        page.text,
+    )
+    assert 'name="smtp_host" value="smtp.larksuite.com"' in page.text
+    smtp_port_input = re.search(r'<input[^>]+name="smtp_port"[^>]*>', page.text)
+    assert smtp_port_input is not None
+    assert 'type="number"' in smtp_port_input.group(0)
+    assert 'inputmode="numeric"' in smtp_port_input.group(0)
+    assert 'min="1"' in smtp_port_input.group(0)
+    assert 'max="65535"' in smtp_port_input.group(0)
+    assert "value=" not in smtp_port_input.group(0)
+    assert '<option value="ssl" selected>SSL（默认 465）</option>' in page.text
+    assert '<option value="starttls">STARTTLS（默认 587）</option>' in page.text
+    assert 'name="mailbox" value="INBOX"' in page.text
+    assert '<option value="ignore" selected>忽略（推荐）</option>' in page.text
+    assert '<option value="allow">允许进入处理流程</option>' in page.text
+    assert "默认忽略同域来信，以降低自动回复循环风险。" in page.text
+    assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in page.text
+    password_input = re.search(r'<input[^>]+type="password"[^>]+name="password"[^>]*>', page.text)
+    assert password_input is not None
+    assert 'autocomplete="current-password"' in password_input.group(0)
+    assert "value=" not in password_input.group(0)
+    assert "channel-form-grid" in page.text
+    assert "@media (max-width:720px)" in page.text
+    assert ".channel-form-grid{grid-template-columns:1fr}" in page.text
+    assert ".channel-form-grid .span-2{grid-column:auto}" in page.text
+
+
+async def test_accounts_page_renders_email_sanitized_health_without_password(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"email_enabled": True})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    leaked_password = "mail-password-must-not-leak"
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="email",
+            name="Support Email",
+            external_account_id="support@example.com",
+            public_id=f"email_{uuid.uuid4().hex}",
+            credential_bundle=encrypt_secret_bundle(
+                {"username": "support@example.com", "password": leaked_password}
+            ),
+            config={
+                "mailbox": "INBOX",
+                "smtp_security": "ssl",
+                "email_health_status": "READY",
+                "email_health_checked_at": "2026-08-03T00:00:00+00:00",
+                "email_health_error_code": f"AUTH_FAILED:{leaked_password}:<script>",
+            },
+            capability={"dm": True, "max_text_length": 10000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        response = await client.get("/admin/accounts")
+
+    assert response.status_code == 200
+    assert "Support Email" in response.text
+    assert "接入探测" in response.text
+    assert "通过" in response.text
+    assert "Mailbox INBOX" in response.text
+    assert "Security ssl" in response.text
+    assert "探测时间 2026-08-03 00:00 UTC" in response.text
+    assert "2026-08-03T00:00:00+00:00" not in response.text
+    assert "仅表示最近一次凭证接入验证，不是持续监控" in response.text
+    assert "Health" not in response.text
+    assert "AUTH_FAILEDmail-password-must-not-leakscript" not in response.text
+    assert leaked_password not in response.text
+    assert "<script>" not in response.text
+
+
+def test_email_probe_timestamp_formatter_handles_invalid_iso_safely():
+    from social_reply.application.account_management.admin_console import _fmt_iso_timestamp
+
+    assert _fmt_iso_timestamp("2026-08-03T08:30:00+08:00") == "2026-08-03 00:30 UTC"
+    assert _fmt_iso_timestamp("not-a-timestamp") == "—"
+    assert _fmt_iso_timestamp(None) == "—"
+
+
+async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
+    migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin
+
+    captured = {}
+    submissions = []
+    disabled_settings = admin.get_settings().model_copy(update={"email_enabled": False})
+    enabled_settings = disabled_settings.model_copy(update={"email_enabled": True})
+    monkeypatch.setattr(admin, "get_settings", lambda: disabled_settings)
+
+    async def fake_submit(**kwargs):
+        submissions.append(kwargs)
+        captured.update(kwargs)
+        return uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+
+    async def fake_dispatch(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(admin, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(admin, "dispatch_actor", fake_dispatch)
+    payload = {
+        "tenant_id": "default",
+        "brand_id": "default",
+        "name": "",
+        "email_address": " Support@Example.COM. ",
+        "from_name": "",
+        "username": "mail-user",
+        "password": "mail-password-must-not-leak",
+        "imap_host": "IMAP.LARKSUITE.COM.",
+        "imap_port": "993",
+        "mailbox": "INBOX",
+        "smtp_host": "SMTP.LARKSUITE.COM.",
+        "smtp_port": "",
+        "smtp_security": "ssl",
+        "internal_domain_policy": "ignore",
+        "automation_default": "BOT_DRAFT_ONLY",
+    }
+    async with _app_client() as anonymous:
+        unauthenticated = await anonymous.post(
+            "/admin/connect/email", data={"csrf_token": "bad", **payload, "unexpected": "x"}
+        )
+    async with _app_client() as client:
+        csrf = await _login(client)
+        bad_csrf = await client.post("/admin/connect/email", data={"csrf_token": "bad", **payload})
+        wrong_tenant = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "tenant_id": "forbidden"},
+        )
+        disabled = await client.post("/admin/connect/email", data={"csrf_token": csrf, **payload})
+        monkeypatch.setattr(admin, "get_settings", lambda: enabled_settings)
+        extra = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "unexpected": "x"},
+        )
+        active = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "automation_default": "BOT_ACTIVE"},
+        )
+        blank_username = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "username": ""},
+        )
+        blank_password = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "password": ""},
+        )
+        oversized_password = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "password": "x" * 513},
+        )
+        invalid_brand = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "brand_id": "invalid brand"},
+        )
+        disallowed_settings = enabled_settings.model_copy(
+            update={"email_allowed_hosts": frozenset({"smtp.larksuite.com"})}
+        )
+        monkeypatch.setattr(admin, "get_settings", lambda: disallowed_settings)
+        disallowed = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload},
+        )
+        monkeypatch.setattr(admin, "get_settings", lambda: enabled_settings)
+        submitted = await client.post("/admin/connect/email", data={"csrf_token": csrf, **payload})
+        starttls_submitted = await client.post(
+            "/admin/connect/email",
+            data={"csrf_token": csrf, **payload, "smtp_security": "starttls"},
+        )
+
+    assert unauthenticated.status_code == 303
+    assert unauthenticated.headers["location"] == "/admin/login"
+    assert bad_csrf.status_code == 403
+    assert wrong_tenant.status_code == 403
+    assert disabled.status_code == 503
+    assert disabled.json()["detail"] == "email_integration_disabled"
+    assert extra.status_code == 422
+    assert active.status_code == 422
+    assert blank_username.status_code == 422
+    assert blank_password.status_code == 422
+    assert oversized_password.status_code == 422
+    assert invalid_brand.status_code == 422
+    assert disallowed.status_code == 422
+    assert disallowed.json()["detail"] == "email_hostname_not_allowed"
+    for rejected in (
+        extra,
+        active,
+        blank_username,
+        blank_password,
+        oversized_password,
+        invalid_brand,
+        disallowed,
+    ):
+        assert "mail-user" not in rejected.text
+        assert "mail-password-must-not-leak" not in rejected.text
+    assert submitted.status_code == 303
+    assert submitted.headers["location"] == "/admin/jobs/dddddddd-dddd-dddd-dddd-dddddddddddd"
+    assert starttls_submitted.status_code == 303
+    assert "mail-password-must-not-leak" not in submitted.text
+    assert len(submissions) == 2
+    assert submissions[0]["platform"] == "email"
+    assert submissions[0]["tenant_id"] == "default"
+    assert submissions[0]["request"] == {
+        "automation_default": "BOT_DRAFT_ONLY",
+        "email_address": "Support@example.com",
+        "imap_host": "imap.larksuite.com",
+        "imap_port": 993,
+        "mailbox": "INBOX",
+        "smtp_host": "smtp.larksuite.com",
+        "smtp_port": 465,
+        "smtp_security": "ssl",
+        "internal_domain_policy": "ignore",
+    }
+    assert submissions[0]["secrets"] == {
+        "username": "mail-user",
+        "password": "mail-password-must-not-leak",
+    }
+    assert submissions[1]["request"]["smtp_security"] == "starttls"
+    assert submissions[1]["request"]["smtp_port"] == 587
+    assert type(submissions[1]["request"]["smtp_port"]) is int
+    assert captured == submissions[1]
+    assert not set(submissions[0]["request"]) & {"username", "password"}
 
 
 async def test_accounts_page_renders_feishu_sanitized_channel_health(
@@ -1298,6 +1613,67 @@ async def test_meta_account_automation_only_converges_to_draft_while_switch_is_o
     assert legacy_active.automation_default == "BOT_DRAFT_ONLY"
 
 
+@pytest.mark.parametrize(
+    "settings_update",
+    [
+        {"email_enabled": False, "email_auto_reply_enabled": True},
+        {"email_enabled": True, "email_auto_reply_enabled": False},
+    ],
+)
+async def test_email_account_automation_gate_hides_promotion_and_keeps_history_fallback(
+    session, migrated_db, monkeypatch, settings_update
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    draft_id, legacy_active_id = uuid.uuid4(), uuid.uuid4()
+    for account_id, policy, address in (
+        (draft_id, "BOT_DRAFT_ONLY", "draft@example.com"),
+        (legacy_active_id, "BOT_ACTIVE", "legacy@example.com"),
+    ):
+        await session.execute(
+            insert(models.PlatformAccount).values(
+                id=account_id,
+                tenant_id="default",
+                brand_id="default",
+                platform="email",
+                name=address,
+                external_account_id=address,
+                public_id=f"email_{uuid.uuid4().hex}",
+                config={"mailbox": "INBOX", "smtp_security": "ssl"},
+                capability={"dm": True, "max_text_length": 10000},
+                automation_default=policy,
+                status="active",
+            )
+        )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/accounts")
+        rejected = await client.post(
+            f"/admin/accounts/{draft_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
+        )
+        converged = await client.post(
+            f"/admin/accounts/{legacy_active_id}/automation",
+            data={"csrf_token": csrf, "target": "BOT_DRAFT_ONLY"},
+        )
+
+    assert f'action="/admin/accounts/{draft_id}/automation"' not in page.text
+    assert f'action="/admin/accounts/{legacy_active_id}/automation"' in page.text
+    assert rejected.status_code == 422
+    assert converged.status_code == 303
+    session.expire_all()
+    assert (await session.get(models.PlatformAccount, draft_id)).automation_default == (
+        "BOT_DRAFT_ONLY"
+    )
+    assert (await session.get(models.PlatformAccount, legacy_active_id)).automation_default == (
+        "BOT_DRAFT_ONLY"
+    )
+
+
 async def test_meta_account_can_be_promoted_once_deployment_opts_in(
     session, migrated_db, monkeypatch
 ):
@@ -1371,8 +1747,9 @@ async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
 
     assert response.status_code == 200
     for channel in ("facebook", "instagram", "whatsapp", "feishu"):
-        assert f'data-channel="{channel}" role="listitem" aria-disabled="true"' in response.text
+        assert f'data-channel="{channel}" aria-disabled="true"' in response.text
         assert f'href="/admin/accounts?connect={channel}' not in response.text
+    assert 'role="listitem"' not in response.text
     assert 'action="/admin/oauth/meta/start"' not in response.text
     assert 'action="/admin/oauth/instagram/start"' not in response.text
     assert 'action="/admin/connect/whatsapp"' not in response.text
@@ -1398,7 +1775,8 @@ async def test_accounts_page_disables_x_tile_when_all_stacks_are_off(migrated_db
         disabled = await client.get("/admin/accounts?connect=x")
 
     assert response.status_code == 200
-    assert 'data-channel="x" role="listitem" aria-disabled="true"' in response.text
+    assert 'data-channel="x" aria-disabled="true"' in response.text
+    assert 'role="listitem"' not in response.text
     assert 'href="/admin/accounts?connect=x' not in response.text
     assert 'action="/admin/oauth/x/start"' not in response.text
     assert 'action="/admin/connect/x"' not in response.text
@@ -1567,6 +1945,45 @@ async def test_pin_provisioning_job_requires_secret_resubmission(session, migrat
 
     assert page.status_code == 200
     assert "返回账号页重新提交 PIN 或凭证" in page.text
+    assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
+    assert retry.status_code == 409
+    assert retry.json()["detail"] == "provisioning_secret_resubmission_required"
+
+
+async def test_email_provisioning_job_requires_account_password_resubmission(session, migrated_db):
+    job_id = uuid.uuid4()
+    await session.execute(
+        insert(models.ProvisioningJob).values(
+            id=job_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="email",
+            actor="user:admin",
+            idempotency_key="email-password-resubmit",
+            request={"email_address": "Support@example.com"},
+            staging_secret=None,
+            status="NEEDS_ACTION",
+            current_step="FAILED",
+            result={
+                "requires_secret_resubmission": True,
+                "required_secret": "password",
+            },
+            last_error_code="imap_tls_invalid",
+            last_error_message="Email IMAP protocol validation failed",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get(f"/admin/jobs/{job_id}")
+        retry = await client.post(
+            f"/admin/jobs/{job_id}/retry",
+            data={"csrf_token": csrf},
+        )
+
+    assert page.status_code == 200
+    assert "返回账号页重新提交 Email 账号和密码" in page.text
     assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
     assert retry.status_code == 409
     assert retry.json()["detail"] == "provisioning_secret_resubmission_required"
@@ -1745,6 +2162,82 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
     assert outbox.last_error_code == "TAKEOVER"
     assert audit.action == "HUMAN_ACTIVE"
     assert audit.detail == {"reason": "admin_manual"}
+
+
+async def test_email_conversation_transition_gate_blocks_bot_active_not_human_active(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(update={"email_auto_reply_enabled": False})
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    account_id, contact_id, conversation_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="email",
+            name="support@example.com",
+            external_account_id="support@example.com",
+            public_id=f"email_{uuid.uuid4().hex}",
+            config={"mailbox": "INBOX", "smtp_security": "ssl"},
+            capability={"dm": True, "max_text_length": 10000},
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="default",
+            platform="email",
+            platform_account_id=account_id,
+            external_user_id="customer@example.com",
+            display_name="Email customer",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="email",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"email:{account_id}:customer@example.com",
+            channel_type="dm",
+        )
+    )
+    await session.execute(
+        insert(models.AutomationState).values(
+            conversation_id=conversation_id,
+            state="CLOSED",
+            state_version=1,
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        detail = await client.get(f"/admin/conversations/{conversation_id}")
+        rejected = await client.post(
+            f"/admin/conversations/{conversation_id}/state",
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE", "expect": "CLOSED"},
+        )
+        takeover = await client.post(
+            f"/admin/conversations/{conversation_id}/state",
+            data={"csrf_token": csrf, "target": "HUMAN_ACTIVE", "expect": "CLOSED"},
+        )
+
+    assert detail.status_code == 200
+    assert 'name="target" value="BOT_ACTIVE"' not in detail.text
+    assert 'name="target" value="HUMAN_ACTIVE"' in detail.text
+    assert rejected.status_code == 422
+    assert takeover.status_code == 303
+    session.expire_all()
+    state = await session.get(models.AutomationState, conversation_id)
+    assert state.state == "HUMAN_ACTIVE"
 
 
 async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkeypatch):

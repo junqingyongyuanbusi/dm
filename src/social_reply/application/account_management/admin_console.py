@@ -89,9 +89,34 @@ from social_reply.shared.config import get_settings
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-console"])
 
+_ADMIN_PLATFORMS = (
+    "telegram",
+    "facebook",
+    "instagram",
+    "whatsapp",
+    "x",
+    "feishu",
+    "email",
+)
+
 
 def _fmt(dt: datetime | None) -> str:
     return dt.strftime("%m-%d %H:%M") if dt else "—"
+
+
+def _fmt_iso_timestamp(value: object) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return "—"
+    else:
+        return "—"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _tenant_input(principal: Principal) -> str:
@@ -359,7 +384,7 @@ def _inbox_filter_form(
     )
     platform_options = '<option value="">全部平台</option>' + "".join(
         f'<option value="{value}"{_selected(platform, value)}>{html.escape(value)}</option>'
-        for value in ("telegram", "facebook", "instagram", "whatsapp", "x", "feishu")
+        for value in _ADMIN_PLATFORMS
     )
     status_values = {
         "human": ("WAITING", "CLAIMED", "RESOLVED", "CANCELLED"),
@@ -401,7 +426,7 @@ def _conversation_filter_form(
     )
     platform_options = '<option value="">全部平台</option>' + "".join(
         f'<option value="{value}"{_selected(platform, value)}>{html.escape(value)}</option>'
-        for value in ("telegram", "facebook", "instagram", "whatsapp", "x", "feishu")
+        for value in _ADMIN_PLATFORMS
     )
     return f"""<form class="filters" method="get" action="/admin/conversations">
 <input type="hidden" name="channel" value="{channel}">
@@ -831,14 +856,7 @@ async def inbox_counts(request: Request) -> Response:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
     platform = request.query_params.get("platform", "").strip()
-    if platform and platform not in {
-        "telegram",
-        "facebook",
-        "instagram",
-        "whatsapp",
-        "x",
-        "feishu",
-    }:
+    if platform and platform not in _ADMIN_PLATFORMS:
         raise HTTPException(status_code=422, detail="invalid_platform_filter")
     channel = request.query_params.get("channel", "all").strip()
     if channel not in _CHANNEL_FILTERS:
@@ -887,14 +905,7 @@ async def inbox_page(request: Request) -> Response:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
     platform = request.query_params.get("platform", "").strip()
-    if platform and platform not in {
-        "telegram",
-        "facebook",
-        "instagram",
-        "whatsapp",
-        "x",
-        "feishu",
-    }:
+    if platform and platform not in _ADMIN_PLATFORMS:
         raise HTTPException(status_code=422, detail="invalid_platform_filter")
     channel = request.query_params.get("channel", "all").strip()
     if channel not in _CHANNEL_FILTERS:
@@ -1228,14 +1239,7 @@ async def conversations_page(request: Request) -> Response:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_filter") from exc
     platform = request.query_params.get("platform", "").strip()
-    if platform and platform not in {
-        "telegram",
-        "facebook",
-        "instagram",
-        "whatsapp",
-        "x",
-        "feishu",
-    }:
+    if platform and platform not in _ADMIN_PLATFORMS:
         raise HTTPException(status_code=422, detail="invalid_platform_filter")
     channel = request.query_params.get("channel", "all").strip()
     if channel not in _CHANNEL_FILTERS:
@@ -1619,6 +1623,7 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         for dst, (label, cls) in _TRANSITION_LABELS.items()
         if cur is not None
         and can_transition(cur, AutomationStateEnum(dst))
+        and get_settings().automation_default_allowed(account.platform, dst)
         and (dst == "HUMAN_ACTIVE" or work_item is None)
     )
     decision_rows = (
@@ -1674,7 +1679,7 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         else "—"
     )
     effective_policy = account.automation_default
-    if not get_settings().meta_automation_default_allowed(account.platform, effective_policy):
+    if not get_settings().automation_default_allowed(account.platform, effective_policy):
         effective_policy = "BOT_DRAFT_ONLY"
     policy_label = "自动回复" if effective_policy == "BOT_ACTIVE" else "草稿模式"
     work_actions = ""
@@ -1698,7 +1703,7 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
     ):
         resume_auto = (
             '<button class="btn-sm btn-ghost" name="target" value="BOT_ACTIVE">恢复自动</button>'
-            if get_settings().meta_automation_default_allowed(account.platform, "BOT_ACTIVE")
+            if get_settings().automation_default_allowed(account.platform, "BOT_ACTIVE")
             else ""
         )
         work_actions += f"""<form class="inline" method="post" action="/admin/conversations/{conversation_id}/resume"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm" name="target" value="BOT_DRAFT_ONLY">恢复为草稿</button>{resume_auto}</form>"""
@@ -1923,6 +1928,11 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
         conv = await session.get(models.Conversation, conversation_id)
         if conv is None or conv.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="conversation_not_found")
+        account = await session.get(models.PlatformAccount, conv.platform_account_id)
+        if account is None or account.tenant_id != conv.tenant_id:
+            raise HTTPException(status_code=404, detail="conversation_not_found")
+        if not get_settings().automation_default_allowed(account.platform, target):
+            raise HTTPException(status_code=422, detail="automation_default_not_allowed")
         # CAS：仅当仍处于提交时看到的状态才翻转（防并发接管竞态）
         if target == AutomationStateEnum.HUMAN_ACTIVE:
             flipped = await flip_to_human_active(
@@ -2899,6 +2909,7 @@ _CHANNEL_LABELS = {
     "telegram": "Telegram",
     "whatsapp": "WhatsApp",
     "feishu": "Feishu",
+    "email": "Email",
 }
 
 _CHANNEL_KINDS = {
@@ -2908,6 +2919,7 @@ _CHANNEL_KINDS = {
     "telegram": "Bot Token",
     "whatsapp": "Cloud API",
     "feishu": "自建应用 Bot",
+    "email": "IMAP / SMTP",
 }
 
 
@@ -2929,12 +2941,12 @@ def _channel_tile(channel: str, *, enabled: bool, selected: bool) -> str:
     )
     if not enabled:
         return (
-            f'<div class="channel-tile disabled" data-channel="{channel}" role="listitem" '
+            f'<div class="channel-tile disabled" data-channel="{channel}" '
             f'aria-disabled="true" aria-label="{html.escape(label)} 未启用">{inner}</div>'
         )
-    current = ' aria-current="page"' if selected else ""
+    current = ' aria-current="true"' if selected else ""
     return (
-        f'<a class="channel-tile" data-channel="{channel}" role="listitem"{current} '
+        f'<a class="channel-tile" data-channel="{channel}"{current} '
         f'href="/admin/accounts?connect={channel}#channel-setup" '
         f'aria-label="连接 {html.escape(label)}">{inner}</a>'
     )
@@ -3041,9 +3053,8 @@ async def accounts_page(request: Request) -> Response:
         auto_target = "BOT_DRAFT_ONLY" if a.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
         auto_label = "切为草稿" if a.automation_default == "BOT_ACTIVE" else "切为自动"
         automation_form = ""
-        # 未开启 META_AUTO_REPLY_ENABLED 时，Meta 账号只能向草稿收敛，因此仅对历史遗留的
-        # BOT_ACTIVE 账号保留按钮（用于改回草稿）。
-        if settings.meta_automation_default_allowed(a.platform, auto_target):
+        # 部署 gate 关闭时账号只能向草稿收敛，因此仅对历史 BOT_ACTIVE 账号保留回退按钮。
+        if settings.automation_default_allowed(a.platform, auto_target):
             automation_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{auto_target}"><button class="btn-sm btn-ghost">{auto_label}</button></form>"""
         xchat_form = ""
         channel_status = "—"
@@ -3098,6 +3109,37 @@ async def accounts_page(request: Request) -> Response:
                 f"<div>Comments {_pill(comments_status)}</div>"
                 f"<div class='muted'>{html.escape(subscribed)}</div>"
                 f"<div class='muted'>{html.escape(error_code)}</div>"
+            )
+        elif a.platform == "email":
+            account_config = dict(a.config or {})
+            probe_status = str(account_config.get("email_health_status") or "UNKNOWN")
+            if probe_status == "READY":
+                probe_result = '<span class="pill ok">通过</span>'
+            elif probe_status == "UNKNOWN":
+                probe_result = '<span class="pill neutral">未知</span>'
+            else:
+                probe_result = '<span class="pill err">错误</span>'
+            mailbox = str(account_config.get("mailbox") or "—")
+            smtp_security = str(account_config.get("smtp_security") or "—")
+            checked_at = _fmt_iso_timestamp(account_config.get("email_health_checked_at"))
+            raw_error_code = str(account_config.get("email_health_error_code") or "—")
+            error_code = raw_error_code
+            if raw_error_code != "—" and (
+                len(raw_error_code) > 64
+                or not raw_error_code.isascii()
+                or not all(
+                    character.isupper() or character.isdigit() or character in {"_", "-"}
+                    for character in raw_error_code
+                )
+            ):
+                error_code = "EMAIL_HEALTH_ERROR"
+            channel_status = (
+                f"<div>接入探测 {probe_result}</div>"
+                f"<div class='muted'>Mailbox {html.escape(mailbox)}</div>"
+                f"<div class='muted'>Security {html.escape(smtp_security)}</div>"
+                f"<div class='muted'>探测时间 {html.escape(checked_at)}</div>"
+                f"<div class='muted'>错误 {html.escape(error_code)}</div>"
+                "<div class='muted'>仅表示最近一次凭证接入验证，不是持续监控</div>"
             )
         account_rows += (
             f"<tr><td>{html.escape(a.platform)}</td><td>{html.escape(a.name)}</td>"
@@ -3163,6 +3205,7 @@ async def accounts_page(request: Request) -> Response:
         "telegram": True,
         "whatsapp": settings.whatsapp_enabled,
         "feishu": settings.feishu_enabled,
+        "email": settings.email_enabled,
     }
     requested_channel = request.query_params.get("connect", "")
     selected_channel = (
@@ -3182,8 +3225,8 @@ async def accounts_page(request: Request) -> Response:
         for channel in _CHANNEL_LABELS
     )
     channel_picker = f"""<section class="channel-section" aria-labelledby="add-channel-title">
-<div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">6 个平台</span></div>
-<div class="channel-grid" role="list">{channel_tiles}</div></section>{channel_notice}"""
+<div class="channel-heading"><div><h2 id="add-channel-title">添加渠道</h2><p>选择要连接的平台</p></div><span class="muted">{len(_CHANNEL_LABELS)} 个平台</span></div>
+<div class="channel-grid">{channel_tiles}</div></section>{channel_notice}"""
     facebook_comments = settings.meta_comment_reply_enabled
     facebook_policy_fields = (
         '<input type="hidden" name="instagram_login_mode" value="facebook_login">'
@@ -3231,6 +3274,10 @@ async def accounts_page(request: Request) -> Response:
         selected_panel = f"""<section class="channel-setup" id="channel-setup">
 {_channel_setup_head("feishu", "连接企业自建应用 Bot")}
 <form class="channel-form" method="post" action="/admin/connect/feishu">{common}{_input("app_id", "App ID")}{_input("app_secret", "App Secret", secret=True)}{_input("verification_token", "Verification Token", secret=True)}{_input("encrypt_key", "Encrypt Key", secret=True)}<input type="hidden" name="api_base_url" value="{FEISHU_API_BASE_URL}"><input type="hidden" name="group_mode" value="{FEISHU_GROUP_MODE}"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><button class="btn-block">连接 Feishu</button></form></section>"""
+    elif selected_channel == "email":
+        selected_panel = f"""<section class="channel-setup" id="channel-setup">
+{_channel_setup_head("email", "连接收发邮箱")}
+<form class="channel-form" method="post" action="/admin/connect/email">{common}<div class="channel-form-grid"><div>{_input("email_address", "Email Address", input_type="email", autocomplete="email")}</div><div>{_input("from_name", "From Name（可选）", required=False)}</div><div>{_input("username", "Username", autocomplete="username")}</div><div>{_input("password", "Password", secret=True, autocomplete="current-password")}</div><div>{_input("imap_host", "IMAP Host", value="imap.larksuite.com")}</div><div>{_input("imap_port", "IMAP Port", value="993", input_type="number", inputmode="numeric", min=1, max=65535)}</div><div>{_input("smtp_host", "SMTP Host", value="smtp.larksuite.com")}</div><div>{_input("smtp_port", "SMTP Port（留空按加密方式默认）", required=False, input_type="number", inputmode="numeric", min=1, max=65535)}</div><div><label for="f-email-smtp-security">SMTP Security</label><select id="f-email-smtp-security" name="smtp_security" required><option value="ssl" selected>SSL（默认 465）</option><option value="starttls">STARTTLS（默认 587）</option></select></div><div>{_input("mailbox", "Mailbox", value="INBOX")}</div><div class="span-2"><label for="f-email-domain-policy">同域内部邮件</label><select id="f-email-domain-policy" name="internal_domain_policy" required><option value="ignore" selected>忽略（推荐）</option><option value="allow">允许进入处理流程</option></select><p class="hint">默认忽略同域来信，以降低自动回复循环风险。</p></div></div><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><button class="btn-block">连接 Email</button></form></section>"""
     account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>账号自动化策略</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:
@@ -3304,8 +3351,8 @@ async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Re
         account = await session.get(models.PlatformAccount, account_id)
         if account is None or account.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="account_not_found")
-        if not get_settings().meta_automation_default_allowed(account.platform, target):
-            raise HTTPException(status_code=422, detail="meta_requires_bot_draft_only")
+        if not get_settings().automation_default_allowed(account.platform, target):
+            raise HTTPException(status_code=422, detail="automation_default_not_allowed")
         previous = account.automation_default
         account.automation_default = target
         if previous != target:

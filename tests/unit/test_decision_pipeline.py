@@ -78,6 +78,51 @@ async def test_human_active_forces_ignore():
     assert "HUMAN_ACTIVE" in d.reason_codes
 
 
+@pytest.mark.parametrize(
+    ("email_enabled", "email_auto_reply_enabled", "expected_action"),
+    [
+        (False, False, ReplyAction.DRAFT),
+        (False, True, ReplyAction.DRAFT),
+        (True, False, ReplyAction.DRAFT),
+        (True, True, ReplyAction.AUTO_REPLY),
+    ],
+)
+async def test_email_decision_gate_requires_enabled_and_auto_reply(
+    email_enabled, email_auto_reply_enabled, expected_action
+):
+    decision = await run_decision_pipeline(
+        _snap(platform="email"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        email_auto_reply_allowed=email_enabled and email_auto_reply_enabled,
+    )
+    assert decision.action is expected_action
+    if expected_action is ReplyAction.DRAFT:
+        assert decision.reply_visibility is Visibility.PRIVATE
+        assert decision.reason_codes[-1] == "EMAIL_AUTO_REPLY_DISABLED"
+
+
+async def test_email_auto_reply_gate_does_not_change_handoff():
+    decision = await run_decision_pipeline(
+        _snap(platform="email", text="我要起诉你们"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        email_auto_reply_allowed=False,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert "EMAIL_AUTO_REPLY_DISABLED" not in decision.reason_codes
+
+
+async def test_non_email_auto_reply_ignores_email_gate():
+    decision = await run_decision_pipeline(
+        _snap(platform="telegram"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        email_auto_reply_allowed=False,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+
+
 async def test_draft_only_downgrades_auto_reply_to_private_draft():
     d = await run_decision_pipeline(
         _snap(state="BOT_DRAFT_ONLY"), llm=StubLLMClient(), killswitch=_OpenSwitch()

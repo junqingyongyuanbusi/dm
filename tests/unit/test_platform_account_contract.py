@@ -3,6 +3,8 @@ import pytest
 from social_reply.domain.platform_accounts import (
     ACTIVE_ACCOUNT_STATUS,
     DIRECT_DESTINATION_CAPABILITIES,
+    PROVISIONABLE_ACCOUNT_PLATFORMS,
+    SUPPORTED_ACCOUNT_PLATFORMS,
     AccountPlatform,
     CapabilityKey,
     account_platform,
@@ -37,6 +39,17 @@ def test_capability_defaults_are_platform_specific_and_strict():
     assert capability_enabled(capability, CapabilityKey.X_CHAT) is False
 
 
+def test_email_capability_supports_dm_only_with_provisioning_contract():
+    capability = normalize_account_capability("email", {"dm": True})
+
+    assert account_platform("email") is AccountPlatform.EMAIL
+    assert "email" in SUPPORTED_ACCOUNT_PLATFORMS
+    assert "email" in PROVISIONABLE_ACCOUNT_PLATFORMS
+    assert capability == {"dm": True, "max_text_length": 4000}
+    with pytest.raises(ValueError, match="unknown_keys"):
+        normalize_account_capability("email", {"dm": True, "comments": False})
+
+
 def test_feishu_capability_supports_only_dm_and_mentions():
     capability = normalize_account_capability("feishu", {"dm": True})
 
@@ -67,6 +80,7 @@ def test_destination_capabilities_bind_routes_to_platforms():
     x_dm = DIRECT_DESTINATION_CAPABILITIES["x_dm"]
     feishu_p2p = DIRECT_DESTINATION_CAPABILITIES["feishu_p2p_reply"]
     feishu_group = DIRECT_DESTINATION_CAPABILITIES["feishu_group_reply"]
+    email_reply = DIRECT_DESTINATION_CAPABILITIES["email_reply"]
 
     assert x_dm.platforms == frozenset({AccountPlatform.X})
     assert x_dm.capability is CapabilityKey.DM
@@ -74,3 +88,5 @@ def test_destination_capabilities_bind_routes_to_platforms():
     assert feishu_p2p.capability is CapabilityKey.DM
     assert feishu_group.platforms == frozenset({AccountPlatform.FEISHU})
     assert feishu_group.capability is CapabilityKey.MENTIONS
+    assert email_reply.platforms == frozenset({AccountPlatform.EMAIL})
+    assert email_reply.capability is CapabilityKey.DM

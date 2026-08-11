@@ -7,10 +7,19 @@ from email.message import Message
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
+from itertools import islice
 
 from social_reply.connectors.email.contracts import (
     BULK_PRECEDENCE_VALUES,
+    MAX_ATTACHMENT_CONTENT_TYPE_CHARS,
+    MAX_ATTACHMENT_FILENAME_CHARS,
+    MAX_ATTACHMENTS,
     MAX_INBOUND_TEXT_CHARS,
+    MAX_MESSAGE_ID_BYTES,
+    MAX_REFERENCE_IDS,
+    MAX_REFERENCES_CHARS,
+    MAX_SENDER_NAME_CHARS,
+    MAX_SUBJECT_CHARS,
     PLATFORM,
     STATUS_IGNORED_AUTO_SUBMITTED,
     STATUS_IGNORED_BULK_LIST,
@@ -20,6 +29,11 @@ from social_reply.connectors.email.contracts import (
     STATUS_PENDING,
     STATUS_SCHEMA_UNSUPPORTED,
     SYSTEM_SENDER_LOCAL_PARTS,
+    email_address_domain,
+    email_address_identity_key,
+    email_address_local_part,
+    is_email_domain,
+    normalize_email_address,
 )
 from social_reply.domain.messages.canonical import CanonicalEvent, ChannelType
 
@@ -41,8 +55,9 @@ class EmailInboundAdapter:
         internal_domain_policy: str = "ignore",
     ) -> None:
         self._account_id = account_id
-        self._self_address = self_address.strip().lower()
-        self._self_domain = _address_domain(self._self_address)
+        self._self_address = normalize_email_address(self_address)
+        self._self_identity = email_address_identity_key(self._self_address)
+        self._self_domain = email_address_domain(self._self_address)
         self._internal_domain_policy = internal_domain_policy
 
     def normalize_message(
@@ -65,40 +80,54 @@ class EmailInboundAdapter:
             return [], STATUS_IGNORED_SYSTEM_SENDER
 
         sender_name, sender_address = parseaddr(str(message.get("From", "")))
-        sender_address = sender_address.strip().lower()
-        if not _is_address(sender_address):
+        try:
+            sender_address = normalize_email_address(sender_address)
+        except ValueError:
             return [], STATUS_SCHEMA_UNSUPPORTED
+        sender_name = sender_name.strip()[:MAX_SENDER_NAME_CHARS]
 
-        if _address_local_part(sender_address) in SYSTEM_SENDER_LOCAL_PARTS:
+        sender_identity = email_address_identity_key(sender_address)
+        if email_address_local_part(sender_address) in SYSTEM_SENDER_LOCAL_PARTS:
             return [], STATUS_IGNORED_SYSTEM_SENDER
-        if sender_address == self._self_address:
+        if sender_identity == self._self_identity:
             return [], STATUS_IGNORED_SELF
         if (
             self._internal_domain_policy != "allow"
             and self._self_domain
-            and _address_domain(sender_address) == self._self_domain
+            and email_address_domain(sender_address) == self._self_domain
         ):
             return [], STATUS_IGNORED_INTERNAL
 
-        subject = str(message.get("Subject", "")).strip()
+        subject = str(message.get("Subject", "")).strip()[:MAX_SUBJECT_CHARS]
         body = _extract_body(message)
         text = _combine_subject_and_body(subject, body)
-        message_id, external_event_id = _message_id(
+        message_id, message_identity = _message_id(
             message,
             raw=raw,
             uid=uid,
             uidvalidity=uidvalidity,
+            account_id=self._account_id,
             fallback_domain=self._self_domain,
         )
-        references = str(message.get("References", "")).strip()
-        thread_root = _thread_root(references) or external_event_id
+        references, reference_root = _message_id_list(
+            str(message.get("References", "")),
+            account_id=self._account_id,
+            fallback_domain=self._self_domain,
+        )
+        _, in_reply_to_root = _message_id_list(
+            str(message.get("In-Reply-To", "")),
+            account_id=self._account_id,
+            fallback_domain=self._self_domain,
+        )
+        thread_root = reference_root or in_reply_to_root or message_identity
+        external_event_id = f"{uidvalidity}:{uid}"
 
         event = CanonicalEvent(
             platform=self.platform,
             platform_account_key=self._account_id,
             external_event_id=external_event_id,
-            external_user_id=sender_address,
-            conversation_key=f"email:{self._account_id}:{sender_address}",
+            external_user_id=sender_identity,
+            conversation_key=f"email:{self._account_id}:{sender_identity}:{thread_root}",
             text=text,
             occurred_at=_occurred_at(message),
             channel_type=ChannelType.DM,
@@ -110,6 +139,7 @@ class EmailInboundAdapter:
                 "subject": subject,
                 "message_id": message_id,
                 "references": references,
+                "thread_root": thread_root,
             },
             attachments=_attachments(message),
         )
@@ -138,21 +168,12 @@ def _has_system_return_path(message: Message) -> bool:
         return False
     if value == "<>":
         return True
-    _, address = parseaddr(value)
-    return _address_local_part(address) in SYSTEM_SENDER_LOCAL_PARTS
-
-
-def _is_address(value: str) -> bool:
-    local_part, separator, domain = value.rpartition("@")
-    return bool(separator and local_part and domain)
-
-
-def _address_local_part(value: str) -> str:
-    return value.rpartition("@")[0].split("+", 1)[0].lower()
-
-
-def _address_domain(value: str) -> str:
-    return value.rpartition("@")[2].lower()
+    try:
+        _, address = parseaddr(value)
+        canonical_address = normalize_email_address(address)
+    except ValueError:
+        return False
+    return email_address_local_part(canonical_address) in SYSTEM_SENDER_LOCAL_PARTS
 
 
 def _message_id(
@@ -161,17 +182,40 @@ def _message_id(
     raw: bytes,
     uid: int,
     uidvalidity: int,
+    account_id: str,
     fallback_domain: str,
 ) -> tuple[str, str]:
     value = str(message.get("Message-ID", "")).strip()
-    normalized = _normalize_message_id(value)
-    if normalized:
-        return value, normalized
+    if value:
+        return _bounded_message_id(
+            value,
+            account_id=account_id,
+            fallback_domain=fallback_domain,
+        )
 
     digest = hashlib.sha256(f"{uidvalidity}:{uid}:".encode() + raw).hexdigest()
     normalized = f"email-{digest}"
-    domain = fallback_domain or "reply-core.invalid"
+    domain = _message_id_domain(fallback_domain)
     return f"<{normalized}@{domain}>", normalized
+
+
+def _bounded_message_id(
+    value: str,
+    *,
+    account_id: str,
+    fallback_domain: str,
+) -> tuple[str, str]:
+    value = value.strip()
+    normalized = _normalize_message_id(value)
+    if _is_safe_message_id(normalized):
+        return value, normalized
+
+    domain = _message_id_domain(fallback_domain)
+    digest = hashlib.sha256(
+        f"{account_id}\0{domain}\0{value}".encode("utf-8", errors="replace")
+    ).hexdigest()
+    normalized = f"email-{digest}@{domain}"
+    return f"<{normalized}>", normalized
 
 
 def _normalize_message_id(value: str) -> str:
@@ -181,9 +225,44 @@ def _normalize_message_id(value: str) -> str:
     return value
 
 
-def _thread_root(references: str) -> str | None:
-    match = _MESSAGE_ID_PATTERN.search(references)
-    return _normalize_message_id(match.group(0)) if match else None
+def _is_safe_message_id(value: str) -> bool:
+    return bool(
+        value
+        and len(value.encode("utf-8")) <= MAX_MESSAGE_ID_BYTES
+        and not any(
+            character.isspace() or ord(character) < 32 or character in "<>" for character in value
+        )
+    )
+
+
+def _message_id_domain(value: str) -> str:
+    value = value.strip().lower().removesuffix(".")
+    return value if is_email_domain(value) else "reply-core.invalid"
+
+
+def _message_id_list(
+    value: str,
+    *,
+    account_id: str,
+    fallback_domain: str,
+) -> tuple[str, str | None]:
+    normalized_ids: list[str] = []
+    root: str | None = None
+    current_length = 0
+    for match in islice(_MESSAGE_ID_PATTERN.finditer(value), MAX_REFERENCE_IDS):
+        reply_value, normalized = _bounded_message_id(
+            match.group(0),
+            account_id=account_id,
+            fallback_domain=fallback_domain,
+        )
+        addition = len(reply_value) + (1 if normalized_ids else 0)
+        if current_length + addition > MAX_REFERENCES_CHARS:
+            break
+        normalized_ids.append(reply_value)
+        current_length += addition
+        if root is None:
+            root = normalized
+    return " ".join(normalized_ids), root
 
 
 def _occurred_at(message: Message) -> datetime | None:
@@ -299,10 +378,10 @@ def _attachment_parts(message: Message) -> Iterator[Message]:
 def _attachments(message: Message) -> list[dict[str, str]]:
     return [
         {
-            "filename": part.get_filename() or "",
-            "content_type": part.get_content_type().lower(),
+            "filename": (part.get_filename() or "")[:MAX_ATTACHMENT_FILENAME_CHARS],
+            "content_type": part.get_content_type().lower()[:MAX_ATTACHMENT_CONTENT_TYPE_CHARS],
         }
-        for part in _attachment_parts(message)
+        for part in islice(_attachment_parts(message), MAX_ATTACHMENTS)
     ]
 
 

@@ -1,9 +1,15 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from social_reply.connectors.email.network import (
+    DEFAULT_EMAIL_ALLOWED_HOSTS,
+    EmailNetworkError,
+    normalize_allowed_hosts,
+)
 
 _META_PLATFORMS = {"facebook", "instagram"}
 
@@ -57,6 +63,13 @@ class Settings(BaseSettings):
     instagram_messaging_enabled: bool = True
     whatsapp_enabled: bool = True
     feishu_enabled: bool = False
+    email_enabled: bool = False
+    email_auto_reply_enabled: bool = False
+    email_poll_interval_seconds: int = Field(default=60, ge=5, le=3600)
+    email_max_messages_per_poll: int = Field(default=100, ge=1, le=1000)
+    email_per_sender_daily_reply_limit: int = Field(default=5, ge=1, le=100)
+    email_network_timeout_seconds: float = Field(default=10.0, ge=1.0, le=120.0)
+    email_allowed_hosts: Annotated[frozenset[str], NoDecode] = DEFAULT_EMAIL_ALLOWED_HOSTS
     feishu_handoff_notifications_enabled: bool = False
     feishu_handoff_sweep_interval_seconds: float = Field(default=3, ge=0.5, le=60)
     feishu_handoff_sender_lease_seconds: int = Field(default=30, ge=5, le=600)
@@ -94,6 +107,14 @@ class Settings(BaseSettings):
     # 历史总字符预算，避免长会话放大请求成本或超过模型上下文。
     conversation_history_max_chars: int = Field(default=12000, ge=0, le=50000)
     testing: bool = False
+
+    @field_validator("email_allowed_hosts", mode="before")
+    @classmethod
+    def _normalize_email_allowed_hosts(cls, value: object) -> frozenset[str]:
+        try:
+            return normalize_allowed_hosts(value)
+        except EmailNetworkError as exc:
+            raise ValueError("EMAIL_ALLOWED_HOSTS 配置无效") from exc
 
     @model_validator(mode="after")
     def _normalize_database_url(self) -> "Settings":
@@ -142,6 +163,8 @@ class Settings(BaseSettings):
         instagram_values = (self.instagram_app_id, instagram_secret)
         if any(instagram_values) and not all(instagram_values):
             raise ValueError("INSTAGRAM_APP_ID 与 INSTAGRAM_APP_SECRET 必须同时配置")
+        if self.email_enabled and not self.email_allowed_hosts:
+            raise ValueError("EMAIL_ALLOWED_HOSTS 在 EMAIL_ENABLED=true 时不能为空")
         if not self.platform_secret_key_list:
             raise ValueError("PLATFORM_SECRET_KEYS 未配置；平台凭证必须使用应用层加密")
         from social_reply.infrastructure.secret_crypto import SecretCipher
@@ -195,6 +218,8 @@ class Settings(BaseSettings):
             return self.x_integration_enabled
         if platform == "feishu":
             return self.feishu_enabled
+        if platform == "email":
+            return self.email_enabled
         return True
 
     def platform_disabled_code(self, platform: str) -> str | None:
@@ -206,17 +231,22 @@ class Settings(BaseSettings):
             "whatsapp": "WHATSAPP_DISABLED",
             "x": "X_INTEGRATION_DISABLED",
             "feishu": "FEISHU_DISABLED",
+            "email": "EMAIL_DISABLED",
         }.get(platform, "PLATFORM_DISABLED")
 
-    def meta_automation_default_allowed(self, platform: str, automation_default: str) -> bool:
-        """Whether this deployment lets a Meta account default to something other than draft.
-
-        Draft-only stays allowed unconditionally; the switch only unlocks BOT_ACTIVE, and it
-        must be set on API and Worker alike because provisioning runs in the Worker.
-        """
-        if platform not in _META_PLATFORMS:
+    def automation_default_allowed(self, platform: str, automation_default: str) -> bool:
+        """Whether deployment policy permits an account's requested automation default."""
+        if automation_default != "BOT_ACTIVE":
             return True
-        return automation_default == "BOT_DRAFT_ONLY" or self.meta_auto_reply_enabled
+        if platform in _META_PLATFORMS:
+            return self.meta_auto_reply_enabled
+        if platform == "email":
+            return self.email_enabled and self.email_auto_reply_enabled
+        return True
+
+    def meta_automation_default_allowed(self, platform: str, automation_default: str) -> bool:
+        """Backward-compatible alias for existing Meta account-management callers."""
+        return self.automation_default_allowed(platform, automation_default)
 
     @property
     def facebook_app_credentials(self) -> tuple[str, str] | None:

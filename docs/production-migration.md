@@ -4,6 +4,10 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables,
 and `deploy/vps/README.md` for day-to-day VPS operations.
 
+The current Alembic graph has one head: `e9a1c4f7b620`. Database migration verifies schema state
+only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
+succeeded.
+
 ## Platform secret encryption
 
 Set `PLATFORM_SECRET_KEYS` before deploying. The first comma-separated Fernet key encrypts new
@@ -113,8 +117,9 @@ database backup. After all Feishu rows are absent, downgrade restores the previo
 platform constraint.
 
 Roll out the Feishu-capable code with `FEISHU_ENABLED=false` on API, Worker and Scheduler. Confirm all
-three roles run the same immutable image digest and the database is at the unique current head `d3f6a1b8c904`. Enablement is
-then a coordinated release operation: stop or replace API, Worker and Scheduler so all three receive
+three roles run the same immutable image digest and the database is at the unique current head
+`e9a1c4f7b620`. Enablement is then a coordinated release operation: stop or replace API, Worker and
+Scheduler so all three receive
 `FEISHU_ENABLED=true` and the same health interval on that one digest. Do not expose ingress on a new
 API while an old Worker or Scheduler remains.
 
@@ -125,6 +130,83 @@ performed by the provisioning API. Do not declare the release complete until API
 Scheduler all report the identical digest required by `scripts/publish_railway_release.sh`. Promote
 an account from `BOT_DRAFT_ONLY` to `BOT_ACTIVE` only after provider-side smoke verification. No
 production Feishu credential or successful live Feishu E2E is implied by this migration.
+
+## Email additive revision and rollout
+
+Revision `e9a1c4f7b620` follows `b7e4c2d9a615` and is the unique current head. It is additive for
+Email runtime support:
+
+- replaces `ck_platform_accounts_platform` so `platform_accounts.platform` accepts `email`;
+- extends checkpoint and gap constraints for `EMAIL_IMAP` and
+  `EMAIL_UIDVALIDITY_CHANGED`;
+- creates the partial `ix_outbox_email_bot_sent_account_time` index used when counting successful
+  `DECISION/BOT` Email sends.
+
+The four canonical check constraints remain validated after upgrade and retain their existing names.
+The Outbox rate index is rebuilt with `DROP INDEX CONCURRENTLY IF EXISTS` followed by
+`CREATE INDEX CONCURRENTLY` inside an Alembic autocommit block. This avoids blocking active Outbox
+inserts, updates and deletes while the index is built, and makes a retry recover from either an
+invalid index left by an interrupted concurrent build or a completed index left before Alembic
+advanced the revision row. Concurrent construction still consumes storage, CPU and I/O; monitor
+PostgreSQL load and free disk space during the operating window. Before retrying a failed upgrade,
+inspect the index state:
+
+```sql
+SELECT index_class.relname, index_row.indisready, index_row.indisvalid
+FROM pg_index AS index_row
+JOIN pg_class AS index_class ON index_class.oid = index_row.indexrelid
+JOIN pg_namespace AS namespace ON namespace.oid = index_class.relnamespace
+WHERE namespace.nspname = current_schema()
+  AND index_class.relname = 'ix_outbox_email_bot_sent_account_time';
+```
+
+Rerun Alembic rather than manually creating the index: revision `e9a1c4f7b620` safely drops any
+same-name leftover concurrently and rebuilds the required partial index. Downgrade first checks that
+no durable Email account, checkpoint or gap state exists, then drops the index with
+`DROP INDEX CONCURRENTLY IF EXISTS`; active Outbox writers do not need to pause for that drop.
+
+The migration does not connect to an Email provider, validate credentials or send a message. Before
+rollout, take and verify a PostgreSQL backup and record existing Email-related rows if this revision
+has already been tested in the target database. Deploy one flag-aware image to Railway API, Worker
+and Scheduler with all seven Email settings identical and both gates false:
+
+```env
+EMAIL_ENABLED=false
+EMAIL_AUTO_REPLY_ENABLED=false
+EMAIL_POLL_INTERVAL_SECONDS=60
+EMAIL_MAX_MESSAGES_PER_POLL=100
+EMAIL_PER_SENDER_DAILY_REPLY_LIMIT=5
+EMAIL_NETWORK_TIMEOUT_SECONDS=10
+EMAIL_ALLOWED_HOSTS=imap.larksuite.com,smtp.larksuite.com
+```
+
+Use the standard API-first release order. API owns database preparation: require its deployment to
+reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `e9a1c4f7b620` before
+starting or replacing Worker and Scheduler. Then require all three roles to run the same image
+digest and the same Email flags/allowlist. Do not enable Email on a new API while an old Worker or
+Scheduler remains.
+
+After an administrator supplies the target mailbox credentials, complete the Phase 0 TLS/login and
+readonly mailbox check in `docs/email-integration.md`. Then set `EMAIL_ENABLED=true` on all three
+roles in one coordinated restart and provision the account. New Email accounts are forced to
+`BOT_DRAFT_ONLY`; perform a real inbound poll and human-approved outbound smoke while keeping the
+Railway target `EMAIL_AUTO_REPLY_ENABLED=false` on API, Worker and Scheduler.
+
+Do **not** enable Email automatic replies in this rollout. The current ingestion path has no trusted
+envelope sender and no verified SPF, DKIM or DMARC authentication evidence, so a sender-controlled
+`From` header is insufficient authorization for automatic outbound mail. A future change may alter
+this target only after trusted envelope/authentication evidence is implemented and verified against
+a real mailbox, followed by a separate Email security review and separately approved rollout. A
+successful Alembic upgrade or human-approved smoke is not a substitute for those controls, and this
+repository does not claim that production credentials or a live Email E2E have been validated.
+
+For application rollback, first restore both Email gates to `false` on API, Worker and Scheduler and
+redeploy one prior digest. Prefer leaving revision `e9a1c4f7b620` in place because the schema is
+additive and old code does not need to create Email rows. Downgrade to `b7e4c2d9a615` fails closed if
+any Email platform account, `EMAIL_IMAP` checkpoint or `EMAIL_UIDVALIDITY_CHANGED` gap exists.
+Disabling an account or feature flag is not sufficient. Export the affected durable state and use a
+separately approved deletion/restore plan before downgrade; restore the verified pre-release backup
+if those account or synchronization facts must be retained.
 
 Revision `d4e7f2a9b608` makes `/webhooks/meta/{app_public_id}` unambiguous across Facebook Login
 `platform_family=meta` and standalone Instagram Login `platform_family=instagram`. The migration
@@ -430,7 +512,7 @@ historical open work.
 Before upgrade, take and verify a PostgreSQL backup. Deploy API, Worker and Scheduler with
 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` and identical sender lease, retry and sweep settings.
 After API migrates the database, require all three roles to reach one image digest and confirm the
-unique Alembic head is `b7e4c2d9a615`. Do not enable callbacks while an old API can still receive a
+unique Alembic head is `e9a1c4f7b620`. Do not enable callbacks while an old API can still receive a
 card action or an old Worker/Scheduler is running.
 
 Configure one Tenant at a time:
@@ -476,7 +558,7 @@ cancels only their pending or failed bot decision outboxes with `STALE_CONVERSAT
 
 The required revision order is `f6c2a9d81b40` (human inbox and Outbox provenance), then
 `b8e1d4f7a2c3` (work-item tenant/assignment repair), then `c2f4a6d8e901` (decision fencing), then
-`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication), then `a9d4e6f2b713` (human handoff lifecycle repair), then `d3f6a1b8c904` (structured voice and draft-first knowledge governance), then `b7e4c2d9a615` (Feishu handoff notifications and resolution evidence). Do not cherry-pick only the final revision.
+`e4b7c2d9a610` (add Feishu to the platform constraint), then `f8a1c3d5e702` (Feishu RawEvent webhook deduplication), then `a9d4e6f2b713` (human handoff lifecycle repair), then `d3f6a1b8c904` (structured voice and draft-first knowledge governance), then `b7e4c2d9a615` (Feishu handoff notifications and resolution evidence), then `e9a1c4f7b620` (Email platform/checkpoint/gap/rate-index contract). Do not cherry-pick only the final revision.
 Upgrade through `f6c2a9d81b40`, then run the Human operations
 inventory above and record repair counts before applying `b8e1d4f7a2c3`. Before the fencing step,
 inventory active DecisionJobs by conversation/status, pending or failed `DECISION/BOT` Outboxes tied

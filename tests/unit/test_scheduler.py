@@ -99,11 +99,40 @@ def test_build_specs_registers_feishu_health_in_inspection_lane():
     assert handoff.interval_seconds == 4.5
 
 
+async def test_build_specs_registers_enabled_email_poll_in_inspection_lane(monkeypatch):
+    calls = 0
+
+    async def fake_poll_email_messages() -> list[str]:
+        nonlocal calls
+        calls += 1
+        return ["email-event"]
+
+    monkeypatch.setattr(scheduler, "poll_email_messages", fake_poll_email_messages)
+    specs = {
+        spec.name: spec
+        for spec in scheduler._build_sweep_specs(
+            _settings(
+                email_enabled=True,
+                email_poll_interval_seconds=47,
+                scheduler_inspection_warn_after_seconds=44,
+            )
+        )
+    }
+
+    email = specs["poll_email_messages"]
+    assert email.lane == "inspection"
+    assert email.interval_seconds == 47
+    assert email.warn_after_seconds == 44
+    assert await email.run() == ["email-event"]
+    assert calls == 1
+
+
 def test_build_specs_omits_disabled_integrations():
     specs = {
         spec.name
         for spec in scheduler._build_sweep_specs(
             _settings(
+                email_enabled=False,
                 x_legacy_dm_enabled=False,
                 x_activity_enabled=False,
                 xchat_enabled=False,

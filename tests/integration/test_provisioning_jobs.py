@@ -8,6 +8,8 @@ from sqlalchemy import select, update
 
 from social_reply.application.account_management import jobs
 from social_reply.application.account_management.service import AccountConnectionResult
+from social_reply.connectors.email.imap_client import ImapClientError
+from social_reply.connectors.errors import PermanentSendError
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
@@ -556,3 +558,157 @@ async def test_same_idempotency_key_returns_same_job(migrated_db, tmp_path, monk
         )
     assert count == 1
     get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (ImapClientError("imap_authentication_failed"), "imap_authentication_failed"),
+        (ImapClientError("imap_tls_invalid"), "imap_tls_invalid"),
+        (PermanentSendError("smtp_tls_invalid"), "smtp_tls_invalid"),
+        (ValueError("invalid_mailbox"), "INVALID_REQUEST"),
+    ],
+)
+async def test_terminal_email_failure_clears_secret_and_requires_password_resubmission(
+    migrated_db, monkeypatch, failure, expected_code
+):
+    settings = jobs.get_settings().model_copy(update={"email_enabled": True})
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+
+    async def fail_connect(_job):
+        raise failure
+
+    monkeypatch.setattr(jobs, "_connect", fail_connect)
+    job_id = await jobs.submit_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform="email",
+        actor="user:admin",
+        request={"email_address": "Support@example.com", "idempotency_key": uuid.uuid4().hex},
+        secrets={"username": " mail-user ", "password": " mail-password "},
+    )
+
+    assert await jobs.process_provisioning_job(str(job_id)) == "NEEDS_ACTION"
+    async with get_session_factory()() as session:
+        row = await session.get(models.ProvisioningJob, job_id)
+    assert row.staging_secret is None
+    assert row.last_error_code == expected_code
+    assert "SECRET" not in row.last_error_message
+    assert row.result == {
+        "requires_secret_resubmission": True,
+        "required_secret": "password",
+    }
+    assert jobs.public_job(row)["result"] == row.result
+    assert "mail-password" not in str(jobs.public_job(row))
+    with pytest.raises(ValueError, match="provisioning_secret_resubmission_required"):
+        await jobs.retry_provisioning_job(job_id)
+
+
+async def test_retryable_email_failure_retains_secret_only_until_retry_exhaustion(
+    migrated_db, monkeypatch
+):
+    settings = jobs.get_settings().model_copy(update={"email_enabled": True})
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+
+    async def fail_connect(_job):
+        raise ImapClientError("imap_transport_failed", retryable=True)
+
+    monkeypatch.setattr(jobs, "_connect", fail_connect)
+    job_id = await jobs.submit_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform="email",
+        actor="user:admin",
+        request={"email_address": "Support@example.com", "idempotency_key": uuid.uuid4().hex},
+        secrets={"username": "mail-user", "password": "mail-password"},
+    )
+
+    assert await jobs.process_provisioning_job(str(job_id)) == "FAILED"
+    async with get_session_factory()() as session:
+        retryable = await session.get(models.ProvisioningJob, job_id)
+        assert decrypt_secret_bundle(retryable.staging_secret)["password"] == "mail-password"
+        retryable.attempt_count = jobs._MAX_ATTEMPTS - 1
+        retryable.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    assert await jobs.process_provisioning_job(str(job_id)) == "NEEDS_ACTION"
+    async with get_session_factory()() as session:
+        exhausted = await session.get(models.ProvisioningJob, job_id)
+    assert exhausted.last_error_code == "RETRY_EXHAUSTED"
+    assert exhausted.staging_secret is None
+    assert exhausted.result["required_secret"] == "password"
+
+
+async def test_disabled_email_before_claim_clears_secret_instead_of_pausing(
+    migrated_db, monkeypatch
+):
+    settings = jobs.get_settings().model_copy(update={"email_enabled": False})
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+    job_id = await jobs.submit_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform="email",
+        actor="user:admin",
+        request={"email_address": "Support@example.com", "idempotency_key": uuid.uuid4().hex},
+        secrets={"username": "mail-user", "password": "mail-password"},
+    )
+
+    assert await jobs.process_provisioning_job(str(job_id)) == "NEEDS_ACTION"
+    async with get_session_factory()() as session:
+        row = await session.get(models.ProvisioningJob, job_id)
+    assert row.status == "NEEDS_ACTION"
+    assert row.last_error_code == "EMAIL_DISABLED"
+    assert row.staging_secret is None
+    assert row.result["required_secret"] == "password"
+
+
+async def test_disabled_email_race_and_stale_recovery_clear_secrets(migrated_db, monkeypatch):
+    settings_ref = {"value": jobs.get_settings().model_copy(update={"email_enabled": True})}
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings_ref["value"])
+
+    async def disable_during_connect(_job):
+        settings_ref["value"] = settings_ref["value"].model_copy(update={"email_enabled": False})
+        raise ValueError("email_integration_disabled")
+
+    monkeypatch.setattr(jobs, "_connect", disable_during_connect)
+    race_id = await jobs.submit_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform="email",
+        actor="user:admin",
+        request={"email_address": "Support@example.com", "idempotency_key": uuid.uuid4().hex},
+        secrets={"username": "mail-user", "password": "mail-password"},
+    )
+    assert await jobs.process_provisioning_job(str(race_id)) == "NEEDS_ACTION"
+
+    stale_id = uuid.uuid4()
+    async with get_session_factory()() as session:
+        session.add(
+            models.ProvisioningJob(
+                id=stale_id,
+                tenant_id="tenant-a",
+                brand_id="brand-a",
+                platform="email",
+                actor="user:admin",
+                idempotency_key=uuid.uuid4().hex,
+                request={"email_address": "Support@example.com"},
+                staging_secret=encrypt_secret_bundle(
+                    {"username": "mail-user", "password": "mail-password"}
+                ),
+                status="PROCESSING",
+                current_step="VALIDATE_CREDENTIAL",
+                locked_at=datetime.now(UTC) - timedelta(minutes=10),
+                locked_by="dead-worker",
+            )
+        )
+        await session.commit()
+
+    await jobs.sweep_provisioning_jobs()
+    async with get_session_factory()() as session:
+        race = await session.get(models.ProvisioningJob, race_id)
+        stale = await session.get(models.ProvisioningJob, stale_id)
+    for row in (race, stale):
+        assert row.status == "NEEDS_ACTION"
+        assert row.staging_secret is None
+        assert row.result["requires_secret_resubmission"] is True
+        assert row.result["required_secret"] == "password"

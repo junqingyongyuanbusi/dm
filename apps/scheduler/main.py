@@ -14,6 +14,7 @@ from social_reply.application.account_management.feishu_health import (
 )
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
 from social_reply.application.account_management.meta_health import reconcile_meta_account_health
+from social_reply.application.event_ingestion.email_poll import poll_email_messages
 from social_reply.application.event_ingestion.raw_recovery import sweep_initial_raw_events
 from social_reply.application.event_ingestion.x_dm_poll import poll_x_direct_messages
 from social_reply.application.event_ingestion.x_webhook_health import ensure_x_webhooks_valid
@@ -122,6 +123,16 @@ def _build_sweep_specs(settings: Settings) -> tuple[SweepSpec, ...]:
                 settings.chatwoot_reconcile_interval_seconds,
                 inspection_warn_after,
                 reconcile_chatwoot_messages,
+            )
+        )
+    if settings.email_enabled:
+        specs.append(
+            SweepSpec(
+                "poll_email_messages",
+                "inspection",
+                settings.email_poll_interval_seconds,
+                inspection_warn_after,
+                poll_email_messages,
             )
         )
     if settings.x_legacy_dm_enabled:

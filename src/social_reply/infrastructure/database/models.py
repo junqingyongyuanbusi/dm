@@ -117,7 +117,7 @@ class PlatformAccount(Base):
         UniqueConstraint("tenant_id", "platform", "external_account_id"),
         UniqueConstraint("tenant_id", "id", name="uq_platform_accounts_tenant_id_id"),
         CheckConstraint(
-            "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x', 'feishu')",
+            "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x', 'feishu', 'email')",
             name="ck_platform_accounts_platform",
         ),
         CheckConstraint(
@@ -298,12 +298,13 @@ class PlatformCheckpoint(Base):
             name="uq_platform_checkpoints_account_stream_scope",
         ),
         CheckConstraint(
-            "stream IN ('X_LEGACY_DM', 'XCHAT_DISCOVERY', 'XCHAT_CONVERSATION')",
+            "stream IN ('X_LEGACY_DM', 'XCHAT_DISCOVERY', 'XCHAT_CONVERSATION', 'EMAIL_IMAP')",
             name="ck_platform_checkpoints_stream",
         ),
         CheckConstraint(
             "(stream = 'XCHAT_CONVERSATION' AND scope_key <> '') OR "
-            "(stream <> 'XCHAT_CONVERSATION' AND scope_key = '')",
+            "(stream IN ('X_LEGACY_DM', 'XCHAT_DISCOVERY', 'EMAIL_IMAP') "
+            "AND scope_key = '')",
             name="ck_platform_checkpoints_scope",
         ),
         CheckConstraint("revision >= 0", name="ck_platform_checkpoints_revision"),
@@ -378,7 +379,8 @@ class SyncGap(Base):
     __tablename__ = "sync_gaps"
     __table_args__ = (
         CheckConstraint(
-            "gap_type IN ('PAGE_CAP', 'PAGINATION_ERROR', 'DECRYPT_ERROR')",
+            "gap_type IN ('PAGE_CAP', 'PAGINATION_ERROR', 'DECRYPT_ERROR', "
+            "'EMAIL_UIDVALIDITY_CHANGED')",
             name="ck_sync_gaps_type",
         ),
         CheckConstraint(
@@ -754,6 +756,16 @@ class OutboxMessage(Base):
             "tenant_id",
             "status",
             "created_at",
+        ),
+        Index(
+            "ix_outbox_email_bot_sent_account_time",
+            "platform_account_id",
+            "sent_at",
+            "conversation_id",
+            postgresql_where=text(
+                "status = 'SENT' AND destination_type = 'email_reply' "
+                "AND origin_kind = 'DECISION' AND actor_kind = 'BOT'"
+            ),
         ),
         CheckConstraint(
             "origin_kind IN ('DECISION', 'DRAFT_APPROVAL', 'MANUAL_REPLY', 'SYSTEM_NOTICE')",

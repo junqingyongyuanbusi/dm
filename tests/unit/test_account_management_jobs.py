@@ -1,3 +1,5 @@
+import imaplib
+import ssl
 from pathlib import Path
 
 import httpx
@@ -6,6 +8,9 @@ import pytest
 from social_reply.application.account_management import jobs
 from social_reply.application.account_management.service import AccountConnectionResult
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.connectors.email.imap_client import ImapClientError
+from social_reply.connectors.email.network import EmailNetworkError
+from social_reply.connectors.errors import PermanentSendError, RetryableSendError
 from social_reply.connectors.feishu.client import FeishuClientError
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
@@ -245,6 +250,218 @@ def test_feishu_result_payload_contains_only_public_onboarding_data():
     assert payload["bot_status"] == 2
     assert payload["manual_steps"] == ["Subscribe to im.message.receive_v1."]
     assert "secret" not in str(payload).lower()
+
+
+@pytest.mark.parametrize(
+    "secrets",
+    [
+        {"password": "mail-password"},
+        {"username": "mail-user"},
+        {"username": "mail-user", "password": "mail-password", "token": "extra"},
+        {"username": "", "password": "mail-password"},
+        {"username": "mail-user", "password": ""},
+        {"username": 123, "password": "mail-password"},
+        {"username": "mail-user", "password": object()},
+        {"username": "u" * 513, "password": "mail-password"},
+        {"username": "mail-user", "password": "p" * 513},
+    ],
+)
+async def test_submit_email_job_rejects_invalid_secrets_before_persistence(monkeypatch, secrets):
+    def unexpected_session_factory():
+        raise AssertionError("invalid email credentials must not be persisted")
+
+    monkeypatch.setattr(jobs, "get_session_factory", unexpected_session_factory)
+
+    with pytest.raises(ValueError) as exc_info:
+        await jobs.submit_provisioning_job(
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="email",
+            actor="admin",
+            request={"email_address": "support@example.com"},
+            secrets=secrets,
+        )
+
+    assert str(exc_info.value) == "invalid_email_credentials"
+    for value in secrets.values():
+        if isinstance(value, str) and value:
+            assert value not in str(exc_info.value)
+
+
+def test_email_safe_request_and_public_result_redact_username_and_password():
+    safe = jobs._safe_request(
+        "email",
+        {
+            "email_address": "support@example.com",
+            "imap_host": "imap.example.com",
+            "imap_port": 993,
+            "mailbox": "INBOX",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 465,
+            "smtp_security": "ssl",
+            "internal_domain_policy": "ignore",
+            "username": "mail-user",
+            "password": "mail-password",
+        },
+    )
+    assert safe == {
+        "email_address": "support@example.com",
+        "imap_host": "imap.example.com",
+        "imap_port": 993,
+        "mailbox": "INBOX",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 465,
+        "smtp_security": "ssl",
+        "internal_domain_policy": "ignore",
+    }
+    assert jobs._public_result(
+        {
+            "email_address": "support@example.com",
+            "username": "mail-user",
+            "nested": {"password": "mail-password"},
+        }
+    ) == {"email_address": "support@example.com", "nested": {}}
+
+
+async def test_connect_dispatches_email_with_staged_secrets(monkeypatch):
+    from social_reply.application.account_management import email
+
+    captured = {}
+    settings = jobs.get_settings().model_copy(update={"email_enabled": True})
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+
+    async def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return AccountConnectionResult(
+            account_id=__import__("uuid").uuid4(),
+            platform="email",
+            external_account_id=kwargs["email_address"],
+            public_id="email_public",
+            webhook_url="",
+            name="Support",
+            automation_default="BOT_DRAFT_ONLY",
+        )
+
+    monkeypatch.setattr(email, "connect_email_account", fake_connect)
+    job = type(
+        "Job",
+        (),
+        {
+            "id": __import__("uuid").uuid4(),
+            "attempt_count": 3,
+            "platform": "email",
+            "tenant_id": "tenant-a",
+            "brand_id": "brand-a",
+            "request": {
+                "email_address": "support@example.com",
+                "imap_host": "imap.example.com",
+                "imap_port": 993,
+                "mailbox": "INBOX",
+                "smtp_host": "smtp.example.com",
+                "smtp_port": 587,
+                "smtp_security": "starttls",
+                "from_name": "Support",
+                "internal_domain_policy": "allow",
+                "automation_default": "BOT_DRAFT_ONLY",
+            },
+            "staging_secret": encrypt_secret_bundle(
+                {"username": "mail-user", "password": "mail-password"}
+            ),
+        },
+    )()
+
+    result = await jobs._connect(job)
+
+    assert result.platform == "email"
+    assert captured["username"] == "mail-user"
+    assert captured["password"] == "mail-password"
+    assert captured["smtp_security"] == "starttls"
+    assert captured["provisioning_job_id"] == job.id
+    assert captured["provisioning_attempt_count"] == 3
+    assert captured["tenant_id"] == "tenant-a"
+    assert captured["automation_default"] == "BOT_DRAFT_ONLY"
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected"),
+    [
+        (
+            EmailNetworkError("email_dns_resolution_failed"),
+            (
+                "email_dns_resolution_failed",
+                "Email endpoint validation failed",
+                True,
+            ),
+        ),
+        (
+            EmailNetworkError("email_hostname_not_allowed"),
+            (
+                "email_hostname_not_allowed",
+                "Email endpoint validation failed",
+                False,
+            ),
+        ),
+        (
+            ImapClientError("imap_authentication_failed"),
+            (
+                "imap_authentication_failed",
+                "Email IMAP credentials were rejected",
+                False,
+            ),
+        ),
+        (
+            ImapClientError("imap_select_failed"),
+            ("imap_select_failed", "Email IMAP protocol validation failed", False),
+        ),
+        (
+            ImapClientError("imap_tls_invalid", retryable=False),
+            ("imap_tls_invalid", "Email IMAP protocol validation failed", False),
+        ),
+        (
+            ImapClientError("imap_transport_failed", retryable=True),
+            (
+                "imap_transport_failed",
+                "Email IMAP service is temporarily unavailable",
+                True,
+            ),
+        ),
+        (
+            imaplib.IMAP4.error(b"SECRET BANNER"),
+            ("imap_protocol_error", "Email IMAP protocol validation failed", False),
+        ),
+        (
+            PermanentSendError("smtp_535", "password banner body"),
+            ("smtp_535", "Email SMTP validation failed", False),
+        ),
+        (
+            RetryableSendError("smtp_transport", "password banner body"),
+            (
+                "smtp_transport",
+                "Email SMTP validation is temporarily unavailable",
+                True,
+            ),
+        ),
+        (
+            ssl.SSLError("password banner body"),
+            ("EMAIL_TLS_INVALID", "Email TLS validation failed", False),
+        ),
+        (
+            TimeoutError("password banner body"),
+            (
+                "EMAIL_CONNECTION_TIMEOUT",
+                "Email service connection timed out",
+                True,
+            ),
+        ),
+    ],
+)
+def test_email_provisioning_errors_are_stable_and_sanitized(exception, expected, caplog):
+    actual = jobs._error(exception)
+    assert actual == expected
+    assert "password" not in actual[1]
+    assert "banner" not in actual[1]
+    assert "body" not in actual[1]
+    assert "SECRET BANNER" not in caplog.text
 
 
 def test_secret_store_staging_path_is_outside_database(tmp_path):

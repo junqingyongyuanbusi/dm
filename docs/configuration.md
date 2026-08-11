@@ -148,6 +148,39 @@ decision pipeline. Provisioning and health work pause, and matching Outbox sends
 durable work to recovery; disabling never deletes account credentials, callback identity or Outbox
 evidence.
 
+## Email integration
+
+| Variable | Default | Validation / meaning |
+| --- | --- | --- |
+| `EMAIL_ENABLED` | `false` | Master gate for Email provisioning, Scheduler IMAP polling and delivery; must match across API, Worker and Scheduler |
+| `EMAIL_AUTO_REPLY_ENABLED` | `false` | Second gate permitting an administrator to promote a provisioned Email account to `BOT_ACTIVE`; it does not bypass `EMAIL_ENABLED` or account policy |
+| `EMAIL_POLL_INTERVAL_SECONDS` | `60` | Scheduler IMAP polling cadence; range 5-3600 seconds |
+| `EMAIL_MAX_MESSAGES_PER_POLL` | `100` | Per-account message budget for one poll; range 1-1000 |
+| `EMAIL_PER_SENDER_DAILY_REPLY_LIMIT` | `5` | Maximum successful automatic Bot replies in 24 hours per account+sender, shared across threads; range 1-100 |
+| `EMAIL_NETWORK_TIMEOUT_SECONDS` | `10` | Timeout applied to IMAP/SMTP network operations; range 1-120 seconds |
+| `EMAIL_ALLOWED_HOSTS` | `imap.larksuite.com,smtp.larksuite.com` | Comma-separated exact hostname allowlist; canonicalized to lowercase IDNA hostnames, and required to be nonempty when Email is enabled |
+
+All seven values must be identical on API, Worker and Scheduler running the same image. Host matching
+happens before DNS; every resolved address must also be a public global target. IP literals,
+localhost, private/link-local/loopback/reserved/multicast/unspecified addresses, mixed public/private
+answers and hosts absent from the allowlist fail closed. Add a provider host only after operator
+review; wildcards are not supported.
+
+Email uses two deployment gates. `EMAIL_ENABLED=true` allows account provisioning, polling and the
+Email delivery route. New accounts are nevertheless forced to `BOT_DRAFT_ONLY` by both the API and
+Worker provisioning path. `EMAIL_AUTO_REPLY_ENABLED=true` only unlocks the later administrator
+promotion to `BOT_ACTIVE`; actual automatic sending still requires both gates, an active and
+provisioning-`READY` account, and the account policy. Keep both gates false for the initial image and
+migration rollout, enable the master gate on all three roles for draft-only real smoke, and enable
+the auto-reply gate only after explicit approval. There is no periodic Email health reconciler or continuous monitoring. The Admin “接入探测” result
+and timestamp record only the most recent provisioning-time credential validation over IMAP/SMTP.
+
+The IMAP client uses verified TLS, readonly `SELECT` and `BODY.PEEK[]`. SMTP accepts only SSL or
+strict STARTTLS and never downgrades to plaintext. If `smtp_port` is omitted, SSL defaults to 465 and
+STARTTLS defaults to 587; an explicitly supplied valid port is preserved. Email polling RawEvents retain UID, UIDVALIDITY,
+size and an optional SHA-256 digest, not the RFC822 body. See
+[email-integration.md](email-integration.md) for the complete protocol, Phase 0 and rollout contract.
+
 ## Decision, LLM and knowledge
 
 | Variable | Default | Meaning |

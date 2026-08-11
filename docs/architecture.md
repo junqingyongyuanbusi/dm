@@ -25,7 +25,7 @@ same PostgreSQL schema, encryption keys, feature flags, and connector code.
 | --- | --- | --- |
 | API | Admin UI, users and sessions, OAuth callbacks, Provisioning API, webhook verification, webhook `RawEvent` persistence, actor dispatch | LLM decisions, durable retries, routine platform sending |
 | Worker | Provisioning actors, direct and Chatwoot ingestion actors, XChat decryption, `DecisionJob` execution, Outbox delivery | Schema migration, periodic recovery scheduling |
-| Scheduler | Provisioning/decision/Outbox recovery, Chatwoot reconciliation when enabled, X polling/health, Meta token/subscription reconciliation | HTTP traffic, decision business logic |
+| Scheduler | Provisioning/decision/Outbox recovery, Chatwoot reconciliation when enabled, X polling/health, Email IMAP polling, Meta token/subscription reconciliation | HTTP traffic, decision business logic |
 
 The image entrypoint uses `SERVICE_ROLE=api|worker|scheduler`. API runs database preparation and
 migrations. Worker and Scheduler refuse to start until the database is at Alembic head and encrypted
@@ -60,7 +60,7 @@ Redis is not the source of truth for accounts, ingestion, decisions, deliveries,
 
 ### External systems
 
-- Platform APIs are the transport boundary for Telegram, Facebook, Instagram, WhatsApp, Feishu and X.
+- Platform APIs and Email IMAP/SMTP servers are the transport boundary for Telegram, Facebook, Instagram, WhatsApp, Feishu, Email and X.
 - Chatwoot is an optional bridge, not a startup dependency.
 - OpenAI-compatible chat and embedding APIs are called only from decision/knowledge code, never
   directly from webhook routers.
@@ -71,7 +71,11 @@ Redis is not the source of truth for accounts, ingestion, decisions, deliveries,
 Telegram / Meta / WhatsApp / Feishu / X webhook
   -> API signature, encryption and account validation
   -> Meta: minimal verified-request evidence + account-scoped occurrence RawEvent
-  -> other platforms: account-scoped RawEvent
+  -> other webhook platforms: account-scoped RawEvent
+Email IMAP poll
+  -> Scheduler checkpoint claim + TLS/allowlist/DNS/account validation
+  -> minimal account-scoped polling RawEvent
+Both paths
   -> RawEvent committed in PostgreSQL
   -> CanonicalEvent serialized to Dramatiq
   -> Worker ingest_canonical_event
@@ -104,7 +108,7 @@ valid. Delivery repeats the generation check immediately before provider I/O. Co
 locks serialize cancellation with delivery, but an external send that already completed cannot be
 undone.
 
-Webhook ingestion and X polling persist `RawEvent` evidence before normalization. New Telegram, Meta, Feishu, X direct, Chatwoot webhook, and Chatwoot reconciliation rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
+Webhook ingestion plus X and Email polling persist `RawEvent` evidence before normalization. New Telegram, Meta, Feishu, X direct, Chatwoot webhook, and Chatwoot reconciliation rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
 
 Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes.
 
@@ -221,6 +225,27 @@ These gates are process-local configuration. Old images do not recognize them, s
 platform requires the coordinated API/Worker/Scheduler restart documented in
 `docs/configuration.md`; a mixed-version rolling window is not a valid disable procedure.
 
+## Email platform boundary
+
+Email is an account-owned direct platform with no webhook or `PlatformApp`. Scheduler polls each
+active Email account through verified IMAP SSL, readonly `SELECT` and UID `BODY.PEEK[]`; first poll
+anchors at the current maximum UID instead of replaying existing mail. Polling RawEvents contain
+only UID, UIDVALIDITY, byte size and optional SHA-256 evidence, not RFC822 content. UIDVALIDITY
+changes create an auditable gap and re-anchor without historical replay.
+
+Conversation identity combines account, canonical sender and thread root, so different senders do
+not share context even if thread identifiers collide. Automatic Bot rate limiting instead counts
+successful sends by account+sender across all threads in the preceding 24 hours. SMTP supports only
+verified SSL or strict STARTTLS, with no plaintext downgrade. An omitted SMTP port defaults to 465
+for SSL or 587 for STARTTLS; an explicit valid port is preserved. Both protocols require an exact
+host allowlist match and fail-closed DNS resolution to public targets before every new connection.
+
+`EMAIL_ENABLED` is the platform gate; `EMAIL_AUTO_REPLY_ENABLED` is a second promotion/sending gate.
+Both default false, and provisioning always requires `BOT_DRAFT_ONLY`. There is no periodic Email
+health reconciler or continuous monitoring: the stored result and timestamp describe only the most
+recent provisioning-time IMAP/SMTP credential access validation. Real mailbox validation requires administrator-provided credentials and the Phase 0/draft smoke in
+`docs/email-integration.md`.
+
 ## Feishu platform boundary
 
 Feishu uses one account-owned `PlatformAccount` per enterprise self-built application Bot. App ID,
@@ -276,7 +301,7 @@ Scheduler runs due sweeps independently rather than as one serial cycle:
 - the **core recovery lane** owns ProvisioningJob, initial RawEvent, DecisionJob, Outbox, Feishu
   handoff-notification and XChat recovery;
 - the **inspection lane** owns Chatwoot reconciliation, X polling/subscription/webhook inspection,
-  Meta health reconciliation and Feishu account health inspection.
+  Meta health reconciliation, Feishu account health inspection and Email IMAP polling.
 
 A slow inspection does not block recurring core recovery. Each named sweep permits at most one
 running instance, missed ticks coalesce, and submission, body and completion failures are isolated
@@ -339,8 +364,9 @@ These public systems informed semantics only; Social Reply does not add them as 
 
 ## Deployment invariants
 
-- API, Worker, and Scheduler must receive the same feature flags, including `FEISHU_ENABLED` and
-  `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED`, and the same `PLATFORM_SECRET_KEYS`.
+- API, Worker, and Scheduler must receive the same feature flags, including `FEISHU_ENABLED`,
+  `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED`, `EMAIL_ENABLED` and
+  `EMAIL_AUTO_REPLY_ENABLED`, and the same `PLATFORM_SECRET_KEYS`.
 - Only API performs migration; Worker and Scheduler start after the database reaches head.
 - PostgreSQL and Redis are private infrastructure endpoints. Only API is exposed through the public
   ingress/tunnel.

@@ -63,6 +63,21 @@ PLATFORM_SUBMISSIONS = {
         public_fields=_COMMON_PUBLIC | {"app_id", "api_base_url", "group_mode"},
         secret_fields=frozenset({"app_secret", "verification_token", "encrypt_key"}),
     ),
+    AccountPlatform.EMAIL.value: PlatformSubmissionSpec(
+        public_fields=_COMMON_PUBLIC
+        | {
+            "email_address",
+            "imap_host",
+            "imap_port",
+            "mailbox",
+            "smtp_host",
+            "smtp_port",
+            "smtp_security",
+            "from_name",
+            "internal_domain_policy",
+        },
+        secret_fields=frozenset({"username", "password"}),
+    ),
 }
 
 

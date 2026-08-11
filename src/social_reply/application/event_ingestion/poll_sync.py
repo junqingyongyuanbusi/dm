@@ -19,12 +19,14 @@ class CheckpointStream(StrEnum):
     X_LEGACY_DM = "X_LEGACY_DM"
     XCHAT_DISCOVERY = "XCHAT_DISCOVERY"
     XCHAT_CONVERSATION = "XCHAT_CONVERSATION"
+    EMAIL_IMAP = "EMAIL_IMAP"
 
 
 class GapType(StrEnum):
     PAGE_CAP = "PAGE_CAP"
     PAGINATION_ERROR = "PAGINATION_ERROR"
     DECRYPT_ERROR = "DECRYPT_ERROR"
+    EMAIL_UIDVALIDITY_CHANGED = "EMAIL_UIDVALIDITY_CHANGED"
 
 
 @dataclass(frozen=True)
@@ -241,6 +243,7 @@ async def complete_checkpoint(
     interval_seconds: int,
     page_count: int,
     occurrence_count: int,
+    resolved_gap: GapSpec | None = None,
 ) -> bool:
     async with get_session_factory()() as session:
         now = await _database_now(session)
@@ -279,13 +282,40 @@ async def complete_checkpoint(
                 finished_at=now,
             )
         )
+        if resolved_gap is not None and claim.active_gap is None:
+            session.add(
+                models.SyncGap(
+                    id=uuid.uuid4(),
+                    checkpoint_id=claim.id,
+                    sync_run_id=claim.run_id,
+                    gap_type=resolved_gap.gap_type.value,
+                    status="RESOLVED",
+                    cursor_before=claim.cursor,
+                    candidate_cursor=resolved_gap.candidate_cursor,
+                    resume_token=resolved_gap.resume_token,
+                    detail=dict(resolved_gap.detail),
+                    resolved_at=now,
+                )
+            )
+        gap_values: dict[str, Any] = {
+            "status": "RESOLVED",
+            "resolved_at": now,
+            "updated_at": now,
+        }
+        if resolved_gap is not None and claim.active_gap is not None:
+            gap_values.update(
+                gap_type=resolved_gap.gap_type.value,
+                candidate_cursor=resolved_gap.candidate_cursor,
+                resume_token=resolved_gap.resume_token,
+                detail=dict(resolved_gap.detail),
+            )
         await session.execute(
             update(models.SyncGap)
             .where(
                 models.SyncGap.checkpoint_id == claim.id,
                 models.SyncGap.status.in_(("OPEN", "RETRYING")),
             )
-            .values(status="RESOLVED", resolved_at=now, updated_at=now)
+            .values(**gap_values)
         )
         await session.commit()
         return True

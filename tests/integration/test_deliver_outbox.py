@@ -1,5 +1,7 @@
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -11,6 +13,10 @@ from social_reply.application.message_delivery.outbox import deliver_outbox
 from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision import runner
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
+from social_reply.connectors.email.contracts import (
+    email_address_identity_key,
+    normalize_email_address,
+)
 from social_reply.domain.automation.state_machine import ensure_state, flip_to_human_active
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -1522,3 +1528,589 @@ async def test_permanent_send_error_marks_needs_review_no_retry(session, monkeyp
     assert ob.status == "NEEDS_REVIEW"
     assert ob.last_error_code == "X_CANNOT_DM_349"
     assert ob.next_attempt_at is None  # 永久错不排重试
+
+
+def _email_target(sender: str, thread: str) -> dict:
+    return {
+        "kind": "email",
+        "to": sender,
+        "to_name": "Customer",
+        "subject": "Question",
+        "message_id": f"<message-{thread}@example.com>",
+        "references": f"<root-{thread}@example.com>",
+        "thread_root": f"root-{thread}@example.com",
+    }
+
+
+async def _seed_email_outbox(
+    session,
+    *,
+    sender: str = "sender@example.com",
+    thread: str | None = None,
+    account_id: uuid.UUID | None = None,
+    config: dict | None = None,
+    origin_kind: str = "DECISION",
+    actor_kind: str = "BOT",
+    state: str = "BOT_ACTIVE",
+    status: str = "PENDING",
+    sent_at: datetime | None = None,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    thread = thread or uuid.uuid4().hex
+    sender = normalize_email_address(sender)
+    sender_identity = email_address_identity_key(sender)
+    if account_id is None:
+        account_id = uuid.uuid4()
+        await session.execute(
+            insert(models.PlatformAccount).values(
+                id=account_id,
+                tenant_id="default",
+                brand_id="b1",
+                platform="email",
+                name="email",
+                external_account_id=f"support+{account_id.hex}@example.com",
+                status="active",
+                config=config if config is not None else {"email_health_status": "READY"},
+                capability={"dm": True, "max_text_length": 4000},
+            )
+        )
+    contact_id = await session.scalar(
+        select(models.Contact.id).where(
+            models.Contact.platform_account_id == account_id,
+            models.Contact.external_user_id == sender_identity,
+        )
+    )
+    if contact_id is None:
+        contact_id = uuid.uuid4()
+        await session.execute(
+            insert(models.Contact).values(
+                id=contact_id,
+                tenant_id="default",
+                platform="email",
+                platform_account_id=account_id,
+                external_user_id=sender_identity,
+            )
+        )
+    conversation_id = uuid.uuid4()
+    message_id = uuid.uuid4()
+    outbox_id = uuid.uuid4()
+    target = _email_target(sender, thread)
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="email",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"email:{account_id}:{sender_identity}:{thread}",
+        )
+    )
+    await ensure_state(session, conversation_id, state)
+    await session.execute(
+        insert(models.Message).values(
+            id=message_id,
+            conversation_id=conversation_id,
+            direction="inbound",
+            sender_type="contact",
+            text="inbound",
+            reply_target=target,
+        )
+    )
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=outbox_id,
+            tenant_id="default",
+            conversation_id=conversation_id,
+            platform_account_id=account_id,
+            destination_type="email_reply",
+            destination_id=f"email:{sender}",
+            message_type="text",
+            payload={"text": "reply", "target": target},
+            reply_to_message_id=message_id,
+            origin_kind=origin_kind,
+            actor_kind=actor_kind,
+            idempotency_key=str(outbox_id),
+            status=status,
+            sent_at=sent_at,
+        )
+    )
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            tenant_id="default",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            action="auto_reply",
+            reply_text="reply",
+            source="rule",
+            outbox_id=outbox_id,
+        )
+    )
+    await session.commit()
+    return account_id, outbox_id
+
+
+@pytest.mark.parametrize(
+    ("config", "settings_update", "error_code"),
+    [
+        (
+            {"email_health_status": "READY"},
+            {"email_enabled": False, "email_auto_reply_enabled": True},
+            "EMAIL_DISABLED",
+        ),
+        (
+            {"email_health_status": "ERROR"},
+            {"email_enabled": True, "email_auto_reply_enabled": True},
+            "EMAIL_ACCOUNT_NOT_READY",
+        ),
+        (
+            {"email_health_status": "READY"},
+            {"email_enabled": True, "email_auto_reply_enabled": False},
+            "EMAIL_AUTO_REPLY_DISABLED",
+        ),
+    ],
+)
+async def test_email_send_time_gates_fail_closed_without_attempt(
+    session,
+    monkeypatch,
+    config,
+    settings_update,
+    error_code,
+):
+    _account_id, outbox_id = await _seed_email_outbox(session, config=config)
+    settings = outbox_module.get_settings().model_copy(update=settings_update)
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("Email gate must run before sender resolution")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+    assert await deliver_outbox(str(outbox_id)) == "NEEDS_REVIEW"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.attempt_count == 0
+    assert outbox.last_error_code == error_code
+    assert (
+        await session.scalar(
+            select(models.DeliveryAttempt).where(models.DeliveryAttempt.outbox_id == outbox_id)
+        )
+        is None
+    )
+
+
+async def test_email_sweep_recovers_enabled_auto_and_ready_gates_but_not_rate_limit(
+    session, monkeypatch
+):
+    account_id, disabled_id = await _seed_email_outbox(session, thread="disabled")
+    _, auto_id = await _seed_email_outbox(session, account_id=account_id, thread="auto")
+    _, health_id = await _seed_email_outbox(session, account_id=account_id, thread="health")
+    _, rate_id = await _seed_email_outbox(session, account_id=account_id, thread="rate")
+    _, manual_auto_id = await _seed_email_outbox(
+        session,
+        account_id=account_id,
+        thread="manual-auto",
+        origin_kind="MANUAL_REPLY",
+        actor_kind="ADMIN_HUMAN",
+        state="HUMAN_ACTIVE",
+    )
+    for outbox_id, code in (
+        (disabled_id, "EMAIL_DISABLED"),
+        (auto_id, "EMAIL_AUTO_REPLY_DISABLED"),
+        (health_id, "EMAIL_ACCOUNT_NOT_READY"),
+        (rate_id, "EMAIL_RATE_LIMITED"),
+        (manual_auto_id, "EMAIL_AUTO_REPLY_DISABLED"),
+    ):
+        await session.execute(
+            update(models.OutboxMessage)
+            .where(models.OutboxMessage.id == outbox_id)
+            .values(status="NEEDS_REVIEW", last_error_code=code)
+        )
+    await session.commit()
+
+    settings = sweep_module.get_settings().model_copy(
+        update={"email_enabled": True, "email_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(sweep_module, "get_settings", lambda: settings)
+    enqueued = await sweep_outbox()
+
+    assert {disabled_id, auto_id, health_id} <= set(enqueued)
+    assert rate_id not in enqueued
+    assert manual_auto_id not in enqueued
+    session.expire_all()
+    assert (
+        await session.get(models.OutboxMessage, rate_id)
+    ).last_error_code == "EMAIL_RATE_LIMITED"
+    assert (
+        await session.get(models.OutboxMessage, manual_auto_id)
+    ).last_error_code == "EMAIL_AUTO_REPLY_DISABLED"
+
+
+@pytest.mark.parametrize(
+    ("origin_kind", "state"),
+    [("DRAFT_APPROVAL", "BOT_DRAFT_ONLY"), ("MANUAL_REPLY", "HUMAN_ACTIVE")],
+)
+async def test_email_human_sends_bypass_auto_gate(session, monkeypatch, origin_kind, state):
+    _account_id, outbox_id = await _seed_email_outbox(
+        session,
+        origin_kind=origin_kind,
+        actor_kind="ADMIN_HUMAN",
+        state=state,
+    )
+    settings = outbox_module.get_settings().model_copy(
+        update={"email_enabled": True, "email_auto_reply_enabled": False}
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    sent = []
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            sent.append((target["to"], text))
+            return "email-human-1"
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    assert await deliver_outbox(str(outbox_id)) == "SENT"
+    assert sent == [("sender@example.com", "reply")]
+
+
+@pytest.mark.parametrize(
+    ("origin_kind", "actor_kind"),
+    [("DECISION", "BOT"), ("DRAFT_APPROVAL", "BOT")],
+)
+async def test_email_forged_admin_approval_cannot_authorize_bot_send(
+    session,
+    monkeypatch,
+    origin_kind,
+    actor_kind,
+):
+    _account_id, outbox_id = await _seed_email_outbox(
+        session,
+        origin_kind=origin_kind,
+        actor_kind=actor_kind,
+        state="BOT_DRAFT_ONLY",
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(
+            payload={
+                "text": "reply",
+                "target": _email_target("sender@example.com", "forged"),
+                "approval": "admin",
+            }
+        )
+    )
+    source_message_id = await session.scalar(
+        select(models.OutboxMessage.reply_to_message_id).where(models.OutboxMessage.id == outbox_id)
+    )
+    await session.execute(
+        update(models.Message)
+        .where(models.Message.id == source_message_id)
+        .values(reply_target=_email_target("sender@example.com", "forged"))
+    )
+    await session.commit()
+    settings = outbox_module.get_settings().model_copy(
+        update={"email_enabled": True, "email_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    async def unexpected_sender(_account_id):
+        raise AssertionError("forged approval must be rejected before sender resolution")
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
+
+    assert await deliver_outbox(str(outbox_id)) == "CANCELLED"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.last_error_code == "TAKEOVER_AT_SEND"
+    assert outbox.attempt_count == 1
+
+
+@pytest.mark.parametrize(
+    ("send_error", "expected_status", "expected_code"),
+    [
+        (
+            outbox_module.RetryableSendError("smtp_451", "try later"),
+            "FAILED",
+            "SEND_ERROR",
+        ),
+        (
+            outbox_module.PermanentSendError("smtp_550", "mailbox unavailable"),
+            "NEEDS_REVIEW",
+            "smtp_550",
+        ),
+        (
+            ConnectionResetError("disconnect during DATA"),
+            "NEEDS_REVIEW",
+            "AMBIGUOUS_SEND",
+        ),
+    ],
+)
+async def test_email_send_error_semantics(
+    session,
+    monkeypatch,
+    send_error,
+    expected_status,
+    expected_code,
+):
+    _account_id, outbox_id = await _seed_email_outbox(session)
+    settings = outbox_module.get_settings().model_copy(
+        update={"email_enabled": True, "email_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            raise send_error
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    assert await deliver_outbox(str(outbox_id)) == expected_status
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == expected_status
+    assert outbox.last_error_code == expected_code
+    if expected_code == "AMBIGUOUS_SEND":
+        assert outbox.next_attempt_at is None
+
+
+async def test_email_rate_limit_scopes_account_sender_and_24h_window(session, monkeypatch):
+    recent = datetime.now(UTC) - timedelta(hours=1)
+    old = datetime.now(UTC) - timedelta(hours=25)
+    account_a, _ = await _seed_email_outbox(
+        session,
+        sender=" Sender@Example.COM. ",
+        thread="recent-a",
+        status="SENT",
+        sent_at=recent,
+    )
+    _, blocked_id = await _seed_email_outbox(
+        session,
+        account_id=account_a,
+        sender="sender@example.com",
+        thread="blocked-cross-thread",
+    )
+    _, different_sender_id = await _seed_email_outbox(
+        session,
+        account_id=account_a,
+        sender="other@example.com",
+        thread="different-sender",
+    )
+    _account_b, different_account_id = await _seed_email_outbox(
+        session,
+        sender="sender@example.com",
+        thread="different-account",
+    )
+    account_c, _ = await _seed_email_outbox(
+        session,
+        sender="sender@example.com",
+        thread="old",
+        status="SENT",
+        sent_at=old,
+    )
+    _, outside_window_id = await _seed_email_outbox(
+        session,
+        account_id=account_c,
+        sender="sender@example.com",
+        thread="outside-window",
+    )
+    settings = outbox_module.get_settings().model_copy(
+        update={
+            "email_enabled": True,
+            "email_auto_reply_enabled": True,
+            "email_per_sender_daily_reply_limit": 1,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    sent = []
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            sent.append(target["to"])
+            return f"email-{len(sent)}"
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    assert await deliver_outbox(str(blocked_id)) == "NEEDS_REVIEW"
+    blocked = await session.get(models.OutboxMessage, blocked_id)
+    assert blocked.attempt_count == 0
+    assert blocked.last_error_code == "EMAIL_RATE_LIMITED"
+    assert await deliver_outbox(str(different_sender_id)) == "SENT"
+    assert await deliver_outbox(str(different_account_id)) == "SENT"
+    assert await deliver_outbox(str(outside_window_id)) == "SENT"
+    assert sent == ["other@example.com", "sender@example.com", "sender@example.com"]
+
+
+async def test_email_manual_sends_neither_count_nor_obey_bot_rate_limit(session, monkeypatch):
+    account_id, _ = await _seed_email_outbox(
+        session,
+        origin_kind="MANUAL_REPLY",
+        actor_kind="ADMIN_HUMAN",
+        state="HUMAN_ACTIVE",
+        status="SENT",
+        sent_at=datetime.now(UTC),
+    )
+    _, bot_id = await _seed_email_outbox(
+        session,
+        account_id=account_id,
+        thread="bot-after-manual",
+    )
+    _, manual_id = await _seed_email_outbox(
+        session,
+        account_id=account_id,
+        thread="manual-at-limit",
+        origin_kind="MANUAL_REPLY",
+        actor_kind="ADMIN_HUMAN",
+        state="HUMAN_ACTIVE",
+    )
+    settings = outbox_module.get_settings().model_copy(
+        update={
+            "email_enabled": True,
+            "email_auto_reply_enabled": True,
+            "email_per_sender_daily_reply_limit": 1,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            return "email-sent"
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    assert await deliver_outbox(str(bot_id)) == "SENT"
+    assert await deliver_outbox(str(manual_id)) == "SENT"
+
+
+async def test_concurrent_email_threads_allow_only_one_send_at_limit(session, monkeypatch):
+    account_id, first_id = await _seed_email_outbox(session, thread="concurrent-1")
+    _, second_id = await _seed_email_outbox(
+        session,
+        account_id=account_id,
+        thread="concurrent-2",
+    )
+    settings = outbox_module.get_settings().model_copy(
+        update={
+            "email_enabled": True,
+            "email_auto_reply_enabled": True,
+            "email_per_sender_daily_reply_limit": 1,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return "email-concurrent-1"
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    first_task = asyncio.create_task(deliver_outbox(str(first_id)))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    second_task = asyncio.create_task(deliver_outbox(str(second_id)))
+    await asyncio.sleep(0.05)
+    assert calls == 1
+    assert second_task.done() is False
+    release.set()
+    assert await first_task == "SENT"
+    assert await second_task == "NEEDS_REVIEW"
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("state_change", "expected_code"),
+    [("disable", "EMAIL_DISABLED"), ("health_error", "EMAIL_ACCOUNT_NOT_READY")],
+)
+async def test_email_waiting_sender_lock_revalidates_fresh_account_state(
+    session,
+    monkeypatch,
+    state_change,
+    expected_code,
+):
+    account_id, first_id = await _seed_email_outbox(session, thread="stale-lock-1")
+    _, second_id = await _seed_email_outbox(
+        session,
+        account_id=account_id,
+        thread="stale-lock-2",
+    )
+    settings_ref = {
+        "value": outbox_module.get_settings().model_copy(
+            update={
+                "email_enabled": True,
+                "email_auto_reply_enabled": True,
+                "email_per_sender_daily_reply_limit": 5,
+            }
+        )
+    }
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings_ref["value"])
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_waiting = asyncio.Event()
+    calls = 0
+    lock_entries = 0
+    original_lock = outbox_module.hold_connection_advisory_lock
+
+    @asynccontextmanager
+    async def observed_lock(connection, key):
+        nonlocal lock_entries
+        lock_entries += 1
+        if lock_entries == 2:
+            second_waiting.set()
+        async with original_lock(connection, key):
+            yield
+
+    monkeypatch.setattr(outbox_module, "hold_connection_advisory_lock", observed_lock)
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+            return f"email-stale-lock-{calls}"
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    first_task = asyncio.create_task(deliver_outbox(str(first_id)))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    second_task = asyncio.create_task(deliver_outbox(str(second_id)))
+    await asyncio.wait_for(second_waiting.wait(), timeout=1)
+    assert second_task.done() is False
+
+    if state_change == "disable":
+        settings_ref["value"] = settings_ref["value"].model_copy(update={"email_enabled": False})
+    else:
+        async with get_session_factory()() as mutation_session:
+            await mutation_session.execute(
+                update(models.PlatformAccount)
+                .where(models.PlatformAccount.id == account_id)
+                .values(config={"email_health_status": "ERROR"})
+            )
+            await mutation_session.commit()
+
+    release_first.set()
+    assert await first_task == "SENT"
+    assert await second_task == "NEEDS_REVIEW"
+    assert calls == 1
+    session.expire_all()
+    second = await session.get(models.OutboxMessage, second_id)
+    assert second.last_error_code == expected_code
+    assert second.attempt_count == 0

@@ -10,6 +10,7 @@ class AccountPlatform(StrEnum):
     WHATSAPP = "whatsapp"
     X = "x"
     FEISHU = "feishu"
+    EMAIL = "email"
 
 
 class AccountStatus(StrEnum):
@@ -67,6 +68,10 @@ PLATFORM_CAPABILITY_SPECS = {
         boolean_keys=frozenset({CapabilityKey.DM, CapabilityKey.MENTIONS}),
         max_text_length=4000,
     ),
+    AccountPlatform.EMAIL: PlatformCapabilitySpec(
+        boolean_keys=frozenset({CapabilityKey.DM}),
+        max_text_length=4000,
+    ),
 }
 
 SUPPORTED_ACCOUNT_PLATFORMS = frozenset(platform.value for platform in AccountPlatform)
@@ -78,6 +83,7 @@ PROVISIONABLE_ACCOUNT_PLATFORMS = frozenset(
         AccountPlatform.WHATSAPP.value,
         AccountPlatform.X.value,
         AccountPlatform.FEISHU.value,
+        AccountPlatform.EMAIL.value,
     }
 )
 ACTIVE_ACCOUNT_STATUS = AccountStatus.ACTIVE.value
@@ -136,6 +142,10 @@ DIRECT_DESTINATION_CAPABILITIES = {
     "feishu_group_reply": DestinationCapabilitySpec(
         platforms=frozenset({AccountPlatform.FEISHU}),
         capability=CapabilityKey.MENTIONS,
+    ),
+    "email_reply": DestinationCapabilitySpec(
+        platforms=frozenset({AccountPlatform.EMAIL}),
+        capability=CapabilityKey.DM,
     ),
 }
 

@@ -1,4 +1,6 @@
+import imaplib
 import logging
+import ssl
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +20,13 @@ from social_reply.application.account_management.service import (
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.connectors.email.contracts import (
+    MAX_EMAIL_CREDENTIAL_CHARS,
+    validate_email_account_text,
+)
+from social_reply.connectors.email.imap_client import ImapClientError
+from social_reply.connectors.email.network import EmailNetworkError
+from social_reply.connectors.errors import PermanentSendError, RetryableSendError
 from social_reply.connectors.feishu.client import FeishuClientError
 from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL, FEISHU_GROUP_MODE
 from social_reply.connectors.meta.client import MetaCommentPermissionError
@@ -71,7 +80,72 @@ def _safe_request(platform: str, request: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def _validate_email_secrets(secrets: object) -> None:
+    if not isinstance(secrets, dict) or set(secrets) != {"username", "password"}:
+        raise ValueError("invalid_email_credentials")
+    try:
+        for value in secrets.values():
+            validate_email_account_text(value, maximum=MAX_EMAIL_CREDENTIAL_CHARS)
+    except ValueError:
+        raise ValueError("invalid_email_credentials") from None
+
+
+def _email_resubmission_result(result: object) -> dict[str, Any]:
+    public_result = dict(result) if isinstance(result, dict) else {}
+    return {
+        **public_result,
+        "requires_secret_resubmission": True,
+        "required_secret": "password",
+    }
+
+
+def _mark_email_needs_action(
+    job: models.ProvisioningJob,
+    *,
+    error_code: str,
+    message: str,
+) -> None:
+    job.status = "NEEDS_ACTION"
+    job.current_step = "FAILED"
+    job.next_attempt_at = None
+    job.locked_at = None
+    job.locked_by = None
+    job.last_error_code = error_code
+    job.last_error_message = message
+    job.staging_secret = None
+    job.result = _email_resubmission_result(job.result)
+
+
+def _email_terminal_values(result: object) -> dict[str, Any]:
+    return {
+        "staging_secret": None,
+        "result": _email_resubmission_result(result),
+    }
+
+
 def _error(exc: Exception) -> tuple[str, str, bool]:
+    if isinstance(exc, EmailNetworkError):
+        return (
+            exc.code,
+            "Email endpoint validation failed",
+            exc.code == "email_dns_resolution_failed",
+        )
+    if isinstance(exc, ImapClientError):
+        if exc.code in {"imap_authentication_failed", "imap_login_failed"}:
+            return exc.code, "Email IMAP credentials were rejected", False
+        if exc.retryable:
+            return exc.code, "Email IMAP service is temporarily unavailable", True
+        return exc.code, "Email IMAP protocol validation failed", False
+    if isinstance(exc, imaplib.IMAP4.error):
+        return "imap_protocol_error", "Email IMAP protocol validation failed", False
+    if isinstance(exc, PermanentSendError):
+        return exc.code, "Email SMTP validation failed", False
+    if isinstance(exc, RetryableSendError):
+        return exc.code, "Email SMTP validation is temporarily unavailable", True
+    if isinstance(exc, ssl.SSLError):
+        return "EMAIL_TLS_INVALID", "Email TLS validation failed", False
+    if isinstance(exc, TimeoutError):
+        return "EMAIL_CONNECTION_TIMEOUT", "Email service connection timed out", True
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         retryable = status >= 500 or status == 429
@@ -117,9 +191,21 @@ async def submit_provisioning_job(
 ) -> uuid.UUID:
     if platform not in PROVISIONABLE_ACCOUNT_PLATFORMS:
         raise ValueError(f"unsupported_platform:{platform}")
-    if not tenant_id or not all(ch.isalnum() or ch in {"_", "-"} for ch in tenant_id):
+    if platform == "email":
+        _validate_email_secrets(secrets)
+    if (
+        not tenant_id
+        or len(tenant_id) > 64
+        or not tenant_id.isascii()
+        or not all(ch.isalnum() or ch in {"_", "-"} for ch in tenant_id)
+    ):
         raise ValueError("invalid_tenant_id")
-    if not brand_id or not all(ch.isalnum() or ch in {"_", "-"} for ch in brand_id):
+    if (
+        not brand_id
+        or len(brand_id) > 64
+        or not brand_id.isascii()
+        or not all(ch.isalnum() or ch in {"_", "-"} for ch in brand_id)
+    ):
         raise ValueError("invalid_brand_id")
     key = _idempotency_key(tenant_id, platform, request)
     job_id = uuid.uuid4()
@@ -237,13 +323,21 @@ async def _claim_job(job_id: uuid.UUID) -> models.ProvisioningJob | None:
             return None
         settings = get_settings()
         if not settings.platform_integration_enabled(row.platform):
-            row.status = _PLATFORM_DISABLED_STATUS
-            row.current_step = _PLATFORM_DISABLED_STATUS
-            row.next_attempt_at = None
-            row.locked_at = None
-            row.locked_by = None
-            row.last_error_code = settings.platform_disabled_code(row.platform)
-            row.last_error_message = "Platform integration is disabled"
+            error_code = settings.platform_disabled_code(row.platform) or "PLATFORM_DISABLED"
+            if row.platform == "email":
+                _mark_email_needs_action(
+                    row,
+                    error_code=error_code,
+                    message="Email integration is disabled; resubmit account credentials",
+                )
+            else:
+                row.status = _PLATFORM_DISABLED_STATUS
+                row.current_step = _PLATFORM_DISABLED_STATUS
+                row.next_attempt_at = None
+                row.locked_at = None
+                row.locked_by = None
+                row.last_error_code = error_code
+                row.last_error_message = "Platform integration is disabled"
         else:
             row.status = "PROCESSING"
             row.current_step = "VALIDATE_CREDENTIAL"
@@ -341,6 +435,25 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
             group_mode=str(request.get("group_mode") or FEISHU_GROUP_MODE),
             **common,
         )
+    if job.platform == "email":
+        from social_reply.application.account_management.email import connect_email_account
+
+        return await connect_email_account(
+            email_address=str(request["email_address"]),
+            username=credentials["username"],
+            password=credentials["password"],
+            imap_host=str(request["imap_host"]),
+            imap_port=int(request.get("imap_port", 993)),
+            mailbox=str(request.get("mailbox") or "INBOX"),
+            smtp_host=str(request["smtp_host"]),
+            smtp_port=int(request.get("smtp_port", 465)),
+            smtp_security=str(request.get("smtp_security") or "ssl"),
+            from_name=request.get("from_name"),
+            internal_domain_policy=str(request.get("internal_domain_policy") or "ignore"),
+            provisioning_job_id=job.id,
+            provisioning_attempt_count=job.attempt_count,
+            **common,
+        )
     return await connect_x_account(
         consumer_key=credentials["consumer_key"],
         consumer_secret=credentials["consumer_secret"],
@@ -357,21 +470,48 @@ async def process_provisioning_job(job_id: str) -> str:
     job = await _claim_job(jid)
     if job is None:
         return "SKIPPED_NOT_CLAIMABLE"
-    if job.status == _PLATFORM_DISABLED_STATUS:
+    if job.status != "PROCESSING":
         await record_account_management_audit(
             tenant_id=job.tenant_id,
             actor=job.actor,
-            action="provisioning_paused",
+            action=(
+                "provisioning_paused"
+                if job.status == _PLATFORM_DISABLED_STATUS
+                else "provisioning_failed"
+            ),
             subject_id=str(jid),
-            detail={"platform": job.platform, "error_code": job.last_error_code},
+            detail={
+                "platform": job.platform,
+                "error_code": job.last_error_code,
+                "status": job.status,
+            },
         )
-        return _PLATFORM_DISABLED_STATUS
+        return job.status
     try:
         result = await _connect(job)
     except Exception as exc:  # noqa: BLE001 - platform boundary is normalized below
         disabled_platform = _disabled_platform(exc)
         if disabled_platform is not None:
             error_code = get_settings().platform_disabled_code(disabled_platform)
+            disabled_values: dict[str, Any] = {
+                "status": _PLATFORM_DISABLED_STATUS,
+                "current_step": _PLATFORM_DISABLED_STATUS,
+                "attempt_count": models.ProvisioningJob.attempt_count - 1,
+                "next_attempt_at": None,
+                "locked_at": None,
+                "locked_by": None,
+                "last_error_code": error_code,
+                "last_error_message": "Platform integration is disabled",
+            }
+            if disabled_platform == "email":
+                disabled_values.update(
+                    status="NEEDS_ACTION",
+                    current_step="FAILED",
+                    last_error_message=(
+                        "Email integration is disabled; resubmit account credentials"
+                    ),
+                    **_email_terminal_values(job.result),
+                )
             async with get_session_factory()() as session:
                 updated = (
                     await session.execute(
@@ -381,16 +521,7 @@ async def process_provisioning_job(job_id: str) -> str:
                             models.ProvisioningJob.status == "PROCESSING",
                             models.ProvisioningJob.attempt_count == job.attempt_count,
                         )
-                        .values(
-                            status=_PLATFORM_DISABLED_STATUS,
-                            current_step=_PLATFORM_DISABLED_STATUS,
-                            attempt_count=models.ProvisioningJob.attempt_count - 1,
-                            next_attempt_at=None,
-                            locked_at=None,
-                            locked_by=None,
-                            last_error_code=error_code,
-                            last_error_message="Platform integration is disabled",
-                        )
+                        .values(**disabled_values)
                         .returning(models.ProvisioningJob.id)
                     )
                 ).first()
@@ -402,14 +533,25 @@ async def process_provisioning_job(job_id: str) -> str:
                     job.attempt_count,
                 )
                 return "STALE_CLAIM"
+            terminal_status = (
+                "NEEDS_ACTION" if disabled_platform == "email" else _PLATFORM_DISABLED_STATUS
+            )
             await record_account_management_audit(
                 tenant_id=job.tenant_id,
                 actor=job.actor,
-                action="provisioning_paused",
+                action=(
+                    "provisioning_failed"
+                    if terminal_status == "NEEDS_ACTION"
+                    else "provisioning_paused"
+                ),
                 subject_id=str(jid),
-                detail={"platform": job.platform, "error_code": error_code},
+                detail={
+                    "platform": job.platform,
+                    "error_code": error_code,
+                    "status": terminal_status,
+                },
             )
-            return _PLATFORM_DISABLED_STATUS
+            return terminal_status
         error_code, message, retryable = _error(exc)
         staging_secret = job.staging_secret
         failure_result = dict(job.result or {})
@@ -431,6 +573,9 @@ async def process_provisioning_job(job_id: str) -> str:
             error_code = "RETRY_EXHAUSTED"
             message = "Provisioning retry limit exhausted"
         status = "FAILED" if retryable else "NEEDS_ACTION"
+        if job.platform == "email" and status == "NEEDS_ACTION":
+            staging_secret = None
+            failure_result = _email_resubmission_result(failure_result)
         if retryable:
             delay = min(30 * 2 ** max(job.attempt_count, 1), _MAX_BACKOFF_SECONDS)
             next_attempt_at = datetime.now(UTC) + timedelta(seconds=delay)
@@ -573,6 +718,13 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
             ).scalars()
         )
         for job in paused_jobs:
+            if job.platform == "email":
+                _mark_email_needs_action(
+                    job,
+                    error_code=settings.platform_disabled_code("email") or "EMAIL_DISABLED",
+                    message="Email integration was disabled; resubmit account credentials",
+                )
+                continue
             if not settings.platform_integration_enabled(job.platform):
                 continue
             job.status = "PENDING"
@@ -594,13 +746,21 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
         )
         for job in stale_jobs:
             if not settings.platform_integration_enabled(job.platform):
-                job.status = _PLATFORM_DISABLED_STATUS
-                job.current_step = _PLATFORM_DISABLED_STATUS
-                job.next_attempt_at = None
-                job.locked_at = None
-                job.locked_by = None
-                job.last_error_code = settings.platform_disabled_code(job.platform)
-                job.last_error_message = "Platform integration is disabled"
+                error_code = settings.platform_disabled_code(job.platform) or "PLATFORM_DISABLED"
+                if job.platform == "email":
+                    _mark_email_needs_action(
+                        job,
+                        error_code=error_code,
+                        message="Email integration is disabled; resubmit account credentials",
+                    )
+                else:
+                    job.status = _PLATFORM_DISABLED_STATUS
+                    job.current_step = _PLATFORM_DISABLED_STATUS
+                    job.next_attempt_at = None
+                    job.locked_at = None
+                    job.locked_by = None
+                    job.last_error_code = error_code
+                    job.last_error_message = "Platform integration is disabled"
                 continue
             submitted_secrets = (
                 decrypt_secret_bundle(job.staging_secret) if job.staging_secret else {}
@@ -620,10 +780,17 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
                     "Stale XChat provisioning requires the PIN to be resubmitted"
                 )
             elif job.attempt_count >= _MAX_ATTEMPTS:
-                job.status = "NEEDS_ACTION"
-                job.next_attempt_at = None
-                job.last_error_code = "RETRY_EXHAUSTED"
-                job.last_error_message = "Provisioning retry limit exhausted"
+                if job.platform == "email":
+                    _mark_email_needs_action(
+                        job,
+                        error_code="RETRY_EXHAUSTED",
+                        message="Provisioning retry limit exhausted",
+                    )
+                else:
+                    job.status = "NEEDS_ACTION"
+                    job.next_attempt_at = None
+                    job.last_error_code = "RETRY_EXHAUSTED"
+                    job.last_error_message = "Provisioning retry limit exhausted"
             else:
                 job.status = "FAILED"
                 job.next_attempt_at = now
@@ -632,22 +799,33 @@ async def sweep_provisioning_jobs() -> list[uuid.UUID]:
             job.current_step = "FAILED"
             job.locked_at = None
             job.locked_by = None
-        await session.execute(
-            update(models.ProvisioningJob)
-            .where(
-                models.ProvisioningJob.status.in_(["PENDING", "FAILED"]),
-                models.ProvisioningJob.attempt_count >= _MAX_ATTEMPTS,
-            )
-            .values(
-                status="NEEDS_ACTION",
-                current_step="FAILED",
-                next_attempt_at=None,
-                locked_at=None,
-                locked_by=None,
-                last_error_code="RETRY_EXHAUSTED",
-                last_error_message="Provisioning retry limit exhausted",
-            )
+        exhausted_jobs = list(
+            (
+                await session.execute(
+                    select(models.ProvisioningJob)
+                    .where(
+                        models.ProvisioningJob.status.in_(["PENDING", "FAILED"]),
+                        models.ProvisioningJob.attempt_count >= _MAX_ATTEMPTS,
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars()
         )
+        for job in exhausted_jobs:
+            if job.platform == "email":
+                _mark_email_needs_action(
+                    job,
+                    error_code="RETRY_EXHAUSTED",
+                    message="Provisioning retry limit exhausted",
+                )
+            else:
+                job.status = "NEEDS_ACTION"
+                job.current_step = "FAILED"
+                job.next_attempt_at = None
+                job.locked_at = None
+                job.locked_by = None
+                job.last_error_code = "RETRY_EXHAUSTED"
+                job.last_error_message = "Provisioning retry limit exhausted"
         rows = list(
             (
                 await session.execute(
@@ -690,6 +868,8 @@ def _public_result(value: Any) -> Any:
         "xchat_pin",
         "xchat_private_keys_b64",
         "xchat_signing_key_version",
+        "username",
+        "password",
     }
     if isinstance(value, dict):
         return {key: _public_result(item) for key, item in value.items() if key not in sensitive}

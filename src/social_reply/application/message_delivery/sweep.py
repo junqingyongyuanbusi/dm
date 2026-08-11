@@ -97,6 +97,8 @@ async def sweep_outbox() -> list[uuid.UUID]:
                 _direct_recovery_route("feishu_group_reply", "FEISHU_DISABLED"),
             )
         )
+    if getattr(settings, "email_enabled", False):
+        recoverable_routes.append(_direct_recovery_route("email_reply", "EMAIL_DISABLED"))
     async with get_session_factory()() as session:
         for destination_type, error_code, capability_key, platform in recoverable_routes:
             statement = update(models.OutboxMessage).where(
@@ -156,6 +158,32 @@ async def sweep_outbox() -> list[uuid.UUID]:
                 last_error_message=None,
             )
         )
+        if getattr(settings, "email_auto_reply_enabled", False):
+            auto_ready_email_accounts = select(models.PlatformAccount.id).where(
+                models.PlatformAccount.platform == "email",
+                models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+                models.PlatformAccount.config["email_health_status"].astext == "READY",
+                models.PlatformAccount.capability["dm"].as_boolean().is_(True),
+            )
+            await session.execute(
+                update(models.OutboxMessage)
+                .where(
+                    models.OutboxMessage.status == "NEEDS_REVIEW",
+                    models.OutboxMessage.last_error_code == "EMAIL_AUTO_REPLY_DISABLED",
+                    models.OutboxMessage.destination_type == "email_reply",
+                    models.OutboxMessage.origin_kind == "DECISION",
+                    models.OutboxMessage.actor_kind == "BOT",
+                    models.OutboxMessage.platform_account_id.in_(auto_ready_email_accounts),
+                )
+                .values(
+                    status="PENDING",
+                    next_attempt_at=None,
+                    locked_at=None,
+                    locked_by=None,
+                    last_error_code=None,
+                    last_error_message=None,
+                )
+            )
         ready_feishu_accounts = select(models.PlatformAccount.id).where(
             models.PlatformAccount.platform == "feishu",
             models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
@@ -170,6 +198,28 @@ async def sweep_outbox() -> list[uuid.UUID]:
                     ("feishu_p2p_reply", "feishu_group_reply")
                 ),
                 models.OutboxMessage.platform_account_id.in_(ready_feishu_accounts),
+            )
+            .values(
+                status="PENDING",
+                next_attempt_at=None,
+                locked_at=None,
+                locked_by=None,
+                last_error_code=None,
+                last_error_message=None,
+            )
+        )
+        ready_email_accounts = select(models.PlatformAccount.id).where(
+            models.PlatformAccount.platform == "email",
+            models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+            models.PlatformAccount.config["email_health_status"].astext == "READY",
+        )
+        await session.execute(
+            update(models.OutboxMessage)
+            .where(
+                models.OutboxMessage.status == "NEEDS_REVIEW",
+                models.OutboxMessage.last_error_code == "EMAIL_ACCOUNT_NOT_READY",
+                models.OutboxMessage.destination_type == "email_reply",
+                models.OutboxMessage.platform_account_id.in_(ready_email_accounts),
             )
             .values(
                 status="PENDING",

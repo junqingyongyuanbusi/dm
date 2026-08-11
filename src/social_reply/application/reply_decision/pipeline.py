@@ -36,6 +36,7 @@ async def run_decision_pipeline(
     approved_official_contact_reply: str | None = None,
     history: tuple[tuple[str, str], ...] = (),
     voice_preferences: VoicePreferences | None = None,
+    email_auto_reply_allowed: bool = True,
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
@@ -142,6 +143,17 @@ async def run_decision_pipeline(
             decision,
             action=ReplyAction.DRAFT,
             reply_visibility=Visibility.PRIVATE,
+        )
+    elif (
+        snapshot.platform == "email"
+        and not email_auto_reply_allowed
+        and decision.action is ReplyAction.AUTO_REPLY
+    ):
+        decision = replace(
+            decision,
+            action=ReplyAction.DRAFT,
+            reply_visibility=Visibility.PRIVATE,
+            reason_codes=decision.reason_codes + ("EMAIL_AUTO_REPLY_DISABLED",),
         )
 
     return decision

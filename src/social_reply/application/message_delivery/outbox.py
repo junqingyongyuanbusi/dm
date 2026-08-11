@@ -5,9 +5,9 @@ from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 
 import httpx
-from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy import and_, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from social_reply.application.message_delivery.contracts import (
     SendContractError,
@@ -15,6 +15,7 @@ from social_reply.application.message_delivery.contracts import (
     parse_direct_text_command,
 )
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
+from social_reply.connectors.email.contracts import email_address_identity_key
 from social_reply.connectors.errors import (
     PermanentSendError,
     PlatformSendError,
@@ -31,6 +32,7 @@ from social_reply.domain.platform_accounts import (
 )
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
+    hold_connection_advisory_lock,
     hold_conversation_delivery_lock,
 )
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -115,7 +117,7 @@ async def _record_outcome(
     if platform_message_id is not None:
         values["platform_message_id"] = platform_message_id
     if status == "SENT":
-        values["sent_at"] = datetime.now(UTC)
+        values["sent_at"] = func.clock_timestamp()
     statement = update(models.OutboxMessage).where(models.OutboxMessage.id == outbox_id)
     if require_sending:
         statement = statement.where(models.OutboxMessage.status == "SENDING")
@@ -249,14 +251,16 @@ async def _validate_direct_send(
 ]:
     account = (
         await session.execute(
-            select(models.PlatformAccount).where(
-                models.PlatformAccount.id == row.platform_account_id
-            )
+            select(models.PlatformAccount)
+            .where(models.PlatformAccount.id == row.platform_account_id)
+            .execution_options(populate_existing=True)
         )
     ).scalar_one()
     conversation = (
         await session.execute(
-            select(models.Conversation).where(models.Conversation.id == row.conversation_id)
+            select(models.Conversation)
+            .where(models.Conversation.id == row.conversation_id)
+            .execution_options(populate_existing=True)
         )
     ).scalar_one()
     if (
@@ -267,8 +271,9 @@ async def _validate_direct_send(
         return await _reject_direct_send(session, row, attempt_no, "TENANT_SCOPE_MISMATCH")
     if not is_active_account_status(account.status):
         return await _reject_direct_send(session, row, attempt_no, "ACCOUNT_NOT_ACTIVE")
-    if account.platform in {"facebook", "instagram", "whatsapp", "feishu"}:
-        disabled_code = get_settings().platform_disabled_code(account.platform)
+    settings = get_settings()
+    if account.platform in {"facebook", "instagram", "whatsapp", "feishu", "email"}:
+        disabled_code = settings.platform_disabled_code(account.platform)
         if disabled_code is not None:
             return await _reject_direct_send(
                 session,
@@ -297,6 +302,30 @@ async def _validate_direct_send(
             row,
             attempt_no,
             "FEISHU_ACCOUNT_NOT_READY",
+            count_attempt=False,
+        )
+    if (
+        account.platform == "email"
+        and str((account.config or {}).get("email_health_status") or "") != "READY"
+    ):
+        return await _reject_direct_send(
+            session,
+            row,
+            attempt_no,
+            "EMAIL_ACCOUNT_NOT_READY",
+            count_attempt=False,
+        )
+    if (
+        account.platform == "email"
+        and row.origin_kind == "DECISION"
+        and row.actor_kind == "BOT"
+        and not settings.email_auto_reply_enabled
+    ):
+        return await _reject_direct_send(
+            session,
+            row,
+            attempt_no,
+            "EMAIL_AUTO_REPLY_DISABLED",
             count_attempt=False,
         )
     destination = DIRECT_DESTINATION_CAPABILITIES.get(row.destination_type)
@@ -375,8 +404,81 @@ async def _validate_direct_send(
     return None, account, command
 
 
+def _effective_origin_kind(row: models.OutboxMessage, payload: dict) -> str | None:
+    authority = (row.origin_kind, row.actor_kind)
+    if authority == ("DECISION", "BOT"):
+        return "DECISION"
+    if authority == ("DRAFT_APPROVAL", "ADMIN_HUMAN"):
+        return "DRAFT_APPROVAL"
+    if authority == ("MANUAL_REPLY", "ADMIN_HUMAN"):
+        return "MANUAL_REPLY"
+    if authority == ("SYSTEM_NOTICE", "SYSTEM"):
+        return "SYSTEM_NOTICE"
+    if authority == ("DECISION", "ADMIN_HUMAN") and payload.get("approval") == "admin":
+        return "DRAFT_APPROVAL"
+    return None
+
+
+def _send_state_allowed(
+    row: models.OutboxMessage,
+    payload: dict,
+    state: str | None,
+) -> bool:
+    origin_kind = _effective_origin_kind(row, payload)
+    return (
+        (origin_kind == "DECISION" and state == "BOT_ACTIVE")
+        or (origin_kind == "DRAFT_APPROVAL" and state == "BOT_DRAFT_ONLY")
+        or (origin_kind == "MANUAL_REPLY" and state == "HUMAN_ACTIVE")
+        or (origin_kind == "SYSTEM_NOTICE" and state in {"HANDOFF_PENDING", "HUMAN_ACTIVE"})
+    )
+
+
+def _is_rate_limited_email_reply(row: models.OutboxMessage) -> bool:
+    return (
+        row.destination_type == "email_reply"
+        and row.origin_kind == "DECISION"
+        and row.actor_kind == "BOT"
+    )
+
+
+def _email_sender_lock_key(platform_account_id: uuid.UUID, sender: str) -> str:
+    identity = email_address_identity_key(sender)
+    return f"social-reply:email-sender-delivery:{platform_account_id}:{identity}"
+
+
+async def _email_replies_sent_in_window(
+    session: AsyncSession,
+    *,
+    platform_account_id: uuid.UUID,
+    sender: str,
+) -> int:
+    sender_identity = email_address_identity_key(sender)
+    return int(
+        await session.scalar(
+            select(func.count())
+            .select_from(models.OutboxMessage)
+            .join(
+                models.Conversation,
+                models.Conversation.id == models.OutboxMessage.conversation_id,
+            )
+            .join(models.Contact, models.Contact.id == models.Conversation.contact_id)
+            .where(
+                models.OutboxMessage.platform_account_id == platform_account_id,
+                models.OutboxMessage.destination_type == "email_reply",
+                models.OutboxMessage.origin_kind == "DECISION",
+                models.OutboxMessage.actor_kind == "BOT",
+                models.OutboxMessage.status == "SENT",
+                models.OutboxMessage.sent_at >= func.clock_timestamp() - timedelta(hours=24),
+                models.Contact.external_user_id == sender_identity,
+            )
+        )
+        or 0
+    )
+
+
 async def _deliver_outbox_locked(
     session: AsyncSession,
+    connection: AsyncConnection,
     oid: uuid.UUID,
     conversation_id: uuid.UUID,
 ) -> str:
@@ -484,19 +586,13 @@ async def _deliver_outbox_locked(
             )
         )
     ).scalar_one_or_none()
-    legacy_approval = payload.get("approval") == "admin"
-    origin_kind = "DRAFT_APPROVAL" if legacy_approval else row.origin_kind
-    send_state_allowed = (
-        (origin_kind == "DECISION" and state == "BOT_ACTIVE")
-        or (origin_kind == "DRAFT_APPROVAL" and state == "BOT_DRAFT_ONLY")
-        or (origin_kind == "MANUAL_REPLY" and state == "HUMAN_ACTIVE")
-        or (origin_kind == "SYSTEM_NOTICE" and state in {"HANDOFF_PENDING", "HUMAN_ACTIVE"})
-    )
+    send_state_allowed = _send_state_allowed(row, payload, state)
     if is_public and not send_state_allowed:
         return await _stop_before_send(session, oid, "CANCELLED", "TAKEOVER_AT_SEND", attempt_no)
+    direct_account: models.PlatformAccount | None = None
     direct_command: TextSendCommand | None = None
     if is_direct:
-        stopped, _account, direct_command = await _validate_direct_send(
+        stopped, direct_account, direct_command = await _validate_direct_send(
             session,
             row,
             payload,
@@ -505,118 +601,253 @@ async def _deliver_outbox_locked(
         if stopped is not None:
             return stopped
     target = None if is_direct else await _resolve_target(session, row.conversation_id)
-    await session.execute(
-        update(models.OutboxMessage)
-        .where(models.OutboxMessage.id == oid)
-        .values(attempt_count=attempt_no)
-    )
-    await session.commit()
 
-    if not is_direct and target is None:
-        return await _record_outcome(
-            session,
-            oid,
-            "NEEDS_REVIEW",
-            attempt_no=attempt_no,
-            error_code="NO_MAPPING",
-            error_message="no chatwoot mapping",
-        )
+    async def dispatch() -> str:
+        dispatch_claim = (
+            await session.execute(
+                update(models.OutboxMessage)
+                .where(
+                    models.OutboxMessage.id == oid,
+                    models.OutboxMessage.status == "SENDING",
+                )
+                .values(attempt_count=attempt_no)
+                .returning(models.OutboxMessage.id)
+            )
+        ).first()
+        await session.commit()
+        if dispatch_claim is None:
+            return "SKIPPED_NOT_CLAIMABLE"
 
-    async def fail_retryable(exc: Exception) -> str:
-        if attempt_no >= _MAX_ATTEMPTS:
+        if not is_direct and target is None:
             return await _record_outcome(
                 session,
                 oid,
                 "NEEDS_REVIEW",
                 attempt_no=attempt_no,
+                error_code="NO_MAPPING",
+                error_message="no chatwoot mapping",
+            )
+
+        async def fail_retryable(exc: Exception) -> str:
+            if attempt_no >= _MAX_ATTEMPTS:
+                return await _record_outcome(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    attempt_no=attempt_no,
+                    error_code="SEND_ERROR",
+                    error_message=_safe_error(exc),
+                )
+            next_at = datetime.now(UTC) + timedelta(seconds=min(30 * 2**attempt_no, 3600))
+            return await _record_outcome(
+                session,
+                oid,
+                "FAILED",
+                attempt_no=attempt_no,
                 error_code="SEND_ERROR",
                 error_message=_safe_error(exc),
+                next_attempt_at=next_at,
             )
-        next_at = datetime.now(UTC) + timedelta(seconds=min(30 * 2**attempt_no, 3600))
-        return await _record_outcome(
-            session,
-            oid,
-            "FAILED",
-            attempt_no=attempt_no,
-            error_code="SEND_ERROR",
-            error_message=_safe_error(exc),
-            next_attempt_at=next_at,
-        )
 
-    async def ambiguous(exc: Exception) -> str:
-        return await _record_outcome(
-            session,
-            oid,
-            "NEEDS_REVIEW",
-            attempt_no=attempt_no,
-            error_code="AMBIGUOUS_SEND",
-            error_message=_safe_error(exc),
-        )
+        async def ambiguous(exc: Exception) -> str:
+            return await _record_outcome(
+                session,
+                oid,
+                "NEEDS_REVIEW",
+                attempt_no=attempt_no,
+                error_code="AMBIGUOUS_SEND",
+                error_message=_safe_error(exc),
+            )
 
-    async def fail_permanent(exc: PlatformSendError) -> str:
-        # 平台确定性拒绝(对方不收 DM、超出消息窗口、token 失效):消息未送达且重试无意义,
-        # 直接标 NEEDS_REVIEW 并把平台错误码透传给运营,不进退避重试队列。
-        return await _record_outcome(
-            session,
-            oid,
-            "NEEDS_REVIEW",
-            attempt_no=attempt_no,
-            error_code=exc.code,
-            error_message=exc.message[:500],
-        )
+        async def fail_permanent(exc: PlatformSendError) -> str:
+            # 平台确定性拒绝(对方不收 DM、超出消息窗口、token 失效):消息未送达且重试无意义,
+            # 直接标 NEEDS_REVIEW 并把平台错误码透传给运营,不进退避重试队列。
+            return await _record_outcome(
+                session,
+                oid,
+                "NEEDS_REVIEW",
+                attempt_no=attempt_no,
+                error_code=exc.code,
+                error_message=exc.message[:500],
+            )
 
-    sender = None
-    if is_direct:
-        try:
-            sender = await get_platform_sender(row.platform_account_id)
-        except Exception as exc:  # noqa: BLE001 - sender resolution happens before dispatch
-            return await fail_retryable(exc)
-
-    try:
+        sender = None
         if is_direct:
-            assert direct_command is not None and sender is not None
-            platform_message_id = await _await_send(
-                sender.send_text(
-                    target=direct_command.target,
-                    text=direct_command.text,
-                )
-            )
-            chatwoot_message_id = None
-        else:
-            assert target is not None
-            account_id, chatwoot_conv_id = target
-            chatwoot_message_id = await _await_send(
-                get_chatwoot_client().create_message(
-                    account_id=account_id,
-                    conversation_id=chatwoot_conv_id,
-                    content=payload["text"],
-                    private=(row.message_type == "private_note"),
-                )
-            )
-            platform_message_id = None
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        return await fail_retryable(exc)
-    except (httpx.TimeoutException, httpx.TransportError) as exc:
-        return await ambiguous(exc)
-    except RetryableSendError as exc:
-        return await fail_retryable(exc)
-    except PermanentSendError as exc:
-        return await fail_permanent(exc)
-    except httpx.HTTPStatusError as exc:
-        return (
-            await ambiguous(exc) if exc.response.status_code >= 500 else await fail_retryable(exc)
-        )
-    except Exception as exc:  # noqa: BLE001 - unknown post-dispatch failures are ambiguous
-        return await ambiguous(exc)
+            try:
+                sender = await get_platform_sender(row.platform_account_id)
+            except Exception as exc:  # noqa: BLE001 - sender resolution happens before dispatch
+                return await fail_retryable(exc)
 
-    return await _record_outcome(
-        session,
-        oid,
-        "SENT",
-        attempt_no=attempt_no,
-        chatwoot_message_id=chatwoot_message_id,
-        platform_message_id=platform_message_id,
-    )
+        try:
+            if is_direct:
+                assert direct_command is not None and sender is not None
+                platform_message_id = await _await_send(
+                    sender.send_text(
+                        target=direct_command.target,
+                        text=direct_command.text,
+                    )
+                )
+                chatwoot_message_id = None
+            else:
+                assert target is not None
+                account_id, chatwoot_conv_id = target
+                chatwoot_message_id = await _await_send(
+                    get_chatwoot_client().create_message(
+                        account_id=account_id,
+                        conversation_id=chatwoot_conv_id,
+                        content=payload["text"],
+                        private=(row.message_type == "private_note"),
+                    )
+                )
+                platform_message_id = None
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            return await fail_retryable(exc)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            return await ambiguous(exc)
+        except RetryableSendError as exc:
+            return await fail_retryable(exc)
+        except PermanentSendError as exc:
+            return await fail_permanent(exc)
+        except httpx.HTTPStatusError as exc:
+            return (
+                await ambiguous(exc)
+                if exc.response.status_code >= 500
+                else await fail_retryable(exc)
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown post-dispatch failures are ambiguous
+            return await ambiguous(exc)
+
+        return await _record_outcome(
+            session,
+            oid,
+            "SENT",
+            attempt_no=attempt_no,
+            chatwoot_message_id=chatwoot_message_id,
+            platform_message_id=platform_message_id,
+        )
+
+    if _is_rate_limited_email_reply(row):
+        assert direct_account is not None and direct_command is not None
+        locked_account_id = direct_account.id
+        locked_sender = email_address_identity_key(direct_command.target["to"])
+        await session.commit()
+        async with hold_connection_advisory_lock(
+            connection,
+            _email_sender_lock_key(locked_account_id, locked_sender),
+        ):
+            session.expire_all()
+            fresh_row = (
+                await session.execute(
+                    select(models.OutboxMessage)
+                    .where(models.OutboxMessage.id == oid)
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if fresh_row is None or fresh_row.status != "SENDING":
+                await session.commit()
+                return "SKIPPED_NOT_CLAIMABLE"
+            row = fresh_row
+            attempt_no = row.attempt_count + 1
+            if not isinstance(row.payload, dict):
+                return await _stop_before_send(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    "DELIVERY_PAYLOAD_INVALID",
+                    attempt_no,
+                    count_attempt=False,
+                )
+            payload = dict(row.payload)
+            if not isinstance(payload.get("text"), str) or not payload["text"].strip():
+                return await _stop_before_send(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    "DELIVERY_TEXT_INVALID",
+                    attempt_no,
+                    count_attempt=False,
+                )
+            if row.origin_kind == "DECISION" and row.actor_kind == "BOT":
+                generation = (
+                    await session.execute(
+                        select(
+                            models.ReplyDecision.decision_generation,
+                            models.Conversation.decision_generation,
+                        )
+                        .join(
+                            models.Conversation,
+                            models.Conversation.id == models.ReplyDecision.conversation_id,
+                        )
+                        .where(models.ReplyDecision.outbox_id == oid)
+                    )
+                ).one_or_none()
+                if (
+                    generation is not None
+                    and generation[0] is not None
+                    and generation[0] != generation[1]
+                ):
+                    return await _stop_before_send(
+                        session,
+                        oid,
+                        "CANCELLED",
+                        "STALE_CONVERSATION_INPUT",
+                        attempt_no,
+                        count_attempt=False,
+                    )
+            state = await session.scalar(
+                select(models.AutomationState.state).where(
+                    models.AutomationState.conversation_id == row.conversation_id
+                )
+            )
+            if not _send_state_allowed(row, payload, state):
+                return await _stop_before_send(
+                    session,
+                    oid,
+                    "CANCELLED",
+                    "TAKEOVER_AT_SEND",
+                    attempt_no,
+                )
+            settings = get_settings()
+            stopped, direct_account, direct_command = await _validate_direct_send(
+                session,
+                row,
+                payload,
+                attempt_no,
+            )
+            if stopped is not None:
+                return stopped
+            assert direct_account is not None and direct_command is not None
+            sender = direct_command.target["to"]
+            if (
+                not _is_rate_limited_email_reply(row)
+                or direct_account.id != locked_account_id
+                or email_address_identity_key(sender) != locked_sender
+            ):
+                return await _stop_before_send(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    "DELIVERY_TARGET_INVALID",
+                    attempt_no,
+                    count_attempt=False,
+                )
+            sent_count = await _email_replies_sent_in_window(
+                session,
+                platform_account_id=direct_account.id,
+                sender=sender,
+            )
+            if sent_count >= settings.email_per_sender_daily_reply_limit:
+                return await _stop_before_send(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    "EMAIL_RATE_LIMITED",
+                    attempt_no,
+                    count_attempt=False,
+                )
+            return await dispatch()
+
+    return await dispatch()
 
 
 async def deliver_outbox(outbox_id: str) -> str:
@@ -631,4 +862,4 @@ async def deliver_outbox(outbox_id: str) -> str:
 
     async with hold_conversation_delivery_lock(conversation_id) as connection:
         async with AsyncSession(bind=connection, expire_on_commit=False) as session:
-            return await _deliver_outbox_locked(session, oid, conversation_id)
+            return await _deliver_outbox_locked(session, connection, oid, conversation_id)

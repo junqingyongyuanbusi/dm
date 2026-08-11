@@ -1,6 +1,6 @@
 # Social Reply（多租户社媒消息中台）
 
-这是一个直连 X、Telegram、Facebook、Instagram、WhatsApp 和 Feishu（飞书）的模块化单体，使用 PostgreSQL 保存会话、消息、决策与 Transactional Outbox，并支持 AI 自动回复和本地人工接管。Chatwoot 是可选 Bridge，不是系统启动依赖。
+这是一个直连 X、Telegram、Facebook、Instagram、WhatsApp、Feishu（飞书）和 Email 的模块化单体，使用 PostgreSQL 保存会话、消息、决策与 Transactional Outbox，并支持 AI 自动回复和本地人工接管。Chatwoot 是可选 Bridge，不是系统启动依赖。当前共 7 个直连账号平台；Email 已实现协议与控制面契约，但仓库测试不代表已使用真实邮箱凭证完成联网验证。
 
 ## 本地运行
 
@@ -190,6 +190,24 @@ Card Action Callback 配置为 `card.action.trigger` 回调；测试卡片到达
 并用“已回复，恢复 Bot”解决工单。该动作是客服声明；需要可验证发送证据时，应通过本地 Inbox
 手动回复。完整操作步骤见 [Feishu operator runbook](docs/feishu-integration.md)。
 
+### 连接 Email
+
+Email 已支持管理员接入、Scheduler 只读 IMAP 轮询、统一草稿/人工审核和 SMTP 回复。新部署的
+`EMAIL_ENABLED=false`、`EMAIL_AUTO_REPLY_ENABLED=false`；API、Worker、Scheduler 必须运行
+同一镜像并使用完全一致的七个 Email 配置值。新账号强制从 `BOT_DRAFT_ONLY` 开始，只有总 gate、
+自动回复 gate 和账号 `BOT_ACTIVE` 三者同时满足时才允许 Bot 自动外发。
+
+IMAP 使用 readonly `SELECT` 与 `BODY.PEEK[]`；SMTP 仅允许 SSL 或严格 STARTTLS，不会降级到明文。
+SMTP 端口留空时按加密方式使用 SSL 465 或 STARTTLS 587，显式合法端口保持不变。Admin 显示的
+“接入探测”及探测时间仅表示最近一次凭证接入验证，不是持续监控。Endpoint 必须命中 host
+allowlist，且 DNS 解析结果全部为公共目标。会话按 thread 建立并包含 sender
+以避免串人；24 小时自动回复限额按 account+sender 跨 thread 统计。轮询 RawEvent 只保存 UID、
+UIDVALIDITY、size 和可选 SHA-256，不保存 RFC822 正文。
+
+当前迁移唯一 head 为 `e9a1c4f7b620`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
+目标凭证后，必须先做 Phase 0 TLS/login/readonly 检查，再执行 draft-only real smoke。完整步骤见
+[Email operator runbook](docs/email-integration.md)。
+
 ### 连接 X
 
 ```http
@@ -226,7 +244,7 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 → Rules / RAG / LLM / Final Guard
 → ReplyDecision + Transactional Outbox（同一事务）
 → 发送前状态/capability/接管/平台健康复检
-→ Telegram / Facebook / Instagram / WhatsApp / Feishu / X / XChat
+→ Telegram / Facebook / Instagram / WhatsApp / Feishu / Email / X / XChat
 ```
 
 PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Scheduler 会恢复带版本化 dispatch contract 的新 RawEvent、DecisionJob 和 Outbox；历史缺少安全重建参数的 `PENDING` RawEvent 不会被猜测执行。Worker 提交 Outbox 后仍走低延迟 Fast Path。
@@ -239,6 +257,7 @@ PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；R
 - [配置参考](docs/configuration.md)
 - [账号控制面](docs/admin-control-plane.md)
 - [Feishu operator runbook](docs/feishu-integration.md)
+- [Email operator runbook](docs/email-integration.md)
 - [生产迁移](docs/production-migration.md)
 - [VPS 运维](deploy/vps/README.md)
 - [文档地图与历史材料](docs/README.md)
@@ -248,16 +267,16 @@ PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；R
 ```bash
 uv sync --frozen --all-groups
 uv run ruff check .
-uv run pytest -m "not integration"   # 本地单元门禁，覆盖 6 个直连账号平台
+uv run pytest -m "not integration"   # 本地单元门禁，覆盖 7 个直连账号平台
 
 docker compose -f deploy/docker-compose.yml up -d postgres redis
 docker compose -f deploy/docker-compose.yml exec -T postgres sh -c \
   'psql -U dev -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '\''social_reply_test'\''" | grep -q 1 || createdb -U dev social_reply_test'
 DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
-REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 6 个直连账号平台的全量门禁
+REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 7 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `b7e4c2d9a615`。当前 Feishu 专用测试文件的精确收集数以 `pytest --collect-only` 为准；这不包含跨平台测试中的额外 Feishu 断言，也不代表已使用生产凭证完成真实 Feishu E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行两道门禁：`Ruff`，以及使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `e9a1c4f7b620`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
 
 ## X 贴文评论自动回复
 

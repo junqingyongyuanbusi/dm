@@ -178,3 +178,74 @@ async def test_feishu_sender_cache_rotates_on_account_config_version(session, mo
     await session.commit()
     with pytest.raises(LookupError, match="feishu_app_id_scope_mismatch"):
         await registry.get_platform_sender(account_id)
+
+
+async def test_email_sender_cache_rotates_on_account_config_version(session, monkeypatch):
+    account_id = uuid.uuid4()
+    config = {
+        "smtp_host": " SMTP.Example.COM. ",
+        "smtp_port": 587,
+        "smtp_security": "starttls",
+        "self_address": " Support@Example.COM ",
+        "from_name": "Customer Support",
+    }
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="default",
+            platform="email",
+            name="Email",
+            external_account_id="Support@example.com",
+            public_id=f"email_{uuid.uuid4().hex}",
+            credential_bundle=encrypt_secret_bundle(
+                {"username": "smtp-user", "password": "password-1"}
+            ),
+            config=config,
+            capability={"dm": True, "max_text_length": 4000},
+            config_version=1,
+            automation_default="BOT_DRAFT_ONLY",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    created = []
+
+    class FakeEmailClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            created.append(self)
+
+        async def send_text(self, *, target, text):
+            return f"{target}:{text}"
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(registry, "EmailClient", FakeEmailClient)
+    registry._senders.clear()
+
+    first = await registry.get_platform_sender(account_id)
+    assert first.kwargs["password"] == "password-1"
+    assert await registry.get_platform_sender(account_id) is first
+    assert len(created) == 1
+
+    await session.execute(
+        update(models.PlatformAccount)
+        .where(models.PlatformAccount.id == account_id)
+        .values(
+            credential_bundle=encrypt_secret_bundle(
+                {"username": "smtp-user", "password": "password-2"}
+            ),
+            config_version=2,
+        )
+    )
+    await session.commit()
+
+    second = await registry.get_platform_sender(account_id)
+    assert second is not first
+    assert second.kwargs["password"] == "password-2"
+    assert first.closed is True
+    await registry.close_platform_senders()

@@ -1,4 +1,5 @@
 import asyncio
+import unicodedata
 import uuid
 
 from social_reply.application.account_management.x_credentials import x_credentials
@@ -8,6 +9,18 @@ from social_reply.application.platform_accounts import (
     get_platform_app_runtime,
 )
 from social_reply.connectors.base import PlatformSender
+from social_reply.connectors.email.client import EmailClient
+from social_reply.connectors.email.contracts import (
+    MAX_EMAIL_CREDENTIAL_CHARS,
+    MAX_SENDER_NAME_CHARS,
+    normalize_email_address,
+    validate_email_account_text,
+)
+from social_reply.connectors.email.network import (
+    EmailNetworkError,
+    normalize_hostname,
+    validate_port,
+)
 from social_reply.connectors.feishu.client import FeishuClient
 from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
 from social_reply.connectors.meta.client import MetaGraphClient
@@ -71,6 +84,8 @@ def _build_sender(
     meta_app_secret: str | None = None,
 ) -> PlatformSender:
     credentials = account.credential_bundle
+    if account.platform == "email":
+        return _build_email_sender(account, credentials)
     if account.platform == "telegram":
         return TelegramClient(
             token=credentials.get("bot_token") or credentials["access_token"],
@@ -147,3 +162,65 @@ def _build_sender(
             ),
         )
     raise LookupError(f"platform_sender_not_configured:{account.platform}:{account.id}")
+
+
+def _build_email_sender(
+    account: PlatformAccountRuntime,
+    credentials: dict[str, str],
+) -> EmailClient:
+    username = _required_email_account_text(credentials.get("username"), "username", account.id)
+    password = _required_email_account_text(credentials.get("password"), "password", account.id)
+    smtp_security = _required_email_string(
+        account.config.get("smtp_security"), "smtp_security", account.id
+    )
+    if smtp_security not in {"ssl", "starttls"}:
+        raise LookupError(f"email_smtp_security_invalid:{account.id}")
+
+    try:
+        smtp_host = normalize_hostname(account.config.get("smtp_host"))
+    except EmailNetworkError as exc:
+        raise LookupError(f"{exc.code}:{account.id}") from exc
+    try:
+        smtp_port = validate_port(account.config.get("smtp_port"))
+    except EmailNetworkError as exc:
+        raise LookupError(f"{exc.code}:{account.id}") from exc
+    try:
+        self_address = normalize_email_address(account.config.get("self_address"))
+    except ValueError as exc:
+        raise LookupError(f"email_self_address_invalid:{account.id}") from exc
+
+    from_name_value = account.config.get("from_name")
+    from_name = None
+    if from_name_value is not None:
+        from_name = _required_email_string(from_name_value, "from_name", account.id)
+        if len(from_name) > MAX_SENDER_NAME_CHARS or any(
+            unicodedata.category(character) == "Cc" for character in from_name
+        ):
+            raise LookupError(f"email_from_name_invalid:{account.id}")
+    if account.external_account_id != self_address:
+        raise LookupError(f"email_self_address_scope_mismatch:{account.id}")
+
+    return EmailClient(
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_security=smtp_security,
+        username=username,
+        password=password,
+        self_address=self_address,
+        from_name=from_name,
+        timeout=get_settings().email_network_timeout_seconds,
+        allowed_hosts=get_settings().email_allowed_hosts,
+    )
+
+
+def _required_email_string(value: object, field: str, account_id: uuid.UUID) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise LookupError(f"email_{field}_invalid:{account_id}")
+    return value.strip() if field == "from_name" else value
+
+
+def _required_email_account_text(value: object, field: str, account_id: uuid.UUID) -> str:
+    try:
+        return validate_email_account_text(value, maximum=MAX_EMAIL_CREDENTIAL_CHARS)
+    except ValueError as exc:
+        raise LookupError(f"email_{field}_invalid:{account_id}") from exc

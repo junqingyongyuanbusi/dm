@@ -332,6 +332,10 @@ async def run_and_persist_decision(
             approved_official_contact_reply=approved_official_contact_reply,
             history=history,
             voice_preferences=persona.preferences,
+            email_auto_reply_allowed=(
+                snapshot.platform != "email"
+                or (settings.email_enabled and settings.email_auto_reply_enabled)
+            ),
         )
     handoff_notification_ids: list[uuid.UUID] = []
     async with get_session_factory()() as session:
