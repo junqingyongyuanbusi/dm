@@ -208,6 +208,7 @@ def _page(
         else ""
     )
     skip_link = '<a class="skip-link" href="#main-content">跳到主内容</a>' if groups else ""
+    shell_class = "app-shell app-shell-nav" if groups else "app-shell app-shell-auth"
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">{refresh}
@@ -233,7 +234,10 @@ header{{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px 
 .brand small{{font-family:var(--sans);font-size:12px;color:var(--muted);margin-left:10px;letter-spacing:.02em}}
 .skip-link{{position:fixed;top:8px;left:8px;z-index:20;padding:8px 12px;border-radius:8px;background:var(--text);color:var(--surface);transform:translateY(-150%)}}
 .skip-link:focus{{transform:translateY(0)}}
-.app-shell{{display:grid;grid-template-columns:220px minmax(0,1fr);max-width:1380px;margin:0 auto}}
+.app-shell{{display:grid;max-width:1380px;margin:0 auto}}
+.app-shell-nav{{grid-template-columns:220px minmax(0,1fr)}}
+.app-shell-auth{{grid-template-columns:minmax(0,1fr);max-width:none}}
+.app-shell-auth main{{max-width:none;padding:36px clamp(20px,5vw,72px) 72px}}
 .sidebar{{min-width:0;padding:28px 16px 72px 24px;border-right:1px solid var(--border)}}
 .nav-group{{margin-bottom:22px}}
 .nav-heading{{margin:0 10px 7px;font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}}
@@ -369,16 +373,16 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 .kv th{{width:220px;text-transform:none;letter-spacing:0;font-size:13px;color:var(--muted);font-weight:500;vertical-align:top}}
 .kv td,.kv th{{border-bottom:1px solid var(--border)}}
 .kv tr:last-child td,.kv tr:last-child th{{border-bottom:0}}
-.login-wrap{{min-height:calc(100vh - 120px);display:flex;align-items:center;justify-content:center}}
-.login-card{{width:100%;max-width:400px}}
+.login-wrap{{min-height:calc(100dvh - 128px);display:flex;align-items:center;justify-content:center}}
+.login-card{{width:min(100%,400px)}}
 @media (prefers-reduced-motion:reduce){{*{{transition:none!important}}}}
-@media (max-width:900px){{.app-shell{{grid-template-columns:1fr}} .sidebar{{padding:16px 14px 4px;border-right:0;border-bottom:1px solid var(--border)}} .sidebar nav{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}} .nav-group{{margin-bottom:10px}} .filters{{grid-template-columns:repeat(2,minmax(0,1fr))}} .detail-grid{{grid-template-columns:1fr}}}}
+@media (max-width:900px){{.app-shell-nav{{grid-template-columns:1fr}} .sidebar{{padding:16px 14px 4px;border-right:0;border-bottom:1px solid var(--border)}} .sidebar nav{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}} .nav-group{{margin-bottom:10px}} .filters{{grid-template-columns:repeat(2,minmax(0,1fr))}} .detail-grid{{grid-template-columns:1fr}}}}
 @media (max-width:820px){{.channel-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
 @media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .sidebar nav{{grid-template-columns:1fr}} .nav-group{{border-bottom:1px solid var(--border);padding-bottom:8px}} .nav-group:last-child{{border-bottom:0}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-form-grid{{grid-template-columns:1fr}} .channel-form-grid .span-2{{grid-column:auto}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}} .queue-tabs{{grid-template-columns:1fr}}}}
 @media (max-width:520px){{.channel-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}} .channel-tile{{min-height:104px}} .channel-heading{{align-items:flex-start;flex-direction:column;gap:2px}} .channel-meta{{grid-template-columns:1fr;gap:1px}} .channel-meta dd{{margin-bottom:7px}}}}
 </style></head><body>
 {skip_link}<header><span class="brand">Reply Core<small>Control Plane</small></span><nav>{logout}</nav></header>
-<div class="app-shell">{sidebar}<main id="main-content">{body}</main></div></body></html>"""
+<div class="{shell_class}">{sidebar}<main id="main-content">{body}</main></div></body></html>"""
 
 
 @router.get("/login", response_class=HTMLResponse)

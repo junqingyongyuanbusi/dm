@@ -165,6 +165,7 @@ async def test_grouped_navigation_uses_new_information_architecture(migrated_db)
         page = await client.get("/admin/inbox")
 
     assert page.status_code == 200
+    assert '<div class="app-shell app-shell-nav"><aside class="sidebar">' in page.text
     for group in ("运营", "内容与策略", "集成", "系统"):
         assert group in page.text
     for path, label in (

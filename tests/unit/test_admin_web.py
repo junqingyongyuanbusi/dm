@@ -18,6 +18,17 @@ async def test_admin_dashboard_redirects_to_login():
     assert response.headers["location"] == "/admin/login"
 
 
+async def test_admin_login_uses_full_width_auth_shell():
+    async with await _client() as client:
+        response = await client.get("/admin/login")
+
+    assert response.status_code == 200
+    assert '<div class="app-shell app-shell-auth"><main id="main-content">' in response.text
+    assert 'class="sidebar"' not in response.text
+    assert ".app-shell-auth{grid-template-columns:minmax(0,1fr);max-width:none}" in response.text
+    assert ".app-shell-nav{grid-template-columns:220px minmax(0,1fr)}" in response.text
+
+
 async def test_admin_login_sets_http_only_session_cookie(monkeypatch):
     from social_reply.application.account_management import admin
     from social_reply.application.account_management.auth import Principal
