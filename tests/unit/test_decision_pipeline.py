@@ -145,11 +145,11 @@ async def test_risk_word_handoff_before_llm():
     assert "RISK_WORD" in d.reason_codes
 
 
-async def test_killswitch_error_fails_closed_to_draft():
-    # kill switch 是安全控制：无法验证急停状态时必须 fail-closed（降级草稿，不外发）
+async def test_killswitch_error_fails_closed_to_draft(caplog):
     d = await run_decision_pipeline(_snap(), llm=StubLLMClient(), killswitch=_BrokenSwitch())
     assert d.action is ReplyAction.DRAFT
     assert "KILLSWITCH_UNAVAILABLE" in d.reason_codes
+    assert "kill switch lookup failed" in caplog.text
 
 
 async def test_verbatim_reply_returns_template_text_without_llm():

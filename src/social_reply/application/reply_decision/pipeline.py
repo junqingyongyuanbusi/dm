@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, replace
 
 from social_reply.domain.messages.canonical import ChannelType
@@ -7,6 +8,7 @@ from social_reply.domain.reply.llm import LLMClient, LLMContext
 from social_reply.domain.reply.rules import apply_rules
 from social_reply.domain.reply.voice import VoicePreferences
 
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DecisionSnapshot:
@@ -56,6 +58,14 @@ async def run_decision_pipeline(
             snapshot.brand_id, snapshot.account_id, snapshot.tenant_id
         )
     except Exception:
+        logger.exception(
+            "kill switch lookup failed; decision downgraded to draft",
+            extra={
+                "tenant_id": snapshot.tenant_id,
+                "brand_id": snapshot.brand_id,
+                "account_id": snapshot.account_id,
+            },
+        )
         return ReplyDecision(
             action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule"
         )

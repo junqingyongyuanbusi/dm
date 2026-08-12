@@ -20,9 +20,10 @@ from social_reply.shared.config import get_settings
 
 def _build_embedder(allow_fake: bool) -> EmbeddingClient:
     settings = get_settings()
-    if settings.openai_api_key and not settings.testing:
+    api_key = settings.openai_api_key.get_secret_value()
+    if api_key and not settings.testing:
         return OpenAIEmbeddingClient(
-            api_key=settings.openai_api_key,
+            api_key=api_key,
             base_url=settings.openai_base_url,
             model=settings.openai_embedding_model,
             timeout=settings.openai_timeout_seconds,

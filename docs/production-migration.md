@@ -13,7 +13,8 @@ succeeded.
 Set `PLATFORM_SECRET_KEYS` before deploying. The first comma-separated Fernet key encrypts new
 values; later keys remain available for decrypting older envelopes.
 
-The API startup runs `scripts/prepare_database.py`:
+The API startup runs `scripts/prepare_database.py` under a PostgreSQL advisory lock, so replacement
+instances and accidental multiple API replicas serialize the full preparation sequence:
 
 1. expand the schema through `b7d1e4a9c2f3` when necessary;
 2. encrypt legacy file references or plaintext JSONB bundles;

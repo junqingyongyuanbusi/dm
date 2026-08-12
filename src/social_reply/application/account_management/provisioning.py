@@ -1,7 +1,7 @@
 import hashlib
 import secrets
 import uuid
-from pathlib import Path  # noqa: F401  secrets_root 参数签名保留（内联存储后不再使用）
+from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert

@@ -1,6 +1,5 @@
 import imaplib
 import ssl
-from pathlib import Path
 
 import httpx
 import pytest
@@ -462,15 +461,3 @@ def test_email_provisioning_errors_are_stable_and_sanitized(exception, expected,
     assert "banner" not in actual[1]
     assert "body" not in actual[1]
     assert "SECRET BANNER" not in caplog.text
-
-
-def test_secret_store_staging_path_is_outside_database(tmp_path):
-    path = Path(tmp_path) / "staging" / "job.json"
-    from social_reply.infrastructure.secrets import SecretStore
-
-    store = SecretStore()
-    ref = store.write_mapping(path, {"token": "secret"})
-    assert ref.startswith("file://")
-    assert store.read_mapping(ref, fallback_key="token") == {"token": "secret"}
-    store.delete(ref)
-    assert not path.exists()

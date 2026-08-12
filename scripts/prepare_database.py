@@ -1,17 +1,26 @@
 """Restart-safe database preparation for API startup."""
 
 import asyncio
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from migrate_legacy_secrets import migrate
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from scripts.migrate_legacy_secrets import migrate
+from social_reply.infrastructure.database.engine import get_engine
 from social_reply.shared.config import get_settings
 
 _SECRET_EXPANSION_REVISION = "b7d1e4a9c2f3"
+_DATABASE_PREPARATION_LOCK = "social-reply:database-preparation"
+_DATABASE_PREPARATION_LOCK_TIMEOUT = timedelta(minutes=5)
+_DATABASE_PREPARATION_LOCK_RETRY_SECONDS = 1.0
 
 
 async def _current_revision() -> str | None:
@@ -22,6 +31,33 @@ async def _current_revision() -> str | None:
         )
     await engine.dispose()
     return revision
+
+
+@asynccontextmanager
+async def _hold_database_preparation_lock() -> AsyncIterator[None]:
+    deadline = time.monotonic() + _DATABASE_PREPARATION_LOCK_TIMEOUT.total_seconds()
+    while True:
+        async with get_engine().connect() as connection:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))"),
+                {"key": _DATABASE_PREPARATION_LOCK},
+            )
+            await connection.commit()
+            if acquired is True:
+                try:
+                    yield
+                finally:
+                    unlocked = await connection.scalar(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                        {"key": _DATABASE_PREPARATION_LOCK},
+                    )
+                    await connection.commit()
+                    if unlocked is not True:
+                        await connection.invalidate()
+                return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("database_preparation_lock_timeout")
+        await asyncio.sleep(_DATABASE_PREPARATION_LOCK_RETRY_SECONDS)
 
 
 def _is_at_or_after(script: ScriptDirectory, current: str, target: str) -> bool:
@@ -36,14 +72,19 @@ def _is_at_or_after(script: ScriptDirectory, current: str, target: str) -> bool:
     return False
 
 
+async def _prepare_locked(config: Config, script: ScriptDirectory) -> None:
+    async with _hold_database_preparation_lock():
+        current = await _current_revision()
+        if current is None or not _is_at_or_after(script, current, _SECRET_EXPANSION_REVISION):
+            await asyncio.to_thread(command.upgrade, config, _SECRET_EXPANSION_REVISION)
+        await migrate()
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+
 def prepare() -> None:
     config = Config("alembic.ini")
     script = ScriptDirectory.from_config(config)
-    current = asyncio.run(_current_revision())
-    if current is None or not _is_at_or_after(script, current, _SECRET_EXPANSION_REVISION):
-        command.upgrade(config, _SECRET_EXPANSION_REVISION)
-    asyncio.run(migrate())
-    command.upgrade(config, "head")
+    asyncio.run(_prepare_locked(config, script))
 
 
 def assert_ready() -> None:

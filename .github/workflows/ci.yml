@@ -88,3 +88,56 @@ jobs:
           test -n "$current_revision"
           test "$head_revision" = "$current_revision"
       - run: uv run pytest -q
+
+  image:
+    name: Production image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build linux/amd64 production image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --build-arg "RELEASE_SHA=${GITHUB_SHA}" \
+            --build-arg "BUILD_DATE=1970-01-01T00:00:00Z" \
+            --build-arg "SOURCE_URL=https://github.com/${GITHUB_REPOSITORY}" \
+            --tag reply-core-ci:${GITHUB_SHA} \
+            --load \
+            .
+      - name: Verify image contract
+        run: |
+          set -euo pipefail
+          image="reply-core-ci:${GITHUB_SHA}"
+          test "$(docker image inspect "$image" --format '{{.Config.User}}')" = "appuser"
+          test "$(docker run --rm --entrypoint id "$image" -u)" = "10001"
+          test "$(docker run --rm --entrypoint id "$image" -g)" = "10001"
+          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          test "$(docker image inspect "$image" --format '{{.Architecture}}')" = "amd64"
+          docker run --rm --entrypoint sh "$image" -c 'test ! -w /app/src && test ! -w /app/.venv'
+          docker run --rm --entrypoint sh "$image" -c 'test ! -e /app/tests && test ! -e /app/docs && test ! -e /app/scripts/publish_railway_release.sh'
+          docker run --rm \
+            -e TESTING=true \
+            -e PLATFORM_SECRET_KEYS=Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM= \
+            --entrypoint python \
+            "$image" \
+            -c 'import apps.api.main, apps.worker.main, apps.scheduler.main, scripts.prepare_database; print("runtime imports ok")'
+          docker run --rm \
+            -e TESTING=true \
+            -e PLATFORM_SECRET_KEYS=Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM= \
+            --entrypoint alembic \
+            "$image" \
+            heads
+          if docker run --rm "$image" >/tmp/reply-core-missing-role.log 2>&1; then
+            cat /tmp/reply-core-missing-role.log
+            exit 1
+          fi
+          grep -q "SERVICE_ROLE is required" /tmp/reply-core-missing-role.log
+          if docker run --rm -e SERVICE_ROLE=invalid "$image" >/tmp/reply-core-invalid-role.log 2>&1; then
+            cat /tmp/reply-core-invalid-role.log
+            exit 1
+          fi
+          grep -q "unknown SERVICE_ROLE" /tmp/reply-core-invalid-role.log

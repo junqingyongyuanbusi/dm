@@ -46,7 +46,7 @@ async def sweep_outbox() -> list[uuid.UUID]:
         recoverable_routes.append(_direct_recovery_route("x_dm", "X_LEGACY_DM_DISABLED"))
     if settings.xchat_enabled:
         recoverable_routes.append(_direct_recovery_route("x_chat_message", "XCHAT_DISABLED"))
-    if getattr(settings, "facebook_messenger_enabled", True):
+    if settings.facebook_messenger_enabled:
         recoverable_routes.extend(
             (
                 _direct_recovery_route(
@@ -66,7 +66,7 @@ async def sweep_outbox() -> list[uuid.UUID]:
                 ),
             )
         )
-    if getattr(settings, "instagram_messaging_enabled", True):
+    if settings.instagram_messaging_enabled:
         recoverable_routes.extend(
             (
                 _direct_recovery_route(
@@ -86,18 +86,18 @@ async def sweep_outbox() -> list[uuid.UUID]:
                 ),
             )
         )
-    if getattr(settings, "whatsapp_enabled", True):
+    if settings.whatsapp_enabled:
         recoverable_routes.append(
             _direct_recovery_route("whatsapp_session_message", "WHATSAPP_DISABLED")
         )
-    if getattr(settings, "feishu_enabled", False):
+    if settings.feishu_enabled:
         recoverable_routes.extend(
             (
                 _direct_recovery_route("feishu_p2p_reply", "FEISHU_DISABLED"),
                 _direct_recovery_route("feishu_group_reply", "FEISHU_DISABLED"),
             )
         )
-    if getattr(settings, "email_enabled", False):
+    if settings.email_enabled:
         recoverable_routes.append(_direct_recovery_route("email_reply", "EMAIL_DISABLED"))
     async with get_session_factory()() as session:
         for destination_type, error_code, capability_key, platform in recoverable_routes:
@@ -158,7 +158,7 @@ async def sweep_outbox() -> list[uuid.UUID]:
                 last_error_message=None,
             )
         )
-        if getattr(settings, "email_auto_reply_enabled", False):
+        if settings.email_auto_reply_enabled:
             auto_ready_email_accounts = select(models.PlatformAccount.id).where(
                 models.PlatformAccount.platform == "email",
                 models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),

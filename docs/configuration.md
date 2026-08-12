@@ -233,7 +233,7 @@ These are consumed by container orchestration or `entrypoint.sh`, not by `Settin
 
 | Variable | Owner | Meaning |
 | --- | --- | --- |
-| `SERVICE_ROLE` | entrypoint | `api`, `worker`, or `scheduler` |
+| `SERVICE_ROLE` | entrypoint | Required; must be explicitly set to `api`, `worker`, or `scheduler`. Missing/unknown values fail before startup |
 | `PORT` | entrypoint/API | API listen port, default 8000 |
 | `DRAMATIQ_PROCESSES` | entrypoint/Worker | Worker process count, default 4, range 1-32; never inferred from host CPU count |
 | `DRAMATIQ_THREADS` | entrypoint/Worker | Threads per process, default 8, range 1-32; processes × threads must not exceed 128 |

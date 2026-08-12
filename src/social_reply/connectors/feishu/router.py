@@ -32,7 +32,6 @@ from social_reply.connectors.feishu.security import (
 from social_reply.domain.messages.canonical import canonical_event_to_dict
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +202,7 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
         return JSONResponse({"challenge": payload["challenge"]})
     header = payload.get("header")
     if isinstance(header, dict) and header.get("event_type") == "card.action.trigger":
-        settings = getattr(request.app.state, "settings", get_settings())
+        settings = request.app.state.settings
         return await _card_action_response(
             account,
             payload,
@@ -221,7 +220,7 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
     )
     events = adapter.normalize(sanitized_payload)
     serialized_events = [canonical_event_to_dict(event) for event in events]
-    feature_enabled = getattr(request.app.state, "settings", get_settings()).feishu_enabled
+    feature_enabled = request.app.state.settings.feishu_enabled
     should_dispatch = feature_enabled and bool(serialized_events)
     raw_header = sanitized_payload.get("header")
     raw_event_id_value = nonblank_string_or_none(raw_header.get("event_id")) if raw_header else None
@@ -276,7 +275,7 @@ async def feishu_card_actions(public_id: str, request: Request) -> Response:
     account, payload, body = await _account_payload(public_id, request)
     if _is_url_verification(payload):
         return JSONResponse({"challenge": payload["challenge"]})
-    settings = getattr(request.app.state, "settings", get_settings())
+    settings = request.app.state.settings
     return await _card_action_response(
         account,
         payload,

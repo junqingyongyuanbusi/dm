@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     feishu_health_check_interval_seconds: int = Field(default=600, ge=60, le=86400)
     account_secrets_root: Path = Path(".secrets/accounts")
     platform_secret_keys: SecretStr = SecretStr("")
-    openai_api_key: str = ""
+    openai_api_key: SecretStr = SecretStr("")
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
@@ -173,7 +173,11 @@ class Settings(BaseSettings):
         if not self.testing and self.llm_provider == "stub":
             raise ValueError("LLM_PROVIDER=stub 仅允许测试环境，生产环境禁止公开测试回复")
         # 生产环境启用 openai provider 时必须提供 API key
-        if not self.testing and self.llm_provider == "openai" and self.openai_api_key == "":
+        if (
+            not self.testing
+            and self.llm_provider == "openai"
+            and not self.openai_api_key.get_secret_value()
+        ):
             raise ValueError(
                 "OPENAI_API_KEY 未配置（LLM_PROVIDER=openai 时不能为空）；测试环境请设 TESTING=true"
             )
@@ -243,10 +247,6 @@ class Settings(BaseSettings):
         if platform == "email":
             return self.email_enabled and self.email_auto_reply_enabled
         return True
-
-    def meta_automation_default_allowed(self, platform: str, automation_default: str) -> bool:
-        """Backward-compatible alias for existing Meta account-management callers."""
-        return self.automation_default_allowed(platform, automation_default)
 
     @property
     def facebook_app_credentials(self) -> tuple[str, str] | None:

@@ -145,7 +145,7 @@ def test_testing_true_默认值可用() -> None:
     settings = _make(testing=True)
     assert settings.chatwoot_enabled is False
     assert settings.chatwoot_api_token == "dev-local-token"
-    assert settings.openai_api_key == ""
+    assert settings.openai_api_key.get_secret_value() == ""
     assert settings.openai_base_url == "https://api.openai.com/v1"
     assert settings.openai_model == "gpt-4o-mini"
     assert settings.openai_timeout_seconds == 30.0
@@ -236,7 +236,8 @@ def test_非测试环境_凭证齐全通过() -> None:
         llm_provider="openai",
         openai_api_key="sk-test",
     )
-    assert settings.openai_api_key == "sk-test"
+    assert settings.openai_api_key.get_secret_value() == "sk-test"
+    assert "sk-test" not in repr(settings)
 
 
 @pytest.mark.parametrize(
@@ -498,20 +499,20 @@ def test_非测试环境_空_control_api_key_拒绝() -> None:
 
 def test_meta_账号默认必须草稿除非显式开启自动回复() -> None:
     locked = _make(testing=True)
-    assert locked.meta_automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
-    assert locked.meta_automation_default_allowed("facebook", "BOT_ACTIVE") is False
-    assert locked.meta_automation_default_allowed("instagram", "BOT_ACTIVE") is False
+    assert locked.automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
+    assert locked.automation_default_allowed("facebook", "BOT_ACTIVE") is False
+    assert locked.automation_default_allowed("instagram", "BOT_ACTIVE") is False
     # 非 Meta 平台不受这个发布范围约束
-    assert locked.meta_automation_default_allowed("telegram", "BOT_ACTIVE") is True
-    assert locked.meta_automation_default_allowed("x", "BOT_ACTIVE") is True
+    assert locked.automation_default_allowed("telegram", "BOT_ACTIVE") is True
+    assert locked.automation_default_allowed("x", "BOT_ACTIVE") is True
 
 
 def test_显式开启后_meta_账号可用_bot_active() -> None:
     unlocked = _make(testing=True, meta_auto_reply_enabled=True)
-    assert unlocked.meta_automation_default_allowed("facebook", "BOT_ACTIVE") is True
-    assert unlocked.meta_automation_default_allowed("instagram", "BOT_ACTIVE") is True
+    assert unlocked.automation_default_allowed("facebook", "BOT_ACTIVE") is True
+    assert unlocked.automation_default_allowed("instagram", "BOT_ACTIVE") is True
     # 开关只解锁 BOT_ACTIVE，草稿始终允许
-    assert unlocked.meta_automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
+    assert unlocked.automation_default_allowed("facebook", "BOT_DRAFT_ONLY") is True
 
 
 @pytest.mark.parametrize(

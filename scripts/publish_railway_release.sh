@@ -58,7 +58,7 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
-for command_name in git docker railway gh jq curl date awk python3; do
+for command_name in git docker railway gh jq curl date awk python3 uv; do
   require_command "$command_name"
 done
 for timeout_name in DEPLOY_TIMEOUT_SECONDS CI_TIMEOUT_SECONDS; do
@@ -210,6 +210,15 @@ railway_status_json() {
     --json
 }
 
+validate_railway_config() {
+  if ! uv run --frozen --no-dev python scripts/validate_railway_config.py \
+    "$RAILWAY_PROJECT_ID" \
+    "$RAILWAY_ENVIRONMENT" \
+    "$PUBLIC_BASE_URL"; then
+    fail "Railway service variables failed the production consistency check"
+  fi
+  log "verified Railway role assignment and shared production configuration"
+}
 validate_railway_target() {
   local status_json
   status_json="$(railway_status_json)"
@@ -376,6 +385,7 @@ log "release commit: $full_sha"
 wait_for_ci
 revalidate_dev_head
 validate_railway_target
+validate_railway_config
 validate_railway_colocation
 
 for service in "${RAILWAY_SERVICES[@]}"; do

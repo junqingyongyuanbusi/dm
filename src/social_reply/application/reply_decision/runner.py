@@ -51,7 +51,7 @@ def _get_llm() -> LLMClient:
         settings = get_settings()
         if settings.llm_provider == "openai":
             _llm = OpenAILLMClient(
-                api_key=settings.openai_api_key,
+                api_key=settings.openai_api_key.get_secret_value(),
                 base_url=settings.openai_base_url,
                 model=settings.openai_model,
                 timeout=settings.openai_timeout_seconds,
@@ -87,7 +87,7 @@ def _get_embedder() -> EmbeddingClient:
     if _embedder is None:
         settings = get_settings()
         _embedder = OpenAIEmbeddingClient(
-            api_key=settings.openai_api_key,
+            api_key=settings.openai_api_key.get_secret_value(),
             base_url=settings.openai_base_url,
             model=settings.openai_embedding_model,
             timeout=settings.openai_timeout_seconds,
@@ -290,6 +290,14 @@ async def run_and_persist_decision(
     try:
         killswitch = _make_killswitch()
     except Exception:
+        logger.exception(
+            "kill switch initialization failed; decision downgraded to draft",
+            extra={
+                "tenant_id": snapshot.tenant_id,
+                "brand_id": snapshot.brand_id,
+                "account_id": snapshot.account_id,
+            },
+        )
         # redis_url 配置错误等构造期异常也必须 fail-closed：
         # 不得逃逸为静默决策丢失；与管线内部急停不可用同路，降级为草稿而非放行外发。
         decision = ReplyDecision(

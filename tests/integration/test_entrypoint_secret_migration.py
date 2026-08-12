@@ -7,8 +7,24 @@ import pytest
 
 def test_entrypoint_prepares_api_and_gates_worker_roles():
     script = Path("entrypoint.sh").read_text()
-    assert "python scripts/prepare_database.py" in script
-    assert script.count("python scripts/assert_database_ready.py") == 2
+    assert 'ROLE="${SERVICE_ROLE:-}"' in script
+    assert "SERVICE_ROLE is required" in script
+    assert "python -m scripts.prepare_database" in script
+    assert script.count("python -m scripts.assert_database_ready") == 2
+
+
+def test_entrypoint_rejects_missing_role():
+    env = {**os.environ}
+    env.pop("SERVICE_ROLE", None)
+    result = subprocess.run(
+        ["sh", "entrypoint.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 1
+    assert "SERVICE_ROLE is required" in result.stderr
 
 
 def test_release_requires_app_and_state_service_colocation():
@@ -17,6 +33,8 @@ def test_release_requires_app_and_state_service_colocation():
     assert 'RAILWAY_REGION="us-east4-eqdc4a"' in script
     assert script.count("validate_railway_colocation") == 3
     assert "scripts/railway_active_region.py" in script
+    assert "scripts/validate_railway_config.py" in script
+    assert script.count("validate_railway_config") == 3
 
 
 def _run_worker_entrypoint(

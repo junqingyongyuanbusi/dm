@@ -20,6 +20,7 @@ from social_reply.connectors.email.contracts import (
 from social_reply.domain.automation.state_machine import ensure_state, flip_to_human_active
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
 
@@ -85,10 +86,11 @@ async def test_disabled_chatwoot_outbox_fails_closed(session, monkeypatch):
     _conv_id, ob_id = await _seed(session, state="BOT_ACTIVE", message_type="text")
     fake = get_chatwoot_client()
     before = len(fake.sent)
+    settings = get_settings()
     monkeypatch.setattr(
         outbox_module,
         "get_settings",
-        lambda: type("Settings", (), {"chatwoot_enabled": False})(),
+        lambda: settings.model_copy(update={"chatwoot_enabled": False}),
     )
 
     assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
@@ -108,16 +110,13 @@ async def test_disabled_chatwoot_outbox_fails_closed(session, monkeypatch):
     assert attempt.error_code == "CHATWOOT_DISABLED"
 
     def enabled():
-        return type(
-            "Settings",
-            (),
-            {
+        return settings.model_copy(
+            update={
                 "chatwoot_enabled": True,
                 "x_legacy_dm_enabled": True,
                 "xchat_enabled": True,
-            },
-        )()
-
+            }
+        )
     monkeypatch.setattr(outbox_module, "get_settings", enabled)
     monkeypatch.setattr(sweep_module, "get_settings", enabled)
     assert ob_id in await sweep_outbox()
@@ -1269,16 +1268,18 @@ async def test_x_stack_disabled_outbox_pauses_and_recovers(
         capability=capability,
         target=target,
     )
+    base_settings = get_settings()
 
     def settings(**overrides):
-        values = {
-            "chatwoot_enabled": True,
-            "x_legacy_dm_enabled": True,
-            "xchat_enabled": True,
-            **settings_values,
-            **overrides,
-        }
-        return type("Settings", (), values)()
+        return base_settings.model_copy(
+            update={
+                "chatwoot_enabled": True,
+                "x_legacy_dm_enabled": True,
+                "xchat_enabled": True,
+                **settings_values,
+                **overrides,
+            }
+        )
 
     monkeypatch.setattr(outbox_module, "get_settings", settings)
     assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
@@ -1421,29 +1422,25 @@ async def test_x_paused_outbox_waits_for_capability_reconciliation(session, monk
         session,
         capability={"dm": False, "max_text_length": 280},
     )
+    base_settings = get_settings()
 
     def disabled_settings():
-        return type(
-            "Settings",
-            (),
-            {
+        return base_settings.model_copy(
+            update={
                 "chatwoot_enabled": True,
                 "x_legacy_dm_enabled": False,
                 "xchat_enabled": True,
-            },
-        )()
+            }
+        )
 
     def enabled_settings():
-        return type(
-            "Settings",
-            (),
-            {
+        return base_settings.model_copy(
+            update={
                 "chatwoot_enabled": True,
                 "x_legacy_dm_enabled": True,
                 "xchat_enabled": True,
-            },
-        )()
-
+            }
+        )
     monkeypatch.setattr(outbox_module, "get_settings", disabled_settings)
     assert await deliver_outbox(str(ob_id)) == "NEEDS_REVIEW"
     monkeypatch.setattr(sweep_module, "get_settings", enabled_settings)
