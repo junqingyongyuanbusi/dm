@@ -5,11 +5,13 @@ readonly IMAGE_REPO="zhiyangxiaozi/reply-core"
 readonly RAILWAY_PROJECT_ID="abcf3199-e5ac-415b-a22e-062206390331"
 readonly RAILWAY_PROJECT_NAME="reply-core"
 readonly RAILWAY_ENVIRONMENT="production"
+readonly RAILWAY_REGION="us-east4-eqdc4a"
 readonly PUBLIC_BASE_URL="https://relay.nexory.top"
 readonly SOURCE_URL="https://github.com/junqingyongyuanbusi/dm"
 readonly DEPLOY_TIMEOUT_SECONDS="${DEPLOY_TIMEOUT_SECONDS:-900}"
 readonly CI_TIMEOUT_SECONDS="${CI_TIMEOUT_SECONDS:-1200}"
 readonly RAILWAY_SERVICES=(api worker scheduler)
+readonly RAILWAY_COLOCATED_SERVICES=(api worker scheduler Postgres Redis)
 
 usage() {
   cat <<'EOF'
@@ -236,6 +238,21 @@ railway_source_image() {
   railway_service_node "$1" | jq -r '.source.image // ""'
 }
 
+active_region() {
+  railway_status_json | python3 scripts/railway_active_region.py "$RAILWAY_ENVIRONMENT" "$1"
+}
+
+validate_railway_colocation() {
+  local service service_region
+  for service in "${RAILWAY_COLOCATED_SERVICES[@]}"; do
+    service_region="$(active_region "$service")" \
+      || fail "could not determine the sole active Railway region for $service"
+    [[ "$service_region" == "$RAILWAY_REGION" ]] \
+      || fail "Railway $service region $service_region does not match $RAILWAY_REGION"
+  done
+  log "verified Railway colocation: ${RAILWAY_COLOCATED_SERVICES[*]} -> $RAILWAY_REGION"
+}
+
 active_deployment_json() {
   railway_service_node "$1" | jq '
     .activeDeployments
@@ -359,6 +376,7 @@ log "release commit: $full_sha"
 wait_for_ci
 revalidate_dev_head
 validate_railway_target
+validate_railway_colocation
 
 for service in "${RAILWAY_SERVICES[@]}"; do
   source_image="$(railway_source_image "$service")"
@@ -535,6 +553,7 @@ for service in "${RAILWAY_SERVICES[@]}"; do
   [[ -n "$final_id" && "$final_digest" == "$expected_digest" ]] \
     || fail "$service active deployment does not match $expected_digest"
 done
+validate_railway_colocation
 revalidate_dev_head
 write_manifest "completed"
 

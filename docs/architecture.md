@@ -29,7 +29,10 @@ same PostgreSQL schema, encryption keys, feature flags, and connector code.
 
 The image entrypoint uses `SERVICE_ROLE=api|worker|scheduler`. API runs database preparation and
 migrations. Worker and Scheduler refuse to start until the database is at Alembic head and encrypted
-credential envelopes can be read.
+credential envelopes can be read. Worker process and thread counts are explicitly bounded by
+`DRAMATIQ_PROCESSES` and `DRAMATIQ_THREADS`; they must not inherit a managed host's visible CPU count.
+All three roles, PostgreSQL, and Redis must run in one infrastructure region because every durable
+reply crosses multiple broker, transaction, and advisory-lock boundaries.
 
 ## State ownership
 

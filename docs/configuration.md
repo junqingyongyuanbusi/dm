@@ -235,12 +235,17 @@ These are consumed by container orchestration or `entrypoint.sh`, not by `Settin
 | --- | --- | --- |
 | `SERVICE_ROLE` | entrypoint | `api`, `worker`, or `scheduler` |
 | `PORT` | entrypoint/API | API listen port, default 8000 |
+| `DRAMATIQ_PROCESSES` | entrypoint/Worker | Worker process count, default 4, range 1-32; never inferred from host CPU count |
+| `DRAMATIQ_THREADS` | entrypoint/Worker | Threads per process, default 8, range 1-32; processes × threads must not exceed 128 |
+| `DRAMATIQ_WORKER_TIMEOUT_MS` | entrypoint/Worker | Redis empty-queue polling backoff cap, default 250ms, range 50-5000ms; lower values reduce low-volume pickup latency but increase idle Redis fetches |
 | `PG_PASSWORD` | VPS compose | PostgreSQL application password |
 | `CLOUDFLARE_TUNNEL_TOKEN` | VPS compose | Cloudflare Tunnel authentication |
 
 VPS compose injects `DATABASE_URL`, `REDIS_URL`, `SERVICE_ROLE`, and `PORT` into containers. Do not
 add role-specific copies of feature flags; divergent values can accept work that another role will
-not process or recover.
+not process or recover. Deploy API, Worker, Scheduler, PostgreSQL, and Redis in one infrastructure
+region. Cross-region Worker database and broker round trips multiply across each durable reply stage
+and can turn a two-second direct reply into tens of seconds without producing retries or errors.
 
 ## Template policy
 
