@@ -86,6 +86,7 @@ def _callback_url(account: models.PlatformAccount | None) -> str:
     )
 
 
+@router.get("/integrations/feishu/handoff", response_class=HTMLResponse)
 @router.get("/feishu-handoff", response_class=HTMLResponse)
 async def feishu_handoff_page(request: Request) -> Response:
     principal = await _web_principal(request)

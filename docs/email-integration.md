@@ -157,7 +157,7 @@ Railway 必须保持 API、Worker、Scheduler 使用同一个不可变提交构�
 3. 再启动或替换 Worker、Scheduler，确认三角色均为 `SUCCESS`、同一 digest、相同 Email flags
    和 allowlist；
 4. 管理员完成 Phase 0 后，在三个角色同时设置 `EMAIL_ENABLED=true` 并协调重启，再通过
-   `/admin/accounts` 或 `POST /api/v1/platform-accounts/email` 接入账号；
+   `/admin/integrations/accounts` 或 `POST /api/v1/platform-accounts/email` 接入账号；
 5. 保持新账号 `BOT_DRAFT_ONLY` 完成 real smoke。当前 Railway rollout 的目标配置固定为
    `EMAIL_AUTO_REPLY_ENABLED=false`，不得逐账号提升到 `BOT_ACTIVE`。只有后续实现并用真实邮件
    验证可信 envelope sender 和 SPF/DKIM/DMARC 证据，且完成独立安全评审与单独发布批准后，
@@ -181,7 +181,7 @@ Railway 必须保持 API、Worker、Scheduler 使用同一个不可变提交构�
 | 专用密码轮换 | 在 provider 侧吊销旧密码并生成新密码，再通过账号接入流程更新凭证并重新执行 IMAP/SMTP probe |
 | 暂停渠道 | 三角色同时设 `EMAIL_ENABLED=false` 并重启；Outbox、账号、checkpoint 和 gap 保留 |
 | 暂停自动外发 | 三角色同时设 `EMAIL_AUTO_REPLY_ENABLED=false`；新 Bot 决策保持草稿/发送前 fail closed，人工发送仍按现有权限链路处理 |
-| 单账号停用 | 在 `/admin/accounts` 停用账号 |
+| 单账号停用 | 在 `/admin/integrations/accounts` 停用账号 |
 | 观察轮询 | Scheduler 日志中的 `sweep_name=poll_email_messages` 及账号级稳定错误码 |
 | 收信断流 | 检查总 gate、账号 active/READY、凭证是否吊销、allowlist、DNS 公共目标、IMAP 登录/SELECT，以及 UIDVALIDITY gap |
 | 发送失败 | 检查 Outbox `last_error_code`；SMTP 5xx 通常为永久失败，4xx/连接前网络错误按现有重试语义处理，发送后结果不明确时不盲目重试 |

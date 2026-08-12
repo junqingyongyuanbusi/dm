@@ -314,7 +314,7 @@ async def _picker(request: Request, candidates: list[dict], context: dict) -> Re
         for index, candidate in enumerate(candidates)
     )
     label = "Instagram 账号" if context["platform"] == "instagram" else "Facebook Page"
-    body = f"""<a class="back" href="/admin/accounts">← 返回账号页</a>
+    body = f"""<a class="back" href="/admin/integrations/accounts">← 返回平台账号</a>
 <section class="card"><h1 style="font-size:24px">选择要接入的 {label}</h1>
 <form method="post" action="/admin/oauth/meta/select">
 <input type="hidden" name="csrf_token" value="{csrf}">

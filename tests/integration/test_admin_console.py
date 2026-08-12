@@ -159,6 +159,62 @@ async def test_console_pages_render_after_login(migrated_db):
                 assert "新会话默认" not in resp.text
 
 
+async def test_grouped_navigation_uses_new_information_architecture(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        page = await client.get("/admin/inbox")
+
+    assert page.status_code == 200
+    for group in ("运营", "内容与策略", "集成", "系统"):
+        assert group in page.text
+    for path, label in (
+        ("/admin/content/knowledge", "知识库"),
+        ("/admin/content/brand-voice", "品牌语气"),
+        ("/admin/integrations/accounts", "平台账号"),
+        ("/admin/integrations/feishu/handoff", "Feishu 人工通知"),
+        ("/admin/system/health", "系统健康"),
+        ("/admin/system/safety", "安全控制"),
+        ("/admin/system/users", "用户管理"),
+    ):
+        assert f'href="{path}"' in page.text
+        assert label in page.text
+    assert "aria-current='page'" in page.text
+    assert 'href="#main-content">跳到主内容</a>' in page.text
+    assert '<span class="nav-heading">运营</span>' in page.text
+
+
+async def test_new_page_routes_render_and_legacy_routes_remain_available(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        pairs = (
+            ("/admin/content/knowledge", "/admin/knowledge", "知识库"),
+            ("/admin/content/brand-voice", "/admin/prompt", "品牌语气"),
+            ("/admin/integrations/accounts", "/admin/accounts", "平台账号"),
+            ("/admin/system/health", "/admin/health", "系统健康"),
+        )
+        for current, legacy, marker in pairs:
+            current_response = await client.get(current)
+            legacy_response = await client.get(legacy)
+            assert current_response.status_code == 200
+            assert legacy_response.status_code == 200
+            assert marker in current_response.text
+            assert marker in legacy_response.text
+
+
+async def test_account_connection_routes_are_deep_linkable(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        index = await client.get("/admin/integrations/accounts")
+        telegram = await client.get("/admin/integrations/accounts/new/telegram")
+        missing = await client.get("/admin/integrations/accounts/new/not-a-provider")
+
+    assert index.status_code == 200
+    assert 'href="/admin/integrations/accounts/new/telegram"' in index.text
+    assert telegram.status_code == 200
+    assert 'action="/admin/connect/telegram"' in telegram.text
+    assert "aria-current='page'" in telegram.text
+    assert missing.status_code == 404
+
 async def test_navigation_does_not_poll_inbox_counts(migrated_db):
     async with _app_client() as client:
         await _login(client)
@@ -184,7 +240,7 @@ async def test_legacy_decisions_and_delivery_pages_redirect_after_login(migrated
     assert decisions.status_code == 303
     assert decisions.headers["location"] == "/admin/inbox?queue=drafts"
     assert delivery.status_code == 303
-    assert delivery.headers["location"] == "/admin/health"
+    assert delivery.headers["location"] == "/admin/inbox?queue=delivery"
 
 
 async def test_health_page_is_read_only(migrated_db):
@@ -193,7 +249,7 @@ async def test_health_page_is_read_only(migrated_db):
         response = await client.get("/admin/health")
 
     assert response.status_code == 200
-    main = re.search(r"<main>(.*)</main>", response.text, re.DOTALL)
+    main = re.search(r"<main[^>]*>(.*)</main>", response.text, re.DOTALL)
     assert main is not None
     assert "系统健康" in main.group(1)
     assert "<form" not in main.group(1)
@@ -1443,7 +1499,9 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
         assert "mail-user" not in rejected.text
         assert "mail-password-must-not-leak" not in rejected.text
     assert submitted.status_code == 303
-    assert submitted.headers["location"] == "/admin/jobs/dddddddd-dddd-dddd-dddd-dddddddddddd"
+    assert submitted.headers["location"] == (
+        "/admin/integrations/provisioning-jobs/dddddddd-dddd-dddd-dddd-dddddddddddd"
+    )
     assert starttls_submitted.status_code == 303
     assert "mail-password-must-not-leak" not in submitted.text
     assert len(submissions) == 2
@@ -2563,6 +2621,19 @@ async def test_knowledge_csv_import_rejects_bad_tenant_and_csrf(migrated_db, mon
         assert no_csrf.status_code == 403
 
 
+async def test_global_killswitch_has_separate_safety_page(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        accounts = await client.get("/admin/integrations/accounts")
+        safety = await client.get("/admin/system/safety")
+
+    assert accounts.status_code == 200
+    assert "自动回复总开关" not in accounts.text
+    assert safety.status_code == 200
+    assert "安全控制" in safety.text
+    assert 'name="scope" value="global"' in safety.text
+
+
 async def test_killswitch_toggle_sets_flag(migrated_db):
     import redis.asyncio as aioredis
 
@@ -2580,6 +2651,7 @@ async def test_killswitch_toggle_sets_flag(migrated_db):
                 data={"csrf_token": csrf, "scope": "global", "tenant_id": settings.tenant_id},
             )
             assert resp.status_code == 303
+            assert resp.headers["location"] == "/admin/system/safety"
         assert await redis.get(key) is not None  # 已置急停
         # 再次切换应解除
         async with _app_client() as client:

@@ -45,7 +45,9 @@ ${PUBLIC_BASE_URL}/admin
 
 控制面与 webhook 数据面分离：
 
-- Web 控制面：`/admin`，PostgreSQL 服务端会话（浏览器仅持有 opaque HTTP-only Cookie）、CSRF 防护；
+- Web 控制面：`/admin`，使用分组导航：运营（工作队列、对话）、内容与策略（知识库、品牌语气）、集成（平台账号、Feishu 人工通知）和系统（健康、安全控制、用户）；PostgreSQL 服务端会话，浏览器仅持有 opaque HTTP-only Cookie，并使用 CSRF 防护；
+- 当前页面路径以 `/admin/content/*`、`/admin/integrations/*`、`/admin/system/*` 为主，原 `/admin/accounts`、`/admin/knowledge`、`/admin/prompt`、`/admin/health`、`/admin/users` 和 `/admin/feishu-handoff` 继续作为兼容路由；
+- OAuth callback 路径保持 `/admin/oauth/*/callback`，不会随浏览器信息架构移动；
 - Provisioning API：`/api/v1/platform-accounts/*`，使用独立 `CONTROL_API_KEY`，只供服务间调用；
 - 数据面：`/webhooks/telegram/*`、`/webhooks/meta/*`、`/webhooks/x/*`、`/webhooks/feishu/*`；
 - Durable provisioning：提交后返回 `202 + job_id`，Worker 执行平台验证/落库/Webhook 配置，Scheduler 恢复失败或中断任务；
@@ -64,7 +66,7 @@ PUBLIC_BASE_URL=https://reply.example.com
 PLATFORM_SECRET_KEYS=<Fernet key；轮换时逗号分隔>
 ```
 
-`ADMIN_USERNAME` / `ADMIN_PASSWORD` 是 bootstrap 超级管理员：可查看 `ADMIN_ALLOWED_TENANTS` 中全部数据，并在 `/admin/users` 直接创建绑定到单一 Tenant 的普通用户。普通用户首次登录必须修改初始密码，之后可在“账号”页自行授权和管理本 Tenant 的平台账号，但无权操作租户总开关；系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` 是 bootstrap 超级管理员：可查看 `ADMIN_ALLOWED_TENANTS` 中全部数据，并在 `/admin/system/users`（兼容 `/admin/users`）直接创建绑定到单一 Tenant 的普通用户。普通用户首次登录必须修改初始密码，之后可在“平台账号”页自行授权和管理本 Tenant 的平台账号，但无权操作 `/admin/system/safety` 的租户总开关；系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
 
 Provisioning API 请求使用：
 
@@ -103,7 +105,7 @@ Scheduler 必须同时设置 `META_AUTO_REPLY_ENABLED=true`。默认 `false`：
   `BOT_DRAFT_ONLY` 完成接入。
 - 关闭时：后台「切为自动」按钮不渲染，直接 POST 也返回 422
   `meta_requires_bot_draft_only`。已是 `BOT_ACTIVE` 的历史账号仍可改回草稿。
-- 开启时：管理员可在接入完成后到 `/admin/accounts` 逐个账号点「切为自动」。每次变更写入
+- 开启时：管理员可在接入完成后到 `/admin/integrations/accounts` 逐个账号点「切为自动」。每次变更写入
   `audit_logs`（`action=SET_AUTOMATION_DEFAULT`）。
 
 Facebook 与 Instagram 评论自动回复还要求三个角色同时设置
@@ -114,7 +116,7 @@ Messenger/Instagram 私信也会开始自动回复。
 
 这个开关不改变单会话控制：`/admin/conversations/{id}` 的状态翻转任何时候都可用。
 
-Messenger 推荐从 `/admin/accounts` 使用 Facebook Login OAuth。Control API 等价请求：
+Messenger 推荐从 `/admin/integrations/accounts` 使用 Facebook Login OAuth。Control API 等价请求：
 
 ```http
 POST /api/v1/platform-accounts/meta
@@ -135,12 +137,12 @@ POST /api/v1/platform-accounts/meta
 
 Facebook 评论授权需要 `pages_read_engagement`、`pages_read_user_content` 和
 `pages_manage_engagement`，且权限必须覆盖所选 Page。部署开关后，已有 Page 必须从
-`/admin/accounts` 重新执行 Facebook Login 授权；系统使用 `auth_type=rerequest` 请求新增权限。
+`/admin/integrations/accounts` 重新执行 Facebook Login 授权；系统使用 `auth_type=rerequest` 请求新增权限。
 缺少权限时接入任务返回 `META_COMMENT_PERMISSION_REQUIRED`，健康状态显示 `REAUTH_REQUIRED`。
 
 Instagram 提供两条不可混用的接入路径：
 
-- **Facebook Login**：从 `/admin/accounts` 的 Facebook Login 卡片选择关联 Page 的 Instagram
+- **Facebook Login**：从 `/admin/integrations/accounts` 的 Facebook Login 卡片选择关联 Page 的 Instagram
   专业账号；保存 Page access token、IG professional account ID 和必填 `page_id`，订阅与发送使用
   Facebook Graph 路径。评论需要 `pages_read_engagement`、`instagram_manage_comments`；Page
   账号级只订阅 `messages`，评论通过 App 级 `instagram/comments` webhook 投递。Control API 传
@@ -153,7 +155,7 @@ Instagram 提供两条不可混用的接入路径：
 评论开关关闭时，两条路径仍默认 `enable_comments=false`、`BOT_DRAFT_ONLY`；两个 Meta 开关都
 开启时，评论 capability 可默认启用，但新账号仍是 `BOT_DRAFT_ONLY`。管理员必须在接入完成后逐个
 账号显式切到 `BOT_ACTIVE`，才会自动外发评论或私信。已有 Instagram token 必须从
-`/admin/accounts` 按原登录路径重新授权。`meta` 与 `instagram` App family 共用
+`/admin/integrations/accounts` 按原登录路径重新授权。`meta` 与 `instagram` App family 共用
 `/webhooks/meta/{app_public_id}` 路由，因此数据库会拒绝跨 family 重复的 `app_public_id`。
 
 Meta 只在「App 级 Webhooks 产品」与「账号级订阅」都列出某个字段时才投递事件。接入与健康巡检
@@ -172,7 +174,7 @@ Meta 只在「App 级 Webhooks 产品」与「账号级订阅」都列出某个�
 
 Feishu 使用企业自建应用 Bot，不使用自定义群机器人 webhook。新部署先用
 `FEISHU_ENABLED=false` 将同一镜像部署到 API、Worker、Scheduler，确认数据库与三个角色就绪后，
-再协调重启并同时设为 `true`。然后在 `/admin/accounts` 提交 App ID、App Secret、Verification
+再协调重启并同时设为 `true`。然后在 `/admin/integrations/accounts` 提交 App ID、App Secret、Verification
 Token 和 Encrypt Key；Control API 等价入口为
 `POST /api/v1/platform-accounts/feishu`。凭证按 Tenant 暂存和落库时均由
 `PLATFORM_SECRET_KEYS` 加密。
@@ -180,11 +182,11 @@ Token 和 Encrypt Key；Control API 等价入口为
 接入任务验证应用与 Bot，但不会通过 API 修改飞书开放平台的事件回调。管理员必须复制任务返回的
 `${PUBLIC_BASE_URL}/webhooks/feishu/{public_id}`，在飞书开放平台手工订阅
 `im.message.receive_v1`，完成 URL verification，并发布应用。账号固定从 `BOT_DRAFT_ONLY`
-开始；草稿 smoke 通过后，再在 `/admin/accounts` 明确点击「切为自动」进入 `BOT_ACTIVE`。
+开始；草稿 smoke 通过后，再在 `/admin/integrations/accounts` 明确点击「切为自动」进入 `BOT_ACTIVE`。
 私信和群内明确 `@Bot` 的文本消息受支持；普通群消息与 `@所有人` 不在范围内。
 
 人工接管卡片使用独立的 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` 暗发布开关。在
-`/admin/feishu-handoff` 选择客服群、维护 app-scoped operator `open_id` allowlist，并把页面显示的
+`/admin/integrations/feishu/handoff` 选择客服群、维护 app-scoped operator `open_id` allowlist，并把页面显示的
 Card Action Callback 配置为 `card.action.trigger` 回调；测试卡片到达后，API、Worker、Scheduler
 必须同时启用该开关。新的 HANDOFF 会在同一事务中留下持久化通知意图，客服可在飞书卡片认领，
 并用“已回复，恢复 Bot”解决工单。该动作是客服声明；需要可验证发送证据时，应通过本地 Inbox
@@ -332,7 +334,7 @@ XAA 的完整事件枚举里没有任何回复/评论专用事件（只有 `post
 
 ## 提示词品牌表达偏好（后台可配）
 
-`/admin/prompt` 不再接受自由文本系统指令，只允许选择 `tone`、`length`、`empathy`、`emoji` 四个有限枚举。保存后 API 同时写入规范 JSON `voice_preferences` 和代码编译的兼容 `persona` 文本；新 Worker 只读取 JSON 并编译固定英文条款，旧 Worker 在混合版本窗口也只能看到代码生成文本。
+`/admin/content/brand-voice` 不再接受自由文本系统指令，只允许选择 `tone`、`length`、`empathy`、`emoji` 四个有限枚举。保存后 API 同时写入规范 JSON `voice_preferences` 和代码编译的兼容 `persona` 文本；新 Worker 只读取 JSON 并编译固定英文条款，旧 Worker 在混合版本窗口也只能看到代码生成文本。
 
 **WikiFX 身份、同语言回复策略、领域事实边界、动作含义、风险/可见性规则和安全策略不可编辑。** 这些规则与严格六字段输出 schema 由代码固定追加。数据库中的旧 `persona` 任意文本永远不会被新代码执行；缺失或畸形 JSON 会安全回落到代码编译的默认偏好。
 

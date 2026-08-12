@@ -89,7 +89,23 @@ async def test_admin_login_accepts_only_whitelisted_next(monkeypatch):
             },
         )
         assert safe.headers["location"] == "/admin/accounts?provider=x&status=connected"
-
+        new_page = await client.get(
+            "/admin/login?next=%2Fadmin%2Fintegrations%2Faccounts%3Fprovider%3Dx%26status%3Dconnected"
+        )
+        new_csrf = client.cookies["reply_admin_csrf"]
+        assert new_page.status_code == 200
+        new_safe = await client.post(
+            "/admin/login",
+            data={
+                "csrf_token": new_csrf,
+                "username": "admin",
+                "password": "password",
+                "next": "/admin/integrations/accounts?provider=x&status=connected",
+            },
+        )
+        assert new_safe.headers["location"] == (
+            "/admin/integrations/accounts?provider=x&status=connected"
+        )
     async with await _client() as client:
         await client.get("/admin/login")
         csrf = client.cookies["reply_admin_csrf"]

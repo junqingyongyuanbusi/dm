@@ -42,7 +42,7 @@ router = APIRouter(prefix="/admin", tags=["admin-web"])
 _SESSION_COOKIE = "reply_admin_session"
 _CSRF_COOKIE = "reply_admin_csrf"
 _SESSION_TTL_SECONDS = 8 * 60 * 60
-_SAFE_NEXT_PATHS = {"/admin/accounts"}
+_SAFE_NEXT_PATHS = {"/admin/accounts", "/admin/integrations/accounts"}
 _SAFE_NEXT_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -127,15 +127,35 @@ def tenant_id_or_default(principal: Principal, requested: str) -> str:
     return tenant
 
 
-_NAV_ITEMS = (
-    ("overview", "/admin", "总览"),
-    ("inbox", "/admin/inbox", "收件箱"),
-    ("conversations", "/admin/conversations", "对话"),
-    ("knowledge", "/admin/knowledge", "知识库"),
-    ("prompt", "/admin/prompt", "提示词"),
-    ("accounts", "/admin/accounts", "账号"),
-    ("handoff", "/admin/feishu-handoff", "人工通知"),
-    ("health", "/admin/health", "系统健康"),
+_NAV_GROUPS = (
+    (
+        "运营",
+        (
+            ("overview", "/admin", "总览"),
+            ("inbox", "/admin/inbox", "工作队列"),
+            ("conversations", "/admin/conversations", "对话"),
+        ),
+    ),
+    (
+        "内容与策略",
+        (
+            ("knowledge", "/admin/content/knowledge", "知识库"),
+            ("brand-voice", "/admin/content/brand-voice", "品牌语气"),
+        ),
+    ),
+    (
+        "集成",
+        (
+            ("accounts", "/admin/integrations/accounts", "平台账号"),
+            ("handoff", "/admin/integrations/feishu/handoff", "Feishu 人工通知"),
+        ),
+    ),
+    (
+        "系统",
+        (
+            ("health", "/admin/system/health", "系统健康"),
+        ),
+    ),
 )
 
 
@@ -151,16 +171,43 @@ def _page(
     """Claude 风格页面外壳：暖米白底、衬线标题、赤陶橙点缀、大留白、零 JS。"""
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     logout = '<a class="nav-link" href="/admin/logout">退出</a>' if show_logout else ""
-    nav_items = _NAV_ITEMS + (("users", "/admin/users", "用户"),) if show_users else _NAV_ITEMS
-    tabs = (
+    nav_groups = _NAV_GROUPS
+    if show_users:
+        nav_groups = tuple(
+            (
+                label,
+                items
+                + (
+                    ("safety", "/admin/system/safety", "安全控制"),
+                    ("users", "/admin/system/users", "用户管理"),
+                )
+                if label == "系统"
+                else items,
+            )
+            for label, items in nav_groups
+        )
+    groups = (
         "".join(
-            f'<a class="tab{" active" if key == active else ""}" href="{href}">{label}</a>'
-            for key, href, label in nav_items
+            '<section class="nav-group">'
+            f'<span class="nav-heading">{html.escape(label)}</span>'
+            + "".join(
+                f'<a class="nav-item{" active" if key == active else ""}" '
+                f'href="{href}"{" aria-current=\'page\'" if key == active else ""}>'
+                f"{html.escape(item_label)}</a>"
+                for key, href, item_label in items
+            )
+            + "</section>"
+            for label, items in nav_groups
         )
         if show_logout
         else ""
     )
-    nav_bar = f'<nav class="tabs" aria-label="主导航">{tabs}</nav>' if tabs else ""
+    sidebar = (
+        f'<aside class="sidebar"><nav aria-label="主导航">{groups}</nav></aside>'
+        if groups
+        else ""
+    )
+    skip_link = '<a class="skip-link" href="#main-content">跳到主内容</a>' if groups else ""
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">{refresh}
@@ -181,16 +228,21 @@ def _page(
 }}
 *{{box-sizing:border-box}}
 body{{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}}
-header{{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--border);padding:12px 32px;display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap}}
+header{{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;gap:18px}}
 .brand{{font-family:var(--serif);font-size:19px;letter-spacing:-0.01em;white-space:nowrap}}
 .brand small{{font-family:var(--sans);font-size:12px;color:var(--muted);margin-left:10px;letter-spacing:.02em}}
-.tabs{{display:flex;gap:4px;flex-wrap:wrap}}
-.tab{{color:var(--muted);text-decoration:none;font-size:14px;padding:8px 14px;border-radius:8px;transition:color .18s,background .18s}}
-.tab:hover{{color:var(--text);background:var(--surface-2)}}
-.tab.active{{color:var(--accent);background:var(--accent-tint);font-weight:500}}
+.skip-link{{position:fixed;top:8px;left:8px;z-index:20;padding:8px 12px;border-radius:8px;background:var(--text);color:var(--surface);transform:translateY(-150%)}}
+.skip-link:focus{{transform:translateY(0)}}
+.app-shell{{display:grid;grid-template-columns:220px minmax(0,1fr);max-width:1380px;margin:0 auto}}
+.sidebar{{min-width:0;padding:28px 16px 72px 24px;border-right:1px solid var(--border)}}
+.nav-group{{margin-bottom:22px}}
+.nav-heading{{margin:0 10px 7px;font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}}
+.nav-item{{display:block;padding:8px 10px;border-radius:8px;color:var(--muted);font-size:14px;text-decoration:none;transition:color .18s,background .18s}}
+.nav-item:hover{{color:var(--text);background:var(--surface-2)}}
+.nav-item.active{{color:var(--accent);background:var(--accent-tint);font-weight:600}}
 .nav-link{{color:var(--muted);text-decoration:none;font-size:14px;padding:8px 12px;border-radius:8px;transition:color .18s,background .18s}}
 .nav-link:hover{{color:var(--text);background:var(--surface-2)}}
-main{{max-width:1100px;margin:0 auto;padding:36px 24px 72px}}
+main{{min-width:0;max-width:1160px;width:100%;padding:36px 32px 72px}}
 h1{{font-family:var(--serif);font-weight:600;font-size:30px;letter-spacing:-0.015em;margin:0 0 6px}}
 h2{{font-family:var(--serif);font-weight:600;font-size:21px;letter-spacing:-0.01em;margin:0 0 4px}}
 h3{{font-family:var(--serif);font-weight:600;font-size:17px;margin:0 0 2px}}
@@ -320,13 +372,13 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 .login-wrap{{min-height:calc(100vh - 120px);display:flex;align-items:center;justify-content:center}}
 .login-card{{width:100%;max-width:400px}}
 @media (prefers-reduced-motion:reduce){{*{{transition:none!important}}}}
-@media (max-width:900px){{.filters{{grid-template-columns:repeat(2,minmax(0,1fr))}} .detail-grid{{grid-template-columns:1fr}}}}
+@media (max-width:900px){{.app-shell{{grid-template-columns:1fr}} .sidebar{{padding:16px 14px 4px;border-right:0;border-bottom:1px solid var(--border)}} .sidebar nav{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}} .nav-group{{margin-bottom:10px}} .filters{{grid-template-columns:repeat(2,minmax(0,1fr))}} .detail-grid{{grid-template-columns:1fr}}}}
 @media (max-width:820px){{.channel-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
-@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-form-grid{{grid-template-columns:1fr}} .channel-form-grid .span-2{{grid-column:auto}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}} .queue-tabs{{grid-template-columns:1fr}}}}
+@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .sidebar nav{{grid-template-columns:1fr}} .nav-group{{border-bottom:1px solid var(--border);padding-bottom:8px}} .nav-group:last-child{{border-bottom:0}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-form-grid{{grid-template-columns:1fr}} .channel-form-grid .span-2{{grid-column:auto}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}} .queue-tabs{{grid-template-columns:1fr}}}}
 @media (max-width:520px){{.channel-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}} .channel-tile{{min-height:104px}} .channel-heading{{align-items:flex-start;flex-direction:column;gap:2px}} .channel-meta{{grid-template-columns:1fr;gap:1px}} .channel-meta dd{{margin-bottom:7px}}}}
 </style></head><body>
-<header><span class="brand">Reply Core<small>Control Plane</small></span>{nav_bar}<nav>{logout}</nav></header>
-<main>{body}</main></body></html>"""
+{skip_link}<header><span class="brand">Reply Core<small>Control Plane</small></span><nav>{logout}</nav></header>
+<div class="app-shell">{sidebar}<main id="main-content">{body}</main></div></body></html>"""
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -742,7 +794,10 @@ async def _submit_form(
         str(job_id),
         inline=lambda: process_provisioning_job(str(job_id)),
     )
-    return RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        f"/admin/integrations/provisioning-jobs/{job_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @router.post("/connect/telegram")
@@ -779,6 +834,7 @@ async def admin_connect_email(request: Request) -> Response:
     return await _submit_form(request, "email")
 
 
+@router.get("/integrations/provisioning-jobs/{job_id}", response_class=HTMLResponse)
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
 async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
     principal = await _web_principal(request)
@@ -799,12 +855,14 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
         if job.platform == "email":
             retry = (
                 '<p class="muted">该 Email 任务的暂存密码已清除。'
-                '<a href="/admin/accounts">返回账号页重新提交 Email 账号和密码</a>。</p>'
+                '<a href="/admin/integrations/accounts/new/email">'
+                "返回账号页重新提交 Email 账号和密码</a>。</p>"
             )
         else:
             retry = (
                 '<p class="muted">该任务的一次性凭证已清除。'
-                '<a href="/admin/accounts">返回账号页重新提交 PIN 或凭证</a>。</p>'
+                '<a href="/admin/integrations/accounts">'
+                "返回账号页重新提交 PIN 或凭证</a>。</p>"
             )
     elif job.status in {"FAILED", "NEEDS_ACTION"} and not auto_retry:
         retry = f"""<form method="post" action="/admin/jobs/{job.id}/retry" style="max-width:200px"><input type="hidden" name="csrf_token" value="{csrf}"><button>重试任务</button></form>"""
@@ -822,7 +880,7 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
     return HTMLResponse(
         _page(
             "Provisioning Job",
-            f"""<a class="back" href="/admin/accounts">← 返回账号页</a>
+            f"""<a class="back" href="/admin/integrations/accounts">← 返回平台账号</a>
 <section class="card"><h1 style="font-size:24px">Provisioning Job</h1>{refresh_note}
 <div class="tablewrap"><table class="kv">{rows}</table></div>{retry}</section>""",
             refresh_seconds=4 if in_flight else 0,
@@ -859,4 +917,7 @@ async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
         str(job_id),
         inline=lambda: process_provisioning_job(str(job_id)),
     )
-    return RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        f"/admin/integrations/provisioning-jobs/{job_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )

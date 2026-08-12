@@ -2200,6 +2200,7 @@ def _knowledge_actions(doc: models.KnowledgeDocument, csrf: str) -> str:
 <form class="inline" method="post" action="/admin/knowledge/{doc.id}/delete"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-danger" onclick="return confirm('确认删除该知识条目？此操作不可恢复。')">删除</button></form>"""
 
 
+@router.get("/content/knowledge", response_class=HTMLResponse)
 @router.get("/knowledge", response_class=HTMLResponse)
 async def knowledge_page(request: Request, notice: str = "") -> Response:
     principal = await _web_principal(request)
@@ -2574,6 +2575,7 @@ def _prompt_tenant(principal: Principal, requested: str) -> str:
     return tenant_id_or_default(principal, requested)
 
 
+@router.get("/content/brand-voice", response_class=HTMLResponse)
 @router.get("/prompt", response_class=HTMLResponse)
 async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -> Response:
     principal = await _web_principal(request)
@@ -2600,7 +2602,7 @@ async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -
     voice_fields = "".join(
         _voice_select(name, getattr(preferences, name).value) for name in _VOICE_UI
     )
-    body = f"""<h1>提示词</h1><p class="lede">只选择有限的品牌语气偏好；后台不接受任意系统指令。WikiFX 身份、领域事实边界、动作含义和安全规则由系统固定，不可修改。</p>{banner}
+    body = f"""<h1>品牌语气</h1><p class="lede">设置有限、可审计的品牌表达偏好；后台不接受任意系统指令，系统身份、事实边界、动作含义和安全规则固定且不可覆盖。</p>{banner}
 <section class="card"><h2>结构化品牌语气偏好 {origin}</h2>
 <p class="hint">这些选项只影响需要 LLM 生成回复时的代码内置表达条款。知识库原文直答不经过它；无法添加自由文本或覆盖安全契约。</p>
 <form method="post" action="/admin/prompt/save"><input type="hidden" name="csrf_token" value="{csrf}">
@@ -2622,7 +2624,7 @@ async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -
 {_input("text", "测试消息（模拟客户发来的内容）")}
 <button class="btn-block">试运行</button></form>{trial}</section>"""
     response = HTMLResponse(
-        _page("提示词", body, active="prompt", show_users=principal.is_superadmin)
+        _page("品牌语气", body, active="brand-voice", show_users=principal.is_superadmin)
     )
     return _ensure_csrf(response, request, csrf)
 
@@ -2763,6 +2765,7 @@ async def prompt_trial(request: Request) -> Response:
 # ---------- System health ----------
 
 
+@router.get("/system/health", response_class=HTMLResponse)
 @router.get("/health", response_class=HTMLResponse)
 async def health_page(request: Request) -> Response:
     principal = await _web_principal(request)
@@ -2857,7 +2860,7 @@ async def delivery_page(request: Request) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
-    return RedirectResponse("/admin/health", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/inbox?queue=delivery", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/delivery/{outbox_id}/retry")
@@ -2895,11 +2898,6 @@ async def delivery_retry(request: Request, outbox_id: uuid.UUID) -> Response:
 
 # ---------- 账号 / 急停 / 接入 ----------
 
-
-def _kill_keys(tenant: str, account_ids: list[str]) -> list[str]:
-    return [f"killswitch:global:{tenant}"] + [
-        f"killswitch:account:{tenant}:{aid}" for aid in account_ids
-    ]
 
 
 _CHANNEL_LABELS = {
@@ -2947,7 +2945,7 @@ def _channel_tile(channel: str, *, enabled: bool, selected: bool) -> str:
     current = ' aria-current="true"' if selected else ""
     return (
         f'<a class="channel-tile" data-channel="{channel}"{current} '
-        f'href="/admin/accounts?connect={channel}#channel-setup" '
+        f'href="/admin/integrations/accounts/new/{channel}" '
         f'aria-label="连接 {html.escape(label)}">{inner}</a>'
     )
 
@@ -2960,6 +2958,8 @@ def _channel_setup_head(channel: str, subtitle: str) -> str:
     )
 
 
+@router.get("/integrations/accounts/new/{provider}", response_class=HTMLResponse)
+@router.get("/integrations/accounts", response_class=HTMLResponse)
 @router.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request) -> Response:
     principal = await _web_principal(request)
@@ -3017,31 +3017,11 @@ async def accounts_page(request: Request) -> Response:
     try:
         account_keys = [f"killswitch:account:{a.tenant_id}:{a.id}" for a in accounts]
         account_flags = await redis.mget(account_keys) if account_keys else []
-        global_flags = (
-            await redis.mget([f"killswitch:global:{tenant}" for tenant in tenants])
-            if principal.is_superadmin
-            else []
-        )
     finally:
         await redis.aclose()
     account_stopped = {
         str(account.id): account_flags[index] is not None for index, account in enumerate(accounts)
     }
-    killswitch_card = ""
-    if principal.is_superadmin:
-        global_rows = "".join(
-            f"<form class='inline' method='post' action='/admin/killswitch/toggle'>"
-            f"<input type='hidden' name='csrf_token' value='{csrf}'>"
-            f"<input type='hidden' name='scope' value='global'>"
-            f"<input type='hidden' name='tenant_id' value='{html.escape(tenant)}'>"
-            f"<button class='btn-sm {'btn-ghost' if global_flags[index] else 'btn-danger'}'>"
-            f"{html.escape(tenant)}："
-            f"{'解除急停' if global_flags[index] else '全局急停'}</button></form>"
-            for index, tenant in enumerate(tenants)
-        )
-        killswitch_card = f"""<section class="card"><h2>自动回复总开关</h2>
-<p class="hint">急停按租户隔离，启用后该租户自动回复降级为草稿。</p>{global_rows}</section>"""
-
     account_rows = ""
     for a in accounts:
         stopped = account_stopped.get(str(a.id), False)
@@ -3152,7 +3132,7 @@ async def accounts_page(request: Request) -> Response:
 
     job_rows = (
         "".join(
-            f"<tr><td><a href='/admin/jobs/{row.id}'><code>{str(row.id)[:8]}</code></a></td>"
+            f"<tr><td><a href='/admin/integrations/provisioning-jobs/{row.id}'><code>{str(row.id)[:8]}</code></a></td>"
             f"<td>{html.escape(row.platform)}</td>"
             f"<td>{_pill('PROCESSING' if row.status == 'FAILED' and provisioning_job_is_in_flight(row) else row.status)}</td>"
             f"<td class='muted'>{html.escape(row.current_step)}</td>"
@@ -3207,7 +3187,9 @@ async def accounts_page(request: Request) -> Response:
         "feishu": settings.feishu_enabled,
         "email": settings.email_enabled,
     }
-    requested_channel = request.query_params.get("connect", "")
+    requested_channel = request.path_params.get("provider") or request.query_params.get("connect", "")
+    if request.path_params.get("provider") and requested_channel not in _CHANNEL_LABELS:
+        raise HTTPException(status_code=404, detail="integration_provider_not_found")
     selected_channel = (
         requested_channel
         if requested_channel in _CHANNEL_LABELS and channel_enabled[requested_channel]
@@ -3281,16 +3263,49 @@ async def accounts_page(request: Request) -> Response:
     account_card = f"""<section class="card"><h2>平台账号</h2><div class="tablewrap"><table><thead><tr><th>平台</th><th>名称</th><th>状态</th><th>消息通道</th><th>账号自动化策略</th><th>急停</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>"""
     jobs_card = f"""<section class="card"><h2>Provisioning Jobs</h2><p class="hint">最近 20 条接入任务。</p><div class="tablewrap"><table><thead><tr><th>ID</th><th>平台</th><th>状态</th><th>步骤</th><th>错误</th></tr></thead><tbody>{job_rows}</tbody></table></div></section>"""
     if principal.is_superadmin:
-        body = f"""<h1>账号</h1><p class="lede">已接入账号的运行控制、急停开关与接入任务。</p>
-{oauth_banner}{channel_picker}{selected_panel}{killswitch_card}{account_card}{jobs_card}"""
+        body = f"""<h1>平台账号</h1><p class="lede">连接渠道、查看账号健康、调整账号级自动化策略与接入任务。</p>
+{oauth_banner}{channel_picker}{selected_panel}{account_card}{jobs_card}"""
     else:
-        body = f"""<h1>账号授权</h1><p class="lede">授权并管理当前 Tenant 的平台账号。</p>
+        body = f"""<h1>平台账号授权</h1><p class="lede">授权并管理当前 Tenant 的平台账号。</p>
 {oauth_banner}{channel_picker}{selected_panel}{account_card}{jobs_card}"""
     response = HTMLResponse(
-        _page("账号", body, active="accounts", show_users=principal.is_superadmin)
+        _page("平台账号", body, active="accounts", show_users=principal.is_superadmin)
     )
     return _ensure_csrf(response, request, csrf)
 
+
+@router.get("/system/safety", response_class=HTMLResponse)
+async def safety_page(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    if not principal.is_superadmin:
+        raise HTTPException(status_code=403, detail="superadmin_required")
+    csrf = _csrf(request)
+    settings = get_settings()
+    tenants = sorted(principal.allowed_tenants)
+    redis = aioredis.from_url(settings.redis_url)
+    try:
+        flags = await redis.mget([f"killswitch:global:{tenant}" for tenant in tenants])
+    finally:
+        await redis.aclose()
+    controls = "".join(
+        f'<form class="card" method="post" action="/admin/killswitch/toggle">'
+        f'<input type="hidden" name="csrf_token" value="{csrf}">'
+        '<input type="hidden" name="scope" value="global">'
+        f'<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">'
+        f'<h2>{html.escape(tenant)}</h2>'
+        '<p class="hint">启用后自动回复降级为草稿；人工处理和持久化工作流继续运行。</p>'
+        f'<button class="{"btn-ghost" if flags[index] else "btn-danger"}">'
+        f'{"解除全局急停" if flags[index] else "启用全局急停"}</button></form>'
+        for index, tenant in enumerate(tenants)
+    )
+    body = f"""<h1>安全控制</h1><p class="lede">集中管理租户级全局急停。账号级控制仍位于平台账号页。</p>
+<div class="grid">{controls}</div>"""
+    response = HTMLResponse(
+        _page("安全控制", body, active="safety", show_users=True)
+    )
+    return _ensure_csrf(response, request, csrf)
 
 @router.post("/accounts/{account_id}/xchat")
 async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Response:
@@ -3408,4 +3423,5 @@ async def killswitch_toggle(request: Request) -> Response:
             await redis.delete(key)
     finally:
         await redis.aclose()
-    return RedirectResponse("/admin/accounts", status_code=status.HTTP_303_SEE_OTHER)
+    target = "/admin/system/safety" if scope == "global" else "/admin/integrations/accounts"
+    return RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)

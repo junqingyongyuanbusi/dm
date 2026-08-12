@@ -33,7 +33,7 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
     initial_password = "initial-password-123"
     async with _client() as client:
         csrf = await _login(client, "admin", "test-admin-password")
-        page = await client.get("/admin/users")
+        page = await client.get("/admin/system/users")
         assert page.status_code == 200
         assert "创建普通用户" in page.text
         response = await client.post(
@@ -129,5 +129,7 @@ async def test_tenant_user_cannot_open_user_management(session, migrated_db):
     await session.commit()
     async with _client() as client:
         await _login(client, "bob", "bob-personal-password-123")
-        response = await client.get("/admin/users")
+        legacy = await client.get("/admin/users")
+        response = await client.get("/admin/system/users")
+    assert legacy.status_code == 403
     assert response.status_code == 403

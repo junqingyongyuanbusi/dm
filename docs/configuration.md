@@ -108,7 +108,7 @@ authorizations default to `comments=true` and `BOT_DRAFT_ONLY`; the latter switc
 administrator to promote a tested account explicitly. Facebook OAuth requests
 `pages_read_engagement`, `pages_read_user_content`, and `pages_manage_engagement`, validates that
 all three permissions target the selected Page, and subscribes the Page to `feed`. Existing Page
-tokens must be reauthorized from `/admin/accounts`; missing or wrong-Page permissions produce
+tokens must be reauthorized from `/admin/integrations/accounts`; missing or wrong-Page permissions produce
 `META_COMMENT_PERMISSION_REQUIRED` and health status `REAUTH_REQUIRED`. Replies are always public
 child comments on the source comment.
 
@@ -135,7 +135,7 @@ after all three roles restart on one flag-aware image. The environment templates
 `FEISHU_ENABLED=false`. Prepare the self-built application Bot first, deploy the flag-aware image
 with Feishu disabled, then enable all three roles together, provision the account and configure the
 returned account-specific Callback URL. Handoff cards use a second dark-launch gate: keep
-`FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` until `/admin/feishu-handoff` has a validated support
+`FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` until `/admin/integrations/feishu/handoff` has a validated support
 chat and operator allowlist and the Feishu console delivers `card.action.trigger` callbacks to the
 account-specific Card Action Callback URL. The provider API origin is fixed at
 `https://open.feishu.cn` rather than configured by an environment variable.

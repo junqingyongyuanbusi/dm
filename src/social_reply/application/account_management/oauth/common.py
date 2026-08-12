@@ -130,7 +130,7 @@ async def principal_from_oauth_context(context: Mapping[str, Any]) -> Principal 
 
 
 def notice(title: str, message: str, *, status_code: int = 200) -> HTMLResponse:
-    body = f"""<a class="back" href="/admin/accounts">← 返回账号页</a>
+    body = f"""<a class="back" href="/admin/integrations/accounts">← 返回平台账号</a>
 <section class="card"><h1 style="font-size:24px">{html.escape(title)}</h1>
 <p>{html.escape(message)}</p></section>"""
     return HTMLResponse(_page(title, body, active="accounts"), status_code=status_code)

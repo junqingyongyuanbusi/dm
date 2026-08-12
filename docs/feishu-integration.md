@@ -50,7 +50,7 @@ FEISHU_HANDOFF_MAX_ATTEMPTS=8
 
 ## 在 Admin 创建账号
 
-1. 登录 `${PUBLIC_BASE_URL}/admin/accounts`。
+1. 登录 `${PUBLIC_BASE_URL}/admin/integrations/accounts/new/feishu`。
 2. 选择当前管理员有权操作的 Tenant 和 Brand，再选择 **Feishu**。
 3. 填写四个必填字段：
    - App ID（`app_id`）
@@ -81,7 +81,7 @@ FEISHU_HANDOFF_MAX_ATTEMPTS=8
 
 消息接入通过后，再单独配置客服群。该功能不使用自定义群机器人 webhook，也不会把所有群成员自动授权为客服：
 
-1. 登录 `${PUBLIC_BASE_URL}/admin/feishu-handoff`，选择已经 active 且健康为 `READY` 的 Feishu 账号。
+1. 登录 `${PUBLIC_BASE_URL}/admin/integrations/feishu/handoff`，选择已经 active 且健康为 `READY` 的 Feishu 账号。
 2. 填写客服群的 `chat_id` 并保存路由。一个 Tenant 第一版只配置一个通知账号和一个客服群。
 3. 逐个添加客服的 app-scoped `open_id`，分别授予认领和解决权限。只在群里并不代表有权限。
 4. 复制页面显示的 Card Action Callback：
@@ -104,7 +104,7 @@ Message 保留在 PostgreSQL。
 
 账号保持 `BOT_DRAFT_ONLY`，按顺序验证：
 
-- `/admin/accounts` 显示账号为 active，健康状态最终为 `READY`；
+- `/admin/integrations/accounts` 显示账号为 active，健康状态最终为 `READY`；
 - URL verification 成功，飞书控制台不再提示 Callback 校验失败；
 - 向 Bot 发送一条 P2P 文本，Admin 草稿队列出现对应 Tenant/账号/会话的草稿；
 - 在已添加 Bot 的群中明确 `@Bot` 发送文本，出现独立的群会话草稿；
@@ -119,7 +119,7 @@ Message 保留在 PostgreSQL。
 
 只有 draft smoke 和 provider-side 收发验证完成后才允许自动外发：
 
-1. 在 `/admin/accounts` 找到目标 Tenant 的 Feishu 账号。
+1. 在 `/admin/integrations/accounts` 找到目标 Tenant 的 Feishu 账号。
 2. 点击该账号的「切为自动」操作。
 3. 确认账号 `automation_default` 变为 `BOT_ACTIVE`，并检查 `audit_logs` 中存在 `SET_AUTOMATION_DEFAULT`。
 4. 再发送一条 P2P 和一条群 `@Bot` 测试消息，确认自动回复目标正确。

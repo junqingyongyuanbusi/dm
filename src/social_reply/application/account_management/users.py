@@ -20,7 +20,7 @@ from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
-router = APIRouter(prefix="/admin/users", tags=["admin-users"])
+router = APIRouter(prefix="/admin", tags=["admin-users"])
 _CSRF_COOKIE = "reply_admin_csrf"
 
 
@@ -41,7 +41,8 @@ async def _superadmin(request: Request):
     return principal
 
 
-@router.get("", response_class=HTMLResponse)
+@router.get("/system/users", response_class=HTMLResponse)
+@router.get("/users", response_class=HTMLResponse)
 async def users_page(request: Request, notice: str = "") -> Response:
     principal = await _superadmin(request)
     if isinstance(principal, Response):
@@ -112,7 +113,7 @@ async def users_page(request: Request, notice: str = "") -> Response:
     return response
 
 
-@router.post("")
+@router.post("/users")
 async def create_user(request: Request) -> Response:
     principal = await _superadmin(request)
     if isinstance(principal, Response):
