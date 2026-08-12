@@ -263,7 +263,12 @@ deployment_for_digest_json() {
     --service "$service" \
     --limit 100 \
     --json | jq --arg digest "$digest" '
-      map(select(.status == "SUCCESS" and .meta.imageDigest == $digest))
+      map(
+        select(
+          (.status == "SUCCESS" or .status == "REMOVED")
+          and .meta.imageDigest == $digest
+        )
+      )
       | first
     '
 }
