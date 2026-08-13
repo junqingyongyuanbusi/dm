@@ -10,3 +10,13 @@ dist/
 .secrets/
 .serena/
 .worktrees/
+
+# Pi project runtime/install state; keep reviewed prompts, skills, settings, and extension source.
+.pi/npm/
+.pi/git/
+.pi/sessions/
+.pi/**/*.log
+.pi/**/*.jsonl
+.pi/extensions/**/node_modules/
+.pi/auth.json
+.pi/trust.json

@@ -39,6 +39,7 @@
 - `deploy/docker-compose.yml`：仅用于本地 PostgreSQL/Redis 开发与测试，不是生产编排文件。
 - `Dockerfile`、`entrypoint.sh`：三角色共享的 production image 与 fail-closed 启动契约。
 - `.github/workflows/ci.yml`：Ruff、迁移/全量 pytest、真实 `linux/amd64` production image 三道 CI 门禁。
+- `.pi/`：项目级 Pi 工程目录。Pi 识别的 Prompts、Skills、Extensions、Themes、Settings 和 System Prompt 文件受 Project Trust 加载门控制；任意普通文件并不会因此获得保护。根目录 `AGENTS.md` 仍是项目事实与硬约束的唯一契约。不得把 personal model、凭据、本机绝对路径、Session transcript 或未经审查的 Extension/Package 写入该目录。
 
 ## 实际安装命令
 
