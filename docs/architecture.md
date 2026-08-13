@@ -1,7 +1,7 @@
 # Runtime architecture
 
-This document describes the current implementation. Historical design notes in `PLAN.md` and
-`docs/superpowers/plans/` are not runtime authority.
+This document describes the current implementation. Historical notes in `docs/superpowers/plans/`
+are not runtime authority.
 
 ## System shape
 

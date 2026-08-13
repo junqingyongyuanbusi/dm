@@ -1,8 +1,8 @@
 # Production migration notes
 
 This file covers database, encrypted-secret and staged rollout requirements. See
-`docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables,
-and `deploy/vps/README.md` for day-to-day VPS operations.
+`docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
+`scripts/publish_railway_release.sh` for the required production release path.
 
 The current Alembic graph has one head: `e9a1c4f7b620`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has

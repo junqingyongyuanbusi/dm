@@ -261,7 +261,7 @@ PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；R
 - [Feishu operator runbook](docs/feishu-integration.md)
 - [Email operator runbook](docs/email-integration.md)
 - [生产迁移](docs/production-migration.md)
-- [VPS 运维](deploy/vps/README.md)
+- [Railway 生产发布](scripts/publish_railway_release.sh)
 - [文档地图与历史材料](docs/README.md)
 
 ## 测试与 CI

@@ -390,31 +390,24 @@ def test_future_platform_flags_are_independent() -> None:
     assert settings.platform_integration_enabled("telegram") is True
 
 
-def test_environment_templates_disable_future_platforms() -> None:
+def test_local_environment_template_disables_future_platforms() -> None:
     root = Path(__file__).resolve().parents[2]
-    parsed_templates = [
-        _parse_env_template(root / relative_path)
-        for relative_path in (".env.example", "deploy/vps/.env.example")
-    ]
-    for assignments in parsed_templates:
-        assert assignments["FACEBOOK_MESSENGER_ENABLED"] == "false"
-        assert assignments["INSTAGRAM_MESSAGING_ENABLED"] == "false"
-        assert assignments["WHATSAPP_ENABLED"] == "false"
-        assert assignments["FEISHU_ENABLED"] == "false"
-        assert {key: assignments[key] for key in _EMAIL_ENV_DEFAULTS} == _EMAIL_ENV_DEFAULTS
-        assert assignments["META_HEALTH_CHECK_INTERVAL_SECONDS"] == "600"
-        assert assignments["FEISHU_HEALTH_CHECK_INTERVAL_SECONDS"] == "600"
-        assert assignments["SCHEDULER_TICK_SECONDS"] == "0.5"
-        assert assignments["SCHEDULER_CORE_INTERVAL_SECONDS"] == "3"
-        assert assignments["SCHEDULER_CORE_WARN_AFTER_SECONDS"] == "30"
-        assert assignments["SCHEDULER_INSPECTION_WARN_AFTER_SECONDS"] == "300"
-        assert assignments["CHATWOOT_RECONCILE_INTERVAL_SECONDS"] == "3"
-        assert assignments["XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS"] == "30"
-        assert assignments["XCHAT_READY_PROBE_INTERVAL_SECONDS"] == "21600"
-        assert assignments["XCHAT_PENDING_PROBE_INTERVAL_SECONDS"] == "600"
-    assert {key: parsed_templates[0][key] for key in _EMAIL_ENV_DEFAULTS} == {
-        key: parsed_templates[1][key] for key in _EMAIL_ENV_DEFAULTS
-    }
+    assignments = _parse_env_template(root / ".env.example")
+    assert assignments["FACEBOOK_MESSENGER_ENABLED"] == "false"
+    assert assignments["INSTAGRAM_MESSAGING_ENABLED"] == "false"
+    assert assignments["WHATSAPP_ENABLED"] == "false"
+    assert assignments["FEISHU_ENABLED"] == "false"
+    assert {key: assignments[key] for key in _EMAIL_ENV_DEFAULTS} == _EMAIL_ENV_DEFAULTS
+    assert assignments["META_HEALTH_CHECK_INTERVAL_SECONDS"] == "600"
+    assert assignments["FEISHU_HEALTH_CHECK_INTERVAL_SECONDS"] == "600"
+    assert assignments["SCHEDULER_TICK_SECONDS"] == "0.5"
+    assert assignments["SCHEDULER_CORE_INTERVAL_SECONDS"] == "3"
+    assert assignments["SCHEDULER_CORE_WARN_AFTER_SECONDS"] == "30"
+    assert assignments["SCHEDULER_INSPECTION_WARN_AFTER_SECONDS"] == "300"
+    assert assignments["CHATWOOT_RECONCILE_INTERVAL_SECONDS"] == "3"
+    assert assignments["XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS"] == "30"
+    assert assignments["XCHAT_READY_PROBE_INTERVAL_SECONDS"] == "21600"
+    assert assignments["XCHAT_PENDING_PROBE_INTERVAL_SECONDS"] == "600"
 
 
 def test_email_documentation_and_migration_head_contract() -> None:

@@ -40,7 +40,6 @@ def test_parse_extracts_fields():
 
 
 def test_incoming_public_is_inbound_user():
-    # PLAN.md §四 规则 2：仅 incoming 且非 private 进入决策管线
     assert classify(parse_message_created(_payload())) is EventClass.INBOUND_USER
 
 
@@ -49,13 +48,11 @@ def test_incoming_without_text_is_not_reply_eligible():
 
 
 def test_agent_outgoing_public_flips_human():
-    # PLAN.md §六：outgoing 且 sender.type=user 且非 private → 人工接管
     p = _payload(message_type="outgoing", sender={"id": 3, "type": "user"})
     assert classify(parse_message_created(p)) is EventClass.AGENT_PUBLIC_REPLY
 
 
 def test_bot_outgoing_is_reconcile_only():
-    # PLAN.md §四 规则 4：agent_bot 的消息仅用于发送对账
     p = _payload(message_type="outgoing", sender={"id": 2, "type": "agent_bot"})
     assert classify(parse_message_created(p)) is EventClass.BOT_ECHO
 

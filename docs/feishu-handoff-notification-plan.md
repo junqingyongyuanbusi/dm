@@ -968,7 +968,7 @@ human_work_resolution_evidence_total
 - [ ] 更新 `docs/feishu-integration.md`。
 - [ ] 更新 `docs/production-migration.md`。
 - [ ] 更新 `.env.example`。
-- [ ] 更新 `deploy/vps/.env.example`。
+- [ ] 更新 Railway 三角色生产变量和发布前一致性校验。
 - [ ] 记录飞书控制台权限和 card callback 配置步骤。
 - [ ] 记录暂停、恢复和回滚操作。
 

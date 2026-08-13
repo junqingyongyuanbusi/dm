@@ -50,7 +50,7 @@ def parse_message_created(payload: dict) -> ChatwootMessage:
 
 
 def classify(msg: ChatwootMessage) -> EventClass:
-    """PLAN.md §四 发送者甄别（self-echo 的 Outbox 比对在 processor 中另行执行）"""
+    """Classify verified Chatwoot messages for ingestion and reconciliation."""
     if msg.private:
         return EventClass.IGNORE
     if msg.message_type == "incoming":

@@ -4,9 +4,9 @@ Runtime application settings are defined by `social_reply.shared.config.Settings
 variables use the uppercase field name. Values are resolved in this order: explicit constructor
 arguments, process environment, `.env` in the process current working directory, then code defaults.
 
-Use `.env.example` for local development only. Use `deploy/vps/.env.example` for production and
-replace every secret. API, Worker, and Scheduler must use the same application settings unless a
-variable is explicitly deployment-role-only.
+Use `.env.example` for local development only. Production configuration is stored in the deployment
+platform and validated by `scripts/validate_railway_config.py` during every release. API, Worker, and
+Scheduler must use the same application settings unless a variable is explicitly deployment-role-only.
 
 ## Core and security
 
@@ -238,21 +238,20 @@ These are consumed by container orchestration or `entrypoint.sh`, not by `Settin
 | `DRAMATIQ_PROCESSES` | entrypoint/Worker | Worker process count, default 4, range 1-32; never inferred from host CPU count |
 | `DRAMATIQ_THREADS` | entrypoint/Worker | Threads per process, default 8, range 1-32; processes × threads must not exceed 128 |
 | `DRAMATIQ_WORKER_TIMEOUT_MS` | entrypoint/Worker | Redis empty-queue polling backoff cap, default 250ms, range 50-5000ms; lower values reduce low-volume pickup latency but increase idle Redis fetches |
-| `PG_PASSWORD` | VPS compose | PostgreSQL application password |
-| `CLOUDFLARE_TUNNEL_TOKEN` | VPS compose | Cloudflare Tunnel authentication |
 
-VPS compose injects `DATABASE_URL`, `REDIS_URL`, `SERVICE_ROLE`, and `PORT` into containers. Do not
-add role-specific copies of feature flags; divergent values can accept work that another role will
-not process or recover. Deploy API, Worker, Scheduler, PostgreSQL, and Redis in one infrastructure
-region. Cross-region Worker database and broker round trips multiply across each durable reply stage
-and can turn a two-second direct reply into tens of seconds without producing retries or errors.
+Railway injects `DATABASE_URL`, `REDIS_URL`, `SERVICE_ROLE`, and `PORT` into containers. Do not add
+role-specific copies of feature flags; divergent values can accept work that another role will not
+process or recover. Deploy API, Worker, Scheduler, PostgreSQL, and Redis in one infrastructure region.
+Cross-region Worker database and broker round trips multiply across each durable reply stage and can
+turn a two-second direct reply into tens of seconds without producing retries or errors.
 
 ## Template policy
 
 - `.env.example`: executable single-process smoke profile with `TESTING=true`, inline actor
   fallbacks, StubBroker, stub LLM, knowledge retrieval disabled, localhost callbacks and public
   development-only secrets. It does not validate the production Redis/Dramatiq boundary.
-- `deploy/vps/.env.example`: production profile with `TESTING=false`; every blank secret must be
-  generated or copied from the current production environment.
+- Production: Railway service variables are the source of truth. Every release validates required
+  secrets, feature gates, role assignment, Pydantic production settings, and cross-role consistency
+  before building or deploying an image.
 - Repository test configuration: always points at a database whose name ends in `_test`; pytest
   refuses to collect against any other database.

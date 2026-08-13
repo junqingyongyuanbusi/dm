@@ -35,7 +35,7 @@ def test_wrong_signature_rejected():
 
 
 def test_stale_timestamp_rejected():
-    # PLAN.md §十七：时间戳容忍窗口，超窗拒绝以防重放
+    # Reject signatures outside the replay-tolerance window.
     assert not verify_signature(
         secret=SECRET,
         timestamp="1000",

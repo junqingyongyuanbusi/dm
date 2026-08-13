@@ -21,16 +21,16 @@ or live provider E2E has been validated.
   rollout requirements.
 - [Reliability fault drills](reliability-drills.md): repeatable queue-loss, crash, lease, takeover,
   retry-exhaustion and recovery validation.
-- [VPS operations](../deploy/vps/README.md): deployment, backup, upgrade and rollback runbook.
+- [Railway release script](../scripts/publish_railway_release.sh): the required Docker Hub publish and production rollout entrypoint.
 
 When documents disagree, executable code and Alembic migrations define behavior. Update the current
 architecture/configuration documents in the same change that alters their contracts.
 
 ## Historical material
 
-- `../PLAN.md` is the original product and architecture exploration.
 - `superpowers/plans/` contains implementation plans, old code sketches, historical test counts and
-  superseded rollout assumptions.
+  superseded rollout assumptions. Some archived plans reference the removed original `PLAN.md`; those
+  references are preserved as historical context only.
 
 Historical material explains why earlier decisions were considered, but it must not be used as a
 runbook or current API contract.
