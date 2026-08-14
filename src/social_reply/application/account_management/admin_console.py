@@ -71,7 +71,7 @@ from social_reply.domain.automation.state_machine import (
     flip_to_human_active,
 )
 from social_reply.domain.platform_accounts import capability_text_limit
-from social_reply.domain.reply.guard import redact_pii
+from social_reply.domain.reply.guard import has_contact_like, redact_pii
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
 from social_reply.domain.reply.voice import (
@@ -2171,6 +2171,7 @@ _KB_BANNERS = {
 }
 
 _MAX_IMPORT_BYTES = 2 * 1024 * 1024
+_KNOWLEDGE_BULK_PUBLISH_CHUNK_SIZE = 500
 
 
 def _query_int(request: Request, name: str) -> int:
@@ -2229,6 +2230,9 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
         banner = (
             f'<div class="banner ok">导入完成：新增 {n} 条，跳过 {s} 条重复，忽略 {b} 条空行</div>'
         )
+    elif notice == "bulk_published":
+        count = _query_int(request, "count")
+        banner = f'<div class="banner ok">批量发布完成：已发布 {count} 条草稿并记录审计。</div>'
     elif notice in _KB_BANNERS:
         tone, text = _KB_BANNERS[notice]
         banner = f'<div class="banner {tone}">{text}</div>'
@@ -2258,9 +2262,15 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
 <label for="f-kb-csv">CSV 文件</label><input id="f-kb-csv" type="file" name="file" accept=".csv" required>
 <p class="hint">必需列 question,reply；可选 brand_id,platform,category,is_official_contact。布尔值仅接受 true/false/1/0/yes/no（不区分大小写）；空白为 false。所有导入行均为草稿，明确发布前不会参与检索。UTF-8 编码，最多 2000 行 / 2MB。</p>
 <button class="btn-block">上传并导入草稿</button></form></div></details>"""
+    bulk_publish_form = f"""<section class="card"><h2>批量发布草稿</h2>
+<form method="post" action="/admin/knowledge/bulk-publish"><input type="hidden" name="csrf_token" value="{csrf}">
+{_tenant_input(principal)}
+<p class="hint">将所选 Tenant 的普通草稿批量发布并逐条记录审计；已标记或检测到联系方式的草稿仍需单独复核发布。</p>
+<button class="btn-block" onclick="return confirm('确认发布该 Tenant 的全部普通知识库草稿？发布后将立即参与检索。')">批量发布普通草稿</button></form></section>"""
     body = f"""<h1>知识库</h1><p class="lede">回复模板管理：新建和导入默认草稿；只有经过明确发布的条目才参与检索。</p>{banner}
 {add_form}
 {import_form}
+{bulk_publish_form}
 <section class="card"><h2>模板列表</h2><p class="hint">共 {len(docs)} 条（最多显示 200）。官方联系方式必须先分类、复核，再明确发布。</p><div class="tablewrap"><table><thead><tr><th>问题</th><th>回复</th><th>分类</th><th>官方联系方式</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
     response = HTMLResponse(
         _page("知识库", body, active="knowledge", show_users=principal.is_superadmin)
@@ -2387,6 +2397,96 @@ async def knowledge_import(request: Request) -> Response:
     return RedirectResponse(
         f"/admin/knowledge?notice=imported&inserted={report.inserted}"
         f"&skipped={report.skipped}&blank={report.blank}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/knowledge/bulk-publish")
+async def knowledge_bulk_publish(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    requested_tenant = (form.get("tenant_id") or "").strip()
+    if not requested_tenant:
+        raise HTTPException(status_code=422, detail="tenant_id_required")
+    tenant_id = tenant_id_or_default(principal, requested_tenant)
+    async with get_session_factory()() as session:
+        published_count = 0
+        last_id: uuid.UUID | None = None
+        while True:
+            candidate_query = (
+                select(
+                    models.KnowledgeDocument.id,
+                    models.KnowledgeDocument.reply,
+                )
+                .where(
+                    models.KnowledgeDocument.tenant_id == tenant_id,
+                    models.KnowledgeDocument.status == "draft",
+                    models.KnowledgeDocument.is_official_contact.is_(False),
+                )
+                .order_by(models.KnowledgeDocument.id)
+                .limit(_KNOWLEDGE_BULK_PUBLISH_CHUNK_SIZE)
+            )
+            if last_id is not None:
+                candidate_query = candidate_query.where(models.KnowledgeDocument.id > last_id)
+            candidates = (await session.execute(candidate_query)).all()
+            if not candidates:
+                break
+            last_id = candidates[-1].id
+            publishable_ids = [
+                row.id for row in candidates if not has_contact_like(row.reply or "")
+            ]
+            if not publishable_ids:
+                continue
+            published = (
+                await session.execute(
+                    update(models.KnowledgeDocument)
+                    .where(
+                        models.KnowledgeDocument.tenant_id == tenant_id,
+                        models.KnowledgeDocument.status == "draft",
+                        models.KnowledgeDocument.is_official_contact.is_(False),
+                        models.KnowledgeDocument.id.in_(publishable_ids),
+                    )
+                    .values(status="published")
+                    .returning(
+                        models.KnowledgeDocument.id,
+                        models.KnowledgeDocument.tenant_id,
+                        models.KnowledgeDocument.brand_id,
+                        models.KnowledgeDocument.platform,
+                        models.KnowledgeDocument.is_official_contact,
+                    )
+                )
+            ).all()
+            if not published:
+                continue
+            await session.execute(
+                models.AuditLog.__table__.insert(),
+                [
+                    {
+                        "tenant_id": row.tenant_id,
+                        "category": "admin_action",
+                        "actor": principal.actor,
+                        "action": "PUBLISH_KNOWLEDGE",
+                        "subject_type": "knowledge_document",
+                        "subject_id": str(row.id),
+                        "detail": {
+                            "from": "draft",
+                            "to": "published",
+                            "brand": row.brand_id,
+                            "platform": row.platform,
+                            "is_official_contact": row.is_official_contact,
+                            "bulk": True,
+                        },
+                    }
+                    for row in published
+                ],
+            )
+            published_count += len(published)
+        await session.commit()
+    return RedirectResponse(
+        f"/admin/knowledge?notice=bulk_published&count={published_count}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 

@@ -148,6 +148,8 @@ CI 中的 `Production image` Job 是镜像验收的完整权威实现；修改�
 
 仓库变更不能在“代码写完”“本地测试通过”或“Git push 完成”时宣告完成。除非用户明确要求不部署，每个推送到 `dev` 的完成变更都必须发布并部署对应镜像。
 
+任何要求让本地代码在 Railway 生效的交付，默认包含“提交到 `dev` → 推送 `origin/dev` → 等待 CI 全绿 → 构建并发布 Docker Hub immutable SHA 镜像 → 提升同一 digest 为 `latest` → 通过发布脚本更新 Railway 三角色 → 验证健康与 digest”的完整链路。`railway restart` 只重启现有容器，不会携带未提交、未构建或未发布的代码，不得作为代码发布的替代。
+
 ### 提交与 CI
 
 1. 逐项核对用户要求，并审查最终 diff；不得提交无关用户改动。

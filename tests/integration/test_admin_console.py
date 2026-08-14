@@ -2480,6 +2480,141 @@ async def test_knowledge_explicit_publish_unpublish_is_audited_and_idempotent(se
     assert audits[1].detail["to"] == "draft"
 
 
+async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and_idempotent(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    monkeypatch.setattr(admin_console, "_KNOWLEDGE_BULK_PUBLISH_CHUNK_SIZE", 1)
+    normal = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        question="bulk normal",
+        reply="normal reply",
+        status="draft",
+    )
+    normal_two = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b2",
+        question="bulk normal two",
+        reply="second normal reply",
+        status="draft",
+    )
+    official = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="bulk official",
+        reply="support@example.com",
+        status="draft",
+        is_official_contact=True,
+    )
+    unclassified_contact = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="bulk unclassified contact",
+        reply="Email support@example.com",
+        status="draft",
+        is_official_contact=False,
+    )
+    already_published = models.KnowledgeDocument(
+        tenant_id="default",
+        question="already published",
+        reply="published reply",
+        status="published",
+    )
+    foreign = models.KnowledgeDocument(
+        tenant_id="other-tenant",
+        question="foreign draft",
+        reply="foreign reply",
+        status="draft",
+    )
+    session.add_all(
+        [normal, normal_two, official, unclassified_contact, already_published, foreign]
+    )
+    await session.commit()
+    normal_id = normal.id
+    normal_two_id = normal_two.id
+    official_id = official.id
+    unclassified_contact_id = unclassified_contact.id
+    published_id = already_published.id
+    foreign_id = foreign.id
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/knowledge")
+        assert page.status_code == 200
+        assert 'action="/admin/knowledge/bulk-publish"' in page.text
+        assert "批量发布普通草稿" in page.text
+
+        bad_csrf = await client.post(
+            "/admin/knowledge/bulk-publish",
+            data={"csrf_token": "invalid", "tenant_id": "default"},
+        )
+        missing_tenant = await client.post(
+            "/admin/knowledge/bulk-publish",
+            data={"csrf_token": csrf},
+        )
+        first = await client.post(
+            "/admin/knowledge/bulk-publish",
+            data={"csrf_token": csrf, "tenant_id": "default"},
+        )
+        second = await client.post(
+            "/admin/knowledge/bulk-publish",
+            data={"csrf_token": csrf, "tenant_id": "default"},
+        )
+        foreign_attempt = await client.post(
+            "/admin/knowledge/bulk-publish",
+            data={"csrf_token": csrf, "tenant_id": "other-tenant"},
+        )
+
+    assert bad_csrf.status_code == 403
+    assert missing_tenant.status_code == 422
+    assert first.status_code == second.status_code == 303
+    assert "notice=bulk_published&count=2" in first.headers["location"]
+    assert "notice=bulk_published&count=0" in second.headers["location"]
+    assert foreign_attempt.status_code == 403
+    session.expire_all()
+    assert (await session.get(models.KnowledgeDocument, normal_id)).status == "published"
+    assert (await session.get(models.KnowledgeDocument, normal_two_id)).status == "published"
+    assert (await session.get(models.KnowledgeDocument, official_id)).status == "draft"
+    assert (
+        await session.get(models.KnowledgeDocument, unclassified_contact_id)
+    ).status == "draft"
+    assert (await session.get(models.KnowledgeDocument, published_id)).status == "published"
+    assert (await session.get(models.KnowledgeDocument, foreign_id)).status == "draft"
+    audits = (
+        (
+            await session.execute(
+                select(models.AuditLog)
+                .where(
+                    models.AuditLog.subject_id.in_(
+                        [
+                            str(normal_id),
+                            str(normal_two_id),
+                            str(official_id),
+                            str(unclassified_contact_id),
+                        ]
+                    ),
+                    models.AuditLog.action == "PUBLISH_KNOWLEDGE",
+                )
+                .order_by(models.AuditLog.subject_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 2
+    assert {audit.subject_id for audit in audits} == {str(normal_id), str(normal_two_id)}
+    assert all(audit.tenant_id == "default" for audit in audits)
+    assert all(audit.category == "admin_action" for audit in audits)
+    assert all(audit.action == "PUBLISH_KNOWLEDGE" for audit in audits)
+    assert all(audit.detail["bulk"] is True for audit in audits)
+    assert all(audit.detail["from"] == "draft" for audit in audits)
+    assert all(audit.detail["to"] == "published" for audit in audits)
+    assert all(audit.detail["is_official_contact"] is False for audit in audits)
+
+
 async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
     doc = models.KnowledgeDocument(
         tenant_id="default",

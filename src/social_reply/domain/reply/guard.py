@@ -45,7 +45,7 @@ _SHORT_SERVICE_NUMBER = re.compile(
 )
 
 
-def _has_contact_like(text: str) -> bool:
+def has_contact_like(text: str) -> bool:
     return any(
         pattern.search(text)
         for pattern in (
@@ -97,7 +97,7 @@ def run_final_guard(
         return _downgrade(decision, "GUARD_EMPTY")
     if len(text) > _MAX_TEXT_LENGTH.get(platform, _DEFAULT_MAX):
         return _downgrade(decision, "GUARD_TOO_LONG")
-    if _has_contact_like(text):
+    if has_contact_like(text):
         approved_contact = (
             decision.source == "knowledge"
             and approved_official_contact_reply is not None
