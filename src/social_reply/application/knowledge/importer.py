@@ -2,6 +2,7 @@
 
 import csv
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
@@ -13,6 +14,7 @@ from social_reply.application.knowledge.drafts import (
     persist_knowledge_draft,
 )
 from social_reply.domain.knowledge.embeddings import EmbeddingClient
+from social_reply.domain.reply.language import assess_knowledge_language
 from social_reply.infrastructure.database.engine import get_session_factory
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,7 @@ class ImportReport:
     skipped: int  # content_hash 已存在（重复模板）
     blank: int  # 空 question/reply 行
     total: int  # CSV 有效数据行数（含空行）
+    batch_id: uuid.UUID
 
 
 def parse_optional_bool(value: str | None) -> bool:
@@ -46,6 +49,7 @@ def _parse_rows(
     tenant_id: str,
     brand_id_default: str,
     source_name: str,
+    batch_id: uuid.UUID,
 ) -> tuple[list[KnowledgeDraft], int]:
     """解析 CSV，返回 (有效行, 空行数)；表头缺失或超行数抛 ValueError"""
     reader = csv.DictReader(f)
@@ -62,6 +66,7 @@ def _parse_rows(
             blank += 1
             logger.warning("Skipping blank knowledge CSV row: row=%d", row_number)
             continue
+        detected_language, detection_status = assess_knowledge_language(question, reply)
         rows.append(
             build_knowledge_draft(
                 tenant_id=tenant_id,
@@ -71,7 +76,10 @@ def _parse_rows(
                 platform=(raw.get("platform") or "").strip() or None,
                 category=(raw.get("category") or "").strip() or None,
                 is_official_contact=parse_optional_bool(raw.get("is_official_contact")),
+                detected_language=detected_language,
+                language_detection_status=detection_status,
                 source_file=source_name,
+                import_batch_id=batch_id,
             )
         )
     if len(rows) + blank > MAX_IMPORT_ROWS:
@@ -89,11 +97,13 @@ async def import_knowledge_rows(
     actor: str = "knowledge-import",
 ) -> ImportReport:
     """导入回复模板（文本流）：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
+    batch_id = uuid.uuid4()
     rows, blank = _parse_rows(
         f,
         tenant_id=tenant_id,
         brand_id_default=brand_id_default,
         source_name=source_name,
+        batch_id=batch_id,
     )
     # Persist the version reported by the client that produced the vectors.
     embedding_version = embedder.version
@@ -137,6 +147,7 @@ async def import_knowledge_rows(
         skipped=skipped,
         blank=blank,
         total=len(rows) + blank,
+        batch_id=batch_id,
     )
 
 

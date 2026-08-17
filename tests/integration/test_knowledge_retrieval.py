@@ -7,6 +7,8 @@ from sqlalchemy import insert, select
 
 import social_reply.infrastructure.queue.broker  # noqa: F401  确保测试用 StubBroker
 from social_reply.application.knowledge.retrieval import (
+    KnowledgeHit,
+    KnowledgeRetrievalResult,
     retrieve_exact_knowledge,
     retrieve_knowledge,
 )
@@ -14,6 +16,7 @@ from social_reply.application.reply_decision import runner
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.infrastructure.database import models
 from social_reply.shared.config import get_settings
 
@@ -185,7 +188,7 @@ async def test_过滤条件_品牌_状态_版本(session):
 # ---------- runner 层：require_knowledge 降级 / KNOWLEDGE_HIT ----------
 
 
-async def _seed_conversation(session):
+async def _seed_conversation(session, text="请问几点营业"):
     account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -214,7 +217,7 @@ async def _seed_conversation(session):
             conversation_id=conv_id,
             direction="inbound",
             sender_type="contact",
-            text="请问几点营业",
+            text=text,
             chatwoot_message_id=55,
         )
     )
@@ -223,9 +226,9 @@ async def _seed_conversation(session):
     return account_id, conv_id, msg_id
 
 
-def _snapshot(account_id):
+def _snapshot(account_id, text="请问几点营业"):
     return DecisionSnapshot(
-        text="请问几点营业",
+        text=text,
         platform="telegram",
         tenant_id="default",
         brand_id="b1",
@@ -440,3 +443,206 @@ async def test_精确匹配仍优先于混合检索(session, knowledge_enabled):
     assert dec.action == "auto_reply"
     assert "KNOWLEDGE_VERBATIM" in dec.reason_codes
     assert dec.reply_text == "请问几点营业"
+
+
+def _multilingual_result(
+    *,
+    similarity=0.95,
+    second_similarity=None,
+    official=False,
+    exact=False,
+    ambiguous=False,
+):
+    top1 = KnowledgeHit(
+        content="问：How long does a refund take?\n答：Refunds take 3–5 business days.",
+        question="How long does a refund take?",
+        reply="Refunds take 3–5 business days.",
+        similarity=similarity,
+        chunk_id=uuid.uuid4(),
+        content_hash="a" * 64,
+        is_official_contact=official,
+        source_language="en",
+        language_verified=True,
+    )
+    vector_hits = [top1]
+    hits = [top1]
+    if second_similarity is not None:
+        top2 = KnowledgeHit(
+            content="问：How long does verification take?\n答：Verification takes 7 days.",
+            question="How long does verification take?",
+            reply="Verification takes 7 days.",
+            similarity=second_similarity,
+            chunk_id=uuid.uuid4(),
+            content_hash="b" * 64,
+            source_language="en",
+            language_verified=True,
+        )
+        vector_hits.append(top2)
+        hits.append(top2)
+    return KnowledgeRetrievalResult(
+        hits=tuple(hits),
+        vector_hits=tuple(vector_hits),
+        exact_match=exact,
+        exact_ambiguous=ambiguous,
+    )
+
+
+class _FaithfulChineseLLM:
+    async def decide(self, context):
+        assert context.target_language == "zh-Hans"
+        assert len(context.knowledge) == 1
+        assert "Question:" not in context.knowledge[0]
+        assert '"question":"How long does a refund take?"' in context.knowledge[0]
+        assert "问：" not in context.knowledge[0]
+        return ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text="退款通常需要 3 到 5 个工作日。",
+            confidence=0.99,
+        )
+
+    async def verify_grounding(self, **kwargs):
+        return True
+
+
+async def test_multilingual_strong_match_generates_same_language_and_persists_evidence(
+    session, knowledge_enabled
+):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
+    get_settings.cache_clear()
+    runner._llm = _FaithfulChineseLLM()
+    result = _multilingual_result()
+
+    async def fake_fetch(snapshot, **kwargs):
+        assert kwargs["verified_english_only"] is True
+        return result
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "退款多久到账？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.request_language in {"zh", "zh-Hans"}
+    assert decision.reply_language in {"zh", "zh-Hans"}
+    assert decision.knowledge_content_hash == "a" * 64
+    assert decision.knowledge_match_status == "strong"
+    assert decision.grounding_verified is True
+    assert "multilingual-v1" in decision.prompt_version
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_reason"),
+    [
+        (_multilingual_result(similarity=0.7), "NO_STRONG_KNOWLEDGE_MATCH"),
+        (
+            _multilingual_result(similarity=0.9, second_similarity=0.86),
+            "NO_STRONG_KNOWLEDGE_MATCH",
+        ),
+        (_multilingual_result(exact=False, ambiguous=True), "NO_STRONG_KNOWLEDGE_MATCH"),
+    ],
+)
+async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
+    session, knowledge_enabled, result, expected_reason
+):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
+    get_settings.cache_clear()
+
+    class NeverLLM:
+        async def decide(self, context):
+            raise AssertionError("LLM must not be called")
+
+    runner._llm = NeverLLM()
+
+    async def fake_fetch(snapshot, **kwargs):
+        return result
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "请问一般需要多久？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert expected_reason in decision.reason_codes
+
+
+async def test_multilingual_wrong_language_is_blocked_before_outbox(session, knowledge_enabled):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
+    get_settings.cache_clear()
+
+    class WrongLanguageLLM:
+        verifier_called = False
+
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Refunds take 3 to 5 business days.",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            self.verifier_called = True
+            return True
+
+    llm = WrongLanguageLLM()
+    runner._llm = llm
+
+    async def fake_fetch(snapshot, **kwargs):
+        return _multilingual_result()
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "退款多久到账？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+    assert outbox_id is None
+    assert llm.verifier_called is False
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+
+
+async def test_shadow_persists_separate_evidence_without_changing_legacy_decision(
+    session, knowledge_enabled
+):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED", "true")
+    get_settings.cache_clear()
+
+    class LegacyLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="旧路径回复。",
+                confidence=0.99,
+            )
+
+    runner._llm = LegacyLLM()
+    calls = []
+
+    async def fake_fetch(snapshot, **kwargs):
+        calls.append(kwargs["verified_english_only"])
+        return _multilingual_result()
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "请问一般需要多久？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+    assert outbox_id is not None
+    assert calls == [False, True]
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.reply_text == "旧路径回复。"
+    assert decision.multilingual_shadow is True
+    assert decision.multilingual_shadow_evidence["match_status"] == "strong"
+    assert decision.knowledge_content_hash is None

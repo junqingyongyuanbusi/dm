@@ -45,8 +45,18 @@ _REQUIRED_EXPLICIT_GATES = (
     "KNOWLEDGE_RETRIEVAL_ENABLED",
     "KNOWLEDGE_VERBATIM_REPLY",
     "REQUIRE_KNOWLEDGE",
+    "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED",
+    "MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED",
+    "ENGLISH_KNOWLEDGE_ONLY_ENABLED",
+    "KNOWLEDGE_CORPUS_VERSION",
+    "MULTILINGUAL_CALIBRATION_REPORT_SHA256",
+    "MULTILINGUAL_SUPPORTED_LANGUAGES",
+    "MULTILINGUAL_E2E_REPORT_SHA256",
+    "KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY",
+    "KNOWLEDGE_AUTO_REPLY_MIN_MARGIN",
+    "OPENAI_GROUNDING_MODEL",
+    "GROUNDING_VERIFIER_TIMEOUT_SECONDS",
 )
-_REQUIRED_SHARED += _REQUIRED_EXPLICIT_GATES
 _SHARED_SETTING_KEYS = tuple(name.upper() for name in Settings.model_fields)
 
 
@@ -59,9 +69,7 @@ def _validated_settings(service: str, values: Mapping[str, str]) -> Settings:
     for name, field in Settings.model_fields.items():
         key = name.upper()
         kwargs[name] = (
-            values[key]
-            if key in values
-            else field.get_default(call_default_factory=True)
+            values[key] if key in values else field.get_default(call_default_factory=True)
         )
     try:
         return Settings(_env_file=None, **kwargs)  # type: ignore[call-arg]
@@ -77,12 +85,21 @@ def validate(variables: Mapping[str, Mapping[str, str]], *, public_base_url: str
         expected_role = _EXPECTED_ROLES[service]
         if values.get("SERVICE_ROLE") != expected_role:
             errors.append(f"{service}:SERVICE_ROLE_must_equal_{expected_role}")
+        if values.get("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "").strip().lower() != "false":
+            errors.append(f"{service}:MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED_must_equal_false")
+        if values.get("MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED", "").strip().lower() != "false":
+            errors.append(f"{service}:MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED_must_equal_false")
+        if values.get("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "").strip().lower() != "false":
+            errors.append(f"{service}:ENGLISH_KNOWLEDGE_ONLY_ENABLED_must_equal_false")
         if values.get("TESTING", "").strip().lower() != "false":
             errors.append(f"{service}:TESTING_must_equal_false")
         if values.get("PUBLIC_BASE_URL", "").rstrip("/") != public_base_url.rstrip("/"):
             errors.append(f"{service}:PUBLIC_BASE_URL_mismatch")
         for key in _REQUIRED_SHARED:
             if not values.get(key):
+                errors.append(f"{service}:missing_{key}")
+        for key in _REQUIRED_EXPLICIT_GATES:
+            if key not in values:
                 errors.append(f"{service}:missing_{key}")
         try:
             _validated_settings(service, values)
@@ -141,10 +158,7 @@ def main() -> None:
     project, environment, public_base_url = sys.argv[1:]
     try:
         validate(
-            {
-                service: _railway_variables(project, environment, service)
-                for service in _SERVICES
-            },
+            {service: _railway_variables(project, environment, service) for service in _SERVICES},
             public_base_url=public_base_url,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:

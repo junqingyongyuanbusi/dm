@@ -49,6 +49,7 @@ from social_reply.application.knowledge.drafts import (
     persist_knowledge_draft,
 )
 from social_reply.application.knowledge.importer import import_knowledge_rows
+from social_reply.application.knowledge.retrieval import normalize_question
 from social_reply.application.message_delivery.contracts import (
     build_direct_reply_destination,
 )
@@ -72,6 +73,7 @@ from social_reply.domain.automation.state_machine import (
 )
 from social_reply.domain.platform_accounts import capability_text_limit
 from social_reply.domain.reply.guard import has_contact_like, redact_pii
+from social_reply.domain.reply.language import assess_knowledge_language
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
 from social_reply.domain.reply.voice import (
@@ -2162,6 +2164,7 @@ _KB_BANNERS = {
     "embed_failed": ("err", "向量化失败：请检查 Embedding 服务配置后重试。"),
     "status_changed": ("ok", "知识条目状态已更新并记录审计。"),
     "classification_changed": ("ok", "官方联系方式分类已更新并记录审计。"),
+    "language_confirmed": ("ok", "知识条目已人工确认为英语并记录审计。"),
     "deleted": ("ok", "条目已删除。"),
     "import_bad_csv": (
         "err",
@@ -2194,11 +2197,80 @@ def _knowledge_actions(doc: models.KnowledgeDocument, csrf: str) -> str:
             f'<input type="hidden" name="target" value="{official_target}">'
             f'<button class="btn-sm btn-ghost">{official_label}</button></form>'
         )
+        if doc.language_verified:
+            language_confirmation = '<span class="muted">英语已确认</span>'
+        elif doc.language_detection_status in {"mixed", "non_english"}:
+            language_confirmation = '<span class="muted">需创建英语替代条目</span>'
+        else:
+            reason_input = (
+                '<input name="confirmation_reason" placeholder="不确定内容确认理由" required>'
+                if doc.language_detection_status == "unknown"
+                else ""
+            )
+            language_confirmation = (
+                f'<form class="inline" method="post" '
+                f'action="/admin/knowledge/{doc.id}/confirm-english">'
+                f'<input type="hidden" name="csrf_token" value="{csrf}">'
+                f'{reason_input}<button class="btn-sm btn-ghost">确认英语内容</button></form>'
+            )
     else:
         classification = '<span class="muted">先下架再更改分类</span>'
+        language_confirmation = '<span class="muted">先下架再确认语言</span>'
     return f"""<form class="inline" method="post" action="/admin/knowledge/{doc.id}/status"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{status_target}"><button class="btn-sm btn-ghost">{status_label}</button></form>
 {classification}
+{language_confirmation}
 <form class="inline" method="post" action="/admin/knowledge/{doc.id}/delete"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-danger" onclick="return confirm('确认删除该知识条目？此操作不可恢复。')">删除</button></form>"""
+
+
+def _require_knowledge_corpus_mutation_allowed() -> None:
+    settings = get_settings()
+    if (
+        settings.multilingual_knowledge_reply_enabled
+        or settings.multilingual_knowledge_shadow_enabled
+    ):
+        raise HTTPException(status_code=409, detail="knowledge_corpus_pinned_for_multilingual_mode")
+
+
+async def _require_knowledge_publishable(session, doc: models.KnowledgeDocument) -> None:
+    if get_settings().english_knowledge_only_enabled and not (
+        doc.source_language == "en" and doc.language_verified
+    ):
+        raise HTTPException(status_code=409, detail="confirm_english_before_publish")
+    normalized = normalize_question(doc.question)
+    lock_key = f"knowledge-publish:{doc.tenant_id}:{doc.brand_id}:{normalized}"
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0))))
+    platform_overlap = (
+        True
+        if doc.platform is None
+        else or_(
+            models.KnowledgeDocument.platform.is_(None),
+            models.KnowledgeDocument.platform == doc.platform,
+        )
+    )
+    conflicts = await session.scalar(
+        select(func.count())
+        .select_from(models.KnowledgeDocument)
+        .where(
+            models.KnowledgeDocument.id != doc.id,
+            models.KnowledgeDocument.tenant_id == doc.tenant_id,
+            models.KnowledgeDocument.brand_id == doc.brand_id,
+            platform_overlap,
+            models.KnowledgeDocument.status == "published",
+            func.regexp_replace(
+                func.lower(func.trim(models.KnowledgeDocument.question)),
+                r"\s+",
+                " ",
+                "g",
+            )
+            == normalized,
+            or_(
+                models.KnowledgeDocument.reply != doc.reply,
+                models.KnowledgeDocument.is_official_contact != doc.is_official_contact,
+            ),
+        )
+    )
+    if conflicts:
+        raise HTTPException(status_code=409, detail="conflicting_published_knowledge")
 
 
 @router.get("/content/knowledge", response_class=HTMLResponse)
@@ -2222,14 +2294,44 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
             .scalars()
             .all()
         )
+        batch_rows = (
+            await session.execute(
+                select(
+                    models.KnowledgeDocument.import_batch_id,
+                    models.KnowledgeDocument.source_file,
+                    models.KnowledgeDocument.tenant_id,
+                    func.count().label("candidate_count"),
+                    func.max(models.KnowledgeDocument.created_at).label("imported_at"),
+                )
+                .where(
+                    models.KnowledgeDocument.tenant_id.in_(tenants),
+                    models.KnowledgeDocument.import_batch_id.isnot(None),
+                    models.KnowledgeDocument.status == "draft",
+                    models.KnowledgeDocument.language_detection_status == "english",
+                    models.KnowledgeDocument.language_verified.is_(False),
+                )
+                .group_by(
+                    models.KnowledgeDocument.import_batch_id,
+                    models.KnowledgeDocument.source_file,
+                    models.KnowledgeDocument.tenant_id,
+                )
+                .order_by(desc(func.max(models.KnowledgeDocument.created_at)))
+                .limit(100)
+            )
+        ).all()
     banner = ""
     if notice == "imported":
         n = _query_int(request, "inserted")
         s = _query_int(request, "skipped")
         b = _query_int(request, "blank")
+        imported_batch_id = (request.query_params.get("batch_id") or "").strip()
         banner = (
-            f'<div class="banner ok">导入完成：新增 {n} 条，跳过 {s} 条重复，忽略 {b} 条空行</div>'
+            f'<div class="banner ok">导入完成：新增 {n} 条，跳过 {s} 条重复，忽略 {b} 条空行；'
+            f"批次 {html.escape(imported_batch_id or '—')}</div>"
         )
+    elif notice == "bulk_language_confirmed":
+        count = _query_int(request, "count")
+        banner = f'<div class="banner ok">批量英语确认完成：已确认 {count} 条草稿并记录审计。</div>'
     elif notice == "bulk_published":
         count = _query_int(request, "count")
         banner = f'<div class="banner ok">批量发布完成：已发布 {count} 条草稿并记录审计。</div>'
@@ -2238,15 +2340,19 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
         banner = f'<div class="banner {tone}">{text}</div>'
     rows = (
         "".join(
-            f"<tr><td>{html.escape((d.question or '')[:40])}</td>"
-            f"<td class='muted'>{html.escape((d.reply or '')[:48])}</td>"
+            f"<tr><td><details><summary>{html.escape((d.question or '')[:40])}</summary>"
+            f"<pre>{html.escape(d.question or '')}</pre></details></td>"
+            f"<td class='muted'><details><summary>{html.escape((d.reply or '')[:48])}</summary>"
+            f"<pre>{html.escape(d.reply or '')}</pre></details></td>"
             f"<td class='muted'>{html.escape(d.category or '—')}</td>"
             f"<td>{'是' if d.is_official_contact else '否'}</td>"
+            f"<td>{html.escape(d.detected_language)} / {html.escape(d.language_detection_status)}</td>"
+            f"<td>{'英语已确认' if d.language_verified else '待确认'}</td>"
             f"<td>{_pill(d.status)}</td>"
             f"<td>{_knowledge_actions(d, csrf)}</td></tr>"
             for d in docs
         )
-        or "<tr><td colspan='6' class='muted'>知识库为空</td></tr>"
+        or "<tr><td colspan='8' class='muted'>知识库为空</td></tr>"
     )
     add_form = f"""<details class="collapse"><summary>新增知识条目</summary><div class="inner">
 <form method="post" action="/admin/knowledge/add"><input type="hidden" name="csrf_token" value="{csrf}">
@@ -2267,11 +2373,24 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
 {_tenant_input(principal)}
 <p class="hint">将所选 Tenant 的普通草稿批量发布并逐条记录审计；已标记或检测到联系方式的草稿仍需单独复核发布。</p>
 <button class="btn-block" onclick="return confirm('确认发布该 Tenant 的全部普通知识库草稿？发布后将立即参与检索。')">批量发布普通草稿</button></form></section>"""
+    batch_options = "".join(
+        f'<option value="{row.import_batch_id}">'
+        f"{html.escape(row.tenant_id)} / {html.escape(row.source_file or '—')} / "
+        f"{row.candidate_count} 条 / {_fmt(row.imported_at)}</option>"
+        for row in batch_rows
+    )
+    bulk_confirm_form = f"""<section class="card"><h2>批量确认英语知识</h2>
+<form method="post" action="/admin/knowledge/bulk-confirm-english"><input type="hidden" name="csrf_token" value="{csrf}">
+<label for="f-kb-import-batch">导入批次</label>
+<select id="f-kb-import-batch" name="import_batch_id" required>{batch_options or '<option value="">没有待确认英语批次</option>'}</select>
+<p class="hint">只确认自动检测状态为 english 的草稿；mixed、non_english 和 unknown 必须逐条人工复核。</p>
+<button class="btn-block" onclick="return confirm('确认将该 Tenant 下所有检测为英语的草稿标记为人工确认英语？')">批量确认检测为英语</button></form></section>"""
     body = f"""<h1>知识库</h1><p class="lede">回复模板管理：新建和导入默认草稿；只有经过明确发布的条目才参与检索。</p>{banner}
 {add_form}
 {import_form}
+{bulk_confirm_form}
 {bulk_publish_form}
-<section class="card"><h2>模板列表</h2><p class="hint">共 {len(docs)} 条（最多显示 200）。官方联系方式必须先分类、复核，再明确发布。</p><div class="tablewrap"><table><thead><tr><th>问题</th><th>回复</th><th>分类</th><th>官方联系方式</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
+<section class="card"><h2>模板列表</h2><p class="hint">共 {len(docs)} 条（最多显示 200）。官方联系方式必须先分类、复核，再明确发布。</p><div class="tablewrap"><table><thead><tr><th>问题</th><th>回复</th><th>分类</th><th>官方联系方式</th><th>自动语言检测</th><th>英语确认</th><th>状态</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>"""
     response = HTMLResponse(
         _page("知识库", body, active="knowledge", show_users=principal.is_superadmin)
     )
@@ -2296,6 +2415,7 @@ async def knowledge_add(request: Request) -> Response:
     is_official_contact = official_value == "true"
     if not question or not reply:
         raise HTTPException(status_code=422, detail="question_and_reply_required")
+    detected_language, detection_status = assess_knowledge_language(question, reply)
     draft = build_knowledge_draft(
         tenant_id=tenant_id,
         question=question,
@@ -2303,7 +2423,10 @@ async def knowledge_add(request: Request) -> Response:
         brand_id=(form.get("brand_id") or "").strip() or "default",
         category=(form.get("category") or "").strip() or None,
         is_official_contact=is_official_contact,
+        detected_language=detected_language,
+        language_detection_status=detection_status,
         source_file="admin-console",
+        import_batch_id=uuid.uuid4(),
     )
     from social_reply.application.reply_decision.runner import _get_embedder
 
@@ -2396,7 +2519,130 @@ async def knowledge_import(request: Request) -> Response:
         )
     return RedirectResponse(
         f"/admin/knowledge?notice=imported&inserted={report.inserted}"
-        f"&skipped={report.skipped}&blank={report.blank}",
+        f"&skipped={report.skipped}&blank={report.blank}&batch_id={report.batch_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/knowledge/{doc_id}/confirm-english")
+async def knowledge_confirm_english(request: Request, doc_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    confirmation_reason = (form.get("confirmation_reason") or "").strip()
+    async with get_session_factory()() as session:
+        doc = (
+            await session.execute(
+                select(models.KnowledgeDocument)
+                .where(
+                    models.KnowledgeDocument.id == doc_id,
+                    models.KnowledgeDocument.tenant_id.in_(principal.allowed_tenants),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if doc is None:
+            raise HTTPException(status_code=404, detail="knowledge_not_found")
+        if doc.status != "draft":
+            raise HTTPException(status_code=409, detail="unpublish_before_language_confirmation")
+        if doc.language_detection_status in {"mixed", "non_english"}:
+            raise HTTPException(status_code=409, detail="english_replacement_required")
+        if doc.language_detection_status == "unknown" and len(confirmation_reason) < 10:
+            raise HTTPException(status_code=422, detail="language_confirmation_reason_required")
+        if not doc.language_verified or doc.source_language != "en":
+            doc.source_language = "en"
+            doc.language_verified = True
+            session.add(
+                models.AuditLog(
+                    tenant_id=doc.tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action="CONFIRM_KNOWLEDGE_ENGLISH",
+                    subject_type="knowledge_document",
+                    subject_id=str(doc.id),
+                    detail={
+                        "detected_language": doc.detected_language,
+                        "detection_status": doc.language_detection_status,
+                        "source_file": doc.source_file,
+                        "import_batch_id": str(doc.import_batch_id)
+                        if doc.import_batch_id
+                        else None,
+                        "confirmation_reason": confirmation_reason or None,
+                        "bulk": False,
+                    },
+                )
+            )
+        await session.commit()
+    return RedirectResponse(
+        "/admin/knowledge?notice=language_confirmed",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/knowledge/bulk-confirm-english")
+async def knowledge_bulk_confirm_english(request: Request) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    raw_batch_id = (form.get("import_batch_id") or "").strip()
+    try:
+        import_batch_id = uuid.UUID(raw_batch_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_import_batch_id") from exc
+    confirmation_batch_id = str(uuid.uuid4())
+    async with get_session_factory()() as session:
+        batch_tenant = await session.scalar(
+            select(models.KnowledgeDocument.tenant_id)
+            .where(models.KnowledgeDocument.import_batch_id == import_batch_id)
+            .limit(1)
+        )
+        if batch_tenant is None or batch_tenant not in principal.allowed_tenants:
+            raise HTTPException(status_code=404, detail="knowledge_import_batch_not_found")
+        filters = [
+            models.KnowledgeDocument.tenant_id == batch_tenant,
+            models.KnowledgeDocument.import_batch_id == import_batch_id,
+            models.KnowledgeDocument.status == "draft",
+            models.KnowledgeDocument.language_detection_status == "english",
+            models.KnowledgeDocument.language_verified.is_(False),
+        ]
+        docs = (
+            (
+                await session.execute(
+                    select(models.KnowledgeDocument).where(*filters).with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for doc in docs:
+            doc.source_language = "en"
+            doc.language_verified = True
+            session.add(
+                models.AuditLog(
+                    tenant_id=doc.tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action="CONFIRM_KNOWLEDGE_ENGLISH",
+                    subject_type="knowledge_document",
+                    subject_id=str(doc.id),
+                    detail={
+                        "detected_language": doc.detected_language,
+                        "detection_status": doc.language_detection_status,
+                        "source_file": doc.source_file,
+                        "brand": doc.brand_id,
+                        "bulk": True,
+                        "import_batch_id": str(import_batch_id),
+                        "confirmation_batch_id": confirmation_batch_id,
+                    },
+                )
+            )
+        await session.commit()
+    return RedirectResponse(
+        f"/admin/knowledge?notice=bulk_language_confirmed&count={len(docs)}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -2408,6 +2654,7 @@ async def knowledge_bulk_publish(request: Request) -> Response:
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    _require_knowledge_corpus_mutation_allowed()
     requested_tenant = (form.get("tenant_id") or "").strip()
     if not requested_tenant:
         raise HTTPException(status_code=422, detail="tenant_id_required")
@@ -2417,10 +2664,7 @@ async def knowledge_bulk_publish(request: Request) -> Response:
         last_id: uuid.UUID | None = None
         while True:
             candidate_query = (
-                select(
-                    models.KnowledgeDocument.id,
-                    models.KnowledgeDocument.reply,
-                )
+                select(models.KnowledgeDocument)
                 .where(
                     models.KnowledgeDocument.tenant_id == tenant_id,
                     models.KnowledgeDocument.status == "draft",
@@ -2428,63 +2672,44 @@ async def knowledge_bulk_publish(request: Request) -> Response:
                 )
                 .order_by(models.KnowledgeDocument.id)
                 .limit(_KNOWLEDGE_BULK_PUBLISH_CHUNK_SIZE)
+                .with_for_update()
             )
             if last_id is not None:
                 candidate_query = candidate_query.where(models.KnowledgeDocument.id > last_id)
-            candidates = (await session.execute(candidate_query)).all()
+            candidates = (await session.execute(candidate_query)).scalars().all()
             if not candidates:
                 break
             last_id = candidates[-1].id
-            publishable_ids = [
-                row.id for row in candidates if not has_contact_like(row.reply or "")
-            ]
-            if not publishable_ids:
-                continue
-            published = (
-                await session.execute(
-                    update(models.KnowledgeDocument)
-                    .where(
-                        models.KnowledgeDocument.tenant_id == tenant_id,
-                        models.KnowledgeDocument.status == "draft",
-                        models.KnowledgeDocument.is_official_contact.is_(False),
-                        models.KnowledgeDocument.id.in_(publishable_ids),
-                    )
-                    .values(status="published")
-                    .returning(
-                        models.KnowledgeDocument.id,
-                        models.KnowledgeDocument.tenant_id,
-                        models.KnowledgeDocument.brand_id,
-                        models.KnowledgeDocument.platform,
-                        models.KnowledgeDocument.is_official_contact,
-                    )
-                )
-            ).all()
-            if not published:
-                continue
-            await session.execute(
-                models.AuditLog.__table__.insert(),
-                [
-                    {
-                        "tenant_id": row.tenant_id,
-                        "category": "admin_action",
-                        "actor": principal.actor,
-                        "action": "PUBLISH_KNOWLEDGE",
-                        "subject_type": "knowledge_document",
-                        "subject_id": str(row.id),
-                        "detail": {
+            for doc in candidates:
+                if has_contact_like(doc.reply or ""):
+                    continue
+                try:
+                    await _require_knowledge_publishable(session, doc)
+                except HTTPException as exc:
+                    if exc.status_code == 409:
+                        continue
+                    raise
+                doc.status = "published"
+                session.add(
+                    models.AuditLog(
+                        tenant_id=doc.tenant_id,
+                        category="admin_action",
+                        actor=principal.actor,
+                        action="PUBLISH_KNOWLEDGE",
+                        subject_type="knowledge_document",
+                        subject_id=str(doc.id),
+                        detail={
                             "from": "draft",
                             "to": "published",
-                            "brand": row.brand_id,
-                            "platform": row.platform,
-                            "is_official_contact": row.is_official_contact,
+                            "brand": doc.brand_id,
+                            "platform": doc.platform,
+                            "is_official_contact": doc.is_official_contact,
                             "bulk": True,
                         },
-                    }
-                    for row in published
-                ],
-            )
-            published_count += len(published)
-        await session.commit()
+                    )
+                )
+                published_count += 1
+            await session.commit()
     return RedirectResponse(
         f"/admin/knowledge?notice=bulk_published&count={published_count}",
         status_code=status.HTTP_303_SEE_OTHER,
@@ -2498,6 +2723,7 @@ async def knowledge_set_status(request: Request, doc_id: uuid.UUID) -> Response:
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    _require_knowledge_corpus_mutation_allowed()
     target = (form.get("target") or "").strip()
     if target not in {"draft", "published"}:
         raise HTTPException(status_code=422, detail="invalid_knowledge_status")
@@ -2514,6 +2740,8 @@ async def knowledge_set_status(request: Request, doc_id: uuid.UUID) -> Response:
         ).scalar_one_or_none()
         if doc is None:
             raise HTTPException(status_code=404, detail="knowledge_not_found")
+        if target == "published":
+            await _require_knowledge_publishable(session, doc)
         previous = doc.status
         if previous != target:
             doc.status = target
@@ -2612,6 +2840,8 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
         doc = await session.get(models.KnowledgeDocument, doc_id)
         if doc is None or doc.tenant_id not in principal.allowed_tenants:
             raise HTTPException(status_code=404, detail="knowledge_not_found")
+        if doc.status == "published":
+            _require_knowledge_corpus_mutation_allowed()
         await session.delete(doc)  # chunk 级联删除（FK ondelete=CASCADE）
         await session.commit()
     return RedirectResponse(
@@ -2999,7 +3229,6 @@ async def delivery_retry(request: Request, outbox_id: uuid.UUID) -> Response:
 # ---------- 账号 / 急停 / 接入 ----------
 
 
-
 _CHANNEL_LABELS = {
     "x": "X",
     "facebook": "Facebook",
@@ -3287,7 +3516,9 @@ async def accounts_page(request: Request) -> Response:
         "feishu": settings.feishu_enabled,
         "email": settings.email_enabled,
     }
-    requested_channel = request.path_params.get("provider") or request.query_params.get("connect", "")
+    requested_channel = request.path_params.get("provider") or request.query_params.get(
+        "connect", ""
+    )
     if request.path_params.get("provider") and requested_channel not in _CHANNEL_LABELS:
         raise HTTPException(status_code=404, detail="integration_provider_not_found")
     selected_channel = (
@@ -3394,18 +3625,17 @@ async def safety_page(request: Request) -> Response:
         f'<input type="hidden" name="csrf_token" value="{csrf}">'
         '<input type="hidden" name="scope" value="global">'
         f'<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">'
-        f'<h2>{html.escape(tenant)}</h2>'
+        f"<h2>{html.escape(tenant)}</h2>"
         '<p class="hint">启用后自动回复降级为草稿；人工处理和持久化工作流继续运行。</p>'
         f'<button class="{"btn-ghost" if flags[index] else "btn-danger"}">'
-        f'{"解除全局急停" if flags[index] else "启用全局急停"}</button></form>'
+        f"{'解除全局急停' if flags[index] else '启用全局急停'}</button></form>"
         for index, tenant in enumerate(tenants)
     )
     body = f"""<h1>安全控制</h1><p class="lede">集中管理租户级全局急停。账号级控制仍位于平台账号页。</p>
 <div class="grid">{controls}</div>"""
-    response = HTMLResponse(
-        _page("安全控制", body, active="safety", show_users=True)
-    )
+    response = HTMLResponse(_page("安全控制", body, active="safety", show_users=True))
     return _ensure_csrf(response, request, csrf)
+
 
 @router.post("/accounts/{account_id}/xchat")
 async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Response:

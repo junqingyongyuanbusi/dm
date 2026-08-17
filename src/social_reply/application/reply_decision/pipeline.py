@@ -1,14 +1,17 @@
 import logging
+import time
 from dataclasses import dataclass, replace
 
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import redact_pii, run_final_guard
-from social_reply.domain.reply.llm import LLMClient, LLMContext
+from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, LLMClient, LLMContext
 from social_reply.domain.reply.rules import apply_rules
 from social_reply.domain.reply.voice import VoicePreferences
 
 logger = logging.getLogger(__name__)
+_GROUNDING_VERIFIER_VERSION = "grounding-v1"
+
 
 @dataclass(frozen=True)
 class DecisionSnapshot:
@@ -30,12 +33,17 @@ class DecisionSnapshot:
 async def run_decision_pipeline(
     snapshot: DecisionSnapshot,
     *,
-    llm: LLMClient,
+    llm: LLMClient | None,
     killswitch,
     knowledge: tuple[str, ...] = (),
     require_knowledge: bool = False,
     verbatim_reply: str | None = None,
     approved_official_contact_reply: str | None = None,
+    approved_knowledge_reply: str | None = None,
+    verbatim_after_decision: str | None = None,
+    forced_decision: ReplyDecision | None = None,
+    target_language: str = "und",
+    apply_legacy_rules: bool = True,
     history: tuple[tuple[str, str], ...] = (),
     voice_preferences: VoicePreferences | None = None,
     email_auto_reply_allowed: bool = True,
@@ -73,7 +81,7 @@ async def run_decision_pipeline(
         return ReplyDecision(action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH",), source="rule")
 
     # 确定性安全规则（空消息/风险词）优先于一切
-    ruled = apply_rules(snapshot.text)
+    ruled = apply_rules(snapshot.text) if apply_legacy_rules else None
     if snapshot.has_unsupported_attachment:
         decision = ReplyDecision(
             action=ReplyAction.HANDOFF,
@@ -82,6 +90,8 @@ async def run_decision_pipeline(
         )
     elif ruled is not None:
         decision = ruled
+    elif forced_decision is not None:
+        decision = forced_decision
     elif verbatim_reply is not None:
         # Exact templates bypass the LLM so approved wording is preserved.
         decision = ReplyDecision(
@@ -103,19 +113,44 @@ async def run_decision_pipeline(
             for role, text in history
             if role in {"user", "assistant"} and text
         )
-        decision = await llm.decide(
-            LLMContext(
-                text=redact_pii(snapshot.text or ""),
-                conversation_key=snapshot.conversation_key,
-                knowledge=knowledge,
-                history=safe_history,
-                voice_preferences=voice_preferences,
+        if llm is None:
+            decision = ReplyDecision(
+                action=ReplyAction.HANDOFF,
+                reason_codes=("LLM_UNAVAILABLE",),
+                source="rule",
             )
-        )
+        else:
+            decision = await llm.decide(
+                LLMContext(
+                    text=redact_pii(snapshot.text or ""),
+                    conversation_key=snapshot.conversation_key,
+                    knowledge=knowledge,
+                    history=safe_history,
+                    voice_preferences=voice_preferences,
+                    target_language=target_language,
+                    approved_verbatim_available=verbatim_after_decision is not None,
+                )
+            )
         if knowledge:
             # Preserve whether retrieved knowledge influenced the model decision.
             decision = replace(decision, reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
 
+    if verbatim_after_decision is not None and decision.action is ReplyAction.AUTO_REPLY:
+        if decision.reply_text != APPROVED_VERBATIM_SENTINEL:
+            decision = replace(
+                decision,
+                action=ReplyAction.HANDOFF,
+                reply_text=None,
+                source="guard",
+                reason_codes=decision.reason_codes + ("VERBATIM_SENTINEL_MISSING",),
+            )
+        else:
+            decision = replace(
+                decision,
+                reply_text=verbatim_after_decision,
+                source="knowledge",
+                reason_codes=decision.reason_codes + ("KNOWLEDGE_VERBATIM",),
+            )
     # Customer sends are public at this boundary; delivery channels own effective visibility.
     if (
         decision.action is ReplyAction.AUTO_REPLY
@@ -142,8 +177,46 @@ async def run_decision_pipeline(
         decision,
         snapshot.platform,
         approved_official_contact_reply=approved_official_contact_reply,
+        expected_reply_language=target_language,
+        approved_knowledge_reply=approved_knowledge_reply,
     )
 
+    if (
+        target_language != "und"
+        and approved_knowledge_reply is not None
+        and verbatim_after_decision is None
+        and decision.action is ReplyAction.AUTO_REPLY
+    ):
+        faithful = False
+        verifier = getattr(llm, "verify_grounding", None) if llm is not None else None
+        verification_started = time.perf_counter()
+        if verifier is not None:
+            try:
+                faithful = await verifier(
+                    approved_reply=approved_knowledge_reply,
+                    candidate_reply=decision.reply_text or "",
+                    target_language=target_language,
+                )
+            except Exception:
+                logger.exception("grounding verifier failed; decision downgraded to handoff")
+        decision = replace(
+            decision,
+            grounding_verified=faithful,
+            grounding_verifier_version=getattr(
+                llm,
+                "grounding_verifier_id",
+                _GROUNDING_VERIFIER_VERSION,
+            ),
+            grounding_latency_ms=(time.perf_counter() - verification_started) * 1000,
+        )
+        if not faithful:
+            decision = replace(
+                decision,
+                action=ReplyAction.HANDOFF,
+                reply_text=None,
+                source="guard",
+                reason_codes=decision.reason_codes + ("GUARD_KNOWLEDGE_SEMANTIC_MISMATCH",),
+            )
     # 草稿降级必须是管线的最后一步：任何把 action 改回 AUTO_REPLY 的兜底都要排在它前面，
     # 否则决策会以 auto_reply 落库——BOT_DRAFT_ONLY 下既不外发，也进不了 admin 待审队列。
     # Persistence creates a public Outbox only when state and version still match BOT_ACTIVE.

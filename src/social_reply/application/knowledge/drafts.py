@@ -1,4 +1,5 @@
 import hashlib
+import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -16,7 +17,12 @@ class KnowledgeDraft:
     platform: str | None
     category: str | None
     is_official_contact: bool
+    source_language: str
+    language_verified: bool
+    detected_language: str
+    language_detection_status: str
     source_file: str
+    import_batch_id: uuid.UUID | None
     content: str
     embed_text: str
     content_hash: str
@@ -31,7 +37,12 @@ def build_knowledge_draft(
     platform: str | None = None,
     category: str | None = None,
     is_official_contact: bool = False,
+    source_language: str = "und",
+    language_verified: bool = False,
+    detected_language: str = "und",
+    language_detection_status: str = "unknown",
     source_file: str,
+    import_batch_id: uuid.UUID | None = None,
 ) -> KnowledgeDraft:
     content = f"问：{question}\n答：{reply}"
     return KnowledgeDraft(
@@ -42,7 +53,12 @@ def build_knowledge_draft(
         platform=platform,
         category=category,
         is_official_contact=is_official_contact,
+        source_language=source_language,
+        language_verified=language_verified,
+        detected_language=detected_language,
+        language_detection_status=language_detection_status,
         source_file=source_file,
+        import_batch_id=import_batch_id,
         content=content,
         embed_text=question,
         content_hash=hashlib.sha256(content.encode()).hexdigest(),
@@ -83,6 +99,11 @@ async def persist_knowledge_draft(
         reply=draft.reply,
         status="draft",
         is_official_contact=draft.is_official_contact,
+        source_language=draft.source_language,
+        language_verified=draft.language_verified,
+        detected_language=draft.detected_language,
+        language_detection_status=draft.language_detection_status,
+        import_batch_id=draft.import_batch_id,
         source_file=draft.source_file,
     )
     session.add(document)

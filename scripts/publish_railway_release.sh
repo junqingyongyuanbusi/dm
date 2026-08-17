@@ -367,6 +367,11 @@ write_manifest() {
       digest: $digest,
       previous_digest: $previous_digest,
       rollback_tag: $rollback_tag,
+      release_gates: {
+        multilingual_live_enabled: false,
+        multilingual_shadow_enabled: false,
+        english_knowledge_only_enabled: false
+      },
       previous_railway: {
         api_deployment_id: $previous_api_deployment_id,
         worker_deployment_id: $previous_worker_deployment_id,
@@ -563,6 +568,7 @@ for service in "${RAILWAY_SERVICES[@]}"; do
   [[ -n "$final_id" && "$final_digest" == "$expected_digest" ]] \
     || fail "$service active deployment does not match $expected_digest"
 done
+validate_railway_config
 validate_railway_colocation
 revalidate_dev_head
 write_manifest "completed"

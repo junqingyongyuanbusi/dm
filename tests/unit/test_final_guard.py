@@ -235,3 +235,129 @@ def test_empty_reply_blocked():
 def test_clean_reply_passes():
     d = ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text="您好，请提供订单号。")
     assert run_final_guard(d, "telegram").action is ReplyAction.AUTO_REPLY
+
+
+def test_expected_language_and_equivalent_localized_time_fact_pass():
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="退款通常需要 3 到 5 个工作日。",
+    )
+    result = run_final_guard(
+        decision,
+        "telegram",
+        expected_reply_language="zh-Hans",
+        approved_knowledge_reply="Refunds usually take 3–5 business days.",
+    )
+    assert result.action is ReplyAction.AUTO_REPLY
+    assert result.reply_language in {"zh", "zh-Hans"}
+
+
+def test_wrong_reply_language_is_blocked():
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="Refunds usually take three business days.",
+    )
+    result = run_final_guard(
+        decision,
+        "telegram",
+        expected_reply_language="zh-Hans",
+        approved_knowledge_reply="Refunds usually take three business days.",
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_LANGUAGE_MISMATCH" in result.reason_codes
+
+
+def test_changed_time_unit_is_blocked():
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="退款通常需要 3 到 5 个小时。",
+    )
+    result = run_final_guard(
+        decision,
+        "telegram",
+        expected_reply_language="zh-Hans",
+        approved_knowledge_reply="Refunds usually take 3–5 business days.",
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in result.reason_codes
+
+
+def test_changed_protected_entity_is_blocked():
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="根据已批准的服务政策，OtherFX 通常会在 3 个工作日内回复客户的问题。",
+    )
+    result = run_final_guard(
+        decision,
+        "telegram",
+        expected_reply_language="zh-Hans",
+        approved_knowledge_reply="WikiFX usually replies within 3 business days.",
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_KNOWLEDGE_ENTITY_MISMATCH" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "template",
+    ("support@example.com", "https://support.example.com/contact"),
+)
+def test_language_neutral_approved_contact_verbatim_can_pass_in_english(template):
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text=template,
+        source="knowledge",
+    )
+    result = run_final_guard(
+        decision,
+        "telegram",
+        approved_official_contact_reply=template,
+        approved_knowledge_reply=template,
+        expected_reply_language="en",
+    )
+    assert result.action is ReplyAction.AUTO_REPLY
+    assert result.reply_language == "en"
+
+
+def test_fact_guard_allows_localized_word_order_but_blocks_value_role_swap():
+    approved = "Pay USD 10 within 3 days."
+    valid = run_final_guard(
+        ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text="请在 3 天内支付 10 美元。"),
+        "telegram",
+        expected_reply_language="zh-Hans",
+        approved_knowledge_reply=approved,
+    )
+    assert valid.action is ReplyAction.AUTO_REPLY
+
+    invalid = run_final_guard(
+        ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text="请在 10 天内支付 3 美元。"),
+        "telegram",
+        expected_reply_language="zh-Hans",
+        approved_knowledge_reply=approved,
+    )
+    assert invalid.action is ReplyAction.HANDOFF
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in invalid.reason_codes
+
+
+def test_fact_guard_uses_target_locale_for_grouping_separators():
+    equivalent = run_final_guard(
+        ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text="Die Gebühr beträgt 1.000 USD.",
+        ),
+        "telegram",
+        expected_reply_language="de",
+        approved_knowledge_reply="The fee is USD 1,000.",
+    )
+    assert equivalent.action is ReplyAction.AUTO_REPLY
+
+    changed = run_final_guard(
+        ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text="Die Gebühr beträgt 1.000 USD.",
+        ),
+        "telegram",
+        expected_reply_language="de",
+        approved_knowledge_reply="The fee is USD 1.",
+    )
+    assert changed.action is ReplyAction.HANDOFF
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in changed.reason_codes

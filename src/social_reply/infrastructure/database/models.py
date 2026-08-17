@@ -910,6 +910,27 @@ class ReplyDecision(Base):
     reason_codes: Mapped[list] = mapped_column(JSONB, default=list)
     source: Mapped[str] = mapped_column(Text)  # rule / llm / guard
     prompt_version: Mapped[str | None] = mapped_column(Text)
+    request_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
+    reply_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
+    knowledge_content_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_similarity: Mapped[float | None] = mapped_column(Float)
+    knowledge_similarity_margin: Mapped[float | None] = mapped_column(Float)
+    multilingual_shadow: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    multilingual_contract_version: Mapped[str | None] = mapped_column(String(64))
+    multilingual_shadow_evidence: Mapped[dict | None] = mapped_column(JSONB)
+    request_language_confidence: Mapped[float | None] = mapped_column(Float)
+    request_language_source: Mapped[str | None] = mapped_column(String(32))
+    knowledge_top2_content_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_top2_similarity: Mapped[float | None] = mapped_column(Float)
+    knowledge_match_status: Mapped[str | None] = mapped_column(String(16))
+    knowledge_gate_version: Mapped[str | None] = mapped_column(String(32))
+    knowledge_min_similarity_threshold: Mapped[float | None] = mapped_column(Float)
+    knowledge_min_margin_threshold: Mapped[float | None] = mapped_column(Float)
+    grounding_verified: Mapped[bool | None] = mapped_column(Boolean)
+    grounding_verifier_version: Mapped[str | None] = mapped_column(String(128))
+    grounding_latency_ms: Mapped[float | None] = mapped_column(Float)
     state_version_at_decision: Mapped[int | None] = mapped_column(Integer)
     decision_job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("decision_jobs.id"))
     decision_generation: Mapped[int | None] = mapped_column(BigInteger)
@@ -961,6 +982,19 @@ class KnowledgeDocument(Base):
     is_official_contact: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
+    source_language: Mapped[str] = mapped_column(
+        String(35), default="und", server_default=text("'und'")
+    )
+    detected_language: Mapped[str] = mapped_column(
+        String(35), default="und", server_default=text("'und'")
+    )
+    language_detection_status: Mapped[str] = mapped_column(
+        String(16), default="unknown", server_default=text("'unknown'")
+    )
+    language_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
     source_file: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

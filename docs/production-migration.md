@@ -4,9 +4,78 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
 `scripts/publish_railway_release.sh` for the required production release path.
 
-The current Alembic graph has one head: `e9a1c4f7b620`. Database migration verifies schema state
+The current Alembic graph has one head: `f3b8c1d4e726`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
+
+## Multilingual English knowledge shadow revision
+
+Revision `f3b8c1d4e726` is additive after `e9a1c4f7b620`. It adds language-detection,
+English-confirmation, import-batch and decision/shadow evidence fields. Existing knowledge rows are
+backfilled as `source_language='und'` and `language_verified=false`; the migration does not silently
+certify, translate, unpublish or rewrite production knowledge.
+
+Deploy this revision with all three roles explicitly configured as:
+
+```env
+MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=false
+MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED=false
+ENGLISH_KNOWLEDGE_ONLY_ENABLED=false
+MULTILINGUAL_SUPPORTED_LANGUAGES=en,zh,ja,es,fr,de,pt,ar,ru,th
+KNOWLEDGE_CORPUS_VERSION=unversioned
+KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY=0.8
+KNOWLEDGE_AUTO_REPLY_MIN_MARGIN=0.08
+MULTILINGUAL_CALIBRATION_REPORT_SHA256=
+MULTILINGUAL_E2E_REPORT_SHA256=
+OPENAI_GROUNDING_MODEL=
+GROUNDING_VERIFIER_TIMEOUT_SECONDS=8
+```
+
+This release is only the schema/control/shadow slice. It must not enable live multilingual replies.
+The first-release language allowlist is English, Chinese, Japanese, Spanish, French, German,
+Portuguese, Arabic, Russian and Thai. Unknown, ambiguous, short or unsupported languages hand off;
+neutral Chinese text guarantees Chinese but cannot prove simplified/traditional script.
+
+Before shadow collection, inventory the full corpus and have an operator review the generated CSV:
+
+```bash
+uv run python -m apps.cli.knowledge_language_migration inventory \
+  --output dist/knowledge-language-review.csv
+
+uv run python -m apps.cli.knowledge_language_migration apply \
+  --input dist/knowledge-language-review-approved.csv \
+  --actor "user:reviewer"
+
+uv run python -m apps.cli.knowledge_language_migration fingerprint \
+  > dist/knowledge-readiness-fingerprint.json
+# Copy corpus_fingerprint from that report to KNOWLEDGE_CORPUS_VERSION on api/worker/scheduler.
+uv run python -m apps.cli.knowledge_language_migration readiness
+```
+
+The apply command verifies the reviewed row fingerprint against both the CSV display fields and the
+locked database row. Confirmed English published rows stay published. Mixed/non-English rows require
+a separately reviewed, published, verified-English replacement in the same retrieval scope before
+the old row can be unpublished. Preserve the inventory, approved CSV, confirmation batch ID and old
+to new document IDs as rollback evidence.
+
+Only after readiness passes may shadow be enabled (`live=false`, `shadow=true`). Export and label at
+least the required per-language train/holdout sample matrix, then evaluate it:
+
+```bash
+uv run python -m apps.cli.multilingual_shadow_eval export \
+  --output dist/multilingual-shadow-review.csv
+uv run python -m apps.cli.multilingual_shadow_eval evaluate \
+  --input dist/multilingual-shadow-reviewed.csv \
+  --output dist/multilingual-calibration.json
+```
+
+A retrieval report alone does not authorize live mode. Live additionally requires a reviewed,
+immutable end-to-end holdout report covering action selection, output language, grounding, risk/case
+handoff and Outbox blocking. Package both approved reports into the production image, configure their
+SHA-256 values, set `KNOWLEDGE_CORPUS_VERSION` to the computed readiness fingerprint and redeploy all
+three roles together. Startup fails closed if reports, thresholds, corpus, embeddings or active
+Tenant/Brand/Platform coverage do not match. Until those external reviews and reports exist, keep live
+false.
 
 ## Platform secret encryption
 
@@ -182,7 +251,7 @@ EMAIL_ALLOWED_HOSTS=imap.larksuite.com,smtp.larksuite.com
 ```
 
 Use the standard API-first release order. API owns database preparation: require its deployment to
-reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `e9a1c4f7b620` before
+reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `f3b8c1d4e726` before
 starting or replacing Worker and Scheduler. Then require all three roles to run the same image
 digest and the same Email flags/allowlist. Do not enable Email on a new API while an old Worker or
 Scheduler remains.
@@ -513,7 +582,7 @@ historical open work.
 Before upgrade, take and verify a PostgreSQL backup. Deploy API, Worker and Scheduler with
 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` and identical sender lease, retry and sweep settings.
 After API migrates the database, require all three roles to reach one image digest and confirm the
-unique Alembic head is `e9a1c4f7b620`. Do not enable callbacks while an old API can still receive a
+unique Alembic head is `f3b8c1d4e726`. Do not enable callbacks while an old API can still receive a
 card action or an old Worker/Scheduler is running.
 
 Configure one Tenant at a time:

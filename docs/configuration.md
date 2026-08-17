@@ -191,15 +191,38 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Chat completion model |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Knowledge embedding model/version |
-| `OPENAI_TIMEOUT_SECONDS` | `30` | HTTP timeout for chat and embedding calls |
+| `OPENAI_TIMEOUT_SECONDS` | `30` | HTTP timeout for generation calls |
+| `OPENAI_GROUNDING_MODEL` | empty | Optional separate model for semantic fidelity verification; empty uses `OPENAI_MODEL` |
+| `GROUNDING_VERIFIER_TIMEOUT_SECONDS` | `8` | Short fail-closed timeout for the second-pass grounding verifier |
 | `KNOWLEDGE_RETRIEVAL_ENABLED` | `false` | Enables knowledge retrieval |
 | `KNOWLEDGE_MIN_SIMILARITY` | `0.5` | Minimum retrieval score |
 | `KNOWLEDGE_TOP_K` | `3` | Maximum retrieved chunks |
 | `KNOWLEDGE_VERBATIM_REPLY` | `false` | Return matched template text without LLM rewriting |
-| `REQUIRE_KNOWLEDGE` | `false` | Handoff without calling LLM when retrieval has no match |
+| `REQUIRE_KNOWLEDGE` | `false` | Legacy path: handoff without calling LLM when retrieval has no match |
+| `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Live English-corpus multilingual reply path; mutually exclusive with shadow and blocked by readiness/calibration gates |
+| `MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED` | `false` | Record language and verified-English Top1/Top2 evidence without changing legacy action/reply/Outbox |
+| `ENGLISH_KNOWLEDGE_ONLY_ENABLED` | `false` | Require verified English knowledge for live retrieval and publishing |
+| `MULTILINGUAL_SUPPORTED_LANGUAGES` | `en,zh,ja,es,fr,de,pt,ar,ru,th` | First-release auto-reply allowlist; other or unknown languages hand off |
+| `KNOWLEDGE_CORPUS_VERSION` | `unversioned` | Must equal the computed verified-English corpus fingerprint before live startup |
+| `KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY` | `0.8` | Pure-vector Top1 threshold; must match an approved calibration report |
+| `KNOWLEDGE_AUTO_REPLY_MIN_MARGIN` | `0.08` | Minimum Top1 minus Top2 margin; must match an approved calibration report |
+| `MULTILINGUAL_CALIBRATION_REPORT_SHA256` | empty | SHA-256 of the approved retrieval calibration report packaged in the image |
+| `MULTILINGUAL_E2E_REPORT_SHA256` | empty | SHA-256 of the approved end-to-end language/risk/grounding/Outbox report |
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
+The first release intentionally supports only the configured language allowlist. The current message
+is preferred; an ambiguous short message may inherit the most recent reliably detected customer
+message, never an assistant reply. Unknown, unsupported, mixed-language, or insufficiently supported
+messages hand off. Chinese text with identifiable simplified/traditional evidence is checked against
+that writing system; text made only of shared Han characters is treated as neutral `zh`, so it
+guarantees Chinese but cannot promise a simplified/traditional variant.
+
+Live mode cannot start merely because the flags are present. It additionally requires a fully
+verified English corpus with current embeddings and Tenant/Brand/Platform coverage, an approved
+retrieval calibration report whose thresholds and corpus fingerprint match configuration, and an
+approved end-to-end report with zero wrong-language Outbox, risk/case auto-reply, grounding false
+accept, or unexpected customer Outbox events.
 ## Scheduler and reconciliation settings
 
 The scheduler reads one validated settings snapshot at startup. X reconciliation functions also read

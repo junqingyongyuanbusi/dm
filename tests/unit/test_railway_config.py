@@ -31,6 +31,17 @@ _REQUIRED = {
     "KNOWLEDGE_RETRIEVAL_ENABLED": "false",
     "KNOWLEDGE_VERBATIM_REPLY": "false",
     "REQUIRE_KNOWLEDGE": "false",
+    "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "false",
+    "MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED": "false",
+    "ENGLISH_KNOWLEDGE_ONLY_ENABLED": "false",
+    "KNOWLEDGE_CORPUS_VERSION": "unversioned",
+    "MULTILINGUAL_CALIBRATION_REPORT_SHA256": "",
+    "MULTILINGUAL_E2E_REPORT_SHA256": "",
+    "MULTILINGUAL_SUPPORTED_LANGUAGES": "en,zh,ja,es,fr,de,pt,ar,ru,th",
+    "KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY": "0.8",
+    "KNOWLEDGE_AUTO_REPLY_MIN_MARGIN": "0.08",
+    "OPENAI_GROUNDING_MODEL": "",
+    "GROUNDING_VERIFIER_TIMEOUT_SECONDS": "8",
 }
 
 
@@ -52,7 +63,19 @@ def test_validate_accepts_consistent_production_configuration():
         ({"scheduler": {"TESTING": "true"}}, "scheduler:TESTING_must_equal_false"),
         ({"api": {"PUBLIC_BASE_URL": "https://other.example.com"}}, "PUBLIC_BASE_URL"),
         ({"worker": {"PLATFORM_SECRET_KEYS": "different"}}, "PLATFORM_SECRET_KEYS"),
-        ({"scheduler": {"XCHAT_ENABLED": ""}}, "scheduler:missing_XCHAT_ENABLED"),
+        ({"scheduler": {"XCHAT_ENABLED": ""}}, "scheduler:invalid_settings"),
+        (
+            {"api": {"MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "true"}},
+            "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED_must_equal_false",
+        ),
+        (
+            {"worker": {"MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED": "true"}},
+            "MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED_must_equal_false",
+        ),
+        (
+            {"scheduler": {"ENGLISH_KNOWLEDGE_ONLY_ENABLED": "true"}},
+            "ENGLISH_KNOWLEDGE_ONLY_ENABLED_must_equal_false",
+        ),
         ({"worker": {"XCHAT_ENABLED": "flase"}}, "worker:invalid_settings"),
         (
             {"api": {"OPENAI_TIMEOUT_SECONDS": "31"}},

@@ -1,6 +1,8 @@
+import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
@@ -8,8 +10,9 @@ from sqlalchemy import select, update
 
 from social_reply.application.knowledge.retrieval import (
     KnowledgeHit,
-    retrieve_exact_knowledge,
-    retrieve_hybrid_knowledge,
+    KnowledgeRetrievalResult,
+    retrieve_exact_knowledge_result,
+    retrieve_hybrid_knowledge_result,
 )
 from social_reply.application.reply_decision.persist import persist_decision
 from social_reply.application.reply_decision.persona import (
@@ -24,9 +27,10 @@ from social_reply.application.reply_decision.pipeline import (
 from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.guard import redact_pii
+from social_reply.domain.reply.language import detect_customer_language
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.openai_client import OpenAILLMClient
-from social_reply.domain.reply.rules import apply_rules
+from social_reply.domain.reply.rules import apply_multilingual_rules, apply_rules
 from social_reply.domain.reply.voice import DEFAULT_PERSONA
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
@@ -39,6 +43,9 @@ from social_reply.shared.config import get_settings
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PERSONA = ResolvedPersona(text=DEFAULT_PERSONA, revision=None)
+_MULTILINGUAL_CONTRACT_VERSION = "multilingual-v1"
+_MULTILINGUAL_SENTINEL_VERSION = "approved-verbatim-v1"
+_MULTILINGUAL_GATE_VERSION = "strong-gate-v1"
 
 _llm: LLMClient | None = None
 
@@ -55,6 +62,8 @@ def _get_llm() -> LLMClient:
                 base_url=settings.openai_base_url,
                 model=settings.openai_model,
                 timeout=settings.openai_timeout_seconds,
+                grounding_model=settings.openai_grounding_model or None,
+                grounding_timeout=settings.grounding_verifier_timeout_seconds,
             )
         elif settings.llm_provider == "stub":
             _llm = StubLLMClient()
@@ -78,6 +87,14 @@ def _make_killswitch() -> KillSwitchChecker:
     return KillSwitchChecker(_get_redis())
 
 
+@dataclass(frozen=True)
+class _StaticKillSwitch:
+    disabled: bool
+
+    async def is_disabled(self, brand_id: str, account_id: str, tenant_id: str = "default") -> bool:
+        return self.disabled
+
+
 _embedder: EmbeddingClient | None = None
 
 
@@ -95,32 +112,47 @@ def _get_embedder() -> EmbeddingClient:
     return _embedder
 
 
-async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[KnowledgeHit, ...]:
-    """检索开关开启时 embed 用户消息并取 top-k 模板命中；任何失败按无知识继续不阻断决策"""
+async def _fetch_knowledge(
+    snapshot: DecisionSnapshot,
+    *,
+    verified_english_only: bool = False,
+    query_embedding: tuple[float, ...] | None = None,
+    force_enabled: bool = False,
+) -> KnowledgeRetrievalResult:
+    """Retrieve hybrid context plus pure-vector evidence for deterministic relevance gating."""
     settings = get_settings()
-    if not settings.knowledge_retrieval_enabled:
-        return ()
+    if not settings.knowledge_retrieval_enabled and not force_enabled:
+        return KnowledgeRetrievalResult()
     try:
         # 短事务：先做确定性精确匹配。命中时无需调用 embedding API，
         # 对 True/Hi/Thanks 等短模板既更准也更快。
         async with get_session_factory()() as session:
-            exact = await retrieve_exact_knowledge(
+            exact_result = await retrieve_exact_knowledge_result(
                 session,
                 snapshot.text or "",
                 tenant_id=snapshot.tenant_id,
                 brand_id=snapshot.brand_id,
                 platform=snapshot.platform,
+                verified_english_only=verified_english_only,
             )
-        if exact is not None:
-            hits = [exact]
+        if exact_result.exact_match or exact_result.exact_ambiguous:
+            result = replace(
+                exact_result,
+                embedding_version=settings.openai_embedding_model,
+                retrieval_mode="exact",
+            )
         else:
             embedder = _get_embedder()
-            query_embedding = (await embedder.embed([redact_pii(snapshot.text or "")]))[0]
+            embedding_values = (
+                list(query_embedding)
+                if query_embedding is not None
+                else (await embedder.embed([redact_pii(snapshot.text or "")]))[0]
+            )
             async with get_session_factory()() as session:
                 # 混合检索：向量 + 词法 RRF 融合扩大召回；verbatim_safe 标记保护原文直答闸门
-                hits = await retrieve_hybrid_knowledge(
+                result = await retrieve_hybrid_knowledge_result(
                     session,
-                    query_embedding,
+                    embedding_values,
                     snapshot.text or "",
                     tenant_id=snapshot.tenant_id,
                     brand_id=snapshot.brand_id,
@@ -128,22 +160,87 @@ async def _fetch_knowledge(snapshot: DecisionSnapshot) -> tuple[KnowledgeHit, ..
                     embedding_version=embedder.version,
                     top_k=settings.knowledge_top_k,
                     min_similarity=settings.knowledge_min_similarity,
+                    verified_english_only=verified_english_only,
                 )
+            result = replace(
+                result,
+                query_embedding=tuple(embedding_values),
+                embedding_version=embedder.version,
+                retrieval_mode="vector_hybrid",
+            )
     except Exception:
         logger.warning(
             "知识检索失败，按无知识继续: conversation=%s",
             snapshot.conversation_key,
             exc_info=True,
         )
-        return ()
-    if hits:
+        return KnowledgeRetrievalResult(error_code="KNOWLEDGE_RETRIEVAL_FAILED")
+    if result.hits:
         logger.info(
             "知识命中 %d 条: conversation=%s chunks=%s",
-            len(hits),
+            len(result.hits),
             snapshot.conversation_key,
-            [(str(h.chunk_id), h.content_hash[:12], round(h.similarity, 3)) for h in hits],
+            [
+                (str(hit.chunk_id), hit.content_hash[:12], round(hit.similarity, 3))
+                for hit in result.hits
+            ],
         )
-    return tuple(hits)
+    return result
+
+
+@dataclass(frozen=True)
+class KnowledgeMatchAssessment:
+    selected: KnowledgeHit | None = None
+    second: KnowledgeHit | None = None
+    margin: float | None = None
+    strong: bool = False
+    status: str = "none"
+
+
+def _assess_knowledge_match(
+    result: KnowledgeRetrievalResult,
+    *,
+    min_similarity: float,
+    min_margin: float,
+) -> KnowledgeMatchAssessment:
+    if result.error_code:
+        return KnowledgeMatchAssessment(status="error")
+    if result.exact_ambiguous:
+        ordered_exact = sorted(result.hits, key=lambda hit: hit.content_hash)
+        return KnowledgeMatchAssessment(
+            selected=ordered_exact[0] if ordered_exact else None,
+            second=ordered_exact[1] if len(ordered_exact) > 1 else None,
+            margin=0.0,
+            status="ambiguous",
+        )
+    if result.exact_match and result.hits:
+        return KnowledgeMatchAssessment(selected=result.hits[0], strong=True, status="strong")
+    ordered = sorted(result.vector_hits, key=lambda hit: hit.similarity, reverse=True)
+    if not ordered:
+        return KnowledgeMatchAssessment()
+    top1 = ordered[0]
+    top2 = ordered[1] if len(ordered) > 1 else None
+    margin = top1.similarity - top2.similarity if top2 is not None else None
+    strong = top1.similarity >= min_similarity and (margin is None or margin >= min_margin)
+    status = "strong" if strong else ("weak" if top1.similarity < min_similarity else "ambiguous")
+    return KnowledgeMatchAssessment(
+        selected=top1,
+        second=top2,
+        margin=margin,
+        strong=strong,
+        status=status,
+    )
+
+
+def _knowledge_evidence_block(hit: KnowledgeHit) -> str:
+    return json.dumps(
+        {
+            "question": hit.question,
+            "approved_answer": hit.reply,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 class DecisionContextScopeError(RuntimeError):
@@ -287,8 +384,18 @@ async def run_and_persist_decision(
     cutoff_seq = await _validate_decision_scope(snapshot, conversation_id, message_id, account_id)
     # 先给默认值：fail-closed 分支不走管线，但下面落库时仍要拿它拼 prompt_version。
     persona = _DEFAULT_PERSONA
+    prompt_contract_suffix = ""
     try:
-        killswitch = _make_killswitch()
+        if snapshot.automation_state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}:
+            checker = _make_killswitch()
+            killswitch_disabled = await checker.is_disabled(
+                snapshot.brand_id,
+                snapshot.account_id,
+                snapshot.tenant_id,
+            )
+        else:
+            killswitch_disabled = False
+        killswitch = _StaticKillSwitch(killswitch_disabled)
     except Exception:
         logger.exception(
             "kill switch initialization failed; decision downgraded to draft",
@@ -304,47 +411,325 @@ async def run_and_persist_decision(
             action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule"
         )
     else:
-        deterministic_rule = apply_rules(snapshot.text)
-        should_retrieve = snapshot.automation_state != "HUMAN_ACTIVE" and deterministic_rule is None
-        hits = await _fetch_knowledge(snapshot) if should_retrieve else ()
-        # 模板直答：必须基于「相似度最高」的命中判断，不能用 RRF 序的 hits[0]——
-        # RRF 分最高 ≠ 相似度最高，否则会误发词法命中的错模板，或漏发真正强命中的向量项。
-        # 仅精确匹配或达阈值向量命中（verbatim_safe）才原文外发；词法-only/低相似度只作 LLM 上下文。
-        selected_verbatim_hit: KnowledgeHit | None = None
-        if hits and settings.knowledge_verbatim_reply:
-            top_by_similarity = max(hits, key=lambda h: h.similarity)
-            if top_by_similarity.verbatim_safe:
-                selected_verbatim_hit = top_by_similarity
-        verbatim = selected_verbatim_hit.reply if selected_verbatim_hit is not None else None
-        approved_official_contact_reply = (
-            selected_verbatim_hit.reply
-            if selected_verbatim_hit is not None and selected_verbatim_hit.is_official_contact
-            else None
+        deterministic_rule = (
+            apply_multilingual_rules(snapshot.text)
+            if settings.multilingual_knowledge_reply_enabled
+            else apply_rules(snapshot.text)
         )
-        require_knowledge = settings.knowledge_retrieval_enabled and settings.require_knowledge
-        needs_llm_history = (
-            should_retrieve and verbatim is None and not (require_knowledge and not hits)
+        legacy_should_retrieve = (
+            not killswitch_disabled
+            and snapshot.automation_state != "HUMAN_ACTIVE"
+            and deterministic_rule is None
         )
-        history = await _fetch_history(conversation_id, cutoff_seq) if needs_llm_history else ()
-        # 人设只在真要调 LLM 时才读：确定性规则与模板直答都不经过提示词。
-        if should_retrieve and verbatim is None and not (require_knowledge and not hits):
-            async with get_session_factory()() as session:
-                persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
-        decision = await run_decision_pipeline(
-            snapshot,
-            llm=_get_llm(),
-            killswitch=killswitch,
-            knowledge=tuple(h.content for h in hits),
-            require_knowledge=require_knowledge,
-            verbatim_reply=verbatim,
-            approved_official_contact_reply=approved_official_contact_reply,
-            history=history,
-            voice_preferences=persona.preferences,
-            email_auto_reply_allowed=(
-                snapshot.platform != "email"
-                or (settings.email_enabled and settings.email_auto_reply_enabled)
-            ),
+        live_should_retrieve = (
+            not killswitch_disabled
+            and snapshot.automation_state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
+            and deterministic_rule is None
+            and not snapshot.has_unsupported_attachment
         )
+        should_retrieve = (
+            live_should_retrieve
+            if settings.multilingual_knowledge_reply_enabled
+            else legacy_should_retrieve
+        )
+        shadow_should_retrieve = (
+            not killswitch_disabled
+            and snapshot.automation_state != "HUMAN_ACTIVE"
+            and bool(snapshot.text and snapshot.text.strip())
+            and not snapshot.has_unsupported_attachment
+        )
+        language_should_detect = (
+            not killswitch_disabled
+            and snapshot.automation_state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
+            and bool(snapshot.text and snapshot.text.strip())
+        )
+        if settings.multilingual_knowledge_reply_enabled:
+            history = (
+                await _fetch_history(conversation_id, cutoff_seq) if language_should_detect else ()
+            )
+            language = detect_customer_language(snapshot.text, history)
+            language_supported = (
+                language.tag.split("-", 1)[0].casefold()
+                in settings.multilingual_supported_language_set
+            )
+            knowledge_result = (
+                await _fetch_knowledge(
+                    snapshot,
+                    verified_english_only=settings.english_knowledge_only_enabled,
+                )
+                if should_retrieve and language.is_known and language_supported
+                else KnowledgeRetrievalResult()
+            )
+            assessment = _assess_knowledge_match(
+                knowledge_result,
+                min_similarity=settings.knowledge_auto_reply_min_similarity,
+                min_margin=settings.knowledge_auto_reply_min_margin,
+            )
+            gate_evaluated = (
+                should_retrieve
+                and language.is_known
+                and language_supported
+                and not knowledge_result.error_code
+            )
+            selected = assessment.selected
+            forced_decision: ReplyDecision | None = deterministic_rule
+            if should_retrieve and knowledge_result.error_code:
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=(knowledge_result.error_code,),
+                    source="rule",
+                )
+            elif should_retrieve and not language.is_known:
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("UNKNOWN_LANGUAGE",),
+                    source="rule",
+                )
+            elif should_retrieve and not language_supported:
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("UNSUPPORTED_LANGUAGE",),
+                    source="rule",
+                )
+            elif should_retrieve and (not assessment.strong or selected is None):
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("NO_STRONG_KNOWLEDGE_MATCH",),
+                    source="rule",
+                )
+            elif (
+                should_retrieve
+                and selected is not None
+                and selected.is_official_contact
+                and language.tag != "en"
+            ):
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("MULTILINGUAL_OFFICIAL_CONTACT_REVIEW",),
+                    source="rule",
+                )
+
+            needs_llm = should_retrieve and forced_decision is None and selected is not None
+            if needs_llm:
+                prompt_contract_suffix = f"+{_MULTILINGUAL_CONTRACT_VERSION}"
+                if selected is not None and selected.is_official_contact and language.tag == "en":
+                    prompt_contract_suffix += f"+{_MULTILINGUAL_SENTINEL_VERSION}"
+                async with get_session_factory()() as session:
+                    persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
+            decision = await run_decision_pipeline(
+                snapshot,
+                llm=_get_llm() if needs_llm else None,
+                killswitch=killswitch,
+                knowledge=(
+                    (_knowledge_evidence_block(selected),)
+                    if needs_llm and selected is not None
+                    else ()
+                ),
+                require_knowledge=False,
+                approved_official_contact_reply=(
+                    selected.reply
+                    if (
+                        needs_llm
+                        and selected is not None
+                        and selected.is_official_contact
+                        and language.tag == "en"
+                    )
+                    else None
+                ),
+                approved_knowledge_reply=(
+                    selected.reply if needs_llm and selected is not None else None
+                ),
+                verbatim_after_decision=(
+                    selected.reply
+                    if (
+                        needs_llm
+                        and selected is not None
+                        and selected.is_official_contact
+                        and language.tag == "en"
+                    )
+                    else None
+                ),
+                forced_decision=forced_decision,
+                target_language=language.tag if should_retrieve else "und",
+                apply_legacy_rules=False,
+                history=history,
+                voice_preferences=persona.preferences,
+                email_auto_reply_allowed=(
+                    snapshot.platform != "email"
+                    or (settings.email_enabled and settings.email_auto_reply_enabled)
+                ),
+            )
+            decision = replace(
+                decision,
+                request_language=language.tag if language_should_detect else "und",
+                multilingual_contract_version=(
+                    prompt_contract_suffix.lstrip("+").replace("+", "/")
+                    if prompt_contract_suffix
+                    else None
+                ),
+                request_language_confidence=(
+                    language.confidence if language_should_detect else None
+                ),
+                request_language_source=(language.source if language_should_detect else None),
+                knowledge_content_hash=(
+                    selected.content_hash if gate_evaluated and selected is not None else None
+                ),
+                knowledge_similarity=(
+                    selected.similarity if gate_evaluated and selected is not None else None
+                ),
+                knowledge_top2_content_hash=(
+                    assessment.second.content_hash
+                    if gate_evaluated and assessment.second is not None
+                    else None
+                ),
+                knowledge_top2_similarity=(
+                    assessment.second.similarity
+                    if gate_evaluated and assessment.second is not None
+                    else None
+                ),
+                knowledge_similarity_margin=(assessment.margin if gate_evaluated else None),
+                knowledge_match_status=(assessment.status if gate_evaluated else None),
+                knowledge_gate_version=(_MULTILINGUAL_GATE_VERSION if gate_evaluated else None),
+                knowledge_min_similarity_threshold=(
+                    settings.knowledge_auto_reply_min_similarity if gate_evaluated else None
+                ),
+                knowledge_min_margin_threshold=(
+                    settings.knowledge_auto_reply_min_margin if gate_evaluated else None
+                ),
+            )
+        else:
+            knowledge_result = (
+                await _fetch_knowledge(snapshot, verified_english_only=False)
+                if should_retrieve
+                else KnowledgeRetrievalResult()
+            )
+            hits = knowledge_result.hits
+            legacy_forced_decision = (
+                ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("AMBIGUOUS_EXACT_KNOWLEDGE",),
+                    source="rule",
+                )
+                if knowledge_result.exact_ambiguous
+                else None
+            )
+            if settings.multilingual_knowledge_shadow_enabled and shadow_should_retrieve:
+                shadow_result = await _fetch_knowledge(
+                    snapshot,
+                    verified_english_only=True,
+                    query_embedding=knowledge_result.query_embedding,
+                    force_enabled=True,
+                )
+                shadow_history = await _fetch_history(conversation_id, cutoff_seq)
+                shadow_language = detect_customer_language(snapshot.text, shadow_history)
+                shadow_assessment = _assess_knowledge_match(
+                    shadow_result,
+                    min_similarity=settings.knowledge_auto_reply_min_similarity,
+                    min_margin=settings.knowledge_auto_reply_min_margin,
+                )
+                logger.info(
+                    "multilingual knowledge shadow: conversation=%s language=%s strong=%s "
+                    "top1_hash=%s top1_similarity=%s margin=%s",
+                    snapshot.conversation_key,
+                    shadow_language.tag,
+                    shadow_assessment.strong,
+                    (
+                        shadow_assessment.selected.content_hash[:12]
+                        if shadow_assessment.selected is not None
+                        else None
+                    ),
+                    (
+                        round(shadow_assessment.selected.similarity, 4)
+                        if shadow_assessment.selected is not None
+                        else None
+                    ),
+                    (
+                        round(shadow_assessment.margin, 4)
+                        if shadow_assessment.margin is not None
+                        else None
+                    ),
+                )
+            selected_verbatim_hit: KnowledgeHit | None = None
+            if hits and settings.knowledge_verbatim_reply and legacy_forced_decision is None:
+                top_by_similarity = max(hits, key=lambda hit: hit.similarity)
+                if top_by_similarity.verbatim_safe:
+                    selected_verbatim_hit = top_by_similarity
+            verbatim = selected_verbatim_hit.reply if selected_verbatim_hit is not None else None
+            approved_official_contact_reply = (
+                selected_verbatim_hit.reply
+                if selected_verbatim_hit is not None and selected_verbatim_hit.is_official_contact
+                else None
+            )
+            require_knowledge = settings.knowledge_retrieval_enabled and settings.require_knowledge
+            needs_llm_history = (
+                should_retrieve
+                and legacy_forced_decision is None
+                and verbatim is None
+                and not (require_knowledge and not hits)
+            )
+            history = await _fetch_history(conversation_id, cutoff_seq) if needs_llm_history else ()
+            if needs_llm_history:
+                async with get_session_factory()() as session:
+                    persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
+            decision = await run_decision_pipeline(
+                snapshot,
+                llm=_get_llm() if needs_llm_history else None,
+                killswitch=killswitch,
+                knowledge=tuple(hit.content for hit in hits),
+                require_knowledge=require_knowledge,
+                verbatim_reply=verbatim,
+                approved_official_contact_reply=approved_official_contact_reply,
+                forced_decision=legacy_forced_decision,
+                history=history,
+                voice_preferences=persona.preferences,
+                email_auto_reply_allowed=(
+                    snapshot.platform != "email"
+                    or (settings.email_enabled and settings.email_auto_reply_enabled)
+                ),
+            )
+            if settings.multilingual_knowledge_shadow_enabled and shadow_should_retrieve:
+                shadow_selected = shadow_assessment.selected
+                decision = replace(
+                    decision,
+                    multilingual_shadow=True,
+                    multilingual_shadow_evidence={
+                        "contract_version": _MULTILINGUAL_CONTRACT_VERSION,
+                        "gate_version": _MULTILINGUAL_GATE_VERSION,
+                        "corpus_version": settings.knowledge_corpus_version,
+                        "embedding_version": shadow_result.embedding_version,
+                        "retrieval_mode": shadow_result.retrieval_mode,
+                        "error_code": shadow_result.error_code,
+                        "language": {
+                            "tag": shadow_language.tag,
+                            "confidence": shadow_language.confidence,
+                            "source": shadow_language.source,
+                        },
+                        "top1": (
+                            {
+                                "content_hash": shadow_selected.content_hash,
+                                "question": shadow_selected.question,
+                                "approved_reply": shadow_selected.reply,
+                                "similarity": shadow_selected.similarity,
+                            }
+                            if shadow_selected is not None
+                            else None
+                        ),
+                        "top2": (
+                            {
+                                "content_hash": shadow_assessment.second.content_hash,
+                                "question": shadow_assessment.second.question,
+                                "approved_reply": shadow_assessment.second.reply,
+                                "similarity": shadow_assessment.second.similarity,
+                            }
+                            if shadow_assessment.second is not None
+                            else None
+                        ),
+                        "margin": shadow_assessment.margin,
+                        "match_status": shadow_assessment.status,
+                        "min_similarity": settings.knowledge_auto_reply_min_similarity,
+                        "min_margin": settings.knowledge_auto_reply_min_margin,
+                    },
+                )
     handoff_notification_ids: list[uuid.UUID] = []
     async with get_session_factory()() as session:
         if decision_job_id is not None:
@@ -396,7 +781,7 @@ async def run_and_persist_decision(
             message_id,
             account_id,
             decision,
-            prompt_version_label(settings.prompt_version, persona),
+            prompt_version_label(settings.prompt_version, persona) + prompt_contract_suffix,
             decision_job_id=decision_job_id,
             decision_generation=decision_generation,
             decision_claim_token=claim_token,

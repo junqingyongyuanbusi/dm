@@ -4,7 +4,7 @@ from social_reply.application.reply_decision.jobs import snapshot_from_dict, sna
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
-from social_reply.domain.reply.llm import StubLLMClient
+from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, StubLLMClient
 from social_reply.domain.reply.voice import DEFAULT_VOICE_PREFERENCES
 
 
@@ -400,3 +400,112 @@ def test_decision_snapshot_channel_type_round_trips_and_old_jobs_default_to_dm()
 def test_decision_snapshot_attachment_flag_round_trips():
     snapshot = _snap(has_unsupported_attachment=True)
     assert snapshot_from_dict(snapshot_to_dict(snapshot)).has_unsupported_attachment is True
+
+
+async def test_approved_verbatim_is_rendered_only_after_safe_action_sentinel():
+    class SentinelLLM:
+        async def decide(self, context):
+            assert context.approved_verbatim_available is True
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text=APPROVED_VERBATIM_SENTINEL,
+                confidence=0.99,
+            )
+
+    template = "support@example.com"
+    decision = await run_decision_pipeline(
+        _snap(text="How can I contact official support?"),
+        llm=SentinelLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("Official support email: support@example.com",),
+        approved_official_contact_reply=template,
+        approved_knowledge_reply=template,
+        verbatim_after_decision=template,
+        target_language="en",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_text == template
+    assert decision.source == "knowledge"
+    assert "KNOWLEDGE_VERBATIM" in decision.reason_codes
+
+
+async def test_approved_verbatim_missing_sentinel_fails_closed():
+    class WrongTextLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="I copied support@example.com",
+                confidence=0.99,
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(text="How can I contact official support?"),
+        llm=WrongTextLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("Official support email: support@example.com",),
+        approved_official_contact_reply="support@example.com",
+        approved_knowledge_reply="support@example.com",
+        verbatim_after_decision="support@example.com",
+        target_language="en",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert "VERBATIM_SENTINEL_MISSING" in decision.reason_codes
+
+
+@pytest.mark.parametrize("verifier_result", [False, RuntimeError("verifier unavailable")])
+async def test_grounding_verifier_fails_closed(verifier_result):
+    class GroundingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="退款通常需要 3 到 5 个工作日。",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            if isinstance(verifier_result, Exception):
+                raise verifier_result
+            return verifier_result
+
+    decision = await run_decision_pipeline(
+        _snap(text="退款多久到账？"),
+        llm=GroundingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds usually take 3–5 business days.",
+        target_language="zh-Hans",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.grounding_verified is False
+    assert decision.grounding_verifier_version == "grounding-v1"
+    assert "GUARD_KNOWLEDGE_SEMANTIC_MISMATCH" in decision.reason_codes
+
+
+async def test_grounding_verifier_accepts_faithful_localization():
+    class GroundingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="退款通常需要 3 到 5 个工作日。",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            return True
+
+    decision = await run_decision_pipeline(
+        _snap(text="退款多久到账？"),
+        llm=GroundingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds usually take 3–5 business days.",
+        target_language="zh-Hans",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.grounding_verified is True
+    assert decision.grounding_verifier_version == "grounding-v1"

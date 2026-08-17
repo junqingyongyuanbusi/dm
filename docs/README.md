@@ -4,7 +4,7 @@
 
 The direct account platform contract currently covers seven platforms: Telegram, Facebook,
 Instagram, WhatsApp, Feishu, X and Email. The Alembic graph has one current head:
-`e9a1c4f7b620`. Email protocol/unit coverage does not by itself imply that a real mailbox credential
+`f3b8c1d4e726`. Email protocol/unit coverage does not by itself imply that a real mailbox credential
 or live provider E2E has been validated.
 
 - [Runtime architecture](architecture.md): process ownership, state boundaries, message paths and

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -94,6 +96,8 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_timeout_seconds: float = 30.0
+    openai_grounding_model: str = ""
+    grounding_verifier_timeout_seconds: float = Field(default=8.0, gt=0.0, le=30.0)
     # 知识检索：默认全关，不影响现有决策行为
     knowledge_retrieval_enabled: bool = False
     knowledge_min_similarity: float = 0.5
@@ -102,6 +106,22 @@ class Settings(BaseSettings):
     knowledge_verbatim_reply: bool = False
     # true 时检索无命中直接 HANDOFF/INSUFFICIENT_KNOWLEDGE，不调 LLM（省 token，§十三）
     require_knowledge: bool = False
+    # 新多语言知识路径默认关闭：先影子观测和校准，再在三角色原子启用。
+    multilingual_knowledge_reply_enabled: bool = False
+    multilingual_knowledge_shadow_enabled: bool = False
+    english_knowledge_only_enabled: bool = False
+    knowledge_corpus_version: str = "unversioned"
+    multilingual_calibration_report_path: Path = Path(
+        "src/social_reply/shared/multilingual-calibration.json"
+    )
+    multilingual_calibration_report_sha256: str = ""
+    multilingual_supported_languages: str = "en,zh,ja,es,fr,de,pt,ar,ru,th"
+    multilingual_e2e_report_path: Path = Path(
+        "src/social_reply/shared/multilingual-e2e-calibration.json"
+    )
+    multilingual_e2e_report_sha256: str = ""
+    knowledge_auto_reply_min_similarity: float = Field(default=0.8, ge=0.0, le=1.0)
+    knowledge_auto_reply_min_margin: float = Field(default=0.08, ge=0.0, le=1.0)
     # 决策时注入同会话最近历史消息（不含当前这条）；0 关闭多轮上下文。
     conversation_history_limit: int = Field(default=20, ge=0, le=50)
     # 历史总字符预算，避免长会话放大请求成本或超过模型上下文。
@@ -172,6 +192,74 @@ class Settings(BaseSettings):
         SecretCipher(self.platform_secret_key_list)
         if not self.testing and self.llm_provider == "stub":
             raise ValueError("LLM_PROVIDER=stub 仅允许测试环境，生产环境禁止公开测试回复")
+        if self.multilingual_knowledge_reply_enabled and self.multilingual_knowledge_shadow_enabled:
+            raise ValueError(
+                "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED and SHADOW_ENABLED are mutually exclusive"
+            )
+        if self.multilingual_knowledge_reply_enabled and not self.english_knowledge_only_enabled:
+            raise ValueError(
+                "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires ENGLISH_KNOWLEDGE_ONLY_ENABLED=true"
+            )
+        if self.multilingual_knowledge_reply_enabled and not self.knowledge_retrieval_enabled:
+            raise ValueError(
+                "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
+            )
+        if self.multilingual_knowledge_reply_enabled and not self.testing:
+            report_path = self.multilingual_calibration_report_path
+            if not report_path.is_file():
+                raise ValueError(f"multilingual calibration report missing: {report_path}")
+            if not self.multilingual_calibration_report_sha256:
+                raise ValueError("MULTILINGUAL_CALIBRATION_REPORT_SHA256 is required for live mode")
+            report_bytes = report_path.read_bytes()
+            report_digest = hashlib.sha256(report_bytes).hexdigest()
+            if report_digest != self.multilingual_calibration_report_sha256:
+                raise ValueError("multilingual calibration report digest mismatch")
+            report = json.loads(report_bytes)
+            versions = report.get("versions") or {}
+            thresholds = report.get("selected_thresholds") or {}
+            report_languages = frozenset(report.get("supported_languages") or ())
+            if report_languages != self.multilingual_supported_language_set:
+                raise ValueError("multilingual calibration supported language mismatch")
+            if report.get("status") != "pass":
+                raise ValueError("multilingual calibration report is not approved")
+            if versions.get("corpus_version") != self.knowledge_corpus_version:
+                raise ValueError("multilingual calibration corpus version mismatch")
+            if versions.get("embedding_version") != self.openai_embedding_model:
+                raise ValueError("multilingual calibration embedding version mismatch")
+            if versions.get("gate_version") != "strong-gate-v1":
+                raise ValueError("multilingual calibration gate version mismatch")
+            if versions.get("contract_version") != "multilingual-v1":
+                raise ValueError("multilingual calibration contract version mismatch")
+            if thresholds.get("min_similarity") != self.knowledge_auto_reply_min_similarity:
+                raise ValueError("multilingual calibration similarity threshold mismatch")
+            if thresholds.get("min_margin") != self.knowledge_auto_reply_min_margin:
+                raise ValueError("multilingual calibration margin threshold mismatch")
+            e2e_path = self.multilingual_e2e_report_path
+            if not e2e_path.is_file() or not self.multilingual_e2e_report_sha256:
+                raise ValueError(
+                    "approved multilingual end-to-end report is required for live mode"
+                )
+            e2e_bytes = e2e_path.read_bytes()
+            if hashlib.sha256(e2e_bytes).hexdigest() != self.multilingual_e2e_report_sha256:
+                raise ValueError("multilingual end-to-end report digest mismatch")
+            e2e_report = json.loads(e2e_bytes)
+            if e2e_report.get("status") != "pass":
+                raise ValueError("multilingual end-to-end report is not approved")
+            if frozenset(e2e_report.get("supported_languages") or ()) != (
+                self.multilingual_supported_language_set
+            ):
+                raise ValueError("multilingual end-to-end supported language mismatch")
+            if e2e_report.get("corpus_version") != self.knowledge_corpus_version:
+                raise ValueError("multilingual end-to-end corpus version mismatch")
+            safety = e2e_report.get("safety") or {}
+            for metric in (
+                "wrong_language_outbox",
+                "risk_or_case_auto_reply",
+                "grounding_false_accept",
+                "unexpected_customer_outbox",
+            ):
+                if safety.get(metric) != 0:
+                    raise ValueError(f"multilingual end-to-end safety metric failed: {metric}")
         # 生产环境启用 openai provider 时必须提供 API key
         if (
             not self.testing
@@ -210,6 +298,14 @@ class Settings(BaseSettings):
     def x_mention_ingest_enabled(self) -> bool:
         """Mentions ride the Activity webhook, so both switches must be on."""
         return self.x_activity_enabled and self.x_public_reply_enabled
+
+    @property
+    def multilingual_supported_language_set(self) -> frozenset[str]:
+        return frozenset(
+            language.strip().casefold().split("-", 1)[0]
+            for language in self.multilingual_supported_languages.split(",")
+            if language.strip()
+        )
 
     def platform_integration_enabled(self, platform: str) -> bool:
         if platform == "facebook":

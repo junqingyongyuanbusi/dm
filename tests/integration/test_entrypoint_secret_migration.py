@@ -34,7 +34,10 @@ def test_release_requires_app_and_state_service_colocation():
     assert script.count("validate_railway_colocation") == 3
     assert "scripts/railway_active_region.py" in script
     assert "scripts/validate_railway_config.py" in script
-    assert script.count("validate_railway_config") == 3
+    assert script.count("validate_railway_config") == 4
+    assert "multilingual_live_enabled: false" in script
+    assert "multilingual_shadow_enabled: false" in script
+    assert "english_knowledge_only_enabled: false" in script
 
 
 def _run_worker_entrypoint(

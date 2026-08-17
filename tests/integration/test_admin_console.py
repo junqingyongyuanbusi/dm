@@ -216,6 +216,7 @@ async def test_account_connection_routes_are_deep_linkable(migrated_db):
     assert "aria-current='page'" in telegram.text
     assert missing.status_code == 404
 
+
 async def test_navigation_does_not_poll_inbox_counts(migrated_db):
     async with _app_client() as client:
         await _login(client)
@@ -2578,9 +2579,7 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
     assert (await session.get(models.KnowledgeDocument, normal_id)).status == "published"
     assert (await session.get(models.KnowledgeDocument, normal_two_id)).status == "published"
     assert (await session.get(models.KnowledgeDocument, official_id)).status == "draft"
-    assert (
-        await session.get(models.KnowledgeDocument, unclassified_contact_id)
-    ).status == "draft"
+    assert (await session.get(models.KnowledgeDocument, unclassified_contact_id)).status == "draft"
     assert (await session.get(models.KnowledgeDocument, published_id)).status == "published"
     assert (await session.get(models.KnowledgeDocument, foreign_id)).status == "draft"
     audits = (
@@ -2613,6 +2612,100 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
     assert all(audit.detail["from"] == "draft" for audit in audits)
     assert all(audit.detail["to"] == "published" for audit in audits)
     assert all(audit.detail["is_official_contact"] is False for audit in audits)
+
+
+async def test_knowledge_import_batch_confirmation_and_english_publish_gate(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={"english_knowledge_only_enabled": True}
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    first_batch = uuid.uuid4()
+    second_batch = uuid.uuid4()
+    english = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="How long does a refund take?",
+        reply="Refunds usually take 3 to 5 business days.",
+        status="draft",
+        source_file="knowledge.csv",
+        import_batch_id=first_batch,
+        detected_language="en",
+        language_detection_status="english",
+    )
+    same_filename_other_batch = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="How can I update my profile?",
+        reply="Open settings and select Profile.",
+        status="draft",
+        source_file="knowledge.csv",
+        import_batch_id=second_batch,
+        detected_language="en",
+        language_detection_status="english",
+    )
+    mixed = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="English question",
+        reply="中文答案",
+        status="draft",
+        source_file="mixed.csv",
+        import_batch_id=uuid.uuid4(),
+        detected_language="mixed",
+        language_detection_status="mixed",
+    )
+    session.add_all([english, same_filename_other_batch, mixed])
+    await session.commit()
+    english_id = english.id
+    other_id = same_filename_other_batch.id
+    mixed_id = mixed.id
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        page = await client.get("/admin/knowledge")
+        assert str(first_batch) in page.text
+        assert str(second_batch) in page.text
+        confirmed = await client.post(
+            "/admin/knowledge/bulk-confirm-english",
+            data={"csrf_token": csrf, "import_batch_id": str(first_batch)},
+        )
+        mixed_confirmation = await client.post(
+            f"/admin/knowledge/{mixed_id}/confirm-english",
+            data={"csrf_token": csrf},
+        )
+        published = await client.post(
+            "/admin/knowledge/bulk-publish",
+            data={"csrf_token": csrf, "tenant_id": "default"},
+        )
+
+    assert confirmed.status_code == published.status_code == 303
+    assert "count=1" in confirmed.headers["location"]
+    assert mixed_confirmation.status_code == 409
+    session.expire_all()
+    assert (await session.get(models.KnowledgeDocument, english_id)).language_verified is True
+    assert (await session.get(models.KnowledgeDocument, english_id)).status == "published"
+    assert (await session.get(models.KnowledgeDocument, other_id)).language_verified is False
+    assert (await session.get(models.KnowledgeDocument, other_id)).status == "draft"
+    assert (await session.get(models.KnowledgeDocument, mixed_id)).status == "draft"
+    audits = (
+        (
+            await session.execute(
+                select(models.AuditLog).where(
+                    models.AuditLog.subject_id == str(english_id),
+                    models.AuditLog.action == "CONFIRM_KNOWLEDGE_ENGLISH",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 1
+    assert audits[0].detail["import_batch_id"] == str(first_batch)
+    assert audits[0].detail["confirmation_batch_id"]
 
 
 async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
