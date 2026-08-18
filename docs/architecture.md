@@ -47,7 +47,9 @@ PostgreSQL owns:
 - Feishu handoff routes, operator authorization, notification intents and card-action receipts;
 - `ProvisioningJob`, `DecisionJob`, `ReplyDecision` and `OutboxMessage` state;
 - immutable Outbox origin, actor and explicit reply-target provenance for bot decisions, draft approvals and manual replies;
-- delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps.
+- delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps;
+- tenant-scoped `EvaluationRun` and `EvaluationDecision` rows for the trusted-local,
+  synthetic-only internal evaluation foundation.
 
 New webhook and Chatwoot reconciliation `RawEvent` rows persist a versioned initial-dispatch contract before commit. Process crashes and Redis queue loss are recoverable from that row before normalization, then from `DecisionJob` and `OutboxMessage` after their transactional boundaries.
 
@@ -67,6 +69,27 @@ Redis is not the source of truth for accounts, ingestion, decisions, deliveries,
 - Chatwoot is an optional bridge, not a startup dependency.
 - OpenAI-compatible chat and embedding APIs are called only from decision/knowledge code, never
   directly from webhook routers.
+
+## Synthetic evaluation foundation
+
+`src/social_reply/application/evaluation/` is an internal library for pre-registered `SYNTHETIC`
+workloads and trusted local Python candidates. It owns an immutable candidate registry, typed result
+contracts, workload/lease/finalization orchestration and persistence limited to `evaluation_runs` and
+`evaluation_decisions`.
+
+The evaluation runner does not call production `run_and_persist_decision()` or `persist_decision()`.
+Integration coverage verifies that evaluation does not create or mutate `DecisionJob`,
+`ReplyDecision`, `OutboxMessage`, `AutomationState`, `HumanWorkItem` or handoff notification rows.
+This is database-side-effect isolation, not a network sandbox: trusted candidate code could still use
+Python networking directly. There is no CLI, API, queue actor, Admin surface, controlled dataset
+loader, real customer-data extraction or cloud candidate dispatcher in this slice. Result-set
+fingerprints are repository-generated audit summaries; privileged database writer hardening and
+an audited run-deletion/retention workflow are not implemented. `EvaluationRun.expires_at` is a cutoff
+for new reservations, not a hard cancellation deadline: an already claimed work item may heartbeat,
+finish and be finalized after that timestamp. Candidate coroutines must remain
+event-loop cooperative and must not swallow cancellation; the current lease heartbeat is not a hard
+exactly-once boundary for CPU-bound or synchronously blocking local code. A terminable isolated
+executor is a later slice.
 
 ## Direct message path
 

@@ -4,7 +4,7 @@
 
 The direct account platform contract currently covers seven platforms: Telegram, Facebook,
 Instagram, WhatsApp, Feishu, X and Email. The Alembic graph has one current head:
-`f3b8c1d4e726`. Email protocol/unit coverage does not by itself imply that a real mailbox credential
+`a6f1c3d8e205`. Email protocol/unit coverage does not by itself imply that a real mailbox credential
 or live provider E2E has been validated.
 
 - [Runtime architecture](architecture.md): process ownership, state boundaries, message paths and
@@ -25,6 +25,16 @@ or live provider E2E has been validated.
 
 When documents disagree, executable code and Alembic migrations define behavior. Update the current
 architecture/configuration documents in the same change that alters their contracts.
+
+## Proposed research / not runtime authority
+
+- [Multilingual knowledge replies ADR](proposals/multilingual-knowledge-replies-adr.md):
+  proposed architecture and bake-off contract for replying in the customer's language from a
+  canonical English knowledge base. The Phase 1 trusted-local, synthetic-only internal schema and
+  library foundation is implemented; the runtime/live architecture and real dm bake-off are not,
+  no architecture winner has been selected, and runtime configuration remains unchanged.
+- [Multilingual knowledge replies sources](proposals/multilingual-knowledge-replies-sources.md):
+  stable papers and official documentation used by the proposed ADR.
 
 ## Historical material
 

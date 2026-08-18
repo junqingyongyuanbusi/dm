@@ -4,9 +4,21 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
 `scripts/publish_railway_release.sh` for the required production release path.
 
-The current Alembic graph has one head: `f3b8c1d4e726`. Database migration verifies schema state
+The current Alembic graph has one head: `a6f1c3d8e205`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
+
+## Synthetic evaluation foundation revision
+
+Revision `a6f1c3d8e205` is additive after `f3b8c1d4e726`. It creates tenant-scoped
+`evaluation_runs` and `evaluation_decisions` for a trusted-local, synthetic-only internal evaluation
+library. The migration does not connect the evaluation path to API routes, queue actors, Admin,
+customer-message extraction, cloud model providers, ReplyDecision, Outbox or Railway feature flags.
+
+Deploy this revision with multilingual live, shadow and English-only modes still disabled. Database
+readiness at this head proves only that the isolated schema and constraints are present; it does not
+prove that a real dm bake-off, authorized customer-data extraction, network isolation or cloud
+candidate execution is available.
 
 ## Multilingual English knowledge shadow revision
 
@@ -203,7 +215,7 @@ production Feishu credential or successful live Feishu E2E is implied by this mi
 
 ## Email additive revision and rollout
 
-Revision `e9a1c4f7b620` follows `b7e4c2d9a615` and is the unique current head. It is additive for
+Revision `e9a1c4f7b620` follows `b7e4c2d9a615` and was the rollout head for the Email contract slice. It is additive for
 Email runtime support:
 
 - replaces `ck_platform_accounts_platform` so `platform_accounts.platform` accepts `email`;
@@ -251,7 +263,7 @@ EMAIL_ALLOWED_HOSTS=imap.larksuite.com,smtp.larksuite.com
 ```
 
 Use the standard API-first release order. API owns database preparation: require its deployment to
-reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `f3b8c1d4e726` before
+reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `a6f1c3d8e205` before
 starting or replacing Worker and Scheduler. Then require all three roles to run the same image
 digest and the same Email flags/allowlist. Do not enable Email on a new API while an old Worker or
 Scheduler remains.
@@ -582,7 +594,7 @@ historical open work.
 Before upgrade, take and verify a PostgreSQL backup. Deploy API, Worker and Scheduler with
 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` and identical sender lease, retry and sweep settings.
 After API migrates the database, require all three roles to reach one image digest and confirm the
-unique Alembic head is `f3b8c1d4e726`. Do not enable callbacks while an old API can still receive a
+unique Alembic head is `a6f1c3d8e205`. Do not enable callbacks while an old API can still receive a
 card action or an old Worker/Scheduler is running.
 
 Configure one Tenant at a time:
@@ -600,7 +612,7 @@ Configure one Tenant at a time:
    different values, then redeploy all three roles to one verified digest. Confirm the Scheduler
    registers the handoff recovery sweep.
 5. Trigger one controlled HANDOFF. Verify one card is created, an allowed operator can claim it,
-   another operator cannot resolve claimant-owned work, the claimant can choose “已回复，恢复 Bot”,
+   another operator cannot resolve claimant-owned work, the claimant can choose `已回复，恢复 Bot`,
    and the next new customer message follows the account's current automation policy. Verify the
    HumanWorkItem resolution evidence is `FEISHU_OPERATOR_ATTESTED` and no historical message is
    retroactively answered.

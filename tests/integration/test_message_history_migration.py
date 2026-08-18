@@ -184,7 +184,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
             ).scalar_one()
         await engine.dispose()
 
-        assert revision == "f3b8c1d4e726"
+        assert revision == "a6f1c3d8e205"
         assert str(rows[0].conversation_id) == "00000000-0000-0000-0000-000000000103"
         assert rows[0].tenant_id == "tenant-a"
         assert rows[0].status == "CLAIMED"
@@ -350,7 +350,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).all()
-        assert revision == "f3b8c1d4e726"
+        assert revision == "a6f1c3d8e205"
         assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {

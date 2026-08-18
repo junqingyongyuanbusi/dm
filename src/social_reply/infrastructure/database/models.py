@@ -857,6 +857,273 @@ class ProvisioningJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_evaluation_runs_tenant_id_id"),
+        CheckConstraint(
+            "status IN ('RUNNING', 'COMPLETED', 'FAILED')",
+            name="ck_evaluation_runs_status",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING') = (completed_at IS NULL)",
+            name="ck_evaluation_runs_completed_at",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING') = (result_set_fingerprint IS NULL)",
+            name="ck_evaluation_runs_result_fingerprint",
+        ),
+        CheckConstraint(
+            "data_class = 'SYNTHETIC'",
+            name="ck_evaluation_runs_data_class",
+        ),
+        CheckConstraint(
+            "dataset_fingerprint ~ '^[0-9a-f]{64}$' "
+            "AND candidate_manifest_hash ~ '^[0-9a-f]{64}$' "
+            "AND workload_manifest_hash ~ '^[0-9a-f]{64}$' "
+            "AND execution_policy_hash ~ '^[0-9a-f]{64}$' "
+            "AND (result_set_fingerprint IS NULL OR "
+            "result_set_fingerprint ~ '^[0-9a-f]{64}$') "
+            "AND length(btrim(dataset_version)) > 0 "
+            "AND length(btrim(source_token_key_version)) > 0 "
+            "AND length(btrim(execution_policy_version)) > 0 "
+            "AND length(btrim(code_revision)) > 0",
+            name="ck_evaluation_runs_manifest",
+        ),
+        CheckConstraint(
+            "expected_decision_count >= 1",
+            name="ck_evaluation_runs_expected_count",
+        ),
+        Index(
+            "ix_evaluation_runs_tenant_status_created",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(128))
+    data_class: Mapped[str] = mapped_column(String(32))
+    dataset_fingerprint: Mapped[str] = mapped_column(String(64))
+    dataset_version: Mapped[str] = mapped_column(String(128))
+    source_token_key_version: Mapped[str] = mapped_column(String(64))
+    candidate_manifest_hash: Mapped[str] = mapped_column(String(64))
+    workload_manifest_hash: Mapped[str] = mapped_column(String(64))
+    result_set_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    execution_policy_version: Mapped[str] = mapped_column(String(64))
+    execution_policy_hash: Mapped[str] = mapped_column(String(64))
+    code_revision: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(
+        String(16), default="RUNNING", server_default=text("'RUNNING'")
+    )
+    expected_decision_count: Mapped[int] = mapped_column(Integer)
+    retention_class: Mapped[str] = mapped_column(String(32))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EvaluationDecision(Base):
+    __tablename__ = "evaluation_decisions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_evaluation_decisions_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "evaluation_run_id",
+            "source_message_token",
+            "scenario_id",
+            "candidate_contract_id",
+            name="uq_evaluation_decisions_run_source_candidate",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "evaluation_run_id"],
+            ["evaluation_runs.tenant_id", "evaluation_runs.id"],
+            name="fk_evaluation_decisions_tenant_run",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')",
+            name="ck_evaluation_decisions_status",
+        ),
+        CheckConstraint(
+            "(status IN ('PENDING', 'RUNNING')) = (completed_at IS NULL)",
+            name="ck_evaluation_decisions_completed_at",
+        ),
+        CheckConstraint(
+            "task_kind IN ('retrieval', 'language', 'action', 'rendering', 'e2e')",
+            name="ck_evaluation_decisions_task_kind",
+        ),
+        CheckConstraint(
+            "((task_kind IN ('rendering', 'e2e')) "
+            "AND delivery_surface IN ('chatwoot', 'direct')) OR "
+            "((task_kind NOT IN ('rendering', 'e2e')) AND delivery_surface IS NULL)",
+            name="ck_evaluation_decisions_delivery_surface",
+        ),
+        CheckConstraint(
+            "action IS NULL OR action IN ('auto_reply', 'draft', 'handoff', 'ignore')",
+            name="ck_evaluation_decisions_action",
+        ),
+        CheckConstraint(
+            "source_message_token ~ '^[0-9a-f]{64}$' "
+            "AND scenario_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
+            "AND input_fingerprint ~ '^[0-9a-f]{64}$' "
+            "AND candidate_contract_hash ~ '^[0-9a-f]{64}$' "
+            "AND (reply_text_hash IS NULL OR reply_text_hash ~ '^[0-9a-f]{64}$') "
+            "AND (result_fingerprint IS NULL OR result_fingerprint ~ '^[0-9a-f]{64}$') "
+            "AND length(btrim(result_schema_version)) > 0",
+            name="ck_evaluation_decisions_hashes",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(candidate_contract_manifest) = 'object' "
+            "AND candidate_contract_manifest ?& "
+            "ARRAY['contract_id','version','contract_hash','task_kind',"
+            "'result_schema_version','execution_mode'] "
+            "AND candidate_contract_manifest ->> 'contract_id' = candidate_contract_id "
+            "AND candidate_contract_manifest ->> 'version' = candidate_contract_version "
+            "AND candidate_contract_manifest ->> 'contract_hash' = candidate_contract_hash "
+            "AND candidate_contract_manifest ->> 'task_kind' = task_kind "
+            "AND candidate_contract_manifest ->> 'result_schema_version' = "
+            "result_schema_version",
+            name="ck_evaluation_decisions_contract_manifest",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_evaluation_decisions_attempt_count"),
+        CheckConstraint(
+            "COALESCE(model_invocation_count, 0) >= 0 "
+            "AND COALESCE(input_token_count, 0) >= 0 "
+            "AND COALESCE(output_token_count, 0) >= 0",
+            name="ck_evaluation_decisions_execution_counts",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING') = (claim_token IS NOT NULL AND claim_expires_at IS NOT NULL)",
+            name="ck_evaluation_decisions_running_lease",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING') OR result_fingerprint IS NOT NULL",
+            name="ck_evaluation_decisions_terminal_result",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR (result_payload IS NOT NULL "
+            "AND error_code IS NULL AND error_detail IS NULL)",
+            name="ck_evaluation_decisions_success_payload",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR ("
+            "jsonb_typeof(result_payload) = 'object' "
+            "AND jsonb_typeof(result_payload -> 'execution') = 'object' "
+            "AND (result_payload -> 'execution') ?& "
+            "ARRAY['estimated_cost_usd','input_token_count',"
+            "'model_invocation_count','output_token_count'] "
+            "AND latency_ms IS NOT NULL AND latency_ms >= 0 "
+            "AND latency_ms < 'Infinity'::double precision "
+            "AND estimated_cost_usd IS NOT NULL AND estimated_cost_usd >= 0 "
+            "AND estimated_cost_usd < 'Infinity'::double precision "
+            "AND model_invocation_count IS NOT NULL "
+            "AND input_token_count IS NOT NULL AND output_token_count IS NOT NULL "
+            "AND ((task_kind = 'retrieval' "
+            "AND result_payload ? 'ranked_candidates' "
+            "AND jsonb_typeof(result_payload -> 'ranked_candidates') = 'array') "
+            "OR (task_kind = 'language' "
+            "AND result_payload ?& ARRAY['locale','confidence','unknown','source'] "
+            "AND jsonb_typeof(result_payload -> 'locale') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'confidence') = 'number' "
+            "AND (result_payload ->> 'confidence')::double precision BETWEEN 0 AND 1 "
+            "AND jsonb_typeof(result_payload -> 'unknown') = 'boolean' "
+            "AND jsonb_typeof(result_payload -> 'source') = 'string') "
+            "OR (task_kind = 'action' "
+            "AND result_payload ?& ARRAY['action','reason_codes'] "
+            "AND jsonb_typeof(result_payload -> 'action') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'reason_codes') = 'array') "
+            "OR (task_kind = 'rendering' "
+            "AND result_payload ?& ARRAY['reply_text_hash','locale','guard_passed'] "
+            "AND jsonb_typeof(result_payload -> 'reply_text_hash') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'locale') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'guard_passed') = 'boolean') "
+            "OR (task_kind = 'e2e' "
+            "AND result_payload ?& ARRAY['action','locale','reason_codes'] "
+            "AND jsonb_typeof(result_payload -> 'action') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'locale') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'reason_codes') = 'array')))",
+            name="ck_evaluation_decisions_typed_payload",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR task_kind <> 'e2e' OR "
+            "((action IN ('auto_reply','draft') AND reply_text_hash IS NOT NULL) OR "
+            "(action IN ('handoff','ignore') AND reply_text_hash IS NULL))",
+            name="ck_evaluation_decisions_e2e_reply",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR ("
+            "action IS NOT DISTINCT FROM (result_payload ->> 'action') "
+            "AND reason_codes = COALESCE(result_payload -> 'reason_codes', '[]'::jsonb) "
+            "AND reply_text_hash IS NOT DISTINCT FROM (result_payload ->> 'reply_text_hash') "
+            "AND estimated_cost_usd IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,estimated_cost_usd}')::double precision) "
+            "AND model_invocation_count IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,model_invocation_count}')::integer) "
+            "AND input_token_count IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,input_token_count}')::integer) "
+            "AND output_token_count IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,output_token_count}')::integer))",
+            name="ck_evaluation_decisions_result_projection",
+        ),
+        CheckConstraint(
+            "status <> 'FAILED' OR (error_code IS NOT NULL "
+            "AND result_payload IS NULL AND action IS NULL AND reply_text_hash IS NULL "
+            "AND reason_codes = '[]'::jsonb AND estimated_cost_usd IS NULL "
+            "AND model_invocation_count IS NULL AND input_token_count IS NULL "
+            "AND output_token_count IS NULL)",
+            name="ck_evaluation_decisions_failure_payload",
+        ),
+        Index(
+            "ix_evaluation_decisions_run_status_created",
+            "evaluation_run_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_evaluation_decisions_status_claim_expiry",
+            "status",
+            "claim_expires_at",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    evaluation_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    source_message_token: Mapped[str] = mapped_column(String(64))
+    scenario_id: Mapped[str] = mapped_column(String(64))
+    candidate_contract_id: Mapped[str] = mapped_column(String(128))
+    candidate_contract_version: Mapped[str] = mapped_column(String(64))
+    candidate_contract_hash: Mapped[str] = mapped_column(String(64))
+    candidate_contract_manifest: Mapped[dict] = mapped_column(JSONB)
+    task_kind: Mapped[str] = mapped_column(String(16))
+    result_schema_version: Mapped[str] = mapped_column(String(64))
+    delivery_surface: Mapped[str | None] = mapped_column(String(16))
+    input_fingerprint: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(
+        String(16), default="PENDING", server_default=text("'PENDING'")
+    )
+    action: Mapped[str | None] = mapped_column(String(16))
+    reply_text_hash: Mapped[str | None] = mapped_column(String(64))
+    reason_codes: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    result_payload: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
+    model_invocation_count: Mapped[int | None] = mapped_column(Integer)
+    input_token_count: Mapped[int | None] = mapped_column(Integer)
+    output_token_count: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    result_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class DecisionJob(Base):
     __tablename__ = "decision_jobs"
     __table_args__ = (

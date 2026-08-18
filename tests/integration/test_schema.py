@@ -34,6 +34,8 @@ EXPECTED_TABLES = {
     "provisioning_jobs",
     "decision_jobs",
     "reply_decisions",
+    "evaluation_runs",
+    "evaluation_decisions",
     "delivery_attempts",
 }
 
