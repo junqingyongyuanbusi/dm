@@ -50,7 +50,7 @@ argument-hint: "[变更范围或验收标准]"
 - 启动的本地服务和清理状态
 
 ## Verdict
-- verified / failed / blocked
+- lightweight checks passed / scoped verification passed / CI verified / failed / blocked
 ```
 
-只有所有适用门禁通过时才能写 `verified`；环境阻塞与代码失败必须区分。
+只完成 status/diff 等默认轻量检查时必须写 `lightweight checks passed`，并明确代码行为尚未完整验证。只有用户明确指定的专项验收全部通过时才能写 `scoped verification passed`；只有对应提交 SHA 的 GitHub CI 全绿时才能写 `CI verified`。环境阻塞与代码失败必须区分，所有未运行项继续列在 `Gaps and Risks`。
