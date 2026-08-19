@@ -162,11 +162,11 @@ CI 中的 `Production image` Job 是镜像验收的完整权威实现；修改�
 ### Docker Hub 发布契约
 
 - 只能从干净工作树、已推送且等于 `origin/dev` 的 `dev` commit 发布。
-- 对该 commit 只构建一个 `linux/amd64` 镜像。
+- 对该 commit 只构建一个目标 `linux/amd64` production image。涉及新增 Alembic head 时，发布脚本可额外基于当前运行 predecessor digest 构建一个只叠加新 migration graph 的 migration-compatible rollback image；它不是第二个目标镜像。
 - 推送 immutable full-SHA tag：`zhiyangxiaozi/reply-core:<40-character-git-sha>`。
 - 不得单独重建 `latest`。必须用 registry manifest tooling 将已推送的 SHA 镜像提升为 `latest`。
 - 提升时必须使用 `docker buildx imagetools create --prefer-index=false`，确保 SHA tag 与 `latest` 解析到同一 digest。
-- 替换 `latest` 前，将 Railway 当前运行 digest 保留为 `railway-pre-<short-sha>` rollback tag；immutable SHA tag 不得删除或覆盖。
+- 替换 `latest` 前，将 Railway 当前运行 digest 保留为 `railway-pre-<short-sha>` 审计 tag；若新 release 引入 Alembic head，还必须构建、推送并 smoke-test `railway-compat-pre-<short-sha>`，其内容为 predecessor app 加新 migration graph。数据库迁移后应用回滚只能使用 compatible digest，不能直接使用 raw predecessor digest。Immutable tag 不得删除或覆盖。
 
 ### Railway 发布契约
 

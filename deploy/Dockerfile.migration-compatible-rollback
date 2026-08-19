@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+
+ARG BASE_IMAGE=zhiyangxiaozi/reply-core:latest
+FROM ${BASE_IMAGE}
+
+ARG APP_REVISION=unknown
+ARG TARGET_RELEASE_SHA=unknown
+ARG BUILD_DATE=unknown
+ARG SOURCE_URL=https://github.com/junqingyongyuanbusi/dm
+ARG BASE_DIGEST=unknown
+
+USER root
+COPY --chown=10001:10001 migrations/versions/a6f1c3d8e205_evaluation_foundation.py \
+  /app/migrations/versions/a6f1c3d8e205_evaluation_foundation.py
+RUN chmod 0444 /app/migrations/versions/a6f1c3d8e205_evaluation_foundation.py
+
+LABEL org.opencontainers.image.revision="${APP_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      com.nexory.reply-core.rollback-purpose="migration-compatible-predecessor" \
+      com.nexory.reply-core.rollback-base-digest="${BASE_DIGEST}" \
+      com.nexory.reply-core.rollback-target-release="${TARGET_RELEASE_SHA}" \
+      com.nexory.reply-core.database-head="a6f1c3d8e205"
+
+ENV RELEASE_SHA="${APP_REVISION}"
+USER appuser

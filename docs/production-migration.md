@@ -20,6 +20,39 @@ readiness at this head proves only that the isolated schema and constraints are 
 prove that a real dm bake-off, authorized customer-data extraction, network isolation or cloud
 candidate execution is available.
 
+### Migration-compatible rollback
+
+The raw predecessor image does not contain revision `a6f1c3d8e205` and must not be restarted after
+the database reaches this head. Before promoting Docker Hub `latest`,
+`scripts/publish_railway_release.sh` now builds an auxiliary migration-compatible rollback image from
+the exact active predecessor digest and overlays only the additive evaluation migration. Its OCI
+revision remains the predecessor application SHA; labels record the target release SHA, predecessor
+digest and database head.
+
+The release script verifies this image before changing `latest` or Railway. It upgrades an isolated
+test database with the target image, then runs the predecessor image's `scripts.prepare_database` and
+`scripts.assert_database_ready` against head `a6f1c3d8e205`. A release aborts before production
+mutation if the predecessor application plus overlaid migration graph cannot complete database preparation and exact-head readiness checks.
+
+The release manifest records the compatibility tag and digest. Preserve the `deploying`/`completed` manifest in the operator's durable release evidence store; the ignored local `dist/` copy is not the sole retention mechanism. To roll back application behavior
+without downgrading PostgreSQL, run from a trusted checkout containing that manifest:
+
+```bash
+scripts/rollback_railway_migration_compatible.sh \
+  --execute=<target-full-sha> \
+  dist/release-<target-full-sha>.json
+```
+
+The rollback script atomically retags Docker Hub `latest` to the compatibility digest, then redeploys
+API, waits for `/healthz`, and redeploys Worker and Scheduler. It verifies all three roles run the
+same compatibility digest and that production configuration remains fail-closed. PostgreSQL stays at
+`a6f1c3d8e205`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
+evidence only and are not executable rollback targets after migration.
+
+This rollback also works when the target API migrated the database but crashed before Uvicorn became
+healthy, because the compatibility image is built, pushed and smoke-tested before `latest` is
+promoted.
+
 ## Multilingual English knowledge shadow revision
 
 Revision `f3b8c1d4e726` is additive after `e9a1c4f7b620`. It adds language-detection,

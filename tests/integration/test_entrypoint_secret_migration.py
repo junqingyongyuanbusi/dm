@@ -38,6 +38,76 @@ def test_release_requires_app_and_state_service_colocation():
     assert "multilingual_live_enabled: false" in script
     assert "multilingual_shadow_enabled: false" in script
     assert "english_knowledge_only_enabled: false" in script
+    assert "railway-compat-pre-${short_sha}" in script
+    assert "deploy/Dockerfile.migration-compatible-rollback" in script
+    assert "scripts/verify_migration_compatible_rollback.sh" in script
+    assert "migration_compatible_rollback" in script
+    assert Path("scripts/verify_migration_compatible_rollback.sh").stat().st_mode & 0o111
+    assert script.index(
+        'verify_predecessor_image "${IMAGE_REPO}@${previous_digest}"'
+    ) < script.index('rollback_compatible_digest="$(prepare_rollback_compatible_image')
+    assert '"${IMAGE_REPO}@${expected_digest}"' in script
+    assert '"${IMAGE_REPO}@${rollback_compatible_digest}"' in script
+    promotion = script.index('--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"')
+    assert script.index('write_manifest "deploying"') < promotion
+    assert '--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"' in script
+    assert "invalid inherited release lock descriptor" in script
+
+
+def test_migration_compatible_rollback_retags_latest_and_redeploys_in_order():
+    script_path = Path("scripts/rollback_railway_migration_compatible.sh")
+    script = script_path.read_text()
+    promote = script.index("docker buildx imagetools create --prefer-index=false")
+    verify = script.rindex("verify_compatibility_image")
+    api = script.index('api_deployment_id="$(redeploy_role api)"')
+    worker = script.index('worker_deployment_id="$(redeploy_role worker)"')
+    scheduler = script.index('scheduler_deployment_id="$(redeploy_role scheduler)"')
+    assert verify < promote < api < worker < scheduler
+    assert script_path.stat().st_mode & 0o111
+    assert "--execute=<target-full-sha>" in script
+    assert ".run/publish-railway-release.lock" in script
+    assert "expected_compat_ref" in script
+    assert ".previous_digest" in script
+    assert '|| "$digest" == "$previous_digest"' in script
+    assert '|| "$active_digest" == "$previous_digest"' in script
+    assert "release manifest status is not rollback-eligible" in script
+    assert script.count("validate_current_state") >= 4
+    assert script.rindex("require_release_mutation") < promote
+    assert "scripts/rollback_state_guard.py" in script
+    assert "verify_compatibility_image" in script
+    assert "railway_source_image" in script
+    assert "invalid inherited release lock descriptor" in script
+    assert "migration_compatible_rollback.digest" in script
+    assert "wait_for_api_health" in script
+    assert "validate_railway_config.py" in script
+    migration_runbook = Path("docs/production-migration.md").read_text()
+    assert "rollback_railway_migration_compatible.sh" in migration_runbook
+    assert "--execute=<target-full-sha>" in migration_runbook
+
+
+def test_migration_compatible_rollback_rejects_prepared_manifest(tmp_path: Path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for command in ("docker", "railway"):
+        executable = bin_dir / command
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+    manifest = tmp_path / "release.json"
+    target_sha = "a" * 40
+    manifest.write_text('{"status":"prepared","git_sha":"' + target_sha + '"}')
+    result = subprocess.run(
+        [
+            "scripts/rollback_railway_migration_compatible.sh",
+            f"--execute={target_sha}",
+            str(manifest),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
+    assert result.returncode == 1
+    assert "release manifest status is not rollback-eligible: prepared" in result.stderr
 
 
 def _run_worker_entrypoint(

@@ -22,6 +22,7 @@ or live provider E2E has been validated.
 - [Reliability fault drills](reliability-drills.md): repeatable queue-loss, crash, lease, takeover,
   retry-exhaustion and recovery validation.
 - [Railway release script](../scripts/publish_railway_release.sh): the required Docker Hub publish and production rollout entrypoint.
+- [Migration-compatible Railway rollback](../scripts/rollback_railway_migration_compatible.sh): restores the predecessor application on the additive current schema using the release manifest's compatible digest.
 
 When documents disagree, executable code and Alembic migrations define behavior. Update the current
 architecture/configuration documents in the same change that alters their contracts.

@@ -70,9 +70,9 @@ done
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "not inside a Git repository"
 cd "$repo_root"
 mkdir -p .run dist
+release_lock="$repo_root/.run/publish-railway-release.lock"
+script_path="$repo_root/scripts/publish_railway_release.sh"
 if [[ "${DM_RELEASE_LOCK_HELD:-}" != "1" ]]; then
-  release_lock="$repo_root/.run/publish-railway-release.lock"
-  script_path="$repo_root/scripts/publish_railway_release.sh"
   exec python3 - "$release_lock" "$script_path" "$@" <<'PY'
 import fcntl
 import os
@@ -83,13 +83,33 @@ with open(lock_path, "a+", encoding="ascii") as lock_file:
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print(f"[release] ERROR: another local Railway release is already running: {lock_path}", file=sys.stderr)
+        print(f"[release] ERROR: another local Railway release or rollback is running: {lock_path}", file=sys.stderr)
         raise SystemExit(1)
     os.set_inheritable(lock_file.fileno(), True)
     environment = dict(os.environ)
     environment["DM_RELEASE_LOCK_HELD"] = "1"
     environment["DM_RELEASE_LOCK_FD"] = str(lock_file.fileno())
     os.execve(script_path, [script_path, *args], environment)
+PY
+else
+  lock_fd="${DM_RELEASE_LOCK_FD:-}"
+  [[ "$lock_fd" =~ ^[0-9]+$ ]] || fail "invalid inherited release lock descriptor"
+  python3 - "$lock_fd" "$release_lock" <<'PY'
+import fcntl
+import os
+import sys
+
+fd = int(sys.argv[1])
+lock_path = sys.argv[2]
+try:
+    fd_stat = os.fstat(fd)
+    path_stat = os.stat(lock_path)
+    if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+        raise OSError("inherited descriptor does not match release lock")
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (OSError, BlockingIOError) as exc:
+    print(f"[release] ERROR: invalid inherited release lock: {exc}", file=sys.stderr)
+    raise SystemExit(1)
 PY
 fi
 
@@ -112,6 +132,7 @@ short_sha="${full_sha:0:12}"
 sha_ref="${IMAGE_REPO}:${full_sha}"
 latest_ref="${IMAGE_REPO}:latest"
 rollback_ref="${IMAGE_REPO}:railway-pre-${short_sha}"
+rollback_compatible_ref="${IMAGE_REPO}:railway-compat-pre-${short_sha}"
 manifest_path="dist/release-${full_sha}.json"
 revalidate_dev_head
 
@@ -175,6 +196,11 @@ image_metadata() {
   docker buildx imagetools inspect "$1" --format '{{json .Image}}'
 }
 
+image_revision() {
+  jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' \
+    <<<"$(image_metadata "$1")"
+}
+
 verify_sha_image() {
   local reference="$1"
   local metadata revision source image_os architecture
@@ -185,6 +211,52 @@ verify_sha_image() {
   architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
   [[ "$revision" == "$full_sha" ]] || fail "$reference has unexpected OCI revision: $revision"
   [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
+  [[ "$image_os/$architecture" == "linux/amd64" ]] \
+    || fail "$reference has unexpected platform: $image_os/$architecture"
+}
+
+verify_predecessor_image() {
+  local reference="$1"
+  local expected="$2"
+  local metadata revision source image_os architecture digest
+  digest="$(image_digest "$reference")"
+  [[ "$digest" == "$expected" ]] || fail "$reference has unexpected digest: $digest"
+  metadata="$(image_metadata "$reference")"
+  revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
+  source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
+  image_os="$(jq -r '.os // ""' <<<"$metadata")"
+  architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || fail "$reference has invalid app revision: $revision"
+  [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
+  [[ "$image_os/$architecture" == "linux/amd64" ]] \
+    || fail "$reference has unexpected platform: $image_os/$architecture"
+}
+
+verify_rollback_compatible_image() {
+  local reference="$1"
+  local base_digest="$2"
+  local app_revision="$3"
+  local metadata revision source image_os architecture purpose labeled_base labeled_target database_head
+  metadata="$(image_metadata "$reference")"
+  revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
+  source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
+  purpose="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-purpose"] // ""' <<<"$metadata")"
+  labeled_base="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-base-digest"] // ""' <<<"$metadata")"
+  labeled_target="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-target-release"] // ""' <<<"$metadata")"
+  database_head="$(jq -r '.config.Labels["com.nexory.reply-core.database-head"] // ""' <<<"$metadata")"
+  image_os="$(jq -r '.os // ""' <<<"$metadata")"
+  architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
+  [[ "$revision" == "$app_revision" ]] \
+    || fail "$reference has unexpected predecessor app revision: $revision"
+  [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
+  [[ "$purpose" == "migration-compatible-predecessor" ]] \
+    || fail "$reference has unexpected rollback purpose: $purpose"
+  [[ "$labeled_base" == "$base_digest" ]] \
+    || fail "$reference has unexpected rollback base digest: $labeled_base"
+  [[ "$labeled_target" == "$full_sha" ]] \
+    || fail "$reference has unexpected target release: $labeled_target"
+  [[ "$database_head" == "a6f1c3d8e205" ]] \
+    || fail "$reference has unexpected database head: $database_head"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
@@ -201,6 +273,46 @@ select_builder() {
       return
     fi
   done
+}
+
+prepare_rollback_compatible_image() {
+  local reference="$1"
+  local base_digest="$2"
+  local app_revision="$3"
+  local state builder_name build_date digest
+  local -a builder_args
+  state="$(image_state "$reference")"
+  if [[ "$state" == "exists" ]]; then
+    verify_rollback_compatible_image "$reference" "$base_digest" "$app_revision"
+  else
+    revalidate_dev_head
+    builder_name="$(select_builder)"
+    builder_args=()
+    if [[ -n "$builder_name" ]]; then
+      builder_args=(--builder "$builder_name")
+    fi
+    build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    log "building and pushing migration-compatible rollback image: $reference"
+    docker buildx build \
+      "${builder_args[@]}" \
+      --file deploy/Dockerfile.migration-compatible-rollback \
+      --platform linux/amd64 \
+      --provenance=false \
+      --build-arg "BASE_IMAGE=${IMAGE_REPO}@${base_digest}" \
+      --build-arg "APP_REVISION=${app_revision}" \
+      --build-arg "TARGET_RELEASE_SHA=${full_sha}" \
+      --build-arg "BUILD_DATE=${build_date}" \
+      --build-arg "SOURCE_URL=${SOURCE_URL}" \
+      --build-arg "BASE_DIGEST=${base_digest}" \
+      --tag "$reference" \
+      --push \
+      . >&2
+    verify_rollback_compatible_image "$reference" "$base_digest" "$app_revision"
+  fi
+  digest="$(image_digest "$reference")"
+  [[ "$digest" != "$expected_digest" ]] \
+    || fail "rollback-compatible image unexpectedly matches target digest"
+  printf '%s\n' "$digest"
 }
 
 railway_status_json() {
@@ -342,6 +454,8 @@ wait_for_api_health() {
 
 write_manifest() {
   local release_status="$1"
+  local manifest_tmp
+  manifest_tmp="$(mktemp "${manifest_path}.tmp.XXXXXX")"
   jq -n \
     --arg status "$release_status" \
     --arg git_sha "$full_sha" \
@@ -351,6 +465,10 @@ write_manifest() {
     --arg digest "${expected_digest:-}" \
     --arg previous_digest "${previous_digest:-}" \
     --arg rollback_tag "$rollback_ref" \
+    --arg previous_app_revision "${previous_app_revision:-}" \
+    --arg rollback_compatible_tag "$rollback_compatible_ref" \
+    --arg rollback_compatible_digest "${rollback_compatible_digest:-}" \
+    --arg rollback_schema_head "a6f1c3d8e205" \
     --arg previous_api_deployment_id "${previous_api_deployment_id:-}" \
     --arg previous_worker_deployment_id "${previous_worker_deployment_id:-}" \
     --arg previous_scheduler_deployment_id "${previous_scheduler_deployment_id:-}" \
@@ -367,6 +485,12 @@ write_manifest() {
       digest: $digest,
       previous_digest: $previous_digest,
       rollback_tag: $rollback_tag,
+      migration_compatible_rollback: {
+        tag: $rollback_compatible_tag,
+        digest: $rollback_compatible_digest,
+        predecessor_app_revision: $previous_app_revision,
+        database_head: $rollback_schema_head
+      },
       release_gates: {
         multilingual_live_enabled: false,
         multilingual_shadow_enabled: false,
@@ -383,7 +507,24 @@ write_manifest() {
         scheduler_deployment_id: $scheduler_deployment_id
       },
       updated_at: $updated_at
-    }' >"$manifest_path"
+    }' >"$manifest_tmp" \
+    || { rm -f "$manifest_tmp"; fail "could not render release manifest"; }
+  jq -e . "$manifest_tmp" >/dev/null \
+    || { rm -f "$manifest_tmp"; fail "release manifest is not valid JSON"; }
+  python3 - "$manifest_tmp" "$manifest_path" <<'PY'
+import os
+import sys
+
+source, destination = sys.argv[1:]
+with open(source, "rb") as manifest_file:
+    os.fsync(manifest_file.fileno())
+os.replace(source, destination)
+directory_fd = os.open(os.path.dirname(destination) or ".", os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
 }
 
 log "release commit: $full_sha"
@@ -505,28 +646,55 @@ for previous_id in \
   "$previous_scheduler_deployment_id"; do
   [[ -n "$previous_id" ]] || fail "could not retain all predecessor Railway deployment IDs"
 done
+
+verify_predecessor_image "${IMAGE_REPO}@${previous_digest}" "$previous_digest"
+previous_app_revision="$(image_revision "${IMAGE_REPO}@${previous_digest}")"
+[[ "$previous_app_revision" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "predecessor image has invalid OCI revision: ${previous_app_revision:-missing}"
+rollback_compatible_digest="$(prepare_rollback_compatible_image \
+  "$rollback_compatible_ref" "$previous_digest" "$previous_app_revision")"
+[[ "$rollback_compatible_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || fail "invalid migration-compatible rollback digest: $rollback_compatible_digest"
+log "verifying target and migration-compatible predecessor against an isolated a6 database"
+scripts/verify_migration_compatible_rollback.sh \
+  "${IMAGE_REPO}@${expected_digest}" \
+  "${IMAGE_REPO}@${rollback_compatible_digest}"
+[[ "$(image_digest "$rollback_compatible_ref")" == "$rollback_compatible_digest" ]] \
+  || fail "migration-compatible rollback tag changed during smoke test"
+verify_rollback_compatible_image \
+  "${IMAGE_REPO}@${rollback_compatible_digest}" "$previous_digest" "$previous_app_revision"
 write_manifest "prepared"
 
 initial_latest_digest="$(image_digest "$latest_ref")"
 if [[ "$initial_latest_digest" != "$previous_digest" && "$initial_latest_digest" != "$expected_digest" ]]; then
   fail "Docker Hub latest changed to unrelated digest $initial_latest_digest"
 fi
+write_manifest "deploying"
 if [[ "$initial_latest_digest" != "$expected_digest" ]]; then
   revalidate_dev_head
   [[ "$(image_digest "$latest_ref")" == "$initial_latest_digest" ]] \
     || fail "Docker Hub latest changed concurrently before promotion"
-  log "promoting the exact SHA image to $latest_ref"
+  verify_sha_image "$sha_ref"
+  [[ "$(image_digest "$sha_ref")" == "$expected_digest" ]] \
+    || fail "target SHA tag changed before promotion"
+  log "promoting the exact target digest to $latest_ref"
   docker buildx imagetools create --prefer-index=false \
-    --tag "$latest_ref" "$sha_ref" >/dev/null
+    --tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}" >/dev/null
 fi
 latest_digest="$(image_digest "$latest_ref")"
 [[ "$latest_digest" == "$expected_digest" ]] \
   || fail "latest digest $latest_digest does not match SHA digest $expected_digest"
-write_manifest "deploying"
+require_target_latest() {
+  local latest_digest
+  latest_digest="$(image_digest "$latest_ref")"
+  [[ "$latest_digest" == "$expected_digest" ]] \
+    || fail "Docker Hub latest changed during release: $latest_digest"
+}
 
 deploy_role() {
   local service="$1"
   local active active_id active_digest before_id deployment_id
+  require_target_latest
   active="$(active_deployment_json "$service")"
   active_id="$(jq -r '.id // ""' <<<"$active")"
   active_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
@@ -538,6 +706,7 @@ deploy_role() {
   [[ "$active_digest" == "$previous_digest" ]] \
     || fail "$service cannot resume from digest $active_digest"
   before_id="$(jq -r '.id // ""' <<<"$(latest_deployment_json "$service")")"
+  require_target_latest
   log "redeploying Railway $service from source"
   railway redeploy \
     --project "$RAILWAY_PROJECT_ID" \
@@ -557,6 +726,7 @@ worker_deployment_id="$(deploy_role worker)"
 log "Worker ready: $worker_deployment_id"
 scheduler_deployment_id="$(deploy_role scheduler)"
 log "Scheduler ready: $scheduler_deployment_id"
+require_target_latest
 
 final_latest_digest="$(image_digest "$latest_ref")"
 [[ "$final_latest_digest" == "$expected_digest" ]] \
@@ -574,4 +744,5 @@ revalidate_dev_head
 write_manifest "completed"
 
 log "release complete: $full_sha -> $expected_digest"
+log "migration-compatible rollback: $rollback_compatible_ref -> $rollback_compatible_digest"
 log "release manifest: $manifest_path"
