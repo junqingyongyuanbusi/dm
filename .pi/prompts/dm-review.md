@@ -19,7 +19,7 @@ argument-hint: "[范围、文件或关注点]"
 - PostgreSQL 持久事实与 Redis 临时状态边界是否被破坏；
 - 测试是否验证行为而不是锁死私有实现，是否缺少失败、重试、重复投递或恢复场景；
 - 是否出现重复实现、死代码、宽泛静默异常、投机抽象、无调用 wrapper 或明显 AI 风格冗余；
-- 是否遗漏 `AGENTS.md` 要求的 focused、Ruff、pytest、Alembic、Docker image 或发布前验证。
+- 是否遗漏当前变更适用的轻量本地检查、对应 SHA 的 CI 状态，或用户明确要求的专项验证；不得仅因未在本地重复 Ruff、完整 pytest、Alembic 或 Docker build 就判定为缺陷。
 
 硬约束：
 

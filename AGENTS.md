@@ -68,96 +68,45 @@ docker compose -f deploy/docker-compose.yml down
 
 除非用户明确要求清空本地数据，不得添加 `-v`，不得删除 PostgreSQL volume。
 
-## 实际测试命令
+## 本地验证与远端验证
 
-开始前先确认分支和工作区，识别并保留无关用户改动：
+本地默认采用轻量流程，目标是快速审查、提交和推送，不重复 GitHub CI 的完整门禁。开始前只需确认分支、工作区和最终 diff，并保留无关用户改动：
 
 ```bash
 git branch --show-current
 git status --short
-```
-
-先运行与修改直接相关的 focused tests，例如：
-
-```bash
-uv run pytest -q tests/unit/test_config.py
-uv run pytest -q tests/integration/test_admin_console.py
-```
-
-然后运行仓库级 Ruff：
-
-```bash
-uv run ruff check .
-```
-
-完整门禁使用独立的 `_test` 数据库。Pytest 会拒绝非 `_test` 数据库；不得绕过这项保护，也不得指向开发库或生产库。
-
-```bash
-docker compose -f deploy/docker-compose.yml up -d postgres redis
-
-docker compose -f deploy/docker-compose.yml exec -T postgres sh -c \
-  'psql -U dev -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '\''social_reply_test'\''" | grep -q 1 || createdb -U dev social_reply_test'
-
-export TESTING=true
-export DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test
-export REDIS_URL=redis://localhost:6379/0
-export PLATFORM_SECRET_KEYS=Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=
-
-uv run alembic upgrade head
-uv run alembic check
-head_revision="$(uv run alembic heads)"
-current_revision="$(uv run alembic current)"
-test -n "$head_revision"
-test "$head_revision" = "$current_revision"
-
-env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
-    -u http_proxy -u https_proxy -u all_proxy \
-    uv run pytest -q
-
 git diff --check
 ```
 
-按变更类型增加验证：
+默认不在本地启动 PostgreSQL/Redis，不强制运行 focused tests、全仓库 Ruff、Alembic upgrade/check、完整 pytest 或 production image build。代码可以在完成最终 diff 审查后直接提交并推送；不得为了制造干净状态使用 reset、restore、checkout、clean 或 stash。
 
-- 修改 shell 脚本：运行 `bash -n <changed-script>`。
-- 修改迁移或 SQLAlchemy metadata：必须运行上述 Alembic upgrade/check/head-current 全套检查；必要时从空测试库验证。发布前必须阅读 `docs/production-migration.md` 中适用章节，先完成并记录其要求的 PostgreSQL 备份及恢复验证、数据库存、旧副本清退、流量/Worker 暂停和分阶段开关；任一前置条件未满足都不得发布。
-- 修改 Dockerfile、`.dockerignore`、`entrypoint.sh` 或 production runtime assets：必须执行真实 `linux/amd64` build，并复现 `.github/workflows/ci.yml` 的 image contract checks。
-- 修改路由、Webhook、OAuth、Admin 或 Provisioning API：增加 focused route/security tests，并确认稳定协议路径与 HTTP methods 未意外变化。
-- 修改发送、队列、恢复或幂等逻辑：必须覆盖成功、重试、重复投递、并发/lease、fail-closed 和恢复路径。
-- 纯文档变更仍需运行 Ruff、完整 pytest、适用的迁移检查和 `git diff --check`；不得假设文档删除不会破坏测试或脚本引用。
+只有以下情况才增加本地专项验证：
 
-本地 production image 构建命令：
+- 用户在当前请求中明确要求运行某项测试或完整验证。
+- GitHub CI 失败，需要在本地复现首个可操作错误。
+- 改动无法被现有 CI 覆盖，且缺少该检查会让提交内容本身不可解析或不可审查；此时只运行最小检查，例如变更 shell 的 `bash -n <changed-script>` 或变更 Python 文件的定向 Ruff/编译检查。
+- 发布脚本要求在发布前执行的配置、digest、迁移兼容或镜像 smoke；这些检查属于发布流程，不是每次本地提交的前置条件。
 
-```bash
-full_sha="$(git rev-parse HEAD)"
-image="reply-core-local:${full_sha}"
-docker buildx build \
-  --platform linux/amd64 \
-  --provenance=false \
-  --build-arg "RELEASE_SHA=${full_sha}" \
-  --build-arg "BUILD_DATE=1970-01-01T00:00:00Z" \
-  --build-arg "SOURCE_URL=https://github.com/junqingyongyuanbusi/dm" \
-  --tag "$image" \
-  --load \
-  .
-```
+GitHub Actions 是 Ruff、独立 `_test` 数据库迁移、完整 pytest 和真实 `linux/amd64` production image 的权威自动验证。推送后读取对应 SHA 的 CI 状态；CI 失败时根据日志继续修复，不要求在 push 前本地重复同一套完整检查。
 
-CI 中的 `Production image` Job 是镜像验收的完整权威实现；修改镜像契约时必须同步更新 CI 检查。
+Railway 中的“测试”只允许是部署后的有界 smoke、`/healthz`、日志、deployment status、digest 和经授权测试 tenant/account 的真实行为观察。禁止在 Railway `production` 环境执行 pytest，禁止把 Alembic/测试命令指向业务数据库，也不得为测试调用未经授权的真实平台业务 API。
+
+修改迁移、SQLAlchemy metadata、Docker/runtime assets、路由/安全、发送/队列/幂等逻辑时，仍必须保证对应 CI 或发布脚本门禁覆盖这些风险；不得删除或绕过 `_test` 数据库保护、镜像合同、配置一致性、迁移兼容、kill switch、Outbox、租户隔离或发送前复检。
 
 ## 项目验收要求
 
-仓库变更不能在“代码写完”“本地测试通过”或“Git push 完成”时宣告完成。除非用户明确要求不部署，每个推送到 `dev` 的完成变更都必须发布并部署对应镜像。
+仓库变更完成以用户当前请求为准。完成实现和最终 diff 审查后可以直接提交并推送；本地完整测试不是 commit/push 的前置条件。Git push 只更新 GitHub，不自动代表 Railway 已部署。
 
-任何要求让本地代码在 Railway 生效的交付，默认包含“提交到 `dev` → 推送 `origin/dev` → 等待 CI 全绿 → 构建并发布 Docker Hub immutable SHA 镜像 → 提升同一 digest 为 `latest` → 通过发布脚本更新 Railway 三角色 → 验证健康与 digest”的完整链路。`railway restart` 只重启现有容器，不会携带未提交、未构建或未发布的代码，不得作为代码发布的替代。
+只有用户在当前请求中明确要求部署或让代码在 Railway 生效时，才执行“提交到 `dev` → 推送 `origin/dev` → 等待该 SHA 的 CI 全绿 → 构建并发布 Docker Hub immutable SHA 镜像 → 提升同一 digest 为 `latest` → 通过发布脚本更新 Railway 三角色 → 验证健康与 digest”的完整链路。`railway restart` 只重启现有容器，不会携带未提交、未构建或未发布的代码，不得作为代码发布的替代。
 
 ### 提交与 CI
 
 1. 逐项核对用户要求，并审查最终 diff；不得提交无关用户改动。
-2. 运行 focused tests、仓库 Ruff、完整 pytest、适用的迁移/metadata/image 检查和 `git diff --check`。
-3. 在 `dev` 上独立提交当前任务。提交前用 `git diff --cached --check` 和 `git status --short` 确认暂存内容。
-4. 推送到 `origin/dev`。
-5. 等待该提交的全部 GitHub Actions Job 成功；不得在 CI pending、cancelled 或 failed 时发布。
-6. 如果 GitHub、Docker Hub 或 Railway 凭证不可用，报告 `implementation complete, release blocked`；不得声称任务完整或已经部署。
+2. 默认只运行 `git status --short`、`git diff --check` 和提交前的 `git diff --cached --check`；不要求在本地运行 focused、Ruff、完整 pytest、Alembic 或 image build。
+3. 在 `dev` 上独立提交当前任务并推送到 `origin/dev`；推送前后核对 `HEAD` 与远端 SHA。
+4. 推送后读取该提交的 GitHub Actions 状态并如实报告。CI 失败时继续修复；CI pending 不影响“代码已推送”的事实，但不得声称 CI 已通过。
+5. 只有执行 Railway 发布时才必须等待该 SHA 的全部 CI Job 成功；不得在 CI pending、cancelled 或 failed 时发布。
+6. 如果 GitHub、Docker Hub 或 Railway 凭证不可用，准确报告对应的 commit、push、CI 或 release 阻塞状态，不得把未完成阶段说成已完成。
 
 ### Docker Hub 发布契约
 

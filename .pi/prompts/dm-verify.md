@@ -1,5 +1,5 @@
 ---
-description: 按 dm 的 AGENTS.md 选择并执行 focused、仓库级和变更类型验证
+description: 按 dm 的 AGENTS.md 执行轻量本地检查、专项验证或读取 CI/Railway 证据
 argument-hint: "[变更范围或验收标准]"
 ---
 
@@ -14,13 +14,12 @@ argument-hint: "[变更范围或验收标准]"
 
 执行策略：
 
-1. 先运行最小相关 focused tests。
-2. 再运行 `uv run ruff check .`。
-3. 按 `AGENTS.md` 使用独立的 `social_reply_test` 数据库执行 Alembic 与完整 pytest 门禁；不得指向开发库或生产库。
-4. 修改 shell、迁移/metadata、路由/安全、队列/幂等、Docker/runtime assets 时，增加契约规定的专项检查。
-5. 如果需要本地 PostgreSQL/Redis，先记录 `docker compose -f deploy/docker-compose.yml ps` 的初始状态，再用该 Compose 文件启动缺失服务。结束时只停止本次验证新启动的服务；原先已运行的服务必须保持运行。不得执行 `down -v` 或删除现有 volume。
-6. 测试失败时先分类为代码、测试、依赖服务、环境变量、代理、权限、网络、缓存或旧产物问题；不要通过弱化断言、关闭安全校验、换模型或改 Prompt 掩盖环境故障。
-
+1. 默认只审查最终 diff，并执行 `git status --short`、`git diff --check`；不自动运行 focused tests、全仓 Ruff、Alembic、完整 pytest、Docker build 或本地 PostgreSQL/Redis。
+2. 用户明确指定测试、完整验证或某个验收标准时，只运行该范围所需的最小命令。
+3. GitHub CI 是 Ruff、独立 `_test` 数据库迁移、完整 pytest 和 production image 的权威验证；提交已推送时，优先读取对应 SHA 的 CI 状态，不在本地重复整套门禁。
+4. CI 失败时，先读取首个可操作错误；只有需要复现时才在本地启动必要服务或运行对应 focused command。
+5. Railway 验证仅限部署后的有界 smoke、health、日志、deployment status、digest 和经授权测试 tenant/account 的行为观察。禁止在 Railway `production` 环境运行 pytest，禁止将 Alembic/测试连接指向业务数据库，禁止调用未经授权的真实平台业务 API。
+6. 验证失败时区分代码、测试、依赖服务、环境变量、代理、权限、网络、缓存或旧产物问题；不要通过弱化断言、关闭安全校验、换模型或改 Prompt 掩盖故障。
 权限边界：
 
 - 可以运行仓库文档规定的本地只读检查、测试、构建和临时本地测试基础设施。

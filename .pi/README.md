@@ -7,7 +7,7 @@
 | 命令 | 文件 | 用途 | 默认副作用 |
 | --- | --- | --- | --- |
 | `/dm-review` | `prompts/dm-review.md` | 只读审查当前 diff 或指定范围 | 不编辑、不提交、不发布 |
-| `/dm-verify` | `prompts/dm-verify.md` | 按 `AGENTS.md` 选择并执行验证 | 仅本地测试/基础设施；不修改远程状态 |
+| `/dm-verify` | `prompts/dm-verify.md` | 轻量检查当前 diff、读取对应 CI，或按用户要求执行专项验证 | 默认只读本地/远端证据；不自动启动测试基础设施或修改远程状态 |
 | `/dm-handoff` | `prompts/dm-handoff.md` | 生成可恢复、可审计的任务交接 | 不编辑、不提交、不发布 |
 
 Pi 从仓库根目录启动时会自动发现 `.pi/prompts/*.md`，文件名就是斜杠命令名。Prompt 自动发现不递归，因此共享命令保持在 `prompts/` 顶层。
