@@ -52,6 +52,7 @@ def test_release_requires_app_and_state_service_colocation():
     assert script.index('write_manifest "deploying"') < promotion
     assert '--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"' in script
     assert "invalid inherited release lock descriptor" in script
+    assert script.rindex("require_target_latest") < script.index('write_manifest "completed"')
 
 
 def test_migration_compatible_rollback_retags_latest_and_redeploys_in_order():
@@ -80,6 +81,9 @@ def test_migration_compatible_rollback_retags_latest_and_redeploys_in_order():
     assert "migration_compatible_rollback.digest" in script
     assert "wait_for_api_health" in script
     assert "validate_railway_config.py" in script
+    assert script.rindex("require_compat_latest") < script.index(
+        'rollback_manifest="dist/rollback-${target_sha}.json"'
+    )
     migration_runbook = Path("docs/production-migration.md").read_text()
     assert "rollback_railway_migration_compatible.sh" in migration_runbook
     assert "--execute=<target-full-sha>" in migration_runbook

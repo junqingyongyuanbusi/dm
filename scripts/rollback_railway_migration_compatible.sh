@@ -337,6 +337,7 @@ done
 
 uv run --frozen --no-dev python scripts/validate_railway_config.py \
   "$RAILWAY_PROJECT_ID" "$RAILWAY_ENVIRONMENT" "$PUBLIC_BASE_URL"
+require_compat_latest
 
 rollback_manifest="dist/rollback-${target_sha}.json"
 jq -n \

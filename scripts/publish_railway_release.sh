@@ -741,6 +741,7 @@ done
 validate_railway_config
 validate_railway_colocation
 revalidate_dev_head
+require_target_latest
 write_manifest "completed"
 
 log "release complete: $full_sha -> $expected_digest"
