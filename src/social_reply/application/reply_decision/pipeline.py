@@ -6,6 +6,7 @@ from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import redact_pii, run_final_guard
 from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, LLMClient, LLMContext
+from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
 from social_reply.domain.reply.rules import apply_rules
 from social_reply.domain.reply.voice import VoicePreferences
 
@@ -40,6 +41,7 @@ async def run_decision_pipeline(
     verbatim_reply: str | None = None,
     approved_official_contact_reply: str | None = None,
     approved_knowledge_reply: str | None = None,
+    approved_localization: ApprovedLocalizationArtifact | None = None,
     verbatim_after_decision: str | None = None,
     forced_decision: ReplyDecision | None = None,
     target_language: str = "und",
@@ -92,6 +94,31 @@ async def run_decision_pipeline(
         decision = ruled
     elif forced_decision is not None:
         decision = forced_decision
+    elif approved_localization is not None:
+        if (
+            not approved_localization.auto_reply_allowed
+            or not approved_localization.has_valid_text_hash()
+        ):
+            decision = ReplyDecision(
+                action=ReplyAction.HANDOFF,
+                reason_codes=("INVALID_APPROVED_LOCALIZATION",),
+                source="rule",
+            )
+        else:
+            decision = ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text=approved_localization.text,
+                intent="approved_knowledge_localization",
+                confidence=1.0,
+                reason_codes=("KNOWLEDGE_LOCALIZATION",),
+                source="knowledge_localization",
+                reply_language=approved_localization.locale,
+                resolved_locale=approved_localization.locale,
+                knowledge_localization_id=approved_localization.id,
+                knowledge_localization_release_id=approved_localization.release_id,
+                knowledge_localization_text_hash=approved_localization.text_hash,
+                knowledge_localization_source_hash=approved_localization.source_content_hash,
+            )
     elif verbatim_reply is not None:
         # Exact templates bypass the LLM so approved wording is preserved.
         decision = ReplyDecision(
@@ -179,12 +206,20 @@ async def run_decision_pipeline(
         approved_official_contact_reply=approved_official_contact_reply,
         expected_reply_language=target_language,
         approved_knowledge_reply=approved_knowledge_reply,
+        approved_localization_text=(approved_localization.text if approved_localization else None),
+        approved_localization_text_hash=(
+            approved_localization.text_hash if approved_localization else None
+        ),
+        approved_localization_protected_values=(
+            approved_localization.protected_values if approved_localization else ()
+        ),
     )
 
     if (
         target_language != "und"
         and approved_knowledge_reply is not None
         and verbatim_after_decision is None
+        and approved_localization is None
         and decision.action is ReplyAction.AUTO_REPLY
     ):
         faithful = False

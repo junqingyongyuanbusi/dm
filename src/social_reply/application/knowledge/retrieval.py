@@ -22,6 +22,7 @@ class KnowledgeHit:
     content: str  # 展示/LLM 上下文（问+答拼接）
     reply: str  # 文档标准回复
     similarity: float  # 向量余弦相似度 1 - cosine_distance；词法-only 命中为 0.0
+    document_id: uuid.UUID
     chunk_id: uuid.UUID
     content_hash: str
     verbatim_safe: bool = True  # True 才允许原文直答；RRF 词法命中项为 False
@@ -87,6 +88,7 @@ async def retrieve_exact_knowledge_result(
                 KnowledgeDocument.status == "published",
                 *language_scope,
                 KnowledgeDocument.tenant_id == tenant_id,
+                KnowledgeChunk.tenant_id == tenant_id,
                 KnowledgeDocument.brand_id == brand_id,
                 or_(
                     KnowledgeDocument.platform.is_(None),
@@ -109,6 +111,7 @@ async def retrieve_exact_knowledge_result(
             content=row.content,
             reply=row.reply,
             similarity=1.0,
+            document_id=row.document_id,
             chunk_id=row.id,
             content_hash=row.content_hash,
             is_official_contact=row.is_official_contact,
@@ -182,6 +185,7 @@ async def retrieve_knowledge(
     )
     stmt = (
         select(
+            KnowledgeDocument.id.label("document_id"),
             KnowledgeChunk.id,
             KnowledgeChunk.content,
             KnowledgeChunk.content_hash,
@@ -197,6 +201,7 @@ async def retrieve_knowledge(
             KnowledgeDocument.status == "published",
             *language_scope,
             KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeChunk.tenant_id == tenant_id,
             KnowledgeDocument.brand_id == brand_id,
             or_(
                 KnowledgeDocument.platform.is_(None),
@@ -215,6 +220,7 @@ async def retrieve_knowledge(
             content=row.content,
             reply=row.reply,
             similarity=1.0 - row.distance,
+            document_id=row.document_id,
             chunk_id=row.id,
             content_hash=row.content_hash,
             is_official_contact=row.is_official_contact,
@@ -239,7 +245,7 @@ async def _retrieve_lexical(
     platform: str,
     limit: int,
     verified_english_only: bool = False,
-) -> list[tuple[uuid.UUID, str, str, str, str, bool, str, bool]]:
+) -> list[tuple[uuid.UUID, uuid.UUID, str, str, str, str, bool, str, bool]]:
     """Lexically retrieve published chunks and their official-contact classification.
 
     'simple' 分词器与建索引一致；plainto_tsquery 把用户输入按空白切词做 AND，
@@ -259,6 +265,7 @@ async def _retrieve_lexical(
     tsquery = func.plainto_tsquery("simple", normalized)
     stmt = (
         select(
+            KnowledgeDocument.id.label("document_id"),
             KnowledgeChunk.id,
             KnowledgeChunk.content,
             KnowledgeChunk.content_hash,
@@ -273,6 +280,7 @@ async def _retrieve_lexical(
             KnowledgeDocument.status == "published",
             *language_scope,
             KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeChunk.tenant_id == tenant_id,
             KnowledgeDocument.brand_id == brand_id,
             or_(
                 KnowledgeDocument.platform.is_(None),
@@ -286,6 +294,7 @@ async def _retrieve_lexical(
     rows = (await session.execute(stmt)).all()
     return [
         (
+            row.document_id,
             row.id,
             row.content,
             row.content_hash,
@@ -352,6 +361,7 @@ async def retrieve_hybrid_knowledge_result(
         best_similarity[hit.chunk_id] = max(best_similarity.get(hit.chunk_id, 0.0), hit.similarity)
 
     for rank, (
+        document_id,
         cid,
         content,
         content_hash,
@@ -367,6 +377,7 @@ async def retrieve_hybrid_knowledge_result(
                 content=content,
                 reply=reply,
                 similarity=0.0,
+                document_id=document_id,
                 chunk_id=cid,
                 content_hash=content_hash,
                 is_official_contact=is_official_contact,
@@ -387,6 +398,7 @@ async def retrieve_hybrid_knowledge_result(
                 content=base.content,
                 reply=base.reply,
                 similarity=sim,
+                document_id=base.document_id,
                 chunk_id=cid,
                 content_hash=base.content_hash,
                 verbatim_safe=sim >= min_similarity,

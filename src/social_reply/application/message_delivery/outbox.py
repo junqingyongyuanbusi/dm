@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import uuid
 from collections.abc import Awaitable
@@ -9,6 +10,12 @@ from sqlalchemy import and_, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from social_reply.application.account_management.human_workflow import (
+    ensure_open_human_work_item,
+)
+from social_reply.application.handoff_notifications.service import (
+    ensure_handoff_notification_intent,
+)
 from social_reply.application.message_delivery.contracts import (
     SendContractError,
     TextSendCommand,
@@ -476,6 +483,119 @@ async def _email_replies_sent_in_window(
     )
 
 
+async def _localization_send_preflight(
+    session: AsyncSession,
+    *,
+    outbox_id: uuid.UUID,
+    payload_text: str,
+) -> str | None:
+    decision = (
+        await session.execute(
+            select(
+                models.ReplyDecision.tenant_id,
+                models.ReplyDecision.resolved_locale,
+                models.ReplyDecision.knowledge_localization_id,
+                models.ReplyDecision.knowledge_localization_release_id,
+                models.ReplyDecision.knowledge_localization_text_hash,
+                models.ReplyDecision.knowledge_localization_source_hash,
+            ).where(models.ReplyDecision.outbox_id == outbox_id)
+        )
+    ).one_or_none()
+    if decision is None or decision.knowledge_localization_id is None:
+        return None
+    if (
+        decision.resolved_locale == "und"
+        or decision.knowledge_localization_release_id is None
+        or decision.knowledge_localization_text_hash is None
+        or decision.knowledge_localization_source_hash is None
+    ):
+        return "LOCALIZATION_PROVENANCE_INVALID"
+    settings = get_settings()
+    if not settings.multilingual_knowledge_reply_enabled:
+        return "MULTILINGUAL_LIVE_DISABLED"
+    if decision.resolved_locale not in settings.multilingual_live_locale_set:
+        return "MULTILINGUAL_LOCALE_DISABLED"
+    row = (
+        await session.execute(
+            select(
+                models.KnowledgeLocalization,
+                models.KnowledgeDocument.status.label("document_status"),
+                models.KnowledgeDocument.source_language,
+                models.KnowledgeDocument.language_verified,
+                models.KnowledgeChunk.content_hash.label("current_source_hash"),
+            )
+            .join(
+                models.KnowledgeDocument,
+                (models.KnowledgeDocument.tenant_id == models.KnowledgeLocalization.tenant_id)
+                & (models.KnowledgeDocument.id == models.KnowledgeLocalization.document_id),
+            )
+            .join(
+                models.KnowledgeChunk,
+                (models.KnowledgeChunk.tenant_id == models.KnowledgeDocument.tenant_id)
+                & (models.KnowledgeChunk.document_id == models.KnowledgeDocument.id),
+            )
+            .where(
+                models.KnowledgeLocalization.tenant_id == decision.tenant_id,
+                models.KnowledgeLocalization.id == decision.knowledge_localization_id,
+                models.KnowledgeLocalization.release_id
+                == decision.knowledge_localization_release_id,
+                models.KnowledgeChunk.content_hash == decision.knowledge_localization_source_hash,
+            )
+            .with_for_update(of=models.KnowledgeLocalization)
+        )
+    ).one_or_none()
+    if row is None:
+        return "LOCALIZATION_RELEASE_MISSING"
+    artifact = row.KnowledgeLocalization
+    if (
+        artifact.status != "published"
+        or artifact.release_id != decision.knowledge_localization_release_id
+        or artifact.release_id != settings.knowledge_localization_release
+        or not artifact.auto_reply_allowed
+        or not artifact.reviewed_by
+        or artifact.reviewed_at is None
+        or artifact.locale != decision.resolved_locale
+        or artifact.text_hash != decision.knowledge_localization_text_hash
+        or artifact.source_content_hash != decision.knowledge_localization_source_hash
+        or row.current_source_hash != decision.knowledge_localization_source_hash
+        or row.document_status != "published"
+        or row.source_language != "en"
+        or not row.language_verified
+        or payload_text != artifact.localized_text
+        or hashlib.sha256(payload_text.encode()).hexdigest() != artifact.text_hash
+    ):
+        return "LOCALIZATION_RELEASE_REVOKED"
+    return None
+
+
+async def _handoff_localization_failure(
+    session: AsyncSession,
+    *,
+    outbox: models.OutboxMessage,
+    reason_code: str,
+) -> None:
+    state = (
+        await session.execute(
+            select(models.AutomationState)
+            .where(models.AutomationState.conversation_id == outbox.conversation_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if state is None or state.state in {"HUMAN_ACTIVE", "CLOSED"}:
+        return
+    if state.state != "HANDOFF_PENDING":
+        state.state = "HANDOFF_PENDING"
+        state.state_version += 1
+        state.state_changed_reason = reason_code
+    work = await ensure_open_human_work_item(
+        session,
+        tenant_id=outbox.tenant_id,
+        conversation_id=outbox.conversation_id,
+        reason_code=reason_code,
+    )
+    await ensure_handoff_notification_intent(session, work=work)
+
+
 async def _deliver_outbox_locked(
     session: AsyncSession,
     connection: AsyncConnection,
@@ -549,6 +669,28 @@ async def _deliver_outbox_locked(
             attempt_no,
             count_attempt=False,
         )
+    localization_error = None
+    if row.origin_kind == "DECISION" and row.actor_kind == "BOT":
+        localization_error = await _localization_send_preflight(
+            session,
+            outbox_id=oid,
+            payload_text=payload["text"],
+        )
+    if localization_error is not None:
+        await _handoff_localization_failure(
+            session,
+            outbox=row,
+            reason_code=localization_error,
+        )
+        return await _stop_before_send(
+            session,
+            oid,
+            "CANCELLED",
+            localization_error,
+            attempt_no,
+            count_attempt=False,
+        )
+
     is_direct = row.destination_type != "chatwoot_conversation"
     is_public = row.message_type != "private_note"
 

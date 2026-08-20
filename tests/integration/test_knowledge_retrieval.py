@@ -3,7 +3,7 @@
 import uuid
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 
 import social_reply.infrastructure.queue.broker  # noqa: F401  确保测试用 StubBroker
 from social_reply.application.knowledge.retrieval import (
@@ -267,6 +267,77 @@ async def test_require_knowledge_无命中降级转人工(session, knowledge_ena
     assert "INSUFFICIENT_KNOWLEDGE" in dec.reason_codes
 
 
+async def test_retrieval_error_handoffs_without_llm_or_outbox(session, knowledge_enabled):
+    knowledge_enabled.setenv("REQUIRE_KNOWLEDGE", "false")
+    get_settings.cache_clear()
+
+    class NeverLLM:
+        async def decide(self, context):
+            raise AssertionError("LLM must not be called after retrieval failure")
+
+    runner._llm = NeverLLM()
+
+    async def failed_fetch(snapshot, **kwargs):
+        return KnowledgeRetrievalResult(error_code="KNOWLEDGE_RETRIEVAL_FAILED")
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", failed_fetch)
+    account_id, conv_id, msg_id = await _seed_conversation(session)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id), conv_id, msg_id, account_id
+    )
+
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert decision.reason_codes == ["KNOWLEDGE_RETRIEVAL_FAILED"]
+    assert await session.scalar(select(func.count()).select_from(models.OutboxMessage)) == 0
+    state = (await session.execute(select(models.AutomationState))).scalar_one()
+    assert state.state == "HANDOFF_PENDING"
+    work = (await session.execute(select(models.HumanWorkItem))).scalar_one()
+    assert work.status == "WAITING"
+    assert work.reason_code == "KNOWLEDGE_RETRIEVAL_FAILED"
+
+
+async def test_embedding_provider_failure_reaches_handoff_through_real_fetch(
+    session, knowledge_enabled
+):
+    knowledge_enabled.setenv("REQUIRE_KNOWLEDGE", "false")
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED", "true")
+    get_settings.cache_clear()
+
+    class FailingEmbedder:
+        version = "failing-provider"
+        calls = 0
+
+        async def embed(self, texts):
+            self.calls += 1
+            raise RuntimeError("provider unavailable")
+
+    class NeverLLM:
+        async def decide(self, context):
+            raise AssertionError("LLM must not be called after provider failure")
+
+    embedder = FailingEmbedder()
+    runner._embedder = embedder
+    runner._llm = NeverLLM()
+    account_id, conv_id, msg_id = await _seed_conversation(session)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id), conv_id, msg_id, account_id
+    )
+
+    assert embedder.calls == 1  # the failed main retrieval must not be retried by shadow
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert decision.reason_codes == ["KNOWLEDGE_RETRIEVAL_FAILED"]
+    assert await session.scalar(select(func.count()).select_from(models.OutboxMessage)) == 0
+    state = (await session.execute(select(models.AutomationState))).scalar_one()
+    assert state.state == "HANDOFF_PENDING"
+    work = (await session.execute(select(models.HumanWorkItem))).scalar_one()
+    assert work.status == "WAITING"
+    assert work.reason_code == "KNOWLEDGE_RETRIEVAL_FAILED"
+
+
 async def test_llm_handoff_转为公开兜底且不锁会话(session, knowledge_enabled, monkeypatch):
     from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 
@@ -458,6 +529,7 @@ def _multilingual_result(
         question="How long does a refund take?",
         reply="Refunds take 3–5 business days.",
         similarity=similarity,
+        document_id=uuid.uuid4(),
         chunk_id=uuid.uuid4(),
         content_hash="a" * 64,
         is_official_contact=official,
@@ -472,6 +544,7 @@ def _multilingual_result(
             question="How long does verification take?",
             reply="Verification takes 7 days.",
             similarity=second_similarity,
+            document_id=uuid.uuid4(),
             chunk_id=uuid.uuid4(),
             content_hash="b" * 64,
             source_language="en",
@@ -509,6 +582,8 @@ async def test_multilingual_strong_match_generates_same_language_and_persists_ev
 ):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
+    knowledge_enabled.setenv("MULTILINGUAL_LIVE_LOCALES", "zh-Hans")
+    knowledge_enabled.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-zh-v1")
     get_settings.cache_clear()
     runner._llm = _FaithfulChineseLLM()
     result = _multilingual_result()
@@ -523,15 +598,14 @@ async def test_multilingual_strong_match_generates_same_language_and_persists_ev
     outbox_id = await runner.run_and_persist_decision(
         _snapshot(account_id, text), conv_id, msg_id, account_id
     )
-    assert outbox_id is not None
+    assert outbox_id is None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "auto_reply"
+    assert decision.action == "handoff"
     assert decision.request_language in {"zh", "zh-Hans"}
-    assert decision.reply_language in {"zh", "zh-Hans"}
     assert decision.knowledge_content_hash == "a" * 64
     assert decision.knowledge_match_status == "strong"
-    assert decision.grounding_verified is True
-    assert "multilingual-v1" in decision.prompt_version
+    assert "NO_APPROVED_LOCALIZATION" in decision.reason_codes
+    assert "multilingual-v2-reviewed-localization" in decision.prompt_version
 
 
 @pytest.mark.parametrize(
@@ -550,6 +624,8 @@ async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
 ):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
+    knowledge_enabled.setenv("MULTILINGUAL_LIVE_LOCALES", "zh-Hans")
+    knowledge_enabled.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-zh-v1")
     get_settings.cache_clear()
 
     class NeverLLM:
@@ -576,6 +652,8 @@ async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
 async def test_multilingual_wrong_language_is_blocked_before_outbox(session, knowledge_enabled):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
+    knowledge_enabled.setenv("MULTILINGUAL_LIVE_LOCALES", "zh-Hans")
+    knowledge_enabled.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-zh-v1")
     get_settings.cache_clear()
 
     class WrongLanguageLLM:
@@ -608,7 +686,7 @@ async def test_multilingual_wrong_language_is_blocked_before_outbox(session, kno
     assert llm.verifier_called is False
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "handoff"
-    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+    assert "NO_APPROVED_LOCALIZATION" in decision.reason_codes
 
 
 async def test_shadow_persists_separate_evidence_without_changing_legacy_decision(

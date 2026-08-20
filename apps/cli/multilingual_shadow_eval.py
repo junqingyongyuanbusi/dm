@@ -27,6 +27,13 @@ _EXPORT_FIELDS = (
     "customer_text_redacted",
     "actual_action",
     "actual_reason_codes",
+    "reply_language",
+    "resolved_locale",
+    "localization_id",
+    "localization_release",
+    "localization_text_hash",
+    "outbox_id",
+    "grounding_verified",
     "language",
     "language_confidence",
     "language_source",
@@ -47,6 +54,7 @@ _EXPORT_FIELDS = (
     "error_code",
     "evidence_fingerprint",
     "contract_version",
+    "renderer_version",
     "case_type",
     "dataset_split",
     "should_auto_reply",
@@ -121,6 +129,16 @@ async def export_shadow(output: Path) -> None:
                 "customer_text_redacted": _spreadsheet_safe(redact_pii(customer_text or "")),
                 "actual_action": decision.action,
                 "actual_reason_codes": json.dumps(decision.reason_codes, ensure_ascii=False),
+                "reply_language": decision.reply_language,
+                "resolved_locale": decision.resolved_locale,
+                "localization_id": str(decision.knowledge_localization_id or ""),
+                "localization_release": (
+                    decision.knowledge_localization_release_id
+                    or evidence.get("localization_release")
+                ),
+                "localization_text_hash": decision.knowledge_localization_text_hash,
+                "outbox_id": str(decision.outbox_id or ""),
+                "grounding_verified": decision.grounding_verified,
                 "language": language.get("tag") or "und",
                 "language_confidence": language.get("confidence"),
                 "language_source": language.get("source"),
@@ -136,6 +154,7 @@ async def export_shadow(output: Path) -> None:
                 "match_status": evidence.get("match_status"),
                 "gate_version": evidence.get("gate_version"),
                 "contract_version": evidence.get("contract_version"),
+                "renderer_version": evidence.get("renderer_version"),
                 "corpus_version": evidence.get("corpus_version"),
                 "embedding_version": evidence.get("embedding_version"),
                 "retrieval_mode": evidence.get("retrieval_mode"),
@@ -285,9 +304,10 @@ def _validate_sample_coverage(
 def evaluate(path: Path, output: Path) -> None:
     reviewed_rows = _reviewed_rows(path)
     review_dataset_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-    supported_languages = (
-        get_settings().multilingual_supported_language_set or _DEFAULT_CORE_LANGUAGES
-    )
+    settings = get_settings()
+    supported_languages = frozenset(
+        locale.casefold().split("-", 1)[0] for locale in settings.multilingual_live_locale_set
+    ) or (settings.multilingual_supported_language_set or _DEFAULT_CORE_LANGUAGES)
     error_rows = [row for row in reviewed_rows if (row.get("error_code") or "").strip()]
     unsupported_rows = [
         row
@@ -301,7 +321,14 @@ def evaluate(path: Path, output: Path) -> None:
         and (row.get("language") or "und").split("-", 1)[0].casefold() in supported_languages
     ]
     _validate_sample_coverage(rows, supported_languages)
-    version_fields = ("corpus_version", "embedding_version", "gate_version", "contract_version")
+    version_fields = (
+        "corpus_version",
+        "embedding_version",
+        "gate_version",
+        "contract_version",
+        "renderer_version",
+        "localization_release",
+    )
     versions = {
         field: sorted({(row.get(field) or "").strip() for row in rows}) for field in version_fields
     }

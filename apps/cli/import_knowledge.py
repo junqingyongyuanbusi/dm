@@ -27,6 +27,7 @@ def _build_embedder(allow_fake: bool) -> EmbeddingClient:
             base_url=settings.openai_base_url,
             model=settings.openai_embedding_model,
             timeout=settings.openai_timeout_seconds,
+            expected_dimensions=settings.openai_embedding_dimensions,
         )
     # 无 key/测试环境：伪向量版本记 fake-sha256，与真实向量按版本隔离绝不混检。
     # 非测试环境漏配 key 时必须显式 --allow-fake，防止误导入不可用向量还以为成功。

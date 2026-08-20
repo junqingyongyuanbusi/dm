@@ -49,6 +49,10 @@ from social_reply.application.knowledge.drafts import (
     persist_knowledge_draft,
 )
 from social_reply.application.knowledge.importer import import_knowledge_rows
+from social_reply.application.knowledge.localizations import (
+    LocalizationValidationError,
+    revoke_document_localizations,
+)
 from social_reply.application.knowledge.retrieval import normalize_question
 from social_reply.application.message_delivery.contracts import (
     build_direct_reply_destination,
@@ -2744,6 +2748,22 @@ async def knowledge_set_status(request: Request, doc_id: uuid.UUID) -> Response:
             await _require_knowledge_publishable(session, doc)
         previous = doc.status
         if previous != target:
+            if target == "draft":
+                try:
+                    await revoke_document_localizations(
+                        session,
+                        tenant_id=doc.tenant_id,
+                        document_id=doc.id,
+                        actor=principal.actor,
+                        reason="source knowledge unpublished",
+                    )
+                except LocalizationValidationError as exc:
+                    if str(exc) == "localization has a sending outbox":
+                        raise HTTPException(
+                            status_code=409,
+                            detail="localization_send_in_progress",
+                        ) from exc
+                    raise
             doc.status = target
             await session.execute(
                 models.AuditLog.__table__.insert().values(
@@ -2842,7 +2862,21 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
             raise HTTPException(status_code=404, detail="knowledge_not_found")
         if doc.status == "published":
             _require_knowledge_corpus_mutation_allowed()
-        await session.delete(doc)  # chunk 级联删除（FK ondelete=CASCADE）
+            raise HTTPException(status_code=409, detail="unpublish_knowledge_before_delete")
+        localization_exists = await session.scalar(
+            select(models.KnowledgeLocalization.id)
+            .where(
+                models.KnowledgeLocalization.tenant_id == doc.tenant_id,
+                models.KnowledgeLocalization.document_id == doc.id,
+            )
+            .limit(1)
+        )
+        if localization_exists is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="knowledge_with_localization_history_is_immutable",
+            )
+        await session.delete(doc)
         await session.commit()
     return RedirectResponse(
         "/admin/knowledge?notice=deleted", status_code=status.HTTP_303_SEE_OTHER

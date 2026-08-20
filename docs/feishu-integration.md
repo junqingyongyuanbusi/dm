@@ -46,7 +46,7 @@ FEISHU_HANDOFF_SENDER_LEASE_SECONDS=30
 FEISHU_HANDOFF_MAX_ATTEMPTS=8
 ```
 
-先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库唯一 head 为 `a6f1c3d8e205` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。人工通知保持独立的 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false`，直到客服群、operator allowlist、Card Action Callback 和测试卡片全部验证。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
+先将支持 Feishu 的镜像以 `FEISHU_ENABLED=false` 部署到三个角色，确认数据库唯一 head 为 `b7d2e4f6a901` 且旧容器全部退出；再协调重启三个角色并同时设为 `true`。人工通知保持独立的 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false`，直到客服群、operator allowlist、Card Action Callback 和测试卡片全部验证。不要在 API 已开启而 Worker 或 Scheduler 仍关闭/仍运行旧镜像时接入账号。
 
 ## 在 Admin 创建账号
 

@@ -12,6 +12,7 @@ from social_reply.connectors.email.network import (
     EmailNetworkError,
     normalize_allowed_hosts,
 )
+from social_reply.domain.reply.localization import canonicalize_locale
 
 _META_PLATFORMS = {"facebook", "instagram"}
 
@@ -95,6 +96,8 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
+    # 当前 PostgreSQL pgvector 列固定为 Vector(1536)；其它维度必须使用独立版本化索引。
+    openai_embedding_dimensions: int = Field(default=1536, ge=1536, le=1536)
     openai_timeout_seconds: float = 30.0
     openai_grounding_model: str = ""
     grounding_verifier_timeout_seconds: float = Field(default=8.0, gt=0.0, le=30.0)
@@ -115,7 +118,11 @@ class Settings(BaseSettings):
         "src/social_reply/shared/multilingual-calibration.json"
     )
     multilingual_calibration_report_sha256: str = ""
+    # Detectable input languages are not automatically eligible for sending.
     multilingual_supported_languages: str = "en,zh,ja,es,fr,de,pt,ar,ru,th"
+    # Only reviewed localization locales in this allowlist may produce AUTO_REPLY.
+    multilingual_live_locales: str = ""
+    knowledge_localization_release: str = "unversioned"
     multilingual_e2e_report_path: Path = Path(
         "src/social_reply/shared/multilingual-e2e-calibration.json"
     )
@@ -204,6 +211,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
             )
+        live_locale_languages = {
+            locale.casefold().split("-", 1)[0] for locale in self.multilingual_live_locale_set
+        }
+        if not live_locale_languages.issubset(self.multilingual_supported_language_set):
+            raise ValueError("MULTILINGUAL_LIVE_LOCALES must be detectable supported languages")
+        if self.multilingual_knowledge_reply_enabled and not self.multilingual_live_locale_set:
+            raise ValueError("MULTILINGUAL_LIVE_LOCALES is required for multilingual live mode")
+        self.knowledge_localization_release = self.knowledge_localization_release.strip()
+        if self.multilingual_knowledge_reply_enabled and self.knowledge_localization_release in {
+            "",
+            "unversioned",
+        }:
+            raise ValueError("KNOWLEDGE_LOCALIZATION_RELEASE must be pinned for live mode")
         if self.multilingual_knowledge_reply_enabled and not self.testing:
             report_path = self.multilingual_calibration_report_path
             if not report_path.is_file():
@@ -218,7 +238,7 @@ class Settings(BaseSettings):
             versions = report.get("versions") or {}
             thresholds = report.get("selected_thresholds") or {}
             report_languages = frozenset(report.get("supported_languages") or ())
-            if report_languages != self.multilingual_supported_language_set:
+            if report_languages != frozenset(live_locale_languages):
                 raise ValueError("multilingual calibration supported language mismatch")
             if report.get("status") != "pass":
                 raise ValueError("multilingual calibration report is not approved")
@@ -228,8 +248,12 @@ class Settings(BaseSettings):
                 raise ValueError("multilingual calibration embedding version mismatch")
             if versions.get("gate_version") != "strong-gate-v1":
                 raise ValueError("multilingual calibration gate version mismatch")
-            if versions.get("contract_version") != "multilingual-v1":
+            if versions.get("contract_version") != "multilingual-v2-reviewed-localization":
                 raise ValueError("multilingual calibration contract version mismatch")
+            if versions.get("renderer_version") != "reviewed-localization-v1":
+                raise ValueError("multilingual calibration renderer version mismatch")
+            if versions.get("localization_release") != self.knowledge_localization_release:
+                raise ValueError("multilingual calibration localization release mismatch")
             if thresholds.get("min_similarity") != self.knowledge_auto_reply_min_similarity:
                 raise ValueError("multilingual calibration similarity threshold mismatch")
             if thresholds.get("min_margin") != self.knowledge_auto_reply_min_margin:
@@ -245,10 +269,16 @@ class Settings(BaseSettings):
             e2e_report = json.loads(e2e_bytes)
             if e2e_report.get("status") != "pass":
                 raise ValueError("multilingual end-to-end report is not approved")
-            if frozenset(e2e_report.get("supported_languages") or ()) != (
-                self.multilingual_supported_language_set
+            if frozenset(e2e_report.get("supported_locales") or ()) != (
+                self.multilingual_live_locale_set
             ):
                 raise ValueError("multilingual end-to-end supported language mismatch")
+            if e2e_report.get("calibration_report_sha256") != report_digest:
+                raise ValueError("multilingual end-to-end calibration digest mismatch")
+            if (e2e_report.get("versions") or {}) != versions:
+                raise ValueError("multilingual end-to-end runtime versions mismatch")
+            if (e2e_report.get("selected_thresholds") or {}) != thresholds:
+                raise ValueError("multilingual end-to-end thresholds mismatch")
             if e2e_report.get("corpus_version") != self.knowledge_corpus_version:
                 raise ValueError("multilingual end-to-end corpus version mismatch")
             safety = e2e_report.get("safety") or {}
@@ -306,6 +336,18 @@ class Settings(BaseSettings):
             for language in self.multilingual_supported_languages.split(",")
             if language.strip()
         )
+
+    @property
+    def multilingual_live_locale_set(self) -> frozenset[str]:
+        locales: set[str] = set()
+        for locale in self.multilingual_live_locales.split(","):
+            if not locale.strip():
+                continue
+            try:
+                locales.add(canonicalize_locale(locale))
+            except ValueError as exc:
+                raise ValueError("MULTILINGUAL_LIVE_LOCALES contains an invalid locale") from exc
+        return frozenset(locales)
 
     def platform_integration_enabled(self, platform: str) -> bool:
         if platform == "facebook":

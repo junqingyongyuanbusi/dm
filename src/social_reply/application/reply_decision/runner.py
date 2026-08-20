@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import redis.asyncio as aioredis
 from sqlalchemy import select, update
 
+from social_reply.application.knowledge.localizations import load_approved_localization
 from social_reply.application.knowledge.retrieval import (
     KnowledgeHit,
     KnowledgeRetrievalResult,
@@ -43,7 +44,7 @@ from social_reply.shared.config import get_settings
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PERSONA = ResolvedPersona(text=DEFAULT_PERSONA, revision=None)
-_MULTILINGUAL_CONTRACT_VERSION = "multilingual-v1"
+_MULTILINGUAL_CONTRACT_VERSION = "multilingual-v2-reviewed-localization"
 _MULTILINGUAL_SENTINEL_VERSION = "approved-verbatim-v1"
 _MULTILINGUAL_GATE_VERSION = "strong-gate-v1"
 
@@ -108,6 +109,7 @@ def _get_embedder() -> EmbeddingClient:
             base_url=settings.openai_base_url,
             model=settings.openai_embedding_model,
             timeout=settings.openai_timeout_seconds,
+            expected_dimensions=settings.openai_embedding_dimensions,
         )
     return _embedder
 
@@ -170,7 +172,7 @@ async def _fetch_knowledge(
             )
     except Exception:
         logger.warning(
-            "知识检索失败，按无知识继续: conversation=%s",
+            "知识检索失败，强制 HANDOFF: conversation=%s",
             snapshot.conversation_key,
             exc_info=True,
         )
@@ -472,6 +474,40 @@ async def run_and_persist_decision(
                 and not knowledge_result.error_code
             )
             selected = assessment.selected
+            is_english_request = language.tag.split("-", 1)[0].casefold() == "en"
+            approved_localization = None
+            localization_error = False
+            if (
+                should_retrieve
+                and language.is_known
+                and language_supported
+                and not is_english_request
+                and assessment.strong
+                and selected is not None
+                and not knowledge_result.error_code
+            ):
+                try:
+                    async with get_session_factory()() as session:
+                        approved_localization = await load_approved_localization(
+                            session,
+                            tenant_id=snapshot.tenant_id,
+                            document_id=selected.document_id,
+                            source_content_hash=selected.content_hash,
+                            detected_language=language.tag,
+                            pinned_release_id=settings.knowledge_localization_release,
+                            live_locales=set(settings.multilingual_live_locale_set),
+                        )
+                except Exception:
+                    localization_error = True
+                    logger.exception(
+                        "approved localization lookup failed; forcing handoff",
+                        extra={
+                            "tenant_id": snapshot.tenant_id,
+                            "document_id": str(selected.document_id),
+                            "language": language.tag,
+                        },
+                    )
+
             forced_decision: ReplyDecision | None = deterministic_rule
             if should_retrieve and knowledge_result.error_code:
                 forced_decision = ReplyDecision(
@@ -497,11 +533,29 @@ async def run_and_persist_decision(
                     reason_codes=("NO_STRONG_KNOWLEDGE_MATCH",),
                     source="rule",
                 )
+            elif should_retrieve and is_english_request and not settings.knowledge_verbatim_reply:
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("ENGLISH_CANONICAL_VERBATIM_DISABLED",),
+                    source="rule",
+                )
+            elif should_retrieve and localization_error:
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("LOCALIZATION_LOOKUP_FAILED",),
+                    source="rule",
+                )
+            elif should_retrieve and not is_english_request and approved_localization is None:
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("NO_APPROVED_LOCALIZATION",),
+                    source="rule",
+                )
             elif (
-                should_retrieve
+                not is_english_request
                 and selected is not None
                 and selected.is_official_contact
-                and language.tag != "en"
+                and not approved_localization.official_contact_authorized
             ):
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
@@ -509,51 +563,41 @@ async def run_and_persist_decision(
                     source="rule",
                 )
 
-            needs_llm = should_retrieve and forced_decision is None and selected is not None
-            if needs_llm:
+            if should_retrieve:
                 prompt_contract_suffix = f"+{_MULTILINGUAL_CONTRACT_VERSION}"
-                if selected is not None and selected.is_official_contact and language.tag == "en":
-                    prompt_contract_suffix += f"+{_MULTILINGUAL_SENTINEL_VERSION}"
-                async with get_session_factory()() as session:
-                    persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
             decision = await run_decision_pipeline(
                 snapshot,
-                llm=_get_llm() if needs_llm else None,
+                llm=None,
                 killswitch=killswitch,
-                knowledge=(
-                    (_knowledge_evidence_block(selected),)
-                    if needs_llm and selected is not None
-                    else ()
-                ),
-                require_knowledge=False,
-                approved_official_contact_reply=(
+                approved_localization=(approved_localization if forced_decision is None else None),
+                verbatim_reply=(
                     selected.reply
                     if (
-                        needs_llm
+                        forced_decision is None
+                        and is_english_request
                         and selected is not None
-                        and selected.is_official_contact
-                        and language.tag == "en"
+                        and selected.verbatim_safe
                     )
                     else None
                 ),
-                approved_knowledge_reply=(
-                    selected.reply if needs_llm and selected is not None else None
-                ),
-                verbatim_after_decision=(
+                approved_official_contact_reply=(
                     selected.reply
                     if (
-                        needs_llm
+                        forced_decision is None
+                        and is_english_request
                         and selected is not None
                         and selected.is_official_contact
-                        and language.tag == "en"
                     )
                     else None
                 ),
                 forced_decision=forced_decision,
-                target_language=language.tag if should_retrieve else "und",
+                target_language=(
+                    approved_localization.locale
+                    if approved_localization is not None
+                    else (language.tag if should_retrieve else "und")
+                ),
                 apply_legacy_rules=False,
                 history=history,
-                voice_preferences=persona.preferences,
                 email_auto_reply_allowed=(
                     snapshot.platform != "email"
                     or (settings.email_enabled and settings.email_auto_reply_enabled)
@@ -562,6 +606,11 @@ async def run_and_persist_decision(
             decision = replace(
                 decision,
                 request_language=language.tag if language_should_detect else "und",
+                resolved_locale=(
+                    approved_localization.locale
+                    if approved_localization is not None
+                    else ("en" if is_english_request and assessment.strong else "und")
+                ),
                 multilingual_contract_version=(
                     prompt_contract_suffix.lstrip("+").replace("+", "/")
                     if prompt_contract_suffix
@@ -604,16 +653,25 @@ async def run_and_persist_decision(
                 else KnowledgeRetrievalResult()
             )
             hits = knowledge_result.hits
-            legacy_forced_decision = (
-                ReplyDecision(
+            if knowledge_result.error_code:
+                legacy_forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=(knowledge_result.error_code,),
+                    source="rule",
+                )
+            elif knowledge_result.exact_ambiguous:
+                legacy_forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
                     reason_codes=("AMBIGUOUS_EXACT_KNOWLEDGE",),
                     source="rule",
                 )
-                if knowledge_result.exact_ambiguous
-                else None
-            )
-            if settings.multilingual_knowledge_shadow_enabled and shadow_should_retrieve:
+            else:
+                legacy_forced_decision = None
+            if (
+                settings.multilingual_knowledge_shadow_enabled
+                and shadow_should_retrieve
+                and not knowledge_result.error_code
+            ):
                 shadow_result = await _fetch_knowledge(
                     snapshot,
                     verified_english_only=True,
@@ -687,13 +745,19 @@ async def run_and_persist_decision(
                     or (settings.email_enabled and settings.email_auto_reply_enabled)
                 ),
             )
-            if settings.multilingual_knowledge_shadow_enabled and shadow_should_retrieve:
+            if (
+                settings.multilingual_knowledge_shadow_enabled
+                and shadow_should_retrieve
+                and not knowledge_result.error_code
+            ):
                 shadow_selected = shadow_assessment.selected
                 decision = replace(
                     decision,
                     multilingual_shadow=True,
                     multilingual_shadow_evidence={
                         "contract_version": _MULTILINGUAL_CONTRACT_VERSION,
+                        "renderer_version": "reviewed-localization-v1",
+                        "localization_release": settings.knowledge_localization_release,
                         "gate_version": _MULTILINGUAL_GATE_VERSION,
                         "corpus_version": settings.knowledge_corpus_version,
                         "embedding_version": shadow_result.embedding_version,

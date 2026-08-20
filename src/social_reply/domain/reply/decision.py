@@ -1,3 +1,4 @@
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -33,6 +34,11 @@ class ReplyDecision:
     source: str = "llm"  # rule / llm / guard
     request_language: str = "und"
     reply_language: str = "und"
+    resolved_locale: str = "und"
+    knowledge_localization_id: uuid.UUID | None = None
+    knowledge_localization_release_id: str | None = None
+    knowledge_localization_text_hash: str | None = None
+    knowledge_localization_source_hash: str | None = None
     knowledge_content_hash: str | None = None
     knowledge_similarity: float | None = None
     knowledge_similarity_margin: float | None = None

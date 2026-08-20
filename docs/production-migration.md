@@ -4,9 +4,16 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
 `scripts/publish_railway_release.sh` for the required production release path.
 
-The current Alembic graph has one head: `a6f1c3d8e205`. Database migration verifies schema state
+The current Alembic graph has one head: `b7d2e4f6a901`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
+
+
+## Reviewed localization revision
+
+Revision `b7d2e4f6a901` is additive after `a6f1c3d8e205`. It adds tenant-scoped reviewed localization artifacts, pinned release provenance on decisions, composite knowledge-tenant constraints, and send-time localization checks. Deploy it with multilingual live, retrieval shadow, and English-only mode still disabled on API, Worker, and Scheduler. The migration does not authorize production multilingual sending and does not prove OpenRouter cross-language retrieval quality.
+
+The migration-compatible rollback image must overlay both `a6f1c3d8e205` and `b7d2e4f6a901` onto the active predecessor image and advertise database head `b7d2e4f6a901`. Application rollback keeps PostgreSQL at the new additive head; it does not downgrade or delete localization audit history.
 
 ## Synthetic evaluation foundation revision
 
@@ -31,7 +38,7 @@ digest and database head.
 
 The release script verifies this image before changing `latest` or Railway. It upgrades an isolated
 test database with the target image, then runs the predecessor image's `scripts.prepare_database` and
-`scripts.assert_database_ready` against head `a6f1c3d8e205`. A release aborts before production
+`scripts.assert_database_ready` against head `b7d2e4f6a901`. A release aborts before production
 mutation if the predecessor application plus overlaid migration graph cannot complete database preparation and exact-head readiness checks.
 
 The release manifest records the compatibility tag and digest. Preserve the `deploying`/`completed` manifest in the operator's durable release evidence store; the ignored local `dist/` copy is not the sole retention mechanism. To roll back application behavior
@@ -46,7 +53,7 @@ scripts/rollback_railway_migration_compatible.sh \
 The rollback script atomically retags Docker Hub `latest` to the compatibility digest, then redeploys
 API, waits for `/healthz`, and redeploys Worker and Scheduler. It verifies all three roles run the
 same compatibility digest and that production configuration remains fail-closed. PostgreSQL stays at
-`a6f1c3d8e205`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
+`b7d2e4f6a901`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
 evidence only and are not executable rollback targets after migration.
 
 This rollback also works when the target API migrated the database but crashed before Uvicorn became
@@ -296,7 +303,7 @@ EMAIL_ALLOWED_HOSTS=imap.larksuite.com,smtp.larksuite.com
 ```
 
 Use the standard API-first release order. API owns database preparation: require its deployment to
-reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `a6f1c3d8e205` before
+reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `b7d2e4f6a901` before
 starting or replacing Worker and Scheduler. Then require all three roles to run the same image
 digest and the same Email flags/allowlist. Do not enable Email on a new API while an old Worker or
 Scheduler remains.
@@ -627,7 +634,7 @@ historical open work.
 Before upgrade, take and verify a PostgreSQL backup. Deploy API, Worker and Scheduler with
 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` and identical sender lease, retry and sweep settings.
 After API migrates the database, require all three roles to reach one image digest and confirm the
-unique Alembic head is `a6f1c3d8e205`. Do not enable callbacks while an old API can still receive a
+unique Alembic head is `b7d2e4f6a901`. Do not enable callbacks while an old API can still receive a
 card action or an old Worker/Scheduler is running.
 
 Configure one Tenant at a time:

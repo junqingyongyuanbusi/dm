@@ -1,5 +1,7 @@
 # 配置校验测试（Plan 2c Task 0）：生产环境拒绝默认/空凭证
 import ast
+import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -413,21 +415,21 @@ def test_local_environment_template_disables_future_platforms() -> None:
 def test_email_documentation_and_migration_head_contract() -> None:
     root = Path(__file__).resolve().parents[2]
     assert _configuration_email_keys(root / "docs/configuration.md") == set(_EMAIL_ENV_DEFAULTS)
-    assert _migration_heads(root / "migrations/versions") == {"a6f1c3d8e205"}
+    assert _migration_heads(root / "migrations/versions") == {"b7d2e4f6a901"}
 
     production_migration = (root / "docs/production-migration.md").read_text()
     docs_readme = (root / "docs/README.md").read_text()
     root_readme = (root / "README.md").read_text()
     assert re.search(
-        r"current Alembic graph has one head: `a6f1c3d8e205`",
+        r"current Alembic graph has one head: `b7d2e4f6a901`",
         production_migration,
     )
     assert re.search(
-        r"Alembic graph has one current head:\s*`a6f1c3d8e205`",
+        r"Alembic graph has one current head:\s*`b7d2e4f6a901`",
         docs_readme,
     )
     assert re.search(
-        r"current revision 等于唯一 head `a6f1c3d8e205`",
+        r"current revision 等于唯一 head `b7d2e4f6a901`",
         root_readme,
     )
 
@@ -548,3 +550,76 @@ def test_x_mention_ingest_requires_both_activity_and_public_reply() -> None:
     assert (
         _make(testing=True, x_activity_enabled=True, x_public_reply_enabled=False)
     ).x_mention_ingest_enabled is False
+
+
+def test_multilingual_v2_reports_must_bind_same_runtime_contract(tmp_path: Path) -> None:
+    versions = {
+        "corpus_version": "corpus-v1",
+        "embedding_version": "text-embedding-3-small",
+        "gate_version": "strong-gate-v1",
+        "contract_version": "multilingual-v2-reviewed-localization",
+        "renderer_version": "reviewed-localization-v1",
+        "localization_release": "ja-release-v1",
+    }
+    thresholds = {"min_similarity": 0.8, "min_margin": 0.08}
+    calibration = {
+        "status": "pass",
+        "supported_languages": ["ja"],
+        "versions": versions,
+        "selected_thresholds": thresholds,
+    }
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(json.dumps(calibration), encoding="utf-8")
+    calibration_bytes = calibration_path.read_bytes()
+    e2e = {
+        "status": "pass",
+        "supported_locales": ["ja"],
+        "corpus_version": "corpus-v1",
+        "calibration_report_sha256": hashlib.sha256(calibration_bytes).hexdigest(),
+        "versions": versions,
+        "selected_thresholds": thresholds,
+        "safety": {
+            "wrong_language_outbox": 0,
+            "risk_or_case_auto_reply": 0,
+            "grounding_false_accept": 0,
+            "unexpected_customer_outbox": 0,
+        },
+    }
+    e2e_path = tmp_path / "e2e.json"
+    e2e_path.write_text(json.dumps(e2e), encoding="utf-8")
+
+    kwargs = {
+        "testing": False,
+        "chatwoot_enabled": False,
+        "control_api_key": "control-token",
+        "admin_session_secret": "x" * 32,
+        "admin_username": "admin",
+        "admin_password": "password",
+        "admin_allowed_tenants": "default",
+        "public_base_url": "https://reply.example.com",
+        "llm_provider": "openai",
+        "openai_api_key": "sk-test",
+        "knowledge_retrieval_enabled": True,
+        "english_knowledge_only_enabled": True,
+        "multilingual_knowledge_reply_enabled": True,
+        "multilingual_live_locales": "ja",
+        "knowledge_corpus_version": "corpus-v1",
+        "knowledge_localization_release": "ja-release-v1",
+        "multilingual_calibration_report_path": calibration_path,
+        "multilingual_calibration_report_sha256": hashlib.sha256(calibration_bytes).hexdigest(),
+        "multilingual_e2e_report_path": e2e_path,
+        "multilingual_e2e_report_sha256": hashlib.sha256(e2e_path.read_bytes()).hexdigest(),
+    }
+    settings = _make(**kwargs)
+    assert settings.multilingual_live_locale_set == frozenset({"ja"})
+
+    e2e["versions"] = {**versions, "localization_release": "ja-release-v2"}
+    e2e_path.write_text(json.dumps(e2e), encoding="utf-8")
+    kwargs["multilingual_e2e_report_sha256"] = hashlib.sha256(e2e_path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="runtime versions mismatch"):
+        _make(**kwargs)
+
+
+def test_multilingual_live_locales_are_canonicalized() -> None:
+    settings = _make(testing=True, multilingual_live_locales="JA,zh_hans,es_419")
+    assert settings.multilingual_live_locale_set == frozenset({"ja", "zh-Hans", "es-419"})

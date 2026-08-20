@@ -2,11 +2,16 @@
 
 import hashlib
 import math
+import struct
 from typing import Protocol
 
 import httpx
 
 _DIMENSIONS = 1536
+
+
+class EmbeddingResponseError(ValueError):
+    """Provider returned an embedding payload that is unsafe to persist or query."""
 
 
 class EmbeddingClient(Protocol):
@@ -29,11 +34,15 @@ class OpenAIEmbeddingClient:
         self,
         api_key: str,
         base_url: str,
+        expected_dimensions: int,
         model: str = "text-embedding-3-small",
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        if expected_dimensions <= 0:
+            raise ValueError("expected embedding dimensions must be positive")
         self._model = model
+        self.expected_dimensions = expected_dimensions
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {api_key}"},
@@ -41,16 +50,64 @@ class OpenAIEmbeddingClient:
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
             transport=transport,
         )
-        self.version = model  # 版本即模型名：换模型后旧向量按版本过滤不可比
+        # 兼容现有数据库过滤；完整 provider identity 由后续 release manifest 承载。
+        self.version = model
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
         payload = {"model": self._model, "input": texts}
         resp = await self._client.post("/embeddings", json=payload)
         resp.raise_for_status()
-        data = resp.json()["data"]
-        # OpenAI 文档保证 data 含 index；按 index 排序防乱序
-        ordered = sorted(data, key=lambda item: item["index"])
-        return [item["embedding"] for item in ordered]
+        try:
+            body = resp.json()
+            data = body["data"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EmbeddingResponseError("embedding response is missing data") from exc
+        if not isinstance(data, list) or len(data) != len(texts):
+            raise EmbeddingResponseError("embedding response count does not match input count")
+
+        indexed: dict[int, list[float]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                raise EmbeddingResponseError("embedding response item must be an object")
+            index = item.get("index")
+            embedding = item.get("embedding")
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise EmbeddingResponseError("embedding response index must be an integer")
+            if index < 0 or index >= len(texts) or index in indexed:
+                raise EmbeddingResponseError("embedding response indexes are invalid")
+            if not isinstance(embedding, list) or len(embedding) != self.expected_dimensions:
+                raise EmbeddingResponseError(
+                    f"embedding dimension mismatch: expected {self.expected_dimensions}"
+                )
+            vector: list[float] = []
+            for value in embedding:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise EmbeddingResponseError("embedding values must be numeric")
+                number = float(value)
+                if not math.isfinite(number):
+                    raise EmbeddingResponseError("embedding values must be finite")
+                try:
+                    float32 = struct.unpack("!f", struct.pack("!f", number))[0]
+                except OverflowError as exc:
+                    raise EmbeddingResponseError(
+                        "embedding values must fit PostgreSQL vector float32"
+                    ) from exc
+                if not math.isfinite(float32):
+                    raise EmbeddingResponseError(
+                        "embedding values must fit PostgreSQL vector float32"
+                    )
+                vector.append(float32)
+            norm = math.hypot(*vector)
+            if not math.isfinite(norm) or norm <= 0.0:
+                raise EmbeddingResponseError("embedding vector must have a finite non-zero norm")
+            indexed[index] = vector
+
+        expected_indexes = set(range(len(texts)))
+        if set(indexed) != expected_indexes:
+            raise EmbeddingResponseError("embedding response indexes are incomplete")
+        return [indexed[index] for index in range(len(texts))]
 
     async def aclose(self) -> None:
         await self._client.aclose()

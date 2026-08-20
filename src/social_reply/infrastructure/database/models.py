@@ -1151,6 +1151,27 @@ class ReplyDecision(Base):
     __tablename__ = "reply_decisions"
     __table_args__ = (
         UniqueConstraint("message_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "knowledge_localization_id", "knowledge_localization_release_id"],
+            [
+                "knowledge_localizations.tenant_id",
+                "knowledge_localizations.id",
+                "knowledge_localizations.release_id",
+            ],
+            name="fk_reply_decisions_tenant_localization",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(knowledge_localization_id IS NULL AND knowledge_localization_release_id IS NULL "
+            "AND knowledge_localization_text_hash IS NULL "
+            "AND knowledge_localization_source_hash IS NULL) OR "
+            "(knowledge_localization_id IS NOT NULL "
+            "AND knowledge_localization_release_id IS NOT NULL "
+            "AND btrim(knowledge_localization_release_id) <> '' AND resolved_locale <> 'und' "
+            "AND knowledge_localization_text_hash ~ '^[0-9a-f]{64}$' "
+            "AND knowledge_localization_source_hash ~ '^[0-9a-f]{64}$')",
+            name="ck_reply_decisions_localization_provenance",
+        ),
         Index(
             "ix_reply_decisions_decision_job_id",
             "decision_job_id",
@@ -1179,6 +1200,11 @@ class ReplyDecision(Base):
     prompt_version: Mapped[str | None] = mapped_column(Text)
     request_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
     reply_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
+    resolved_locale: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
+    knowledge_localization_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    knowledge_localization_release_id: Mapped[str | None] = mapped_column(String(64))
+    knowledge_localization_text_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_localization_source_hash: Mapped[str | None] = mapped_column(String(64))
     knowledge_content_hash: Mapped[str | None] = mapped_column(String(64))
     knowledge_similarity: Mapped[float | None] = mapped_column(Float)
     knowledge_similarity_margin: Mapped[float | None] = mapped_column(Float)
@@ -1221,6 +1247,7 @@ class DeliveryAttempt(Base):
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
     __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_knowledge_documents_tenant_id_id"),
         CheckConstraint(
             "status IN ('draft', 'published')",
             name="ck_knowledge_documents_status",
@@ -1273,6 +1300,12 @@ class KnowledgeChunk(Base):
     __tablename__ = "knowledge_chunks"
     __table_args__ = (
         UniqueConstraint("tenant_id", "content_hash"),
+        ForeignKeyConstraint(
+            ["tenant_id", "document_id"],
+            ["knowledge_documents.tenant_id", "knowledge_documents.id"],
+            name="fk_knowledge_chunks_tenant_document",
+            ondelete="CASCADE",
+        ),
         # 余弦相似度检索用 HNSW 索引
         Index(
             "ix_knowledge_chunks_embedding",
@@ -1283,9 +1316,7 @@ class KnowledgeChunk(Base):
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(String(64), default="default")
-    document_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True
-    )
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
     content: Mapped[str] = mapped_column(Text)  # 展示/LLM 上下文用（question+reply 拼接）
     # 实际参与 embedding 的文本。非对称检索：只 embed question，与用户 query 同语义空间对齐，
     # 不让 answer 措辞稀释向量（见 importer）。历史行可能为 NULL（旧数据 embed 的是 content）。
@@ -1293,6 +1324,90 @@ class KnowledgeChunk(Base):
     content_hash: Mapped[str] = mapped_column(String(64))  # tenant-scoped sha256 idempotency
     embedding_version: Mapped[str] = mapped_column(String(32))  # 如 "text-embedding-3-small"
     embedding: Mapped[list[float]] = mapped_column(Vector(1536))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class KnowledgeLocalization(Base):
+    __tablename__ = "knowledge_localizations"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_knowledge_localizations_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "release_id",
+            name="uq_knowledge_localizations_tenant_id_id_release",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "document_id"],
+            ["knowledge_documents.tenant_id", "knowledge_documents.id"],
+            name="fk_knowledge_localizations_tenant_document",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'published', 'revoked')",
+            name="ck_knowledge_localizations_status",
+        ),
+        CheckConstraint(
+            "btrim(release_id) <> ''",
+            name="ck_knowledge_localizations_release_id",
+        ),
+        CheckConstraint(
+            "status <> 'published' OR (reviewed_by IS NOT NULL AND btrim(reviewed_by) <> '' "
+            "AND reviewed_at IS NOT NULL)",
+            name="ck_knowledge_localizations_published_review",
+        ),
+        CheckConstraint(
+            "status <> 'revoked' OR (revoked_by IS NOT NULL AND btrim(revoked_by) <> '' "
+            "AND revoked_at IS NOT NULL)",
+            name="ck_knowledge_localizations_revoked_review",
+        ),
+        CheckConstraint(
+            "text_hash ~ '^[0-9a-f]{64}$' AND source_content_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_knowledge_localizations_hashes",
+        ),
+        Index(
+            "uq_knowledge_localizations_active_locale",
+            "tenant_id",
+            "document_id",
+            "release_id",
+            "locale",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
+        ),
+        Index(
+            "ix_knowledge_localizations_lookup",
+            "tenant_id",
+            "document_id",
+            "release_id",
+            "status",
+            "locale",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    release_id: Mapped[str] = mapped_column(String(64))
+    locale: Mapped[str] = mapped_column(String(35))
+    localized_text: Mapped[str] = mapped_column("text", Text)
+    text_hash: Mapped[str] = mapped_column(String(64))
+    source_content_hash: Mapped[str] = mapped_column(String(64))
+    protected_values: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    official_contact_authorized: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    auto_reply_allowed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default=text("'draft'"))
+    source_file: Mapped[str | None] = mapped_column(String(256))
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_by: Mapped[str | None] = mapped_column(Text)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoke_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

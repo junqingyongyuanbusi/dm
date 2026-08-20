@@ -190,7 +190,8 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `OPENAI_API_KEY` | empty | Required outside tests when provider is `openai` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Chat completion model |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Knowledge embedding model/version |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Requested knowledge embedding model/version; real OpenRouter acceptance is not proven by configuration alone |
+| `OPENAI_EMBEDDING_DIMENSIONS` | `1536` | Fixed PostgreSQL `Vector(1536)` contract; other dimensions require a separate versioned backend/index |
 | `OPENAI_TIMEOUT_SECONDS` | `30` | HTTP timeout for generation calls |
 | `OPENAI_GROUNDING_MODEL` | empty | Optional separate model for semantic fidelity verification; empty uses `OPENAI_MODEL` |
 | `GROUNDING_VERIFIER_TIMEOUT_SECONDS` | `8` | Short fail-closed timeout for the second-pass grounding verifier |
@@ -202,7 +203,9 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Live English-corpus multilingual reply path; mutually exclusive with shadow and blocked by readiness/calibration gates |
 | `MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED` | `false` | Record language and verified-English Top1/Top2 evidence without changing legacy action/reply/Outbox |
 | `ENGLISH_KNOWLEDGE_ONLY_ENABLED` | `false` | Require verified English knowledge for live retrieval and publishing |
-| `MULTILINGUAL_SUPPORTED_LANGUAGES` | `en,zh,ja,es,fr,de,pt,ar,ru,th` | First-release auto-reply allowlist; other or unknown languages hand off |
+| `MULTILINGUAL_SUPPORTED_LANGUAGES` | `en,zh,ja,es,fr,de,pt,ar,ru,th` | Detectable input-language set; it does not authorize customer sending |
+| `MULTILINGUAL_LIVE_LOCALES` | empty | Reviewed locale allowlist eligible for `AUTO_REPLY` in the pinned release |
+| `KNOWLEDGE_LOCALIZATION_RELEASE` | `unversioned` | Pinned reviewed localization release; blank/`unversioned` is rejected in live mode |
 | `KNOWLEDGE_CORPUS_VERSION` | `unversioned` | Must equal the computed verified-English corpus fingerprint before live startup |
 | `KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY` | `0.8` | Pure-vector Top1 threshold; must match an approved calibration report |
 | `KNOWLEDGE_AUTO_REPLY_MIN_MARGIN` | `0.08` | Minimum Top1 minus Top2 margin; must match an approved calibration report |

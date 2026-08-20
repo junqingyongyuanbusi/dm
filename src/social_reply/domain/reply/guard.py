@@ -1,3 +1,4 @@
+import hashlib
 import re
 import unicodedata
 from collections import Counter
@@ -103,6 +104,21 @@ def has_contact_like(text: str) -> bool:
             _SHORT_SERVICE_NUMBER,
         )
     )
+
+
+def contact_values(text: str) -> tuple[str, ...]:
+    values: list[str] = []
+    for pattern in (
+        _GROUPED_DIGITS,
+        _EMAIL,
+        _URL,
+        _BARE_DOMAIN,
+        _HANDLE,
+        _MESSAGING_ID,
+        _SHORT_SERVICE_NUMBER,
+    ):
+        values.extend(match.group(0) for match in pattern.finditer(text))
+    return tuple(dict.fromkeys(values))
 
 
 def _ascii_digits(text: str) -> str:
@@ -214,6 +230,9 @@ def run_final_guard(
     approved_official_contact_reply: str | None = None,
     expected_reply_language: str = "und",
     approved_knowledge_reply: str | None = None,
+    approved_localization_text: str | None = None,
+    approved_localization_text_hash: str | None = None,
+    approved_localization_protected_values: tuple[str, ...] = (),
 ) -> ReplyDecision:
     """纯确定性输出闸门；任一项失败降级为 handoff 并记录 reason_code。
     仅对 auto_reply 生效——其它 action 原样返回。"""
@@ -224,11 +243,22 @@ def run_final_guard(
         return _downgrade(decision, "GUARD_EMPTY")
     if len(text) > _MAX_TEXT_LENGTH.get(platform, _DEFAULT_MAX):
         return _downgrade(decision, "GUARD_TOO_LONG")
+    if decision.source == "knowledge_localization":
+        if approved_localization_text is None or approved_localization_text_hash is None:
+            return _downgrade(decision, "GUARD_LOCALIZATION_PROVENANCE_MISSING")
+        if text != approved_localization_text:
+            return _downgrade(decision, "GUARD_LOCALIZATION_TEXT_MISMATCH")
+    approved_localization = decision.source == "knowledge_localization"
+    if approved_localization:
+        if hashlib.sha256(text.encode()).hexdigest() != approved_localization_text_hash:
+            return _downgrade(decision, "GUARD_LOCALIZATION_HASH_MISMATCH")
+        if any(value not in text for value in approved_localization_protected_values):
+            return _downgrade(decision, "GUARD_LOCALIZATION_PROTECTED_VALUE_MISMATCH")
     approved_contact = (
         decision.source == "knowledge"
         and approved_official_contact_reply is not None
         and text == approved_official_contact_reply
-    )
+    ) or approved_localization
     if expected_reply_language != "und":
         language_ok, observed_language = reply_language_matches(expected_reply_language, text)
         if observed_language == "und" and approved_contact:

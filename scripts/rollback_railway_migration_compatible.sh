@@ -98,7 +98,7 @@ expected_compat_ref="${IMAGE_REPO}:railway-compat-pre-${target_sha:0:12}"
 [[ "$target_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid target digest"
 [[ "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid predecessor digest"
 [[ "$previous_app_revision" =~ ^[0-9a-f]{40}$ ]] || fail "invalid predecessor app revision"
-[[ "$database_head" == "a6f1c3d8e205" ]] || fail "unexpected compatibility DB head"
+[[ "$database_head" == "b7d2e4f6a901" ]] || fail "unexpected compatibility DB head"
 
 image_digest() {
   local output digest
