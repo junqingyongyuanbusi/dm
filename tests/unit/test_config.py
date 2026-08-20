@@ -623,3 +623,24 @@ def test_multilingual_v2_reports_must_bind_same_runtime_contract(tmp_path: Path)
 def test_multilingual_live_locales_are_canonicalized() -> None:
     settings = _make(testing=True, multilingual_live_locales="JA,zh_hans,es_419")
     assert settings.multilingual_live_locale_set == frozenset({"ja", "zh-Hans", "es-419"})
+
+
+def test_experimental_account_ids_are_canonicalized_and_validated() -> None:
+    canonical = "12345678-1234-5678-1234-567812345678"
+    settings = _make(
+        testing=True,
+        knowledge_retrieval_enabled=True,
+        multilingual_experimental_reply_enabled=True,
+        multilingual_experimental_account_ids=(
+            "12345678123456781234567812345678,{12345678-1234-5678-1234-567812345678}"
+        ),
+    )
+    assert settings.multilingual_experimental_account_id_set == frozenset({canonical})
+
+    with pytest.raises(ValueError, match="must contain UUIDs"):
+        _make(
+            testing=True,
+            knowledge_retrieval_enabled=True,
+            multilingual_experimental_reply_enabled=True,
+            multilingual_experimental_account_ids="not-a-uuid",
+        )

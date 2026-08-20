@@ -21,6 +21,9 @@ from social_reply.application.message_delivery.contracts import (
     TextSendCommand,
     parse_direct_text_command,
 )
+from social_reply.application.reply_decision.experimental_multilingual import (
+    EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION,
+)
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.connectors.email.contracts import email_address_identity_key
 from social_reply.connectors.errors import (
@@ -31,12 +34,14 @@ from social_reply.connectors.errors import (
 from social_reply.connectors.registry import get_platform_sender
 from social_reply.domain.platform_accounts import (
     DIRECT_DESTINATION_CAPABILITIES,
+    LEGACY_ACTIVE_ACCOUNT_STATUSES,
     CapabilityKey,
     account_platform,
     capability_enabled,
     is_active_account_status,
     normalize_account_capability,
 )
+from social_reply.domain.reply.language import languages_match
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
     hold_connection_advisory_lock,
@@ -487,6 +492,7 @@ async def _localization_send_preflight(
     session: AsyncSession,
     *,
     outbox_id: uuid.UUID,
+    platform_account_id: uuid.UUID,
     payload_text: str,
 ) -> str | None:
     decision = (
@@ -494,6 +500,19 @@ async def _localization_send_preflight(
             select(
                 models.ReplyDecision.tenant_id,
                 models.ReplyDecision.resolved_locale,
+                models.ReplyDecision.request_language,
+                models.ReplyDecision.reply_language,
+                models.ReplyDecision.multilingual_contract_version,
+                models.ReplyDecision.reply_text,
+                models.ReplyDecision.action,
+                models.ReplyDecision.grounding_verified,
+                models.ReplyDecision.knowledge_match_status,
+                models.ReplyDecision.knowledge_gate_version,
+                models.ReplyDecision.knowledge_similarity,
+                models.ReplyDecision.knowledge_similarity_margin,
+                models.ReplyDecision.knowledge_min_similarity_threshold,
+                models.ReplyDecision.knowledge_min_margin_threshold,
+                models.ReplyDecision.knowledge_content_hash,
                 models.ReplyDecision.knowledge_localization_id,
                 models.ReplyDecision.knowledge_localization_release_id,
                 models.ReplyDecision.knowledge_localization_text_hash,
@@ -501,7 +520,75 @@ async def _localization_send_preflight(
             ).where(models.ReplyDecision.outbox_id == outbox_id)
         )
     ).one_or_none()
-    if decision is None or decision.knowledge_localization_id is None:
+    if decision is None:
+        return None
+    settings = get_settings()
+    if decision.multilingual_contract_version == EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION:
+        if not settings.multilingual_experimental_reply_enabled:
+            return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
+        if (
+            str(platform_account_id).casefold()
+            not in settings.multilingual_experimental_account_id_set
+        ):
+            return "EXPERIMENTAL_MULTILINGUAL_ACCOUNT_DISABLED"
+        if (
+            decision.action != "auto_reply"
+            or decision.grounding_verified is not True
+            or decision.knowledge_match_status != "strong"
+            or decision.knowledge_gate_version != "strong-gate-v1"
+            or decision.knowledge_similarity is None
+            or decision.knowledge_min_similarity_threshold is None
+            or decision.knowledge_similarity < decision.knowledge_min_similarity_threshold
+            or decision.knowledge_min_margin_threshold is None
+            or (
+                decision.knowledge_similarity_margin is not None
+                and decision.knowledge_similarity_margin < decision.knowledge_min_margin_threshold
+            )
+        ):
+            return "EXPERIMENTAL_MULTILINGUAL_PROVENANCE_INVALID"
+        if (
+            decision.request_language == "und"
+            or decision.reply_language == "und"
+            or not languages_match(decision.request_language, decision.reply_language)
+            or not languages_match(decision.request_language, decision.resolved_locale)
+            or decision.request_language.split("-", 1)[0].casefold()
+            not in settings.multilingual_supported_language_set
+        ):
+            return "EXPERIMENTAL_MULTILINGUAL_LANGUAGE_INVALID"
+        if payload_text != decision.reply_text:
+            return "EXPERIMENTAL_MULTILINGUAL_PAYLOAD_MISMATCH"
+        if not decision.knowledge_content_hash:
+            return "EXPERIMENTAL_MULTILINGUAL_KNOWLEDGE_INVALID"
+        source_exists = await session.scalar(
+            select(models.KnowledgeChunk.id)
+            .join(
+                models.KnowledgeDocument,
+                (models.KnowledgeDocument.tenant_id == models.KnowledgeChunk.tenant_id)
+                & (models.KnowledgeDocument.id == models.KnowledgeChunk.document_id),
+            )
+            .join(
+                models.PlatformAccount,
+                models.PlatformAccount.id == platform_account_id,
+            )
+            .where(
+                models.PlatformAccount.id == platform_account_id,
+                models.PlatformAccount.tenant_id == decision.tenant_id,
+                models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
+                models.KnowledgeChunk.tenant_id == decision.tenant_id,
+                models.KnowledgeDocument.tenant_id == models.PlatformAccount.tenant_id,
+                models.KnowledgeDocument.brand_id == models.PlatformAccount.brand_id,
+                or_(
+                    models.KnowledgeDocument.platform.is_(None),
+                    models.KnowledgeDocument.platform == models.PlatformAccount.platform,
+                ),
+                models.KnowledgeChunk.content_hash == decision.knowledge_content_hash,
+                models.KnowledgeDocument.status == "published",
+                models.KnowledgeDocument.is_official_contact.is_(False),
+            )
+            .limit(1)
+        )
+        return None if source_exists is not None else "EXPERIMENTAL_MULTILINGUAL_SOURCE_REVOKED"
+    if decision.knowledge_localization_id is None:
         return None
     if (
         decision.resolved_locale == "und"
@@ -510,7 +597,6 @@ async def _localization_send_preflight(
         or decision.knowledge_localization_source_hash is None
     ):
         return "LOCALIZATION_PROVENANCE_INVALID"
-    settings = get_settings()
     if not settings.multilingual_knowledge_reply_enabled:
         return "MULTILINGUAL_LIVE_DISABLED"
     if decision.resolved_locale not in settings.multilingual_live_locale_set:
@@ -674,6 +760,7 @@ async def _deliver_outbox_locked(
         localization_error = await _localization_send_preflight(
             session,
             outbox_id=oid,
+            platform_account_id=row.platform_account_id,
             payload_text=payload["text"],
         )
     if localization_error is not None:

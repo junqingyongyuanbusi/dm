@@ -1,5 +1,6 @@
 import hashlib
 import json
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -112,6 +113,11 @@ class Settings(BaseSettings):
     # 新多语言知识路径默认关闭：先影子观测和校准，再在三角色原子启用。
     multilingual_knowledge_reply_enabled: bool = False
     multilingual_knowledge_shadow_enabled: bool = False
+    # Test-environment escape hatch: target-language generation for explicitly allowlisted accounts.
+    multilingual_experimental_reply_enabled: bool = False
+    multilingual_experimental_account_ids: str = ""
+    multilingual_experimental_min_similarity: float = Field(default=0.5, ge=0.0, le=1.0)
+    multilingual_experimental_min_margin: float = Field(default=0.001, ge=0.0, le=1.0)
     english_knowledge_only_enabled: bool = False
     knowledge_corpus_version: str = "unversioned"
     multilingual_calibration_report_path: Path = Path(
@@ -211,6 +217,27 @@ class Settings(BaseSettings):
             raise ValueError(
                 "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
             )
+        if self.multilingual_experimental_reply_enabled:
+            if (
+                self.multilingual_knowledge_reply_enabled
+                or self.multilingual_knowledge_shadow_enabled
+            ):
+                raise ValueError(
+                    "experimental multilingual reply is mutually exclusive with live/shadow"
+                )
+            if not self.knowledge_retrieval_enabled:
+                raise ValueError(
+                    "experimental multilingual reply requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
+                )
+            if not self.multilingual_experimental_account_id_set:
+                raise ValueError("MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS is required")
+            try:
+                for account_id in self.multilingual_experimental_account_id_set:
+                    uuid.UUID(account_id)
+            except ValueError as exc:
+                raise ValueError(
+                    "MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS must contain UUIDs"
+                ) from exc
         live_locale_languages = {
             locale.casefold().split("-", 1)[0] for locale in self.multilingual_live_locale_set
         }
@@ -348,6 +375,20 @@ class Settings(BaseSettings):
             except ValueError as exc:
                 raise ValueError("MULTILINGUAL_LIVE_LOCALES contains an invalid locale") from exc
         return frozenset(locales)
+
+    @property
+    def multilingual_experimental_account_id_set(self) -> frozenset[str]:
+        account_ids: set[str] = set()
+        for raw in self.multilingual_experimental_account_ids.split(","):
+            if not raw.strip():
+                continue
+            try:
+                account_ids.add(str(uuid.UUID(raw.strip())))
+            except ValueError as exc:
+                raise ValueError(
+                    "MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS must contain UUIDs"
+                ) from exc
+        return frozenset(account_ids)
 
     def platform_integration_enabled(self, platform: str) -> bool:
         if platform == "facebook":

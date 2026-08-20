@@ -15,6 +15,10 @@ from social_reply.application.knowledge.retrieval import (
     retrieve_exact_knowledge_result,
     retrieve_hybrid_knowledge_result,
 )
+from social_reply.application.reply_decision.experimental_multilingual import (
+    EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION,
+    generate_experimental_multilingual_reply,
+)
 from social_reply.application.reply_decision.persist import persist_decision
 from social_reply.application.reply_decision.persona import (
     ResolvedPersona,
@@ -26,9 +30,10 @@ from social_reply.application.reply_decision.pipeline import (
     run_decision_pipeline,
 )
 from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbeddingClient
+from social_reply.domain.platform_accounts import LEGACY_ACTIVE_ACCOUNT_STATUSES
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.guard import redact_pii
-from social_reply.domain.reply.language import detect_customer_language
+from social_reply.domain.reply.language import assess_knowledge_language, detect_customer_language
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 from social_reply.domain.reply.rules import apply_multilingual_rules, apply_rules
@@ -287,6 +292,7 @@ async def _validate_decision_scope(
                     models.Conversation.conversation_key == snapshot.conversation_key,
                     models.Conversation.channel_type == snapshot.channel_type,
                     models.PlatformAccount.id == account_id,
+                    models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
                     models.PlatformAccount.tenant_id == snapshot.tenant_id,
                     models.PlatformAccount.brand_id == snapshot.brand_id,
                     models.PlatformAccount.platform == snapshot.platform,
@@ -413,9 +419,16 @@ async def run_and_persist_decision(
             action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule"
         )
     else:
+        experimental_multilingual = (
+            settings.multilingual_experimental_reply_enabled
+            and snapshot.account_id.casefold() in settings.multilingual_experimental_account_id_set
+        )
+        use_multilingual_path = (
+            settings.multilingual_knowledge_reply_enabled or experimental_multilingual
+        )
         deterministic_rule = (
             apply_multilingual_rules(snapshot.text)
-            if settings.multilingual_knowledge_reply_enabled
+            if use_multilingual_path
             else apply_rules(snapshot.text)
         )
         legacy_should_retrieve = (
@@ -429,11 +442,7 @@ async def run_and_persist_decision(
             and deterministic_rule is None
             and not snapshot.has_unsupported_attachment
         )
-        should_retrieve = (
-            live_should_retrieve
-            if settings.multilingual_knowledge_reply_enabled
-            else legacy_should_retrieve
-        )
+        should_retrieve = live_should_retrieve if use_multilingual_path else legacy_should_retrieve
         shadow_should_retrieve = (
             not killswitch_disabled
             and snapshot.automation_state != "HUMAN_ACTIVE"
@@ -445,7 +454,7 @@ async def run_and_persist_decision(
             and snapshot.automation_state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
             and bool(snapshot.text and snapshot.text.strip())
         )
-        if settings.multilingual_knowledge_reply_enabled:
+        if use_multilingual_path:
             history = (
                 await _fetch_history(conversation_id, cutoff_seq) if language_should_detect else ()
             )
@@ -457,15 +466,27 @@ async def run_and_persist_decision(
             knowledge_result = (
                 await _fetch_knowledge(
                     snapshot,
-                    verified_english_only=settings.english_knowledge_only_enabled,
+                    verified_english_only=(
+                        settings.english_knowledge_only_enabled and not experimental_multilingual
+                    ),
                 )
                 if should_retrieve and language.is_known and language_supported
                 else KnowledgeRetrievalResult()
             )
+            gate_min_similarity = (
+                settings.multilingual_experimental_min_similarity
+                if experimental_multilingual
+                else settings.knowledge_auto_reply_min_similarity
+            )
+            gate_min_margin = (
+                settings.multilingual_experimental_min_margin
+                if experimental_multilingual
+                else settings.knowledge_auto_reply_min_margin
+            )
             assessment = _assess_knowledge_match(
                 knowledge_result,
-                min_similarity=settings.knowledge_auto_reply_min_similarity,
-                min_margin=settings.knowledge_auto_reply_min_margin,
+                min_similarity=gate_min_similarity,
+                min_margin=gate_min_margin,
             )
             gate_evaluated = (
                 should_retrieve
@@ -474,6 +495,14 @@ async def run_and_persist_decision(
                 and not knowledge_result.error_code
             )
             selected = assessment.selected
+            experimental_source_is_english = True
+            if experimental_multilingual and selected is not None:
+                source_language, source_status = assess_knowledge_language(
+                    selected.question, selected.reply
+                )
+                experimental_source_is_english = (
+                    source_language == "en" and source_status == "english"
+                )
             is_english_request = language.tag.split("-", 1)[0].casefold() == "en"
             approved_localization = None
             localization_error = False
@@ -482,6 +511,7 @@ async def run_and_persist_decision(
                 and language.is_known
                 and language_supported
                 and not is_english_request
+                and not experimental_multilingual
                 and assessment.strong
                 and selected is not None
                 and not knowledge_result.error_code
@@ -533,6 +563,14 @@ async def run_and_persist_decision(
                     reason_codes=("NO_STRONG_KNOWLEDGE_MATCH",),
                     source="rule",
                 )
+            elif (
+                should_retrieve and experimental_multilingual and not experimental_source_is_english
+            ):
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("EXPERIMENTAL_KNOWLEDGE_NOT_ENGLISH",),
+                    source="rule",
+                )
             elif should_retrieve and is_english_request and not settings.knowledge_verbatim_reply:
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
@@ -545,7 +583,12 @@ async def run_and_persist_decision(
                     reason_codes=("LOCALIZATION_LOOKUP_FAILED",),
                     source="rule",
                 )
-            elif should_retrieve and not is_english_request and approved_localization is None:
+            elif (
+                should_retrieve
+                and not experimental_multilingual
+                and not is_english_request
+                and approved_localization is None
+            ):
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
                     reason_codes=("NO_APPROVED_LOCALIZATION",),
@@ -555,7 +598,11 @@ async def run_and_persist_decision(
                 not is_english_request
                 and selected is not None
                 and selected.is_official_contact
-                and not approved_localization.official_contact_authorized
+                and (
+                    experimental_multilingual
+                    or approved_localization is None
+                    or not approved_localization.official_contact_authorized
+                )
             ):
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
@@ -563,53 +610,95 @@ async def run_and_persist_decision(
                     source="rule",
                 )
 
-            if should_retrieve:
-                prompt_contract_suffix = f"+{_MULTILINGUAL_CONTRACT_VERSION}"
-            decision = await run_decision_pipeline(
-                snapshot,
-                llm=None,
-                killswitch=killswitch,
-                approved_localization=(approved_localization if forced_decision is None else None),
-                verbatim_reply=(
-                    selected.reply
-                    if (
-                        forced_decision is None
-                        and is_english_request
-                        and selected is not None
-                        and selected.verbatim_safe
-                    )
-                    else None
-                ),
-                approved_official_contact_reply=(
-                    selected.reply
-                    if (
-                        forced_decision is None
-                        and is_english_request
-                        and selected is not None
-                        and selected.is_official_contact
-                    )
-                    else None
-                ),
-                forced_decision=forced_decision,
-                target_language=(
-                    approved_localization.locale
-                    if approved_localization is not None
-                    else (language.tag if should_retrieve else "und")
-                ),
-                apply_legacy_rules=False,
-                history=history,
-                email_auto_reply_allowed=(
-                    snapshot.platform != "email"
-                    or (settings.email_enabled and settings.email_auto_reply_enabled)
-                ),
+            experimental_generate = (
+                experimental_multilingual
+                and not is_english_request
+                and forced_decision is None
+                and selected is not None
             )
+            if experimental_multilingual and not is_english_request:
+                prompt_contract_suffix = f"+{EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION}"
+            elif should_retrieve and not experimental_multilingual:
+                prompt_contract_suffix = f"+{_MULTILINGUAL_CONTRACT_VERSION}"
+
+            if experimental_generate:
+                try:
+                    async with get_session_factory()() as session:
+                        persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
+                    decision = await generate_experimental_multilingual_reply(
+                        snapshot,
+                        selected=selected,
+                        target_language=language.tag,
+                        history=history,
+                        killswitch=killswitch,
+                        llm=_get_llm(),
+                        voice_preferences=persona.preferences,
+                        email_auto_reply_allowed=(
+                            snapshot.platform != "email"
+                            or (settings.email_enabled and settings.email_auto_reply_enabled)
+                        ),
+                    )
+                except Exception:
+                    logger.exception("experimental multilingual runtime failed; forcing handoff")
+                    decision = ReplyDecision(
+                        action=ReplyAction.HANDOFF,
+                        reason_codes=("EXPERIMENTAL_RUNTIME_FAILED",),
+                        source="rule",
+                        resolved_locale=language.tag,
+                        multilingual_contract_version=(EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION),
+                    )
+            else:
+                decision = await run_decision_pipeline(
+                    snapshot,
+                    llm=None,
+                    killswitch=killswitch,
+                    approved_localization=(
+                        approved_localization if forced_decision is None else None
+                    ),
+                    verbatim_reply=(
+                        selected.reply
+                        if (
+                            forced_decision is None
+                            and is_english_request
+                            and selected is not None
+                            and selected.verbatim_safe
+                        )
+                        else None
+                    ),
+                    approved_official_contact_reply=(
+                        selected.reply
+                        if (
+                            forced_decision is None
+                            and is_english_request
+                            and selected is not None
+                            and selected.is_official_contact
+                        )
+                        else None
+                    ),
+                    forced_decision=forced_decision,
+                    target_language=(
+                        approved_localization.locale
+                        if approved_localization is not None
+                        else (language.tag if should_retrieve else "und")
+                    ),
+                    apply_legacy_rules=False,
+                    history=history,
+                    email_auto_reply_allowed=(
+                        snapshot.platform != "email"
+                        or (settings.email_enabled and settings.email_auto_reply_enabled)
+                    ),
+                )
             decision = replace(
                 decision,
                 request_language=language.tag if language_should_detect else "und",
                 resolved_locale=(
                     approved_localization.locale
                     if approved_localization is not None
-                    else ("en" if is_english_request and assessment.strong else "und")
+                    else (
+                        language.tag
+                        if experimental_multilingual and language.is_known
+                        else ("en" if is_english_request and assessment.strong else "und")
+                    )
                 ),
                 multilingual_contract_version=(
                     prompt_contract_suffix.lstrip("+").replace("+", "/")
@@ -640,11 +729,9 @@ async def run_and_persist_decision(
                 knowledge_match_status=(assessment.status if gate_evaluated else None),
                 knowledge_gate_version=(_MULTILINGUAL_GATE_VERSION if gate_evaluated else None),
                 knowledge_min_similarity_threshold=(
-                    settings.knowledge_auto_reply_min_similarity if gate_evaluated else None
+                    gate_min_similarity if gate_evaluated else None
                 ),
-                knowledge_min_margin_threshold=(
-                    settings.knowledge_auto_reply_min_margin if gate_evaluated else None
-                ),
+                knowledge_min_margin_threshold=(gate_min_margin if gate_evaluated else None),
             )
         else:
             knowledge_result = (

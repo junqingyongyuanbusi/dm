@@ -179,11 +179,30 @@ Measure by language, tenant, and scope:
 - HANDOFF rate and safe automation coverage;
 - p50/p95 latency, timeout rate, and variable cost.
 
+
+## Experimental Railway test-account mode
+
+For a Railway environment that is not serving real customers, one or more internal `PlatformAccount.id` UUIDs can use guarded runtime translation without reviewed artifacts:
+
+```dotenv
+MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=false
+MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED=false
+ENGLISH_KNOWLEDGE_ONLY_ENABLED=false
+MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED=true
+MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS=<platform-account-uuid>
+```
+
+The allowlist contains internal PostgreSQL/Railway `PlatformAccount.id` UUIDs, not Telegram chat IDs, usernames, inbox IDs, or public IDs. API, Worker, and Scheduler must receive identical values.
+
+The experimental path detects the current message language, retrieves the existing published corpus with the strong relevance gate, generates only from the selected knowledge item, and runs language/fact/entity/grounding guards. Unknown language, low margin, provider failure, non-English knowledge sources, and official-contact knowledge hand off. Pending Outbox messages recheck the global flag and account allowlist before sending.
+
+This mode is for test accounts only and is recorded as `multilingual-experimental-runtime-v1` with reason `EXPERIMENTAL_UNVERIFIED_CORPUS`. It is not reviewed-localization evidence and must not be enabled for customer production accounts.
+
 ## Current limitations
 
 - The checked-in Fake/DB tests prove wiring and fail-closed behavior, not OpenRouter retrieval quality.
 - The previously exposed OpenRouter key must not be reused. Real endpoint validation requires a rotated key.
 - `text-embedding-3-small` is only the model ID the local code attempts to send to OpenRouter; provider acceptance and returned 1536 dimensions are not yet verified.
-- Runtime translation fallback is not implemented and remains a future, default-off candidate.
+- Experimental runtime translation exists only for explicit test-account UUIDs; reviewed production fallback remains disabled.
 - OpenSearch, Qwen3, BGE-M3, and rerankers remain bake-off candidates; see `docs/multilingual-oss-research.md`.
 - Automatic reply capability is limited to locales with published artifacts in the pinned reviewed release. Missing locales hand off.

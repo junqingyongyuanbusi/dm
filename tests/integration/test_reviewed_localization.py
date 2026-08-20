@@ -19,6 +19,7 @@ from social_reply.application.reply_decision import runner
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.connectors import registry
 from social_reply.domain.automation.state_machine import ensure_state
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.infrastructure.database import models
 from social_reply.shared.config import get_settings
 
@@ -52,6 +53,67 @@ class _CrossLingualTestEmbedder:
 class _NeverLLM:
     async def decide(self, context):
         raise AssertionError("reviewed localization path must not call the LLM")
+
+
+class _ExperimentalLLM:
+    def __init__(self, replies, *, faithful=True):
+        self.replies = replies
+        self.faithful = faithful
+        self.grounding_verifier_id = "experimental-grounding-test"
+
+    async def decide(self, context):
+        return ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text=self.replies[context.target_language],
+            intent="refund_timing",
+            confidence=0.99,
+        )
+
+    async def verify_grounding(self, **kwargs):
+        return self.faithful
+
+
+class _RaisingExperimentalLLM:
+    async def decide(self, context):
+        raise RuntimeError("llm unavailable")
+
+
+@pytest.fixture
+async def experimental_runtime(monkeypatch):
+    monkeypatch.setenv("CHATWOOT_ENABLED", "false")
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    monkeypatch.setenv("KNOWLEDGE_VERBATIM_REPLY", "true")
+    monkeypatch.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "false")
+    monkeypatch.setenv("MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED", "false")
+    monkeypatch.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "false")
+    monkeypatch.setenv("MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED", "false")
+    monkeypatch.setenv("MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS", "")
+    monkeypatch.setenv("MULTILINGUAL_EXPERIMENTAL_MIN_SIMILARITY", "0.5")
+    monkeypatch.setenv("MULTILINGUAL_EXPERIMENTAL_MIN_MARGIN", "0.08")
+    monkeypatch.setenv("KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY", "0.8")
+    monkeypatch.setenv("KNOWLEDGE_AUTO_REPLY_MIN_MARGIN", "0.08")
+    _SENT_TEXTS.clear()
+    registry._senders.clear()
+
+    async def fake_get_platform_sender(account_id):
+        return _FakeTelegramSender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", fake_get_platform_sender)
+
+    def enable(account_id: uuid.UUID, llm) -> None:
+        monkeypatch.setenv("MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED", "true")
+        monkeypatch.setenv("MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS", str(account_id))
+        runner._embedder = _CrossLingualTestEmbedder()
+        runner._llm = llm
+        get_settings.cache_clear()
+
+    try:
+        yield enable
+    finally:
+        runner._embedder = None
+        runner._llm = None
+        registry._senders.clear()
+        get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -155,9 +217,12 @@ async def _seed_english_policy(
     tenant_id: str = "default",
     brand_id: str = "b1",
     platform: str | None = None,
+    question: str = _SOURCE_QUESTION,
+    reply: str = _SOURCE_REPLY,
+    is_official_contact: bool = False,
 ):
     document_id = uuid.uuid4()
-    content = f"Question: {_SOURCE_QUESTION}\nApproved answer: {_SOURCE_REPLY}"
+    content = f"Question: {question}\nApproved answer: {reply}"
     content_hash = hashlib.sha256(content.encode()).hexdigest()
     await session.execute(
         insert(models.KnowledgeDocument).values(
@@ -165,14 +230,14 @@ async def _seed_english_policy(
             tenant_id=tenant_id,
             brand_id=brand_id,
             platform=platform,
-            question=_SOURCE_QUESTION,
-            reply=_SOURCE_REPLY,
+            question=question,
+            reply=reply,
             status="published",
             source_language="en",
             detected_language="en",
             language_detection_status="english",
             language_verified=True,
-            is_official_contact=False,
+            is_official_contact=is_official_contact,
         )
     )
     await session.execute(
@@ -181,7 +246,7 @@ async def _seed_english_policy(
             tenant_id=tenant_id,
             document_id=document_id,
             content=content,
-            embed_text=_SOURCE_QUESTION,
+            embed_text=question,
             content_hash=content_hash,
             embedding_version=_CrossLingualTestEmbedder.version,
             embedding=_VECTOR,
@@ -525,4 +590,209 @@ async def test_delivery_rechecks_live_switch_and_locale(
     assert result == "CANCELLED"
     await session.rollback()
     session.expire_all()
+    await _assert_handoff(session, conversation_id, expected_reason)
+
+
+@pytest.mark.parametrize(
+    ("query", "language", "reply"),
+    [
+        (_JA_QUERY, "ja", _JA_REPLY),
+        ("退款需要多长时间？", "zh-Hans", "退款通常需要3到5个工作日。"),
+        (
+            "¿Cuánto tarda un reembolso?",
+            "es",
+            "Los reembolsos tardan de 3 a 5 días laborables.",
+        ),
+        (
+            "Combien de temps prend un remboursement ?",
+            "fr",
+            "Les remboursements prennent généralement de 3 à 5 jours ouvrables.",
+        ),
+    ],
+)
+async def test_allowlisted_experimental_account_sends_same_language(
+    session, experimental_runtime, query, language, reply
+):
+    await _seed_english_policy(session)
+    account_id, conversation_id, message_id = await _seed_conversation(session, text=query)
+    experimental_runtime(account_id, _ExperimentalLLM({language: reply}))
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, query), conversation_id, message_id, account_id
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.request_language == language
+    assert decision.reply_language == language
+    assert decision.resolved_locale == language
+    assert decision.multilingual_contract_version == "multilingual-experimental-runtime-v1"
+    assert "EXPERIMENTAL_UNVERIFIED_CORPUS" in decision.reason_codes
+    assert "KNOWLEDGE_VERBATIM" not in decision.reason_codes
+    assert decision.grounding_verified is True
+    assert decision.knowledge_min_similarity_threshold == 0.5
+    assert decision.knowledge_min_margin_threshold == 0.08
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == "SENT"
+    assert outbox.payload["text"] == reply
+    assert _SENT_TEXTS == [reply]
+
+
+async def test_non_allowlisted_account_keeps_legacy_verbatim(session, experimental_runtime):
+    await _seed_english_policy(session)
+    account_id, conversation_id, message_id = await _seed_conversation(session, text=_JA_QUERY)
+    experimental_runtime(uuid.uuid4(), _ExperimentalLLM({"ja": _JA_REPLY}))
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, _JA_QUERY), conversation_id, message_id, account_id
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.reply_text == _SOURCE_REPLY
+    assert "KNOWLEDGE_VERBATIM" in decision.reason_codes
+    assert decision.multilingual_contract_version is None
+
+
+async def test_allowlisted_account_english_canonical_remains_legacy(session, experimental_runtime):
+    await _seed_english_policy(session)
+    account_id, conversation_id, message_id = await _seed_conversation(
+        session, text=_SOURCE_QUESTION
+    )
+    experimental_runtime(account_id, _ExperimentalLLM({"en": _SOURCE_REPLY}))
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, _SOURCE_QUESTION), conversation_id, message_id, account_id
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.reply_text == _SOURCE_REPLY
+    assert decision.multilingual_contract_version is None
+    assert "KNOWLEDGE_VERBATIM" in decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("llm", "expected_reason"),
+    [
+        (_ExperimentalLLM({"ja": _SOURCE_REPLY}), "GUARD_LANGUAGE_MISMATCH"),
+        (_ExperimentalLLM({"ja": _JA_REPLY}, faithful=False), "GUARD_KNOWLEDGE_SEMANTIC_MISMATCH"),
+        (_RaisingExperimentalLLM(), "EXPERIMENTAL_LLM_FAILED"),
+    ],
+)
+async def test_experimental_wrong_language_or_grounding_failure_handoffs(
+    session, experimental_runtime, llm, expected_reason
+):
+    await _seed_english_policy(session)
+    account_id, conversation_id, message_id = await _seed_conversation(session, text=_JA_QUERY)
+    experimental_runtime(account_id, llm)
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, _JA_QUERY), conversation_id, message_id, account_id
+    )
+
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert expected_reason in decision.reason_codes
+    assert _SENT_TEXTS == []
+    await _assert_handoff(session, conversation_id, expected_reason)
+
+
+@pytest.mark.parametrize(
+    ("env_key", "env_value", "expected_reason"),
+    [
+        (
+            "MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED",
+            "false",
+            "EXPERIMENTAL_MULTILINGUAL_DISABLED",
+        ),
+        (
+            "MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS",
+            "12345678-1234-5678-1234-567812345678",
+            "EXPERIMENTAL_MULTILINGUAL_ACCOUNT_DISABLED",
+        ),
+    ],
+)
+async def test_experimental_disable_before_send_cancels_and_handoffs(
+    session, experimental_runtime, monkeypatch, env_key, env_value, expected_reason
+):
+    async def defer_fast_path(outbox_id):
+        return "DEFERRED_TEST"
+
+    monkeypatch.setattr(outbox_module, "deliver_outbox", defer_fast_path)
+    await _seed_english_policy(session)
+    account_id, conversation_id, message_id = await _seed_conversation(session, text=_JA_QUERY)
+    experimental_runtime(account_id, _ExperimentalLLM({"ja": _JA_REPLY}))
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, _JA_QUERY), conversation_id, message_id, account_id
+    )
+    assert outbox_id is not None
+
+    monkeypatch.setenv(env_key, env_value)
+    get_settings.cache_clear()
+    result = await deliver_outbox(str(outbox_id))
+
+    assert result == "CANCELLED"
+    assert _SENT_TEXTS == []
+    await session.rollback()
+    session.expire_all()
+    await _assert_handoff(session, conversation_id, expected_reason)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("ambiguous", "UNKNOWN_LANGUAGE"),
+        ("low_margin", "NO_STRONG_KNOWLEDGE_MATCH"),
+        ("official_contact", "MULTILINGUAL_OFFICIAL_CONTACT_REVIEW"),
+        ("provider_failure", "KNOWLEDGE_RETRIEVAL_FAILED"),
+        ("non_english_source", "EXPERIMENTAL_KNOWLEDGE_NOT_ENGLISH"),
+    ],
+)
+async def test_experimental_fail_closed_boundaries(
+    session, experimental_runtime, case, expected_reason
+):
+    if case == "official_contact":
+        await _seed_english_policy(session, is_official_contact=True)
+        query = _JA_QUERY
+    elif case == "non_english_source":
+        await _seed_english_policy(
+            session,
+            question="退款需要多长时间？",
+            reply="退款通常需要3到5个工作日。",
+        )
+        query = _JA_QUERY
+    else:
+        await _seed_english_policy(session)
+        query = "返金希望" if case == "ambiguous" else _JA_QUERY
+    if case == "low_margin":
+        await _seed_english_policy(
+            session,
+            question="How long does account verification take?",
+            reply="Verification takes 7 business days.",
+        )
+
+    account_id, conversation_id, message_id = await _seed_conversation(session, text=query)
+    experimental_runtime(account_id, _ExperimentalLLM({"ja": _JA_REPLY}))
+    if case == "provider_failure":
+
+        class FailingEmbedder:
+            version = _CrossLingualTestEmbedder.version
+
+            async def embed(self, texts):
+                raise RuntimeError("provider unavailable")
+
+        runner._embedder = FailingEmbedder()
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, query), conversation_id, message_id, account_id
+    )
+
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert expected_reason in decision.reason_codes
+    assert _SENT_TEXTS == []
     await _assert_handoff(session, conversation_id, expected_reason)

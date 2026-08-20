@@ -202,6 +202,10 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `REQUIRE_KNOWLEDGE` | `false` | Legacy path: handoff without calling LLM when retrieval has no match |
 | `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Live English-corpus multilingual reply path; mutually exclusive with shadow and blocked by readiness/calibration gates |
 | `MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED` | `false` | Record language and verified-English Top1/Top2 evidence without changing legacy action/reply/Outbox |
+| `MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED` | `false` | Test-only same-language runtime generation for explicitly allowlisted accounts; mutually exclusive with reviewed live/shadow |
+| `MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS` | empty | Comma-separated internal `PlatformAccount.id` UUIDs; not chat IDs, usernames, or public IDs |
+| `MULTILINGUAL_EXPERIMENTAL_MIN_SIMILARITY` | `0.5` | Experimental Top1 similarity threshold; independent of reviewed-live calibration |
+| `MULTILINGUAL_EXPERIMENTAL_MIN_MARGIN` | `0.001` | Experimental Top1/Top2 margin; exact ties remain ambiguous |
 | `ENGLISH_KNOWLEDGE_ONLY_ENABLED` | `false` | Require verified English knowledge for live retrieval and publishing |
 | `MULTILINGUAL_SUPPORTED_LANGUAGES` | `en,zh,ja,es,fr,de,pt,ar,ru,th` | Detectable input-language set; it does not authorize customer sending |
 | `MULTILINGUAL_LIVE_LOCALES` | empty | Reviewed locale allowlist eligible for `AUTO_REPLY` in the pinned release |
