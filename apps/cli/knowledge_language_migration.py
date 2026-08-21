@@ -183,6 +183,7 @@ async def apply_review(path: Path, *, actor: str) -> None:
                 raise ValueError(
                     f"knowledge document changed after review: {document_id}; re-run inventory"
                 )
+            previous_status = doc.status
             detected_language, detection_status = assess_knowledge_language(doc.question, doc.reply)
             doc.detected_language = detected_language
             doc.language_detection_status = detection_status
@@ -197,6 +198,7 @@ async def apply_review(path: Path, *, actor: str) -> None:
                     raise ValueError(f"{document_id} unknown language requires review_reason")
                 doc.source_language = "en"
                 doc.language_verified = True
+                doc.status = "published"
                 counts["confirmed"] += 1
                 action = "CONFIRM_KNOWLEDGE_ENGLISH_MIGRATION"
             elif decision == "unpublish":
@@ -264,7 +266,8 @@ async def apply_review(path: Path, *, actor: str) -> None:
                         "detection_status": detection_status,
                         "review_reason": reason,
                         "replacement_id": (row.get("replacement_id") or "").strip() or None,
-                        "previous_status": row.get("status"),
+                        "previous_status": previous_status,
+                        "new_status": doc.status
                     },
                 )
             )

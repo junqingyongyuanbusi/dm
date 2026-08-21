@@ -2738,6 +2738,65 @@ async def test_runtime_mode_rejects_unverified_non_english_publish(
 
 
 
+async def test_runtime_publish_requires_current_embedding(session, migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "multilingual_knowledge_reply_enabled": True,
+            "english_knowledge_only_enabled": False,
+            "openai_embedding_model": "text-embedding-3-small",
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    doc = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="What is a demo account?",
+        reply="A demo account uses virtual funds.",
+        status="draft",
+        source_language="en",
+        language_verified=True,
+    )
+    session.add(doc)
+    await session.flush()
+    session.add(
+        models.KnowledgeChunk(
+            tenant_id="default",
+            document_id=doc.id,
+            content=(
+                "Question: What is a demo account?\\n"
+                "Approved answer: A demo account uses virtual funds."
+            ),
+            embed_text="What is a demo account?",
+            content_hash="d" * 64,
+            embedding_version="old-model",
+            embedding=[0.0] * 1536,
+        )
+    )
+    await session.flush()
+
+    with pytest.raises(HTTPException, match="knowledge_embedding_not_ready"):
+        await admin_console._require_knowledge_publishable(session, doc)
+
+    session.add(
+        models.KnowledgeChunk(
+            tenant_id="default",
+            document_id=doc.id,
+            content=(
+                "Question: What is a demo account?\\n"
+                "Approved answer: A demo account uses virtual funds."
+            ),
+            embed_text="What is a demo account?",
+            content_hash="e" * 64,
+            embedding_version="text-embedding-3-small",
+            embedding=[0.0] * 1536,
+        )
+    )
+    await session.flush()
+    await admin_console._require_knowledge_publishable(session, doc)
+
+
 async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
     doc = models.KnowledgeDocument(
         tenant_id="default",

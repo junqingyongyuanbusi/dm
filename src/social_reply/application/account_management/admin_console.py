@@ -2239,6 +2239,20 @@ async def _require_knowledge_publishable(session, doc: models.KnowledgeDocument)
         doc.source_language == "en" and doc.language_verified
     ):
         raise HTTPException(status_code=409, detail="confirm_english_before_publish")
+    if (
+        settings.multilingual_knowledge_reply_enabled or settings.english_knowledge_only_enabled
+    ):
+        current_embedding = await session.scalar(
+            select(models.KnowledgeChunk.id)
+            .where(
+                models.KnowledgeChunk.tenant_id == doc.tenant_id,
+                models.KnowledgeChunk.document_id == doc.id,
+                models.KnowledgeChunk.embedding_version == settings.openai_embedding_model,
+            )
+            .limit(1)
+        )
+        if current_embedding is None:
+            raise HTTPException(status_code=409, detail="knowledge_embedding_not_ready")
     normalized = normalize_question(doc.question)
     lock_key = f"knowledge-publish:{doc.tenant_id}:{doc.brand_id}:{normalized}"
     await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0))))
