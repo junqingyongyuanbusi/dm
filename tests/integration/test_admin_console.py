@@ -2660,6 +2660,21 @@ async def test_knowledge_import_batch_confirmation_and_english_publish_gate(
         language_detection_status="mixed",
     )
     session.add_all([english, same_filename_other_batch, mixed])
+    await session.flush()
+    session.add(
+        models.KnowledgeChunk(
+            tenant_id="default",
+            document_id=english.id,
+            content=(
+                "Question: How long does a refund take?\\n"
+                "Approved answer: Refunds usually take 3 to 5 business days."
+            ),
+            embed_text="How long does a refund take?",
+            content_hash="f" * 64,
+            embedding_version="text-embedding-3-small",
+            embedding=[0.0] * 1536,
+        )
+    )
     await session.commit()
     english_id = english.id
     other_id = same_filename_other_batch.id
