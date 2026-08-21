@@ -132,9 +132,9 @@ jobs:
             --build-arg "BASE_DIGEST=${base_digest}" \
             --tag reply-core-compat-ci:${GITHUB_SHA} \
             .
-          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.database-head"}}')" = "b7d2e4f6a901"
+          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.database-head"}}')" = "c3e7a9f1b204"
           test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.rollback-target-release"}}')" = "${GITHUB_SHA}"
-          test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "b7d2e4f6a901"
+          test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "c3e7a9f1b204"
       - name: Verify image contract
         run: |
           set -euo pipefail
