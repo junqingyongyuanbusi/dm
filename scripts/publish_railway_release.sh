@@ -134,11 +134,6 @@ latest_ref="${IMAGE_REPO}:latest"
 rollback_ref="${IMAGE_REPO}:railway-pre-${short_sha}"
 rollback_compatible_ref="${IMAGE_REPO}:railway-compat-pre-${short_sha}"
 manifest_path="dist/release-${full_sha}.json"
-experimental_multilingual_enabled="false"
-experimental_allowlist_count="0"
-experimental_allowlist_sha256=""
-experimental_min_similarity=""
-experimental_min_margin=""
 revalidate_dev_head
 
 wait_for_ci() {
@@ -260,7 +255,7 @@ verify_rollback_compatible_image() {
     || fail "$reference has unexpected rollback base digest: $labeled_base"
   [[ "$labeled_target" == "$full_sha" ]] \
     || fail "$reference has unexpected target release: $labeled_target"
-  [[ "$database_head" == "b7d2e4f6a901" ]] \
+  [[ "$database_head" == "c3e7a9f1b204" ]] \
     || fail "$reference has unexpected database head: $database_head"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
@@ -337,39 +332,6 @@ validate_railway_config() {
   log "verified Railway role assignment and shared production configuration"
 }
 
-capture_experimental_multilingual_gate() {
-  local variables allowlist
-  variables="$(railway variable list \
-    --project "$RAILWAY_PROJECT_ID" \
-    --environment "$RAILWAY_ENVIRONMENT" \
-    --service api \
-    --json)" || fail "could not read api variables for release manifest"
-  experimental_multilingual_enabled="$(
-    jq -r '.MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED // "false" | ascii_downcase' \
-      <<<"$variables"
-  )"
-  allowlist="$(jq -r '.MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS // ""' <<<"$variables")"
-  experimental_min_similarity="$(
-    jq -r '.MULTILINGUAL_EXPERIMENTAL_MIN_SIMILARITY // ""' <<<"$variables"
-  )"
-  experimental_min_margin="$(
-    jq -r '.MULTILINGUAL_EXPERIMENTAL_MIN_MARGIN // ""' <<<"$variables"
-  )"
-  experimental_allowlist_count="$(
-    python3 - "$allowlist" <<'PY'
-import sys
-print(len({value.strip() for value in sys.argv[1].split(",") if value.strip()}))
-PY
-  )"
-  experimental_allowlist_sha256="$(
-    python3 - "$allowlist" <<'PY'
-import hashlib
-import sys
-values = sorted({value.strip() for value in sys.argv[1].split(",") if value.strip()})
-print(hashlib.sha256(",".join(values).encode()).hexdigest())
-PY
-  )"
-}
 validate_railway_target() {
   local status_json
   status_json="$(railway_status_json)"
@@ -507,18 +469,13 @@ write_manifest() {
     --arg previous_app_revision "${previous_app_revision:-}" \
     --arg rollback_compatible_tag "$rollback_compatible_ref" \
     --arg rollback_compatible_digest "${rollback_compatible_digest:-}" \
-    --arg rollback_schema_head "b7d2e4f6a901" \
+    --arg rollback_schema_head "c3e7a9f1b204" \
     --arg previous_api_deployment_id "${previous_api_deployment_id:-}" \
     --arg previous_worker_deployment_id "${previous_worker_deployment_id:-}" \
     --arg previous_scheduler_deployment_id "${previous_scheduler_deployment_id:-}" \
     --arg api_deployment_id "${api_deployment_id:-}" \
     --arg worker_deployment_id "${worker_deployment_id:-}" \
     --arg scheduler_deployment_id "${scheduler_deployment_id:-}" \
-    --arg experimental_multilingual_enabled "$experimental_multilingual_enabled" \
-    --arg experimental_allowlist_count "$experimental_allowlist_count" \
-    --arg experimental_allowlist_sha256 "$experimental_allowlist_sha256" \
-    --arg experimental_min_similarity "$experimental_min_similarity" \
-    --arg experimental_min_margin "$experimental_min_margin" \
     --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{
       status: $status,
@@ -534,16 +491,6 @@ write_manifest() {
         digest: $rollback_compatible_digest,
         predecessor_app_revision: $previous_app_revision,
         database_head: $rollback_schema_head
-      },
-      release_gates: {
-        multilingual_live_enabled: false,
-        multilingual_shadow_enabled: false,
-        english_knowledge_only_enabled: false,
-        experimental_multilingual_enabled: ($experimental_multilingual_enabled == "true"),
-        experimental_allowlist_count: ($experimental_allowlist_count | tonumber),
-        experimental_allowlist_sha256: $experimental_allowlist_sha256,
-        experimental_min_similarity: ($experimental_min_similarity | tonumber),
-        experimental_min_margin: ($experimental_min_margin | tonumber)
       },
       previous_railway: {
         api_deployment_id: $previous_api_deployment_id,
@@ -581,7 +528,6 @@ wait_for_ci
 revalidate_dev_head
 validate_railway_target
 validate_railway_config
-capture_experimental_multilingual_gate
 validate_railway_colocation
 
 for service in "${RAILWAY_SERVICES[@]}"; do

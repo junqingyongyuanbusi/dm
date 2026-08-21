@@ -32,16 +32,10 @@ _REQUIRED = {
     "KNOWLEDGE_VERBATIM_REPLY": "false",
     "REQUIRE_KNOWLEDGE": "false",
     "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "false",
-    "MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED": "false",
-    "MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED": "false",
-    "MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS": "",
-    "MULTILINGUAL_EXPERIMENTAL_MIN_SIMILARITY": "0.5",
-    "MULTILINGUAL_EXPERIMENTAL_MIN_MARGIN": "0.001",
     "ENGLISH_KNOWLEDGE_ONLY_ENABLED": "false",
     "KNOWLEDGE_CORPUS_VERSION": "unversioned",
     "MULTILINGUAL_CALIBRATION_REPORT_SHA256": "",
     "MULTILINGUAL_E2E_REPORT_SHA256": "",
-    "MULTILINGUAL_SUPPORTED_LANGUAGES": "en,zh,ja,es,fr,de,pt,ar,ru,th",
     "KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY": "0.8",
     "KNOWLEDGE_AUTO_REPLY_MIN_MARGIN": "0.08",
     "OPENAI_GROUNDING_MODEL": "",
@@ -60,6 +54,44 @@ def test_validate_accepts_consistent_production_configuration():
     validate(_variables(), public_base_url="https://relay.example.com")
 
 
+def test_validate_accepts_runtime_multilingual_generation() -> None:
+    overrides = {
+        service: {
+            "KNOWLEDGE_RETRIEVAL_ENABLED": "true",
+            "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "true",
+            "ENGLISH_KNOWLEDGE_ONLY_ENABLED": "true",
+        }
+        for service in ("api", "worker", "scheduler")
+    }
+    validate(_variables(**overrides), public_base_url="https://relay.example.com")
+
+
+def test_validate_accepts_only_retrieval_and_multilingual_switches() -> None:
+    values = _variables(
+        **{
+            service: {
+                "KNOWLEDGE_RETRIEVAL_ENABLED": "true",
+                "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "true",
+            }
+            for service in ("api", "worker", "scheduler")
+        }
+    )
+    optional_runtime_metadata = {
+        "ENGLISH_KNOWLEDGE_ONLY_ENABLED",
+        "KNOWLEDGE_CORPUS_VERSION",
+        "MULTILINGUAL_CALIBRATION_REPORT_SHA256",
+        "MULTILINGUAL_E2E_REPORT_SHA256",
+        "OPENAI_GROUNDING_MODEL",
+        "GROUNDING_VERIFIER_TIMEOUT_SECONDS",
+        "KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY",
+        "KNOWLEDGE_AUTO_REPLY_MIN_MARGIN",
+    }
+    for service_values in values.values():
+        for key in optional_runtime_metadata:
+            service_values.pop(key, None)
+    validate(values, public_base_url="https://relay.example.com")
+
+
 @pytest.mark.parametrize(
     "overrides,expected",
     [
@@ -68,18 +100,6 @@ def test_validate_accepts_consistent_production_configuration():
         ({"api": {"PUBLIC_BASE_URL": "https://other.example.com"}}, "PUBLIC_BASE_URL"),
         ({"worker": {"PLATFORM_SECRET_KEYS": "different"}}, "PLATFORM_SECRET_KEYS"),
         ({"scheduler": {"XCHAT_ENABLED": ""}}, "scheduler:invalid_settings"),
-        (
-            {"api": {"MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "true"}},
-            "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED_must_equal_false",
-        ),
-        (
-            {"worker": {"MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED": "true"}},
-            "MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED_must_equal_false",
-        ),
-        (
-            {"scheduler": {"ENGLISH_KNOWLEDGE_ONLY_ENABLED": "true"}},
-            "ENGLISH_KNOWLEDGE_ONLY_ENABLED_must_equal_false",
-        ),
         ({"worker": {"XCHAT_ENABLED": "flase"}}, "worker:invalid_settings"),
         (
             {"api": {"OPENAI_TIMEOUT_SECONDS": "31"}},

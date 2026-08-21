@@ -43,23 +43,7 @@ _REQUIRED_EXPLICIT_GATES = (
     "META_AUTO_REPLY_ENABLED",
     "META_COMMENT_REPLY_ENABLED",
     "KNOWLEDGE_RETRIEVAL_ENABLED",
-    "KNOWLEDGE_VERBATIM_REPLY",
-    "REQUIRE_KNOWLEDGE",
     "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED",
-    "MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED",
-    "MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED",
-    "MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS",
-    "MULTILINGUAL_EXPERIMENTAL_MIN_SIMILARITY",
-    "MULTILINGUAL_EXPERIMENTAL_MIN_MARGIN",
-    "ENGLISH_KNOWLEDGE_ONLY_ENABLED",
-    "KNOWLEDGE_CORPUS_VERSION",
-    "MULTILINGUAL_CALIBRATION_REPORT_SHA256",
-    "MULTILINGUAL_SUPPORTED_LANGUAGES",
-    "MULTILINGUAL_E2E_REPORT_SHA256",
-    "KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY",
-    "KNOWLEDGE_AUTO_REPLY_MIN_MARGIN",
-    "OPENAI_GROUNDING_MODEL",
-    "GROUNDING_VERIFIER_TIMEOUT_SECONDS",
 )
 _SHARED_SETTING_KEYS = tuple(name.upper() for name in Settings.model_fields)
 
@@ -89,12 +73,6 @@ def validate(variables: Mapping[str, Mapping[str, str]], *, public_base_url: str
         expected_role = _EXPECTED_ROLES[service]
         if values.get("SERVICE_ROLE") != expected_role:
             errors.append(f"{service}:SERVICE_ROLE_must_equal_{expected_role}")
-        if values.get("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "").strip().lower() != "false":
-            errors.append(f"{service}:MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED_must_equal_false")
-        if values.get("MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED", "").strip().lower() != "false":
-            errors.append(f"{service}:MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED_must_equal_false")
-        if values.get("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "").strip().lower() != "false":
-            errors.append(f"{service}:ENGLISH_KNOWLEDGE_ONLY_ENABLED_must_equal_false")
         if values.get("TESTING", "").strip().lower() != "false":
             errors.append(f"{service}:TESTING_must_equal_false")
         if values.get("PUBLIC_BASE_URL", "").rstrip("/") != public_base_url.rstrip("/"):

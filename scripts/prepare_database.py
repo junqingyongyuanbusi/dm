@@ -47,7 +47,11 @@ async def _assert_multilingual_knowledge_ready() -> None:
             expected_embedding_version=settings.openai_embedding_model,
         )
     assert_knowledge_readiness(report)
-    if report["corpus_fingerprint"] != settings.knowledge_corpus_version:
+    expected_corpus = settings.knowledge_corpus_version.strip()
+    if (
+        expected_corpus not in {"", "unversioned"}
+        and report["corpus_fingerprint"] != expected_corpus
+    ):
         raise RuntimeError("multilingual_knowledge_not_ready:corpus_fingerprint_mismatch")
 
 

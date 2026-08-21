@@ -207,6 +207,8 @@ async def persist_decision(
                 knowledge_localization_text_hash=decision.knowledge_localization_text_hash,
                 knowledge_localization_source_hash=decision.knowledge_localization_source_hash,
                 knowledge_content_hash=decision.knowledge_content_hash,
+                knowledge_document_id=decision.knowledge_document_id,
+                knowledge_chunk_id=decision.knowledge_chunk_id,
                 knowledge_similarity=decision.knowledge_similarity,
                 knowledge_similarity_margin=decision.knowledge_similarity_margin,
                 multilingual_shadow=decision.multilingual_shadow,

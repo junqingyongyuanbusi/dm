@@ -1,7 +1,7 @@
 # 企业邮箱（Email）渠道接入与运维
 
 > 状态：Email 渠道已实现，包括账号接入、只读 IMAP 轮询、统一决策/人工草稿、SMTP
-> 回复、Outbox 恢复和管理员控制面。当前 Alembic 唯一 head 为 `b7d2e4f6a901`。
+> 回复、Outbox 恢复和管理员控制面。当前 Alembic 唯一 head 为 `c3e7a9f1b204`。
 >
 > 仓库测试使用 stub/fake 协议客户端，不代表已使用真实企业邮箱凭证联网验证。管理员提供
 > 目标邮箱凭证后，仍必须先完成本文 Phase 0，再执行接入后的 real smoke。
@@ -152,7 +152,7 @@ Railway 必须保持 API、Worker、Scheduler 使用同一个不可变提交构�
 七个 Email 配置项提供相同值。标准顺序：
 
 1. 先以 `EMAIL_ENABLED=false`、`EMAIL_AUTO_REPLY_ENABLED=false` 部署目标镜像；
-2. API 先启动并执行数据库准备/迁移，确认数据库唯一 head 为 `b7d2e4f6a901`，API deployment
+2. API 先启动并执行数据库准备/迁移，确认数据库唯一 head 为 `c3e7a9f1b204`，API deployment
    `SUCCESS` 且 `/healthz` 正常；
 3. 再启动或替换 Worker、Scheduler，确认三角色均为 `SUCCESS`、同一 digest、相同 Email flags
    和 allowlist；

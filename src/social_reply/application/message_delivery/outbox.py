@@ -21,8 +21,8 @@ from social_reply.application.message_delivery.contracts import (
     TextSendCommand,
     parse_direct_text_command,
 )
-from social_reply.application.reply_decision.experimental_multilingual import (
-    EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION,
+from social_reply.application.reply_decision.multilingual_generation import (
+    MULTILINGUAL_GENERATION_CONTRACT_VERSION,
 )
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.connectors.email.contracts import email_address_identity_key
@@ -51,6 +51,9 @@ from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# 旧 experimental 测试路径已删除；其遗留待发决策一律拒绝（fail-closed）。
+_LEGACY_EXPERIMENTAL_CONTRACT_VERSION = "multilingual-experimental-runtime-v1"
 
 _MAX_ATTEMPTS = 5
 _CANCELLED_SEND_DRAIN_SECONDS = 30
@@ -494,6 +497,7 @@ async def _localization_send_preflight(
     outbox_id: uuid.UUID,
     platform_account_id: uuid.UUID,
     payload_text: str,
+    message_type: str,
 ) -> str | None:
     decision = (
         await session.execute(
@@ -513,6 +517,8 @@ async def _localization_send_preflight(
                 models.ReplyDecision.knowledge_min_similarity_threshold,
                 models.ReplyDecision.knowledge_min_margin_threshold,
                 models.ReplyDecision.knowledge_content_hash,
+                models.ReplyDecision.knowledge_document_id,
+                models.ReplyDecision.knowledge_chunk_id,
                 models.ReplyDecision.knowledge_localization_id,
                 models.ReplyDecision.knowledge_localization_release_id,
                 models.ReplyDecision.knowledge_localization_text_hash,
@@ -523,15 +529,13 @@ async def _localization_send_preflight(
     if decision is None:
         return None
     settings = get_settings()
-    if decision.multilingual_contract_version == EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION:
-        if not settings.multilingual_experimental_reply_enabled:
-            return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
-        if (
-            str(platform_account_id).casefold()
-            not in settings.multilingual_experimental_account_id_set
-        ):
-            return "EXPERIMENTAL_MULTILINGUAL_ACCOUNT_DISABLED"
-        if (
+    if decision.multilingual_contract_version == _LEGACY_EXPERIMENTAL_CONTRACT_VERSION:
+        return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
+    if decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION:
+        if not settings.multilingual_knowledge_reply_enabled:
+            return "MULTILINGUAL_LIVE_DISABLED"
+        is_draft = message_type == "private_note" or decision.action == "draft"
+        if not is_draft and (
             decision.action != "auto_reply"
             or decision.grounding_verified is not True
             or decision.knowledge_match_status != "strong"
@@ -545,20 +549,20 @@ async def _localization_send_preflight(
                 and decision.knowledge_similarity_margin < decision.knowledge_min_margin_threshold
             )
         ):
-            return "EXPERIMENTAL_MULTILINGUAL_PROVENANCE_INVALID"
-        if (
+            return "MULTILINGUAL_PROVENANCE_INVALID"
+        if not is_draft and (
             decision.request_language == "und"
             or decision.reply_language == "und"
             or not languages_match(decision.request_language, decision.reply_language)
             or not languages_match(decision.request_language, decision.resolved_locale)
-            or decision.request_language.split("-", 1)[0].casefold()
-            not in settings.multilingual_supported_language_set
         ):
-            return "EXPERIMENTAL_MULTILINGUAL_LANGUAGE_INVALID"
+            return "MULTILINGUAL_LANGUAGE_INVALID"
         if payload_text != decision.reply_text:
-            return "EXPERIMENTAL_MULTILINGUAL_PAYLOAD_MISMATCH"
+            return "MULTILINGUAL_PAYLOAD_MISMATCH"
         if not decision.knowledge_content_hash:
-            return "EXPERIMENTAL_MULTILINGUAL_KNOWLEDGE_INVALID"
+            return "MULTILINGUAL_KNOWLEDGE_INVALID"
+        if not decision.knowledge_document_id or not decision.knowledge_chunk_id:
+            return "MULTILINGUAL_KNOWLEDGE_IDENTITY_INVALID"
         source_exists = await session.scalar(
             select(models.KnowledgeChunk.id)
             .join(
@@ -576,6 +580,8 @@ async def _localization_send_preflight(
                 models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
                 models.KnowledgeChunk.tenant_id == decision.tenant_id,
                 models.KnowledgeDocument.tenant_id == models.PlatformAccount.tenant_id,
+                models.KnowledgeDocument.id == decision.knowledge_document_id,
+                models.KnowledgeChunk.id == decision.knowledge_chunk_id,
                 models.KnowledgeDocument.brand_id == models.PlatformAccount.brand_id,
                 or_(
                     models.KnowledgeDocument.platform.is_(None),
@@ -583,11 +589,13 @@ async def _localization_send_preflight(
                 ),
                 models.KnowledgeChunk.content_hash == decision.knowledge_content_hash,
                 models.KnowledgeDocument.status == "published",
+                models.KnowledgeDocument.source_language == "en",
+                models.KnowledgeDocument.language_verified.is_(True),
                 models.KnowledgeDocument.is_official_contact.is_(False),
             )
             .limit(1)
         )
-        return None if source_exists is not None else "EXPERIMENTAL_MULTILINGUAL_SOURCE_REVOKED"
+        return None if source_exists is not None else "MULTILINGUAL_SOURCE_REVOKED"
     if decision.knowledge_localization_id is None:
         return None
     if (
@@ -597,10 +605,6 @@ async def _localization_send_preflight(
         or decision.knowledge_localization_source_hash is None
     ):
         return "LOCALIZATION_PROVENANCE_INVALID"
-    if not settings.multilingual_knowledge_reply_enabled:
-        return "MULTILINGUAL_LIVE_DISABLED"
-    if decision.resolved_locale not in settings.multilingual_live_locale_set:
-        return "MULTILINGUAL_LOCALE_DISABLED"
     row = (
         await session.execute(
             select(
@@ -636,7 +640,6 @@ async def _localization_send_preflight(
     if (
         artifact.status != "published"
         or artifact.release_id != decision.knowledge_localization_release_id
-        or artifact.release_id != settings.knowledge_localization_release
         or not artifact.auto_reply_allowed
         or not artifact.reviewed_by
         or artifact.reviewed_at is None
@@ -762,6 +765,7 @@ async def _deliver_outbox_locked(
             outbox_id=oid,
             platform_account_id=row.platform_account_id,
             payload_text=payload["text"],
+            message_type=row.message_type,
         )
     if localization_error is not None:
         await _handoff_localization_failure(

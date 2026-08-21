@@ -1,6 +1,3 @@
-import hashlib
-import json
-import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -13,7 +10,6 @@ from social_reply.connectors.email.network import (
     EmailNetworkError,
     normalize_allowed_hosts,
 )
-from social_reply.domain.reply.localization import canonicalize_locale
 
 _META_PLATFORMS = {"facebook", "instagram"}
 
@@ -110,24 +106,16 @@ class Settings(BaseSettings):
     knowledge_verbatim_reply: bool = False
     # true 时检索无命中直接 HANDOFF/INSUFFICIENT_KNOWLEDGE，不调 LLM（省 token，§十三）
     require_knowledge: bool = False
-    # 新多语言知识路径默认关闭：先影子观测和校准，再在三角色原子启用。
+    # 多语言知识回复（运行时生成路径）：开启后，任意可检测的非英语消息在英语知识库
+    # 强命中时由 LLM 生成同语言回复；低置信度先走占位符保护的查询翻译回退。
+    # 英语事实源不变；und/检测失败、无强命中、official-contact、守卫不符一律 HANDOFF。
     multilingual_knowledge_reply_enabled: bool = False
-    multilingual_knowledge_shadow_enabled: bool = False
-    # Test-environment escape hatch: target-language generation for explicitly allowlisted accounts.
-    multilingual_experimental_reply_enabled: bool = False
-    multilingual_experimental_account_ids: str = ""
-    multilingual_experimental_min_similarity: float = Field(default=0.5, ge=0.0, le=1.0)
-    multilingual_experimental_min_margin: float = Field(default=0.001, ge=0.0, le=1.0)
     english_knowledge_only_enabled: bool = False
     knowledge_corpus_version: str = "unversioned"
     multilingual_calibration_report_path: Path = Path(
         "src/social_reply/shared/multilingual-calibration.json"
     )
     multilingual_calibration_report_sha256: str = ""
-    # Detectable input languages are not automatically eligible for sending.
-    multilingual_supported_languages: str = "en,zh,ja,es,fr,de,pt,ar,ru,th"
-    # Only reviewed localization locales in this allowlist may produce AUTO_REPLY.
-    multilingual_live_locales: str = ""
     knowledge_localization_release: str = "unversioned"
     multilingual_e2e_report_path: Path = Path(
         "src/social_reply/shared/multilingual-e2e-calibration.json"
@@ -205,118 +193,11 @@ class Settings(BaseSettings):
         SecretCipher(self.platform_secret_key_list)
         if not self.testing and self.llm_provider == "stub":
             raise ValueError("LLM_PROVIDER=stub 仅允许测试环境，生产环境禁止公开测试回复")
-        if self.multilingual_knowledge_reply_enabled and self.multilingual_knowledge_shadow_enabled:
-            raise ValueError(
-                "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED and SHADOW_ENABLED are mutually exclusive"
-            )
-        if self.multilingual_knowledge_reply_enabled and not self.english_knowledge_only_enabled:
-            raise ValueError(
-                "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires ENGLISH_KNOWLEDGE_ONLY_ENABLED=true"
-            )
         if self.multilingual_knowledge_reply_enabled and not self.knowledge_retrieval_enabled:
             raise ValueError(
                 "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
             )
-        if self.multilingual_experimental_reply_enabled:
-            if (
-                self.multilingual_knowledge_reply_enabled
-                or self.multilingual_knowledge_shadow_enabled
-            ):
-                raise ValueError(
-                    "experimental multilingual reply is mutually exclusive with live/shadow"
-                )
-            if not self.knowledge_retrieval_enabled:
-                raise ValueError(
-                    "experimental multilingual reply requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
-                )
-            if not self.multilingual_experimental_account_id_set:
-                raise ValueError("MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS is required")
-            try:
-                for account_id in self.multilingual_experimental_account_id_set:
-                    uuid.UUID(account_id)
-            except ValueError as exc:
-                raise ValueError(
-                    "MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS must contain UUIDs"
-                ) from exc
-        live_locale_languages = {
-            locale.casefold().split("-", 1)[0] for locale in self.multilingual_live_locale_set
-        }
-        if not live_locale_languages.issubset(self.multilingual_supported_language_set):
-            raise ValueError("MULTILINGUAL_LIVE_LOCALES must be detectable supported languages")
-        if self.multilingual_knowledge_reply_enabled and not self.multilingual_live_locale_set:
-            raise ValueError("MULTILINGUAL_LIVE_LOCALES is required for multilingual live mode")
         self.knowledge_localization_release = self.knowledge_localization_release.strip()
-        if self.multilingual_knowledge_reply_enabled and self.knowledge_localization_release in {
-            "",
-            "unversioned",
-        }:
-            raise ValueError("KNOWLEDGE_LOCALIZATION_RELEASE must be pinned for live mode")
-        if self.multilingual_knowledge_reply_enabled and not self.testing:
-            report_path = self.multilingual_calibration_report_path
-            if not report_path.is_file():
-                raise ValueError(f"multilingual calibration report missing: {report_path}")
-            if not self.multilingual_calibration_report_sha256:
-                raise ValueError("MULTILINGUAL_CALIBRATION_REPORT_SHA256 is required for live mode")
-            report_bytes = report_path.read_bytes()
-            report_digest = hashlib.sha256(report_bytes).hexdigest()
-            if report_digest != self.multilingual_calibration_report_sha256:
-                raise ValueError("multilingual calibration report digest mismatch")
-            report = json.loads(report_bytes)
-            versions = report.get("versions") or {}
-            thresholds = report.get("selected_thresholds") or {}
-            report_languages = frozenset(report.get("supported_languages") or ())
-            if report_languages != frozenset(live_locale_languages):
-                raise ValueError("multilingual calibration supported language mismatch")
-            if report.get("status") != "pass":
-                raise ValueError("multilingual calibration report is not approved")
-            if versions.get("corpus_version") != self.knowledge_corpus_version:
-                raise ValueError("multilingual calibration corpus version mismatch")
-            if versions.get("embedding_version") != self.openai_embedding_model:
-                raise ValueError("multilingual calibration embedding version mismatch")
-            if versions.get("gate_version") != "strong-gate-v1":
-                raise ValueError("multilingual calibration gate version mismatch")
-            if versions.get("contract_version") != "multilingual-v2-reviewed-localization":
-                raise ValueError("multilingual calibration contract version mismatch")
-            if versions.get("renderer_version") != "reviewed-localization-v1":
-                raise ValueError("multilingual calibration renderer version mismatch")
-            if versions.get("localization_release") != self.knowledge_localization_release:
-                raise ValueError("multilingual calibration localization release mismatch")
-            if thresholds.get("min_similarity") != self.knowledge_auto_reply_min_similarity:
-                raise ValueError("multilingual calibration similarity threshold mismatch")
-            if thresholds.get("min_margin") != self.knowledge_auto_reply_min_margin:
-                raise ValueError("multilingual calibration margin threshold mismatch")
-            e2e_path = self.multilingual_e2e_report_path
-            if not e2e_path.is_file() or not self.multilingual_e2e_report_sha256:
-                raise ValueError(
-                    "approved multilingual end-to-end report is required for live mode"
-                )
-            e2e_bytes = e2e_path.read_bytes()
-            if hashlib.sha256(e2e_bytes).hexdigest() != self.multilingual_e2e_report_sha256:
-                raise ValueError("multilingual end-to-end report digest mismatch")
-            e2e_report = json.loads(e2e_bytes)
-            if e2e_report.get("status") != "pass":
-                raise ValueError("multilingual end-to-end report is not approved")
-            if frozenset(e2e_report.get("supported_locales") or ()) != (
-                self.multilingual_live_locale_set
-            ):
-                raise ValueError("multilingual end-to-end supported language mismatch")
-            if e2e_report.get("calibration_report_sha256") != report_digest:
-                raise ValueError("multilingual end-to-end calibration digest mismatch")
-            if (e2e_report.get("versions") or {}) != versions:
-                raise ValueError("multilingual end-to-end runtime versions mismatch")
-            if (e2e_report.get("selected_thresholds") or {}) != thresholds:
-                raise ValueError("multilingual end-to-end thresholds mismatch")
-            if e2e_report.get("corpus_version") != self.knowledge_corpus_version:
-                raise ValueError("multilingual end-to-end corpus version mismatch")
-            safety = e2e_report.get("safety") or {}
-            for metric in (
-                "wrong_language_outbox",
-                "risk_or_case_auto_reply",
-                "grounding_false_accept",
-                "unexpected_customer_outbox",
-            ):
-                if safety.get(metric) != 0:
-                    raise ValueError(f"multilingual end-to-end safety metric failed: {metric}")
         # 生产环境启用 openai provider 时必须提供 API key
         if (
             not self.testing
@@ -355,40 +236,6 @@ class Settings(BaseSettings):
     def x_mention_ingest_enabled(self) -> bool:
         """Mentions ride the Activity webhook, so both switches must be on."""
         return self.x_activity_enabled and self.x_public_reply_enabled
-
-    @property
-    def multilingual_supported_language_set(self) -> frozenset[str]:
-        return frozenset(
-            language.strip().casefold().split("-", 1)[0]
-            for language in self.multilingual_supported_languages.split(",")
-            if language.strip()
-        )
-
-    @property
-    def multilingual_live_locale_set(self) -> frozenset[str]:
-        locales: set[str] = set()
-        for locale in self.multilingual_live_locales.split(","):
-            if not locale.strip():
-                continue
-            try:
-                locales.add(canonicalize_locale(locale))
-            except ValueError as exc:
-                raise ValueError("MULTILINGUAL_LIVE_LOCALES contains an invalid locale") from exc
-        return frozenset(locales)
-
-    @property
-    def multilingual_experimental_account_id_set(self) -> frozenset[str]:
-        account_ids: set[str] = set()
-        for raw in self.multilingual_experimental_account_ids.split(","):
-            if not raw.strip():
-                continue
-            try:
-                account_ids.add(str(uuid.UUID(raw.strip())))
-            except ValueError as exc:
-                raise ValueError(
-                    "MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS must contain UUIDs"
-                ) from exc
-        return frozenset(account_ids)
 
     def platform_integration_enabled(self, platform: str) -> bool:
         if platform == "facebook":

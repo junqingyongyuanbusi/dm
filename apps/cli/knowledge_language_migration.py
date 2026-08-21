@@ -152,12 +152,6 @@ def _load_reviewed_rows(path: Path) -> list[dict[str, str]]:
 
 
 async def apply_review(path: Path, *, actor: str) -> None:
-    settings = get_settings()
-    if (
-        settings.multilingual_knowledge_reply_enabled
-        or settings.multilingual_knowledge_shadow_enabled
-    ):
-        raise RuntimeError("knowledge language migration requires live=false and shadow=false")
     reviewed = _load_reviewed_rows(path)
     confirmation_batch_id = str(uuid.uuid4())
     counts = {"confirmed": 0, "unpublished": 0, "skipped": 0}
@@ -294,7 +288,11 @@ async def readiness() -> None:
     print(json.dumps(report, ensure_ascii=False))
     try:
         assert_knowledge_readiness(report)
-        if report["corpus_fingerprint"] != get_settings().knowledge_corpus_version:
+        expected_corpus = get_settings().knowledge_corpus_version.strip()
+        if (
+            expected_corpus not in {"", "unversioned"}
+            and report["corpus_fingerprint"] != expected_corpus
+        ):
             raise RuntimeError(
                 "knowledge corpus fingerprint does not match KNOWLEDGE_CORPUS_VERSION"
             )

@@ -200,36 +200,20 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `KNOWLEDGE_TOP_K` | `3` | Maximum retrieved chunks |
 | `KNOWLEDGE_VERBATIM_REPLY` | `false` | Return matched template text without LLM rewriting |
 | `REQUIRE_KNOWLEDGE` | `false` | Legacy path: handoff without calling LLM when retrieval has no match |
-| `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Live English-corpus multilingual reply path; mutually exclusive with shadow and blocked by readiness/calibration gates |
-| `MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED` | `false` | Record language and verified-English Top1/Top2 evidence without changing legacy action/reply/Outbox |
-| `MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED` | `false` | Test-only same-language runtime generation for explicitly allowlisted accounts; mutually exclusive with reviewed live/shadow |
-| `MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS` | empty | Comma-separated internal `PlatformAccount.id` UUIDs; not chat IDs, usernames, or public IDs |
-| `MULTILINGUAL_EXPERIMENTAL_MIN_SIMILARITY` | `0.5` | Experimental Top1 similarity threshold; independent of reviewed-live calibration |
-| `MULTILINGUAL_EXPERIMENTAL_MIN_MARGIN` | `0.001` | Experimental Top1/Top2 margin; exact ties remain ambiguous |
-| `ENGLISH_KNOWLEDGE_ONLY_ENABLED` | `false` | Require verified English knowledge for live retrieval and publishing |
-| `MULTILINGUAL_SUPPORTED_LANGUAGES` | `en,zh,ja,es,fr,de,pt,ar,ru,th` | Detectable input-language set; it does not authorize customer sending |
-| `MULTILINGUAL_LIVE_LOCALES` | empty | Reviewed locale allowlist eligible for `AUTO_REPLY` in the pinned release |
-| `KNOWLEDGE_LOCALIZATION_RELEASE` | `unversioned` | Pinned reviewed localization release; blank/`unversioned` is rejected in live mode |
-| `KNOWLEDGE_CORPUS_VERSION` | `unversioned` | Must equal the computed verified-English corpus fingerprint before live startup |
-| `KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY` | `0.8` | Pure-vector Top1 threshold; must match an approved calibration report |
-| `KNOWLEDGE_AUTO_REPLY_MIN_MARGIN` | `0.08` | Minimum Top1 minus Top2 margin; must match an approved calibration report |
-| `MULTILINGUAL_CALIBRATION_REPORT_SHA256` | empty | SHA-256 of the approved retrieval calibration report packaged in the image |
-| `MULTILINGUAL_E2E_REPORT_SHA256` | empty | SHA-256 of the approved end-to-end language/risk/grounding/Outbox report |
+| `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Enables English-corpus multilingual runtime generation; non-English requests use the detected language, with no language or account allowlist; requires knowledge retrieval |
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
-The first release intentionally supports only the configured language allowlist. The current message
-is preferred; an ambiguous short message may inherit the most recent reliably detected customer
-message, never an assistant reply. Unknown, unsupported, mixed-language, or insufficiently supported
-messages hand off. Chinese text with identifiable simplified/traditional evidence is checked against
-that writing system; text made only of shared Han characters is treated as neutral `zh`, so it
-guarantees Chinese but cannot promise a simplified/traditional variant.
+The runtime accepts any language that the fail-closed detector can identify. The current message is
+preferred; an ambiguous short message may inherit the most recent reliably detected customer message,
+never an assistant reply. Unknown or mixed-language messages hand off. Chinese text with identifiable
+simplified/traditional evidence is checked against that writing system; shared Han-only text remains
+neutral `zh`.
 
-Live mode cannot start merely because the flags are present. It additionally requires a fully
-verified English corpus with current embeddings and Tenant/Brand/Platform coverage, an approved
-retrieval calibration report whose thresholds and corpus fingerprint match configuration, and an
-approved end-to-end report with zero wrong-language Outbox, risk/case auto-reply, grounding false
-accept, or unexpected customer Outbox events.
+Multilingual runtime generation requires only `KNOWLEDGE_RETRIEVAL_ENABLED=true` and
+`MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true`. It retrieves verified-English knowledge in code, uses a
+protected query-translation retry when needed, and relies on the existing language, grounding,
+contact, kill-switch, and Outbox guards. It does not require a calibration report or language allowlist.
 ## Scheduler and reconciliation settings
 
 The scheduler reads one validated settings snapshot at startup. X reconciliation functions also read

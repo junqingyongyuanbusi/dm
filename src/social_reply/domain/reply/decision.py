@@ -40,6 +40,8 @@ class ReplyDecision:
     knowledge_localization_text_hash: str | None = None
     knowledge_localization_source_hash: str | None = None
     knowledge_content_hash: str | None = None
+    knowledge_document_id: uuid.UUID | None = None
+    knowledge_chunk_id: uuid.UUID | None = None
     knowledge_similarity: float | None = None
     knowledge_similarity_margin: float | None = None
     multilingual_shadow: bool = False

@@ -4,7 +4,7 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
 `scripts/publish_railway_release.sh` for the required production release path.
 
-The current Alembic graph has one head: `b7d2e4f6a901`. Database migration verifies schema state
+The current Alembic graph has one head: `c3e7a9f1b204`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
 
@@ -13,7 +13,7 @@ succeeded.
 
 Revision `b7d2e4f6a901` is additive after `a6f1c3d8e205`. It adds tenant-scoped reviewed localization artifacts, pinned release provenance on decisions, composite knowledge-tenant constraints, and send-time localization checks. Deploy it with multilingual live, retrieval shadow, and English-only mode still disabled on API, Worker, and Scheduler. The migration does not authorize production multilingual sending and does not prove OpenRouter cross-language retrieval quality.
 
-The migration-compatible rollback image must overlay both `a6f1c3d8e205` and `b7d2e4f6a901` onto the active predecessor image and advertise database head `b7d2e4f6a901`. Application rollback keeps PostgreSQL at the new additive head; it does not downgrade or delete localization audit history.
+The migration-compatible rollback image must overlay both `a6f1c3d8e205` and the current head migration `c3e7a9f1b204` onto the active predecessor image and advertise database head `c3e7a9f1b204`. Application rollback keeps PostgreSQL at the new additive head; it does not downgrade or delete localization audit history.
 
 ## Synthetic evaluation foundation revision
 
@@ -38,7 +38,7 @@ digest and database head.
 
 The release script verifies this image before changing `latest` or Railway. It upgrades an isolated
 test database with the target image, then runs the predecessor image's `scripts.prepare_database` and
-`scripts.assert_database_ready` against head `b7d2e4f6a901`. A release aborts before production
+`scripts.assert_database_ready` against head `c3e7a9f1b204`. A release aborts before production
 mutation if the predecessor application plus overlaid migration graph cannot complete database preparation and exact-head readiness checks.
 
 The release manifest records the compatibility tag and digest. Preserve the `deploying`/`completed` manifest in the operator's durable release evidence store; the ignored local `dist/` copy is not the sole retention mechanism. To roll back application behavior
@@ -53,81 +53,40 @@ scripts/rollback_railway_migration_compatible.sh \
 The rollback script atomically retags Docker Hub `latest` to the compatibility digest, then redeploys
 API, waits for `/healthz`, and redeploys Worker and Scheduler. It verifies all three roles run the
 same compatibility digest and that production configuration remains fail-closed. PostgreSQL stays at
-`b7d2e4f6a901`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
+`c3e7a9f1b204`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
 evidence only and are not executable rollback targets after migration.
 
 This rollback also works when the target API migrated the database but crashed before Uvicorn became
 healthy, because the compatibility image is built, pushed and smoke-tested before `latest` is
 promoted.
 
-## Multilingual English knowledge shadow revision
+## Multilingual runtime generation
 
-Revision `f3b8c1d4e726` is additive after `e9a1c4f7b620`. It adds language-detection,
-English-confirmation, import-batch and decision/shadow evidence fields. Existing knowledge rows are
-backfilled as `source_language='und'` and `language_verified=false`; the migration does not silently
-certify, translate, unpublish or rewrite production knowledge.
+The runtime path keeps English knowledge as the only factual source and generates the reply in the
+customer's detected language. It does not use a configured language list, locale allowlist, experimental
+account list, or reviewed localization release as a prerequisite.
 
-Deploy this revision with all three roles explicitly configured as:
+Enable the existing switches on all three roles only when retrieval is ready:
 
 ```env
-MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=false
-MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED=false
-ENGLISH_KNOWLEDGE_ONLY_ENABLED=false
-MULTILINGUAL_SUPPORTED_LANGUAGES=en,zh,ja,es,fr,de,pt,ar,ru,th
-KNOWLEDGE_CORPUS_VERSION=unversioned
-KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY=0.8
-KNOWLEDGE_AUTO_REPLY_MIN_MARGIN=0.08
-MULTILINGUAL_CALIBRATION_REPORT_SHA256=
-MULTILINGUAL_E2E_REPORT_SHA256=
-OPENAI_GROUNDING_MODEL=
-GROUNDING_VERIFIER_TIMEOUT_SECONDS=8
+KNOWLEDGE_RETRIEVAL_ENABLED=true
+MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true
 ```
 
-This release is only the schema/control/shadow slice. It must not enable live multilingual replies.
-The first-release language allowlist is English, Chinese, Japanese, Spanish, French, German,
-Portuguese, Arabic, Russian and Thai. Unknown, ambiguous, short or unsupported languages hand off;
-neutral Chinese text guarantees Chinese but cannot prove simplified/traditional script.
+The runner forces `verified_english_only=True` for this path. It uses direct cross-language retrieval,
+then a protected query-translation retry when the answer-level match is weak. It generates from the
+English approved answer, checks output language and grounding, and sends only after the existing Outbox
+preflight. Unknown language, no strong match, official contact, wrong-language output, failed grounding,
+or provider failure becomes `HANDOFF`; `BOT_DRAFT_ONLY` keeps a private-note draft for review.
 
-Before shadow collection, inventory the full corpus and have an operator review the generated CSV:
+The old `MULTILINGUAL_SUPPORTED_LANGUAGES`, `MULTILINGUAL_LIVE_LOCALES`, and experimental account
+configuration are retired and must not be added to Railway variables. Existing reviewed localization
+records remain readable and their pending Outbox rows continue to receive provenance checks, but new
+runtime decisions do not require artifacts.
 
-```bash
-uv run python -m apps.cli.knowledge_language_migration inventory \
-  --output dist/knowledge-language-review.csv
-
-uv run python -m apps.cli.knowledge_language_migration apply \
-  --input dist/knowledge-language-review-approved.csv \
-  --actor "user:reviewer"
-
-uv run python -m apps.cli.knowledge_language_migration fingerprint \
-  > dist/knowledge-readiness-fingerprint.json
-# Copy corpus_fingerprint from that report to KNOWLEDGE_CORPUS_VERSION on api/worker/scheduler.
-uv run python -m apps.cli.knowledge_language_migration readiness
-```
-
-The apply command verifies the reviewed row fingerprint against both the CSV display fields and the
-locked database row. Confirmed English published rows stay published. Mixed/non-English rows require
-a separately reviewed, published, verified-English replacement in the same retrieval scope before
-the old row can be unpublished. Preserve the inventory, approved CSV, confirmation batch ID and old
-to new document IDs as rollback evidence.
-
-Only after readiness passes may shadow be enabled (`live=false`, `shadow=true`). Export and label at
-least the required per-language train/holdout sample matrix, then evaluate it:
-
-```bash
-uv run python -m apps.cli.multilingual_shadow_eval export \
-  --output dist/multilingual-shadow-review.csv
-uv run python -m apps.cli.multilingual_shadow_eval evaluate \
-  --input dist/multilingual-shadow-reviewed.csv \
-  --output dist/multilingual-calibration.json
-```
-
-A retrieval report alone does not authorize live mode. Live additionally requires a reviewed,
-immutable end-to-end holdout report covering action selection, output language, grounding, risk/case
-handoff and Outbox blocking. Package both approved reports into the production image, configure their
-SHA-256 values, set `KNOWLEDGE_CORPUS_VERSION` to the computed readiness fingerprint and redeploy all
-three roles together. Startup fails closed if reports, thresholds, corpus, embeddings or active
-Tenant/Brand/Platform coverage do not match. Until those external reviews and reports exist, keep live
-false.
+For a bounded release, deploy API, Worker, and Scheduler with the same values and verify the normal CI,
+health, digest, and Outbox checks. No multilingual calibration report or per-language rollout gate is
+required by startup configuration.
 
 ## Platform secret encryption
 
@@ -303,7 +262,7 @@ EMAIL_ALLOWED_HOSTS=imap.larksuite.com,smtp.larksuite.com
 ```
 
 Use the standard API-first release order. API owns database preparation: require its deployment to
-reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `b7d2e4f6a901` before
+reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `c3e7a9f1b204` before
 starting or replacing Worker and Scheduler. Then require all three roles to run the same image
 digest and the same Email flags/allowlist. Do not enable Email on a new API while an old Worker or
 Scheduler remains.
@@ -634,7 +593,7 @@ historical open work.
 Before upgrade, take and verify a PostgreSQL backup. Deploy API, Worker and Scheduler with
 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` and identical sender lease, retry and sweep settings.
 After API migrates the database, require all three roles to reach one image digest and confirm the
-unique Alembic head is `b7d2e4f6a901`. Do not enable callbacks while an old API can still receive a
+unique Alembic head is `c3e7a9f1b204`. Do not enable callbacks while an old API can still receive a
 card action or an old Worker/Scheduler is running.
 
 Configure one Tenant at a time:

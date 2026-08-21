@@ -146,9 +146,35 @@ def test_reply_language_allows_language_neutral_contact_tokens():
     assert reply_language_matches("de", "Weitere Informationen: https://example.com/a.b")[0] is True
 
 
+
+@pytest.mark.parametrize(
+    ("language", "sample"),
+    [
+        ("zh-Hans", "退款通常需要3到5个工作日。"),
+        ("ja", "返金には通常3〜5営業日かかります。"),
+        ("ko", "환불은 보통 3~5영업일이 걸립니다."),
+        ("hi", "रिफंड में आमतौर पर 3 से 5 कार्यदिवस लगते हैं।"),
+        ("si", "මුදල් ආපසු ලබා ගැනීමට සාමාන්‍යයෙන් වැඩ කරන දින 3 සිට 5 දක්වා ගත වේ."),
+        ("lo", "ການຄືນເງິນໃຊ້ເວລາ 3 ຫາ 5 ວັນເຮັດວຽກ."),
+        ("km", "ការបង្វិលប្រាក់វិញត្រូវចំណាយពេល ៣ ដល់ ៥ ថ្ងៃធ្វើការ។"),
+        ("my", "ငွေပြန်အမ်းရန် အလုပ်လုပ်ရက် ၃ မှ ၅ ရက်ကြာနိုင်သည်။"),
+    ],
+)
+def test_reply_language_allows_detected_writing_systems(language, sample):
+    assert reply_language_matches(language, sample)[0] is True
+    assert reply_language_matches(language, "Refunds take 3 to 5 business days.")[0] is False
+
+
+def test_ethiopic_script_is_ambiguous_and_fails_closed():
+    sample = "የገንዘብ ተመላሽ ከ3 እስከ 5 የስራ ቀናት ይወስዳል።"
+    assert detect_language(sample).tag == "und"
+    assert reply_language_matches("am", sample)[0] is False
+
+
+
 def test_knowledge_language_assessment_separates_detection_from_confirmation():
     assert assess_knowledge_language(
-        "How long does a refund take?",
+        "Could you please explain how long a refund usually takes in business days?",
         "Refunds usually take 3 to 5 business days.",
     ) == ("en", "english")
     assert assess_knowledge_language("Refund", "退款通常需要 3 到 5 个工作日。") == (

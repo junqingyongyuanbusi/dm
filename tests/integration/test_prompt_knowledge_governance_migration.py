@@ -15,7 +15,7 @@ from social_reply.application.reply_decision.persona import (
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "a9d4e6f2b713"
-_HEAD_REVISION = "b7d2e4f6a901"
+_HEAD_REVISION = "c3e7a9f1b204"
 
 
 async def test_historical_data_upgrade_downgrade_and_reupgrade():

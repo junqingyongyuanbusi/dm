@@ -33,8 +33,9 @@ async def knowledge_readiness_report(
         .where(
             models.KnowledgeDocument.status == "published",
             (
-                (models.KnowledgeDocument.source_language != "en")
-                | models.KnowledgeDocument.language_verified.is_(False)
+                models.KnowledgeDocument.source_language.is_(None)
+                | (models.KnowledgeDocument.source_language != "en")
+                | models.KnowledgeDocument.language_verified.isnot(True)
             ),
         )
     )

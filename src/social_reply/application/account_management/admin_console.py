@@ -2227,16 +2227,15 @@ def _knowledge_actions(doc: models.KnowledgeDocument, csrf: str) -> str:
 
 
 def _require_knowledge_corpus_mutation_allowed() -> None:
-    settings = get_settings()
-    if (
-        settings.multilingual_knowledge_reply_enabled
-        or settings.multilingual_knowledge_shadow_enabled
-    ):
-        raise HTTPException(status_code=409, detail="knowledge_corpus_pinned_for_multilingual_mode")
+    # Runtime provenance is checked at decision/send time; do not freeze knowledge maintenance.
+    return None
 
 
 async def _require_knowledge_publishable(session, doc: models.KnowledgeDocument) -> None:
-    if get_settings().english_knowledge_only_enabled and not (
+    settings = get_settings()
+    if (
+        settings.multilingual_knowledge_reply_enabled or settings.english_knowledge_only_enabled
+    ) and not (
         doc.source_language == "en" and doc.language_verified
     ):
         raise HTTPException(status_code=409, detail="confirm_english_before_publish")

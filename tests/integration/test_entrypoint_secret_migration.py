@@ -35,9 +35,7 @@ def test_release_requires_app_and_state_service_colocation():
     assert "scripts/railway_active_region.py" in script
     assert "scripts/validate_railway_config.py" in script
     assert script.count("validate_railway_config") == 4
-    assert "multilingual_live_enabled: false" in script
-    assert "multilingual_shadow_enabled: false" in script
-    assert "english_knowledge_only_enabled: false" in script
+    assert "capture_experimental_multilingual_gate" not in script
     assert "railway-compat-pre-${short_sha}" in script
     assert "deploy/Dockerfile.migration-compatible-rollback" in script
     assert "scripts/verify_migration_compatible_rollback.sh" in script

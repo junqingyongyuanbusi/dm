@@ -43,6 +43,10 @@ class LLMClient(Protocol):
         target_language: str,
     ) -> bool: ...
 
+    async def translate_to_english(self, text: str) -> str | None:
+        """查询翻译回退用：把客户查询译成英语。不可用/失败返回 None（fail-closed）。"""
+        ...
+
 
 class StubLLMClient:
     grounding_verifier_id = "grounding-v1:stub"
@@ -69,3 +73,7 @@ class StubLLMClient:
         target_language: str,
     ) -> bool:
         return True
+
+    async def translate_to_english(self, text: str) -> str | None:
+        # Stub 不提供翻译：回退路径静默关闭，不影响主路径。
+        return None

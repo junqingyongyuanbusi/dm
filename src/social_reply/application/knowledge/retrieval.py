@@ -49,6 +49,10 @@ def normalize_question(value: str) -> str:
     return " ".join(value.casefold().strip().split())
 
 
+def canonical_answer_identity(reply: str, is_official_contact: bool) -> tuple[str, bool]:
+    """Stable identity for one approved answer inside a scoped knowledge set."""
+    return (" ".join(reply.casefold().split()), is_official_contact)
+
 async def retrieve_exact_knowledge_result(
     session: AsyncSession,
     question: str,
@@ -123,7 +127,9 @@ async def retrieve_exact_knowledge_result(
     )
     if not hits:
         return KnowledgeRetrievalResult()
-    evidence = {(hit.reply.strip(), hit.is_official_contact) for hit in hits}
+    evidence = {
+        canonical_answer_identity(hit.reply, hit.is_official_contact) for hit in hits
+    }
     if len(evidence) > 1:
         return KnowledgeRetrievalResult(
             hits=hits,

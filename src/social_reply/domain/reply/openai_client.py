@@ -365,5 +365,42 @@ class OpenAILLMClient:
             logger.exception("LLM grounding verification failed; rejecting candidate reply")
             return False
 
+    async def translate_to_english(self, text: str) -> str | None:
+        """查询翻译回退：把客户查询译成英语，仅用于检索召回。
+
+        译文永远不直接面向客户（官方回复只来自英语原文+生成路径）。
+        任何网络/解析/refusal 失败都返回 None，调用方按无回退继续。
+        """
+        payload = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate the user message into concise English for knowledge base "
+                        "retrieval. Output only the translation, nothing else. Preserve tokens "
+                        "like __QTP_0__ unchanged, and keep product names, numbers, and "
+                        "identifiers verbatim."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        }
+        try:
+            response = await self._client.post(
+                "/chat/completions",
+                json=payload,
+                timeout=self._grounding_timeout,
+            )
+            response.raise_for_status()
+            message = response.json()["choices"][0]["message"]
+            if message.get("refusal"):
+                return None
+            content = (message.get("content") or "").strip()
+            return content or None
+        except Exception:
+            logger.exception("query translation request failed; fallback disabled")
+            return None
+
     async def aclose(self) -> None:
         await self._client.aclose()

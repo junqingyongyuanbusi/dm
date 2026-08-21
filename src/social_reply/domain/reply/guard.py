@@ -54,19 +54,25 @@ _TIME_UNIT_PATTERNS = (
     (
         "day",
         re.compile(
-            r"(?i)business\s+days?|days?|工作日|天|jours?|días?|dias?|営業日|일|วัน|дн(?:я|ей)?|أيام?"
+            r"(?i)business\s+days?|days?|工作日|天|jours?|días?|dias?|営業日|일|วัน|дн(?:я|ей)?|أيام?|दिन|दिवस|hari|දින|ວັນ|ថ្ងៃ|ရက်"
         ),
     ),
     (
         "hour",
-        re.compile(r"(?i)hours?|小时|小時|heures?|horas?|時間|시간|ชั่วโมง|час(?:а|ов)?|ساعات?"),
+        re.compile(r"(?i)hours?|小时|小時|heures?|horas?|時間|시간|ชั่วโมง|час(?:а|ов)?|ساعات?|घंटे|jam|පැය|ຊົ່ວໂມງ|နာရီ")
     ),
     (
         "week",
-        re.compile(r"(?i)weeks?|周|週|semaines?|semanas?|週間|주|สัปดาห์|недел(?:я|и|ь)|أسابيع?"),
+        re.compile(r"(?i)weeks?|周|週|semaines?|semanas?|週間|주|สัปดาห์|недел(?:я|и|ь)|أسابيع?|सप्ताह|minggu|සතිය|ອາທິດ|အပတ်")
     ),
-    ("month", re.compile(r"(?i)months?|月|mois|meses?|か月|개월|เดือน|месяц(?:а|ев)?|أشهر?")),
-    ("year", re.compile(r"(?i)years?|年|ans?|años?|anos?|年間|년|ปี|лет|سنوات?")),
+    (
+        "month",
+        re.compile(r"(?i)months?|月|mois|meses?|か月|개월|เดือน|месяц(?:а|ев)?|أشهر?|महीने|bulan|මාස|ເດືອນ|လ"),
+    ),
+    (
+        "year",
+        re.compile(r"(?i)years?|年|ans?|años?|anos?|年間|년|ปี|лет|سنوات?|वर्ष|tahun|වසර|ປີ|နှစ်"),
+    ),
 )
 _CURRENCY_PATTERNS = (
     ("USD", re.compile(r"(?i)USD|US\$|美元|dollars?|dólares?")),

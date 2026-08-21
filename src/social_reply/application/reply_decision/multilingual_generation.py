@@ -1,3 +1,9 @@
+"""多语言运行时生成路径（live 模式的非英语默认路径）。
+
+英语知识库是唯一事实源：命中发布后，把英语 question/approved_answer 作为证据交给
+LLM，由 contract 强制 target_language 输出；管线内置语言守卫与 grounding verifier。
+"""
+
 import json
 import logging
 from dataclasses import replace
@@ -10,7 +16,7 @@ from social_reply.domain.reply.voice import VoicePreferences
 
 logger = logging.getLogger(__name__)
 
-EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION = "multilingual-experimental-runtime-v1"
+MULTILINGUAL_GENERATION_CONTRACT_VERSION = "multilingual-runtime-generation-v1"
 
 
 def _knowledge_evidence(hit: KnowledgeHit) -> str:
@@ -21,7 +27,7 @@ def _knowledge_evidence(hit: KnowledgeHit) -> str:
     )
 
 
-async def generate_experimental_multilingual_reply(
+async def generate_multilingual_reply(
     snapshot: DecisionSnapshot,
     *,
     selected: KnowledgeHit,
@@ -31,13 +37,9 @@ async def generate_experimental_multilingual_reply(
     llm: LLMClient,
     voice_preferences: VoicePreferences,
     email_auto_reply_allowed: bool,
+    fallback_reason_codes: tuple[str, ...] = (),
 ) -> ReplyDecision:
-    """Generate a guarded same-language reply for an explicitly allowlisted test account.
-
-    This path intentionally uses the existing published corpus even when it has not completed the
-    verified-English review lifecycle. It is test-only provenance, never proof of a reviewed
-    localization artifact.
-    """
+    """Generate a guarded same-language reply from the canonical English knowledge hit."""
     try:
         decision = await run_decision_pipeline(
             snapshot,
@@ -53,20 +55,27 @@ async def generate_experimental_multilingual_reply(
             email_auto_reply_allowed=email_auto_reply_allowed,
         )
     except Exception:
-        logger.exception("experimental multilingual generation failed; forcing handoff")
-        decision = ReplyDecision(
+        logger.exception("multilingual generation failed; forcing handoff")
+        return ReplyDecision(
             action=ReplyAction.HANDOFF,
-            reason_codes=("EXPERIMENTAL_LLM_FAILED",),
+            reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
             source="rule",
+            resolved_locale=target_language,
+            multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION,
         )
-    reason_codes = (
-        ("EXPERIMENTAL_UNVERIFIED_CORPUS", *decision.reason_codes)
-        if decision.action is ReplyAction.HANDOFF
-        else (*decision.reason_codes, "EXPERIMENTAL_UNVERIFIED_CORPUS")
-    )
+    if decision.action is ReplyAction.HANDOFF:
+        return replace(
+            decision,
+            resolved_locale=target_language,
+            multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+        )
     return replace(
         decision,
         resolved_locale=target_language,
-        multilingual_contract_version=EXPERIMENTAL_MULTILINGUAL_CONTRACT_VERSION,
-        reason_codes=reason_codes,
+        multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+        reason_codes=(
+            *decision.reason_codes,
+            *fallback_reason_codes,
+            "MULTILINGUAL_RUNTIME_GENERATION",
+        ),
     )

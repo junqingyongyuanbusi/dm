@@ -116,8 +116,15 @@ class LanguageDetection:
 
     @property
     def is_known(self) -> bool:
+        """A tag is known only after detect_language has applied its path-specific gate."""
         return self.tag != UNKNOWN_LANGUAGE
-
+    @property
+    def is_reliable(self) -> bool:
+        return (
+            self.is_known
+            and self.confidence >= _MIN_CONFIDENCE
+            and self.margin >= _MIN_MARGIN
+        )
 
 @cache
 def _detector(languages: tuple[Language, ...]) -> LanguageDetector:
@@ -150,10 +157,26 @@ def _script_of_letter(char: str) -> str:
         return "gurmukhi"
     if 0x0A80 <= value <= 0x0AFF:
         return "gujarati"
+    if 0x0B00 <= value <= 0x0B7F:
+        return "odia"
     if 0x0B80 <= value <= 0x0BFF:
         return "tamil"
     if 0x0C00 <= value <= 0x0C7F:
         return "telugu"
+    if 0x0C80 <= value <= 0x0CFF:
+        return "kannada"
+    if 0x0D00 <= value <= 0x0D7F:
+        return "malayalam"
+    if 0x0D80 <= value <= 0x0DFF:
+        return "sinhala"
+    if 0x0E80 <= value <= 0x0EFF:
+        return "lao"
+    if 0x1000 <= value <= 0x109F:
+        return "myanmar"
+    if 0x1200 <= value <= 0x137F:
+        return "ethiopic"
+    if 0x1780 <= value <= 0x17FF:
+        return "khmer"
     if 0x0530 <= value <= 0x058F:
         return "armenian"
     if 0x10A0 <= value <= 0x10FF:
@@ -282,11 +305,21 @@ def detect_language(text: str | None, *, source: str = "current_message") -> Lan
         ):
             return LanguageDetection(tag=UNKNOWN_LANGUAGE, source="unknown")
         return LanguageDetection(tag="he", confidence=1.0, margin=1.0, source=source)
+    if dominant_script == "ethiopic":
+        # Amharic and Tigrinya share this script; fail closed without a language classifier.
+        return LanguageDetection(tag=UNKNOWN_LANGUAGE, source="script_ambiguous")
     direct_script_languages = {
         "gurmukhi": "pa",
         "gujarati": "gu",
+        "odia": "or",
         "tamil": "ta",
         "telugu": "te",
+        "kannada": "kn",
+        "malayalam": "ml",
+        "sinhala": "si",
+        "lao": "lo",
+        "myanmar": "my",
+        "khmer": "km",
         "armenian": "hy",
         "georgian": "ka",
     }
@@ -321,7 +354,7 @@ def detect_customer_language(
     history: tuple[tuple[str, str], ...] = (),
 ) -> LanguageDetection:
     current = detect_language(text)
-    if current.is_known and current.tag != "zh":
+    if current.is_reliable and current.tag != "zh":
         return current
 
     recent_user_messages = [
@@ -329,7 +362,7 @@ def detect_customer_language(
     ][-3:]
     for message in reversed(recent_user_messages):
         detected = detect_language(message, source="recent_user_history")
-        if not detected.is_known:
+        if not detected.is_reliable:
             continue
         if current.tag == "zh" and detected.tag not in {"zh-Hans", "zh-Hant"}:
             continue
@@ -352,8 +385,9 @@ def languages_match(expected: str, observed: str) -> bool:
 
 
 def reply_language_matches(expected: str, text: str) -> tuple[bool, str]:
-    observed = detect_language(text).tag
-    if not languages_match(expected, observed):
+    observed_detection = detect_language(text)
+    observed = observed_detection.tag
+    if not observed_detection.is_reliable or not languages_match(expected, observed):
         return False, observed
 
     sentence_safe = _strip_language_neutral_tokens(text)
@@ -364,8 +398,9 @@ def reply_language_matches(expected: str, text: str) -> tuple[bool, str]:
         letter_count = sum(unicodedata.category(char).startswith("L") for char in cleaned_fragment)
         if letter_count < _MIN_LETTERS:
             continue
-        fragment_language = detect_language(cleaned_fragment).tag
-        if fragment_language == UNKNOWN_LANGUAGE:
+        fragment_detection = detect_language(cleaned_fragment)
+        fragment_language = fragment_detection.tag
+        if not fragment_detection.is_reliable or fragment_language == UNKNOWN_LANGUAGE:
             return False, observed
         if not languages_match(expected, fragment_language):
             return False, observed
@@ -392,6 +427,20 @@ def reply_language_matches(expected: str, text: str) -> tuple[bool, str]:
         "mr": {"devanagari", "latin"},
         "bn": {"bengali", "latin"},
         "he": {"hebrew", "latin"},
+        "pa": {"gurmukhi", "latin"},
+        "gu": {"gujarati", "latin"},
+        "ta": {"tamil", "latin"},
+        "te": {"telugu", "latin"},
+        "kn": {"kannada", "latin"},
+        "ml": {"malayalam", "latin"},
+        "or": {"odia", "latin"},
+        "si": {"sinhala", "latin"},
+        "lo": {"lao", "latin"},
+        "my": {"myanmar", "latin"},
+        "am": {"ethiopic", "latin"},
+        "km": {"khmer", "latin"},
+        "hy": {"armenian", "latin"},
+        "ka": {"georgian", "latin"}
     }.get(primary, {"latin"})
     disallowed = sum(count for script, count in scripts.items() if script not in allowed_scripts)
     if disallowed / total > 0.1:
@@ -406,7 +455,7 @@ def reply_language_matches(expected: str, text: str) -> tuple[bool, str]:
 
 def assess_knowledge_language(question: str, reply: str) -> tuple[str, str]:
     detections = (detect_language(question), detect_language(reply))
-    known_tags = [detection.tag for detection in detections if detection.is_known]
+    known_tags = [detection.tag for detection in detections if detection.is_reliable]
     primary_languages = {tag.split("-", 1)[0] for tag in known_tags}
     if not known_tags:
         return UNKNOWN_LANGUAGE, "unknown"

@@ -10,6 +10,7 @@ from social_reply.application.knowledge.retrieval import (
     KnowledgeHit,
     KnowledgeRetrievalResult,
     retrieve_exact_knowledge,
+    retrieve_exact_knowledge_result,
     retrieve_knowledge,
 )
 from social_reply.application.reply_decision import runner
@@ -71,6 +72,20 @@ async def test_短模板忽略大小写和空白精确命中(session):
     assert hit is not None
     assert hit.reply == "True"
     assert hit.similarity == 1.0
+
+
+async def test_exact_duplicate_answer_variants_are_one_approved_answer(session):
+    await _seed_chunk(session, "refund timing", reply="Refunds take 3 to 5 business days.")
+    await _seed_chunk(session, "refund timing", reply=" refunds take 3 to 5 business days. ")
+
+    result = await retrieve_exact_knowledge_result(
+        session, "refund timing", tenant_id="default", brand_id="b1", platform="telegram"
+    )
+
+    assert result.exact_match is True
+    assert result.exact_ambiguous is False
+    assert result.hits
+
 
 
 async def test_精确匹配排除草稿并传播官方联系方式标记(session):
@@ -302,7 +317,6 @@ async def test_embedding_provider_failure_reaches_handoff_through_real_fetch(
     session, knowledge_enabled
 ):
     knowledge_enabled.setenv("REQUIRE_KNOWLEDGE", "false")
-    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED", "true")
     get_settings.cache_clear()
 
     class FailingEmbedder:
@@ -582,8 +596,6 @@ async def test_multilingual_strong_match_generates_same_language_and_persists_ev
 ):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
-    knowledge_enabled.setenv("MULTILINGUAL_LIVE_LOCALES", "zh-Hans")
-    knowledge_enabled.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-zh-v1")
     get_settings.cache_clear()
     runner._llm = _FaithfulChineseLLM()
     result = _multilingual_result()
@@ -598,14 +610,15 @@ async def test_multilingual_strong_match_generates_same_language_and_persists_ev
     outbox_id = await runner.run_and_persist_decision(
         _snapshot(account_id, text), conv_id, msg_id, account_id
     )
-    assert outbox_id is None
+    assert outbox_id is not None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "handoff"
+    assert decision.action == "auto_reply"
     assert decision.request_language in {"zh", "zh-Hans"}
+    assert decision.reply_language == "zh-Hans"
     assert decision.knowledge_content_hash == "a" * 64
     assert decision.knowledge_match_status == "strong"
-    assert "NO_APPROVED_LOCALIZATION" in decision.reason_codes
-    assert "multilingual-v2-reviewed-localization" in decision.prompt_version
+    assert decision.multilingual_contract_version == "multilingual-runtime-generation-v1"
+    assert decision.grounding_verified is True
 
 
 @pytest.mark.parametrize(
@@ -624,8 +637,6 @@ async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
 ):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
-    knowledge_enabled.setenv("MULTILINGUAL_LIVE_LOCALES", "zh-Hans")
-    knowledge_enabled.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-zh-v1")
     get_settings.cache_clear()
 
     class NeverLLM:
@@ -652,8 +663,6 @@ async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
 async def test_multilingual_wrong_language_is_blocked_before_outbox(session, knowledge_enabled):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
-    knowledge_enabled.setenv("MULTILINGUAL_LIVE_LOCALES", "zh-Hans")
-    knowledge_enabled.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-zh-v1")
     get_settings.cache_clear()
 
     class WrongLanguageLLM:
@@ -686,41 +695,4 @@ async def test_multilingual_wrong_language_is_blocked_before_outbox(session, kno
     assert llm.verifier_called is False
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "handoff"
-    assert "NO_APPROVED_LOCALIZATION" in decision.reason_codes
-
-
-async def test_shadow_persists_separate_evidence_without_changing_legacy_decision(
-    session, knowledge_enabled
-):
-    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_SHADOW_ENABLED", "true")
-    get_settings.cache_clear()
-
-    class LegacyLLM:
-        async def decide(self, context):
-            return ReplyDecision(
-                action=ReplyAction.AUTO_REPLY,
-                reply_text="旧路径回复。",
-                confidence=0.99,
-            )
-
-    runner._llm = LegacyLLM()
-    calls = []
-
-    async def fake_fetch(snapshot, **kwargs):
-        calls.append(kwargs["verified_english_only"])
-        return _multilingual_result()
-
-    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
-    text = "请问一般需要多久？"
-    account_id, conv_id, msg_id = await _seed_conversation(session, text)
-    outbox_id = await runner.run_and_persist_decision(
-        _snapshot(account_id, text), conv_id, msg_id, account_id
-    )
-    assert outbox_id is not None
-    assert calls == [False, True]
-    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "auto_reply"
-    assert decision.reply_text == "旧路径回复。"
-    assert decision.multilingual_shadow is True
-    assert decision.multilingual_shadow_evidence["match_status"] == "strong"
-    assert decision.knowledge_content_hash is None
+    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes

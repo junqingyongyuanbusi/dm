@@ -1206,6 +1206,8 @@ class ReplyDecision(Base):
     knowledge_localization_text_hash: Mapped[str | None] = mapped_column(String(64))
     knowledge_localization_source_hash: Mapped[str | None] = mapped_column(String(64))
     knowledge_content_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    knowledge_chunk_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     knowledge_similarity: Mapped[float | None] = mapped_column(Float)
     knowledge_similarity_margin: Mapped[float | None] = mapped_column(Float)
     multilingual_shadow: Mapped[bool] = mapped_column(

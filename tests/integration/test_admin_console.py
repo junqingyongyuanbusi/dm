@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import insert, select, update
 
 from apps.api.main import create_app
@@ -2706,6 +2707,35 @@ async def test_knowledge_import_batch_confirmation_and_english_publish_gate(
     assert len(audits) == 1
     assert audits[0].detail["import_batch_id"] == str(first_batch)
     assert audits[0].detail["confirmation_batch_id"]
+
+
+async def test_runtime_mode_rejects_unverified_non_english_publish(
+    session, migrated_db, monkeypatch
+):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "multilingual_knowledge_reply_enabled": True,
+            "english_knowledge_only_enabled": False,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    doc = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="退款政策",
+        reply="中文答案",
+        status="draft",
+        source_language="zh",
+        language_verified=False,
+    )
+    session.add(doc)
+    await session.commit()
+
+    with pytest.raises(HTTPException, match="confirm_english_before_publish"):
+        await admin_console._require_knowledge_publishable(session, doc)
+
 
 
 async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
