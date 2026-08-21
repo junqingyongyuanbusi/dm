@@ -196,6 +196,21 @@ async def apply_review(path: Path, *, actor: str) -> None:
                     )
                 if detection_status == "unknown" and len(reason) < 10:
                     raise ValueError(f"{document_id} unknown language requires review_reason")
+                settings = get_settings()
+                current_embedding = await session.scalar(
+                    select(models.KnowledgeChunk.id)
+                    .where(
+                        models.KnowledgeChunk.tenant_id == doc.tenant_id,
+                        models.KnowledgeChunk.document_id == doc.id,
+                        models.KnowledgeChunk.embedding_version == settings.openai_embedding_model,
+                        models.KnowledgeChunk.embedding.is_not(None),
+                    )
+                    .with_for_update()
+                )
+                if current_embedding is None:
+                    raise ValueError(
+                        f"{document_id} cannot confirm English without current embedding"
+                    )
                 doc.source_language = "en"
                 doc.language_verified = True
                 doc.status = "published"
