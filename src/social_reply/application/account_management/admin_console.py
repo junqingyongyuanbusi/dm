@@ -6,6 +6,7 @@
 import json
 import logging
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import NoReturn
@@ -2239,6 +2240,8 @@ async def _require_knowledge_publishable(session, doc: models.KnowledgeDocument)
         doc.source_language == "en" and doc.language_verified
     ):
         raise HTTPException(status_code=409, detail="confirm_english_before_publish")
+    if doc.is_official_contact or has_contact_like(doc.reply or ""):
+        raise HTTPException(status_code=409, detail="official_contact_requires_review")
     if (
         settings.multilingual_knowledge_reply_enabled or settings.english_knowledge_only_enabled
     ):
@@ -2248,6 +2251,7 @@ async def _require_knowledge_publishable(session, doc: models.KnowledgeDocument)
                 models.KnowledgeChunk.tenant_id == doc.tenant_id,
                 models.KnowledgeChunk.document_id == doc.id,
                 models.KnowledgeChunk.embedding_version == settings.openai_embedding_model,
+                models.KnowledgeChunk.embedding.is_not(None),
             )
             .limit(1)
         )
@@ -2351,7 +2355,12 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
         banner = f'<div class="banner ok">批量英语确认完成：已确认 {count} 条草稿并记录审计。</div>'
     elif notice == "bulk_published":
         count = _query_int(request, "count")
-        banner = f'<div class="banner ok">批量发布完成：已发布 {count} 条草稿并记录审计。</div>'
+        skipped = _query_int(request, "skipped")
+        reasons = html.escape((request.query_params.get("skip_reasons") or "").strip())
+        banner = (
+            f'<div class="banner ok">批量发布完成：已发布 {count} 条，跳过 {skipped} 条。'
+            f"跳过原因：{reasons or '无'}。</div>"
+        )
     elif notice in _KB_BANNERS:
         tone, text = _KB_BANNERS[notice]
         banner = f'<div class="banner {tone}">{text}</div>'
@@ -2678,6 +2687,7 @@ async def knowledge_bulk_publish(request: Request) -> Response:
     tenant_id = tenant_id_or_default(principal, requested_tenant)
     async with get_session_factory()() as session:
         published_count = 0
+        skipped_reasons: Counter[str] = Counter()
         last_id: uuid.UUID | None = None
         while True:
             candidate_query = (
@@ -2699,11 +2709,13 @@ async def knowledge_bulk_publish(request: Request) -> Response:
             last_id = candidates[-1].id
             for doc in candidates:
                 if has_contact_like(doc.reply or ""):
+                    skipped_reasons["official_contact_requires_review"] += 1
                     continue
                 try:
                     await _require_knowledge_publishable(session, doc)
                 except HTTPException as exc:
                     if exc.status_code == 409:
+                        skipped_reasons[str(exc.detail or "publish_rejected")] += 1
                         continue
                     raise
                 doc.status = "published"
@@ -2727,8 +2739,17 @@ async def knowledge_bulk_publish(request: Request) -> Response:
                 )
                 published_count += 1
             await session.commit()
+    skipped_count = sum(skipped_reasons.values())
+    query = urlencode(
+        {
+            "notice": "bulk_published",
+            "count": published_count,
+            "skipped": skipped_count,
+            "skip_reasons": json.dumps(dict(skipped_reasons), ensure_ascii=False, sort_keys=True),
+        }
+    )
     return RedirectResponse(
-        f"/admin/knowledge?notice=bulk_published&count={published_count}",
+        f"/admin/knowledge?{query}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 

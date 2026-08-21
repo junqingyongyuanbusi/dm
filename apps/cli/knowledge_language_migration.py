@@ -178,8 +178,8 @@ async def apply_review(path: Path, *, actor: str) -> None:
             row_fingerprint = _review_fingerprint_from_row(row)
             if not reviewed_fingerprint or row_fingerprint != reviewed_fingerprint:
                 raise ValueError(f"review row content does not match fingerprint: {document_id}")
-            applied_fingerprint = _review_fingerprint(doc)
-            if not reviewed_fingerprint or reviewed_fingerprint != applied_fingerprint:
+            before_fingerprint = _review_fingerprint(doc)
+            if not reviewed_fingerprint or reviewed_fingerprint != before_fingerprint:
                 raise ValueError(
                     f"knowledge document changed after review: {document_id}; re-run inventory"
                 )
@@ -196,24 +196,8 @@ async def apply_review(path: Path, *, actor: str) -> None:
                     )
                 if detection_status == "unknown" and len(reason) < 10:
                     raise ValueError(f"{document_id} unknown language requires review_reason")
-                settings = get_settings()
-                current_embedding = await session.scalar(
-                    select(models.KnowledgeChunk.id)
-                    .where(
-                        models.KnowledgeChunk.tenant_id == doc.tenant_id,
-                        models.KnowledgeChunk.document_id == doc.id,
-                        models.KnowledgeChunk.embedding_version == settings.openai_embedding_model,
-                        models.KnowledgeChunk.embedding.is_not(None),
-                    )
-                    .with_for_update()
-                )
-                if current_embedding is None:
-                    raise ValueError(
-                        f"{document_id} cannot confirm English without current embedding"
-                    )
                 doc.source_language = "en"
                 doc.language_verified = True
-                doc.status = "published"
                 counts["confirmed"] += 1
                 action = "CONFIRM_KNOWLEDGE_ENGLISH_MIGRATION"
             elif decision == "unpublish":
@@ -265,6 +249,7 @@ async def apply_review(path: Path, *, actor: str) -> None:
                 action = "UNPUBLISH_NON_ENGLISH_KNOWLEDGE_MIGRATION"
             else:
                 raise ValueError(f"unsupported decision for {document_id}: {decision}")
+            after_fingerprint = _review_fingerprint(doc)
             session.add(
                 models.AuditLog(
                     tenant_id=doc.tenant_id,
@@ -276,7 +261,8 @@ async def apply_review(path: Path, *, actor: str) -> None:
                     detail={
                         "confirmation_batch_id": confirmation_batch_id,
                         "reviewed_fingerprint": reviewed_fingerprint,
-                        "applied_fingerprint": applied_fingerprint,
+                        "previous_fingerprint": before_fingerprint,
+                        "applied_fingerprint": after_fingerprint,
                         "detected_language": detected_language,
                         "detection_status": detection_status,
                         "review_reason": reason,

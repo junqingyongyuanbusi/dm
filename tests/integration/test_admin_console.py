@@ -2794,6 +2794,13 @@ async def test_runtime_publish_requires_current_embedding(session, migrated_db, 
     with pytest.raises(HTTPException, match="knowledge_embedding_not_ready"):
         await admin_console._require_knowledge_publishable(session, doc)
 
+    class NoEmbeddingSession:
+        async def scalar(self, statement):
+            return None
+
+    with pytest.raises(HTTPException, match="knowledge_embedding_not_ready"):
+        await admin_console._require_knowledge_publishable(NoEmbeddingSession(), doc)
+
     session.add(
         models.KnowledgeChunk(
             tenant_id="default",
@@ -2811,6 +2818,45 @@ async def test_runtime_publish_requires_current_embedding(session, migrated_db, 
     await session.flush()
     await admin_console._require_knowledge_publishable(session, doc)
 
+
+
+async def test_single_publish_rejects_contact_like_reply(session, migrated_db, monkeypatch):
+    from social_reply.application.account_management import admin_console
+
+    settings = admin_console.get_settings().model_copy(
+        update={
+            "multilingual_knowledge_reply_enabled": True,
+            "english_knowledge_only_enabled": False,
+        }
+    )
+    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    doc = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="Where can I contact support?",
+        reply="Email support@example.com for help.",
+        status="draft",
+        source_language="en",
+        language_verified=True,
+        is_official_contact=False,
+    )
+    session.add(doc)
+    await session.flush()
+    session.add(
+        models.KnowledgeChunk(
+            tenant_id="default",
+            document_id=doc.id,
+            content="support contact",
+            embed_text=doc.question,
+            content_hash="p" * 64,
+            embedding_version=settings.openai_embedding_model,
+            embedding=[0.0] * 1536,
+        )
+    )
+    await session.flush()
+
+    with pytest.raises(HTTPException, match="official_contact_requires_review"):
+        await admin_console._require_knowledge_publishable(session, doc)
 
 async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
     doc = models.KnowledgeDocument(
