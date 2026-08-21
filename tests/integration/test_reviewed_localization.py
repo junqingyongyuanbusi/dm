@@ -639,6 +639,29 @@ async def test_allowlisted_experimental_account_sends_same_language(
     assert _SENT_TEXTS == [reply]
 
 
+async def test_experimental_accepts_english_answer_when_question_lid_is_unknown(
+    session, experimental_runtime
+):
+    question = "How can I check a broker’s license on WikiFX?"
+    answer = "Open the broker profile on WikiFX and review the Regulatory Information section."
+    query = "WikiFXでブローカーのライセンスを確認するにはどうすればいいですか？"
+    reply = "WikiFXでブローカーのプロフィールを開き、規制情報セクションを確認してください。"
+    await _seed_english_policy(session, question=question, reply=answer)
+    account_id, conversation_id, message_id = await _seed_conversation(session, text=query)
+    experimental_runtime(account_id, _ExperimentalLLM({"ja": reply}))
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, query), conversation_id, message_id, account_id
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.request_language == "ja"
+    assert decision.reply_language == "ja"
+    assert "EXPERIMENTAL_KNOWLEDGE_NOT_ENGLISH" not in decision.reason_codes
+
+
 async def test_non_allowlisted_account_keeps_legacy_verbatim(session, experimental_runtime):
     await _seed_english_policy(session)
     account_id, conversation_id, message_id = await _seed_conversation(session, text=_JA_QUERY)

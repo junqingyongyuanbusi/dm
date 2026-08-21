@@ -500,9 +500,10 @@ async def run_and_persist_decision(
                 source_language, source_status = assess_knowledge_language(
                     selected.question, selected.reply
                 )
-                experimental_source_is_english = (
-                    source_language == "en" and source_status == "english"
-                )
+                experimental_source_is_english = source_language == "en" and source_status in {
+                    "english",
+                    "unknown",
+                }
             is_english_request = language.tag.split("-", 1)[0].casefold() == "en"
             approved_localization = None
             localization_error = False
