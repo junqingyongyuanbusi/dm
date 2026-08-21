@@ -20,6 +20,7 @@ from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.connectors import registry
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.language import detect_language
 from social_reply.infrastructure.database import models
 from social_reply.shared.config import get_settings
 
@@ -646,6 +647,8 @@ async def test_experimental_accepts_english_answer_when_question_lid_is_unknown(
     answer = "Open the broker profile on WikiFX and review the Regulatory Information section."
     query = "WikiFXでブローカーのライセンスを確認するにはどうすればいいですか？"
     reply = "WikiFXでブローカーのプロフィールを開き、規制情報セクションを確認してください。"
+    assert detect_language(question).tag == "und"
+    assert detect_language(answer).tag == "en"
     await _seed_english_policy(session, question=question, reply=answer)
     account_id, conversation_id, message_id = await _seed_conversation(session, text=query)
     experimental_runtime(account_id, _ExperimentalLLM({"ja": reply}))
@@ -772,6 +775,7 @@ async def test_experimental_disable_before_send_cancels_and_handoffs(
         ("official_contact", "MULTILINGUAL_OFFICIAL_CONTACT_REVIEW"),
         ("provider_failure", "KNOWLEDGE_RETRIEVAL_FAILED"),
         ("non_english_source", "EXPERIMENTAL_KNOWLEDGE_NOT_ENGLISH"),
+        ("unknown_reply", "EXPERIMENTAL_KNOWLEDGE_NOT_ENGLISH"),
     ],
 )
 async def test_experimental_fail_closed_boundaries(
@@ -785,6 +789,17 @@ async def test_experimental_fail_closed_boundaries(
             session,
             question="退款需要多长时间？",
             reply="退款通常需要3到5个工作日。",
+        )
+        query = _JA_QUERY
+    elif case == "unknown_reply":
+        source_question = "How can I check a broker license?"
+        source_reply = "N/A"
+        assert detect_language(source_question).tag == "en"
+        assert detect_language(source_reply).tag == "und"
+        await _seed_english_policy(
+            session,
+            question=source_question,
+            reply=source_reply,
         )
         query = _JA_QUERY
     else:

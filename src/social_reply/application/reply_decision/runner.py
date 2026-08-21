@@ -33,7 +33,7 @@ from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbe
 from social_reply.domain.platform_accounts import LEGACY_ACTIVE_ACCOUNT_STATUSES
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.guard import redact_pii
-from social_reply.domain.reply.language import assess_knowledge_language, detect_customer_language
+from social_reply.domain.reply.language import detect_customer_language, detect_language
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 from social_reply.domain.reply.rules import apply_multilingual_rules, apply_rules
@@ -497,12 +497,11 @@ async def run_and_persist_decision(
             selected = assessment.selected
             experimental_source_is_english = True
             if experimental_multilingual and selected is not None:
-                source_language, source_status = assess_knowledge_language(
-                    selected.question, selected.reply
-                )
-                experimental_source_is_english = source_language == "en" and source_status in {
-                    "english",
-                    "unknown",
+                question_language = detect_language(selected.question).tag
+                reply_language = detect_language(selected.reply).tag
+                experimental_source_is_english = reply_language == "en" and question_language in {
+                    "en",
+                    "und",
                 }
             is_english_request = language.tag.split("-", 1)[0].casefold() == "en"
             approved_localization = None
