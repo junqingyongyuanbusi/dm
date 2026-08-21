@@ -201,45 +201,51 @@ async def apply_review(path: Path, *, actor: str) -> None:
                 action = "CONFIRM_KNOWLEDGE_ENGLISH_MIGRATION"
             elif decision == "unpublish":
                 replacement_value = (row.get("replacement_id") or "").strip()
-                try:
-                    replacement_id = uuid.UUID(replacement_value)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"{document_id} unpublish requires a valid replacement_id"
-                    ) from exc
-                if replacement_id == document_id:
-                    raise ValueError(f"{document_id} cannot replace itself")
-                replacement = (
-                    await session.execute(
-                        select(models.KnowledgeDocument)
-                        .where(models.KnowledgeDocument.id == replacement_id)
-                        .with_for_update()
+                reason = (row.get("review_reason") or "").strip()
+                if not replacement_value:
+                    if len(reason) < 10:
+                        raise ValueError(
+                            f"{document_id} unpublish without replacement requires review_reason"
+                        )
+                else:
+                    try:
+                        replacement_id = uuid.UUID(replacement_value)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{document_id} unpublish requires a valid replacement_id"
+                        ) from exc
+                    if replacement_id == document_id:
+                        raise ValueError(f"{document_id} cannot replace itself")
+                    replacement = (
+                        await session.execute(
+                            select(models.KnowledgeDocument)
+                            .where(models.KnowledgeDocument.id == replacement_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if replacement is None:
+                        raise ValueError(f"replacement not found: {replacement_id}")
+                    platform_covered = (
+                        replacement.platform is None
+                        if doc.platform is None
+                        else replacement.platform in {None, doc.platform}
                     )
-                ).scalar_one_or_none()
-                if replacement is None:
-                    raise ValueError(f"replacement not found: {replacement_id}")
-                platform_covered = (
-                    replacement.platform is None
-                    if doc.platform is None
-                    else replacement.platform in {None, doc.platform}
-                )
-                if (
-                    replacement.tenant_id != doc.tenant_id
-                    or replacement.brand_id != doc.brand_id
-                    or not platform_covered
-                    or replacement.status != "published"
-                    or replacement.source_language != "en"
-                    or not replacement.language_verified
-                ):
-                    raise ValueError(
-                        f"replacement {replacement_id} must be published verified English "
-                        "knowledge in the same tenant/brand/platform scope"
-                    )
+                    if (
+                        replacement.tenant_id != doc.tenant_id
+                        or replacement.brand_id != doc.brand_id
+                        or not platform_covered
+                        or replacement.status != "published"
+                        or replacement.source_language != "en"
+                        or not replacement.language_verified
+                    ):
+                        raise ValueError(
+                            f"replacement {replacement_id} must be published verified English "
+                            "knowledge in the same tenant/brand/platform scope"
+                        )
                 if doc.status == "published":
                     doc.status = "draft"
                 counts["unpublished"] += 1
                 action = "UNPUBLISH_NON_ENGLISH_KNOWLEDGE_MIGRATION"
-                reason = (row.get("review_reason") or "").strip()
             else:
                 raise ValueError(f"unsupported decision for {document_id}: {decision}")
             session.add(
