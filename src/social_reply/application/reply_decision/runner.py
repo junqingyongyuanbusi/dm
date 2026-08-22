@@ -365,6 +365,27 @@ async def _validate_decision_scope(
     return int(current.history_seq)
 
 
+def _answered_turns(history: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+    """只保留形成过问—答配对的轮次，供喂给模型的上下文使用。
+
+    未被回复的客户消息已经转人工，不属于机器人的上下文。把它们喂给模型会让模型
+    把当前消息的意图判成那条悬而未决的旧问题：实测同一会话里，历史含一条从未
+    被回答的牌照类问题时，当前的问候消息 handoff 4/4；只保留已应答的轮次后
+    auto_reply 4/4。
+
+    助手消息一律保留；客户消息只在紧随其后存在助手回复时保留。
+
+    注意这只过滤模型上下文，不过滤语言检测用的历史——未应答的客户消息仍然是
+    客户语种的有效证据，detect_customer_language 的历史回退依赖它们。
+    """
+    answered: list[tuple[str, str]] = []
+    for index, (role, text) in enumerate(history):
+        following = history[index + 1] if index + 1 < len(history) else None
+        if role == "assistant" or (following is not None and following[0] == "assistant"):
+            answered.append((role, text))
+    return tuple(answered)
+
+
 async def _fetch_history(
     conversation_id: uuid.UUID, cutoff_seq: int
 ) -> tuple[tuple[str, str], ...]:
@@ -513,6 +534,9 @@ async def run_and_persist_decision(
                 # 只在真的要判语种时才给 LLM：其余情况保持纯确定性、零额外调用。
                 llm=_get_llm_or_none() if language_should_detect else None,
             )
+            # 语言检测用完整历史（未应答的客户消息仍是语种证据），喂给模型的上下文
+            # 只留已应答的轮次——悬而未决的旧问题会把当前消息的意图带偏。
+            model_history = _answered_turns(history)
             is_english_request = (
                 language.is_reliable and language.tag.split("-", 1)[0].casefold() == "en"
             )
@@ -647,7 +671,7 @@ async def run_and_persist_decision(
                     snapshot,
                     selected=selected,
                     target_language=language.tag,
-                    history=history,
+                    history=model_history,
                     killswitch=killswitch,
                     llm=generation_llm,
                     voice_preferences=persona.preferences,
@@ -692,7 +716,7 @@ async def run_and_persist_decision(
                         language.tag if should_retrieve and language.is_reliable else "und"
                     ),
                     apply_legacy_rules=False,
-                    history=history,
+                    history=model_history,
                     email_auto_reply_allowed=(
                         snapshot.platform != "email"
                         or (settings.email_enabled and settings.email_auto_reply_enabled)
