@@ -4,7 +4,11 @@ from dataclasses import dataclass, replace
 
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
-from social_reply.domain.reply.guard import redact_pii, run_final_guard
+from social_reply.domain.reply.guard import (
+    LANGUAGE_VERIFICATION_STRICT,
+    redact_pii,
+    run_final_guard,
+)
 from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, LLMClient, LLMContext
 from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
 from social_reply.domain.reply.rules import apply_rules
@@ -49,6 +53,7 @@ async def run_decision_pipeline(
     history: tuple[tuple[str, str], ...] = (),
     voice_preferences: VoicePreferences | None = None,
     email_auto_reply_allowed: bool = True,
+    language_verification: str = LANGUAGE_VERIFICATION_STRICT,
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
@@ -213,6 +218,8 @@ async def run_decision_pipeline(
         approved_localization_protected_values=(
             approved_localization.protected_values if approved_localization else ()
         ),
+        customer_text=snapshot.text,
+        language_verification=language_verification,
     )
 
     if (

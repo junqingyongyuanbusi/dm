@@ -47,6 +47,14 @@ class LLMClient(Protocol):
         """查询翻译回退用：把客户查询译成英语。不可用/失败返回 None（fail-closed）。"""
         ...
 
+    async def detect_language_tag(self, text: str) -> str | None:
+        """语言兜底判定：确定性检测判不出语种时使用，返回 BCP-47 标签。
+
+        与 translate_to_english 同约定——能力不可用、调用失败、或返回值不是合法
+        BCP-47 标签时返回 None，调用方按"检测不出"继续（fail-closed）。
+        """
+        ...
+
 
 class StubLLMClient:
     grounding_verifier_id = "grounding-v1:stub"
@@ -76,4 +84,8 @@ class StubLLMClient:
 
     async def translate_to_english(self, text: str) -> str | None:
         # Stub 不提供翻译：回退路径静默关闭，不影响主路径。
+        return None
+
+    async def detect_language_tag(self, text: str) -> str | None:
+        # Stub 不提供语言判定：兜底路径静默关闭，确定性检测结果原样生效。
         return None

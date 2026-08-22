@@ -11,6 +11,7 @@ from dataclasses import replace
 from social_reply.application.knowledge.retrieval import KnowledgeHit
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.guard import LANGUAGE_VERIFICATION_STRICT
 from social_reply.domain.reply.llm import LLMClient
 from social_reply.domain.reply.voice import VoicePreferences
 
@@ -38,6 +39,7 @@ async def generate_multilingual_reply(
     voice_preferences: VoicePreferences,
     email_auto_reply_allowed: bool,
     fallback_reason_codes: tuple[str, ...] = (),
+    language_verification: str = LANGUAGE_VERIFICATION_STRICT,
 ) -> ReplyDecision:
     """Generate a guarded same-language reply from the canonical English knowledge hit."""
     try:
@@ -53,6 +55,7 @@ async def generate_multilingual_reply(
             history=history,
             voice_preferences=voice_preferences,
             email_auto_reply_allowed=email_auto_reply_allowed,
+            language_verification=language_verification,
         )
     except Exception:
         logger.exception("multilingual generation failed; forcing handoff")

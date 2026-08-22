@@ -550,6 +550,10 @@ async def _localization_send_preflight(
             )
         ):
             return "MULTILINGUAL_PROVENANCE_INVALID"
+        # 语言自洽性复核。注意与 guard 的耦合：lenient 校验（语种由模型判定、
+        # 确定性检测复核不了）必须把 reply_language 落成目标语言而非 und，否则
+        # 合格回复会在这里被拒发。那条路径的语义忠实度由上面的
+        # grounding_verified is True 承担——两者缺一，安全链条就断了。
         if not is_draft and (
             decision.request_language == "und"
             or decision.reply_language == "und"
@@ -557,6 +561,7 @@ async def _localization_send_preflight(
             or not languages_match(decision.request_language, decision.resolved_locale)
         ):
             return "MULTILINGUAL_LANGUAGE_INVALID"
+
         if payload_text != decision.reply_text:
             return "MULTILINGUAL_PAYLOAD_MISMATCH"
         if not decision.knowledge_content_hash:

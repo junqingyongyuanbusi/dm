@@ -361,3 +361,120 @@ def test_fact_guard_uses_target_locale_for_grouping_separators():
     )
     assert changed.action is ReplyAction.HANDOFF
     assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in changed.reason_codes
+
+
+# --- Task 2：任意语言支持（脚本泛化 / 时间单位分层 / lenient 校验）---
+
+_APPROVED_DAYS = "Refunds take 3 to 5 business days."
+
+
+def _auto(text: str) -> ReplyDecision:
+    return ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text=text)
+
+
+def test_script_generalization_unblocks_languages_missing_from_the_table():
+    # 马其顿语能被 detect_language 正确判出，但不在 _LANGUAGE_ALLOWED_SCRIPTS 里，
+    # 旧行为把西里尔字母全判成越界。客户原文的文字系统应当补进允许集合。
+    customer = "Колку време трае враќањето на средствата?"
+    reply = "Враќањето на средствата трае од 3 до 5 работни дена."
+    blocked = run_final_guard(_auto(reply), "telegram", expected_reply_language="mk")
+    assert blocked.action is ReplyAction.HANDOFF
+    assert "GUARD_LANGUAGE_MISMATCH" in blocked.reason_codes
+
+    allowed = run_final_guard(
+        _auto(reply), "telegram", expected_reply_language="mk", customer_text=customer
+    )
+    assert allowed.action is ReplyAction.AUTO_REPLY
+
+
+def test_customer_script_only_widens_never_narrows():
+    # 日语是 kana+han 混合书写，客户原文主导脚本可能只有 kana；
+    # 绝不能因此把回复里的汉字判成越界。
+    result = run_final_guard(
+        _auto("返金には通常3〜5営業日かかります。"),
+        "telegram",
+        expected_reply_language="ja",
+        customer_text="返金はいつ反映されますか？",
+    )
+    assert result.action is ReplyAction.AUTO_REPLY
+
+
+def test_unrecognized_time_unit_is_marked_unverified_not_blocked():
+    # 德语 Werktage 不在 _TIME_UNIT_PATTERNS 词表内：数值一致即放行，
+    # 单位标注为未校验，交 grounding verifier 兜底。
+    result = run_final_guard(
+        _auto("Rückerstattungen dauern 3 bis 5 Werktage."),
+        "telegram",
+        expected_reply_language="de",
+        approved_knowledge_reply=_APPROVED_DAYS,
+    )
+    assert result.action is ReplyAction.AUTO_REPLY
+    assert "FACT_UNIT_UNVERIFIED" in result.reason_codes
+
+
+def test_recognized_time_unit_swap_is_still_blocked():
+    # 候选侧识别出了单位却与批准答案不同——确凿篡改，降级不适用。
+    result = run_final_guard(
+        _auto("退款需要 3 到 5 个小时。"),
+        "telegram",
+        expected_reply_language="zh-Hans",
+        approved_knowledge_reply=_APPROVED_DAYS,
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in result.reason_codes
+
+
+def test_unit_downgrade_does_not_let_number_tampering_through():
+    # 单位降级只放宽单位，数值层永远严格。
+    result = run_final_guard(
+        _auto("Rückerstattungen dauern 30 bis 5 Werktage."),
+        "telegram",
+        expected_reply_language="de",
+        approved_knowledge_reply=_APPROVED_DAYS,
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in result.reason_codes
+
+
+def test_covered_language_still_verifies_units_strictly():
+    result = run_final_guard(
+        _auto("返金は3〜5営業日かかります。"),
+        "telegram",
+        expected_reply_language="ja",
+        approved_knowledge_reply=_APPROVED_DAYS,
+        customer_text="返金はいつ反映されますか？",
+    )
+    assert result.action is ReplyAction.AUTO_REPLY
+    assert "FACT_UNIT_UNVERIFIED" not in result.reason_codes
+
+
+def test_lenient_verification_accepts_language_the_detector_cannot_confirm():
+    # 尼泊尔语：detect_language 主动 fail-closed，严格校验必然拦下；
+    # 语种由模型判定时退到文字系统一致性。
+    customer = "म पैसा कसरी निकाल्न सक्छु?"
+    reply = "फिर्ता गर्न 3 देखि 5 कार्य दिन लाग्छ।"
+    strict = run_final_guard(_auto(reply), "telegram", expected_reply_language="ne")
+    assert strict.action is ReplyAction.HANDOFF
+
+    lenient = run_final_guard(
+        _auto(reply),
+        "telegram",
+        expected_reply_language="ne",
+        customer_text=customer,
+        language_verification="lenient",
+    )
+    assert lenient.action is ReplyAction.AUTO_REPLY
+    assert lenient.reply_language == "ne"  # 不能留 und，否则投递层硬拒绝
+    assert "LANGUAGE_MODEL_ATTESTED" in lenient.reason_codes
+
+
+def test_lenient_verification_still_blocks_wrong_writing_system():
+    result = run_final_guard(
+        _auto("Refunds take 3 to 5 business days."),
+        "telegram",
+        expected_reply_language="ne",
+        customer_text="म पैसा कसरी निकाल्न सक्छु?",
+        language_verification="lenient",
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in result.reason_codes

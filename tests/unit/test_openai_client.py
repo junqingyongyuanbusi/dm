@@ -299,3 +299,72 @@ async def test_refusal_降级_handoff_refusal():
     decision = await _client(handler).decide(_CTX)
     assert decision.action is ReplyAction.HANDOFF
     assert "LLM_REFUSAL" in decision.reason_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("returned", "expected"),
+    [
+        ("es", "es"),
+        ("NE", "ne"),
+        ("  sw  ", "sw"),
+        ("zh-hans", "zh-Hans"),
+        ("zh-Hant", "zh-Hant"),
+        ("pt-BR", "pt"),  # region 解析后丢弃，与 detect_language 的输出形状一致
+        ("fil", "fil"),
+    ],
+)
+async def test_语言兜底判定归一化为_bcp47_标签(returned, expected):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response(json.dumps({"language_tag": returned}))
+
+    assert await _client(handler).detect_language_tag("Hola") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "returned",
+    [
+        "und",
+        "unknown",
+        "Spanish",
+        "es_ES",
+        "",
+        "the language is Spanish",
+    ],
+)
+async def test_语言兜底判定拒绝非法标签(returned):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response(json.dumps({"language_tag": returned}))
+
+    assert await _client(handler).detect_language_tag("Hola") is None
+
+
+@pytest.mark.asyncio
+async def test_语言兜底判定在_refusal_时返回_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response("", refusal="no")
+
+    assert await _client(handler).detect_language_tag("Hola") is None
+
+
+@pytest.mark.asyncio
+async def test_语言兜底判定在_http_错误时返回_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    assert await _client(handler).detect_language_tag("Hola") is None
+
+
+@pytest.mark.asyncio
+async def test_语言兜底判定使用_structured_output_且不篡改客户原文():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _completion_response(json.dumps({"language_tag": "es"}))
+
+    await _client(handler).detect_language_tag("Hola")
+    payload = json.loads(captured[0].content)
+    assert payload["response_format"]["json_schema"]["name"] == "language_detection"
+    assert payload["messages"][-1] == {"role": "user", "content": "Hola"}

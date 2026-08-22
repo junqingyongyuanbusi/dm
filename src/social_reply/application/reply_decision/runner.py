@@ -16,6 +16,10 @@ from social_reply.application.knowledge.retrieval import (
     retrieve_exact_knowledge_result,
     retrieve_hybrid_knowledge_result,
 )
+from social_reply.application.reply_decision.language_resolution import (
+    LLM_FALLBACK_SOURCE,
+    resolve_customer_language,
+)
 from social_reply.application.reply_decision.multilingual_generation import (
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
     generate_multilingual_reply,
@@ -33,8 +37,11 @@ from social_reply.application.reply_decision.pipeline import (
 from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from social_reply.domain.platform_accounts import LEGACY_ACTIVE_ACCOUNT_STATUSES
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
-from social_reply.domain.reply.guard import redact_pii
-from social_reply.domain.reply.language import detect_customer_language
+from social_reply.domain.reply.guard import (
+    LANGUAGE_VERIFICATION_LENIENT,
+    LANGUAGE_VERIFICATION_STRICT,
+    redact_pii,
+)
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 from social_reply.domain.reply.rules import apply_multilingual_rules, apply_rules
@@ -76,6 +83,19 @@ def _get_llm() -> LLMClient:
         else:
             raise ValueError(f"未知 LLM_PROVIDER: {settings.llm_provider}（仅支持 stub/openai）")
     return _llm
+
+
+def _get_llm_or_none() -> LLMClient | None:
+    """给可选能力用的构造入口：拿不到 client 就当能力不可用，绝不打断决策。
+
+    语言兜底判定是纯增强——它失败时确定性检测结果照常生效，
+    因此不该让 LLM_PROVIDER 配错这类构造期异常冒泡成决策丢失。
+    """
+    try:
+        return _get_llm()
+    except Exception:
+        logger.exception("LLM construction failed; language fallback disabled")
+        return None
 
 
 _redis = None
@@ -487,9 +507,20 @@ async def run_and_persist_decision(
             history = (
                 await _fetch_history(conversation_id, cutoff_seq) if language_should_detect else ()
             )
-            language = detect_customer_language(snapshot.text, history)
+            language = await resolve_customer_language(
+                snapshot.text,
+                history,
+                # 只在真的要判语种时才给 LLM：其余情况保持纯确定性、零额外调用。
+                llm=_get_llm_or_none() if language_should_detect else None,
+            )
             is_english_request = (
                 language.is_reliable and language.tag.split("-", 1)[0].casefold() == "en"
+            )
+            # 模型判定的语种，确定性检测复核不了它，输出闸门退到文字系统一致性校验。
+            language_verification = (
+                LANGUAGE_VERIFICATION_LENIENT
+                if language.source == LLM_FALLBACK_SOURCE
+                else LANGUAGE_VERIFICATION_STRICT
             )
             # 英语知识库是唯一事实源：live 模式强制只命中 verified English 文档。
             knowledge_result = (
@@ -627,6 +658,7 @@ async def run_and_persist_decision(
                     fallback_reason_codes=(
                         ("QUERY_TRANSLATION_FALLBACK",) if query_translation_used else ()
                     ),
+                    language_verification=language_verification,
                 )
             else:
                 decision = await run_decision_pipeline(
@@ -665,6 +697,7 @@ async def run_and_persist_decision(
                         snapshot.platform != "email"
                         or (settings.email_enabled and settings.email_auto_reply_enabled)
                     ),
+                    language_verification=language_verification,
                 )
             decision = replace(
                 decision,

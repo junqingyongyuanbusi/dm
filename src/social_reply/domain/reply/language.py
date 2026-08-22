@@ -260,9 +260,24 @@ def _strip_language_neutral_tokens(text: str) -> str:
         stripped = f"{stripped[: match.start()]} {stripped[end:]}"
 
 
-def detect_language(text: str | None, *, source: str = "current_message") -> LanguageDetection:
+def _normalize_for_detection(text: str | None) -> str:
+    """脱掉脱敏占位符与语言中立 token（邮箱/URL/@handle），只留可判定语种的文本。"""
     normalized = _REDACTION_PLACEHOLDER.sub(" ", (text or ""))
-    normalized = _strip_language_neutral_tokens(normalized).strip()
+    return _strip_language_neutral_tokens(normalized).strip()
+
+
+def has_detectable_letters(text: str | None) -> bool:
+    """是否含足够的实义字母，值得为它做语言判定。
+
+    与 detect_language 共用同一套归一化和最小字母数，因此二者判断一致：
+    本函数为 False 时 detect_language 必然返回 und。纯 emoji、纯数字、
+    只有邮箱/链接的消息据此被挡在 LLM 兜底判定之外，不浪费模型调用。
+    """
+    return sum(_letter_scripts(_normalize_for_detection(text)).values()) >= _MIN_LETTERS
+
+
+def detect_language(text: str | None, *, source: str = "current_message") -> LanguageDetection:
+    normalized = _normalize_for_detection(text)
     scripts = _letter_scripts(normalized)
     letter_count = sum(scripts.values())
     if letter_count < _MIN_LETTERS:
@@ -384,7 +399,74 @@ def languages_match(expected: str, observed: str) -> bool:
     return expected_parts[1] == observed_parts[1]
 
 
-def reply_language_matches(expected: str, text: str) -> tuple[bool, str]:
+# 各语言允许出现的文字系统。这张表天然追不上世界上的语言——例如它收了 ru/uk/bg
+# 却漏了同用西里尔文的 mk/sr/be/kk/mn，导致这些能被正确检测的语言反被闸门误杀。
+# 因此调用方可用 allowed_scripts 参数直接给出期望集合（通常取客户原文的主导文字
+# 系统），本表只作为无上下文时的回退。
+_LANGUAGE_ALLOWED_SCRIPTS: dict[str, frozenset[str]] = {
+    "zh": frozenset({"han", "latin"}),
+    "ja": frozenset({"kana", "han", "latin"}),
+    "ko": frozenset({"hangul", "han", "latin"}),
+    "ar": frozenset({"arabic", "latin"}),
+    "fa": frozenset({"arabic", "latin"}),
+    "ur": frozenset({"arabic", "latin"}),
+    "ru": frozenset({"cyrillic", "latin"}),
+    "uk": frozenset({"cyrillic", "latin"}),
+    "bg": frozenset({"cyrillic", "latin"}),
+    "th": frozenset({"thai", "latin"}),
+    "el": frozenset({"greek", "latin"}),
+    "hi": frozenset({"devanagari", "latin"}),
+    "mr": frozenset({"devanagari", "latin"}),
+    "bn": frozenset({"bengali", "latin"}),
+    "he": frozenset({"hebrew", "latin"}),
+    "pa": frozenset({"gurmukhi", "latin"}),
+    "gu": frozenset({"gujarati", "latin"}),
+    "ta": frozenset({"tamil", "latin"}),
+    "te": frozenset({"telugu", "latin"}),
+    "kn": frozenset({"kannada", "latin"}),
+    "ml": frozenset({"malayalam", "latin"}),
+    "or": frozenset({"odia", "latin"}),
+    "si": frozenset({"sinhala", "latin"}),
+    "lo": frozenset({"lao", "latin"}),
+    "my": frozenset({"myanmar", "latin"}),
+    "am": frozenset({"ethiopic", "latin"}),
+    "km": frozenset({"khmer", "latin"}),
+    "hy": frozenset({"armenian", "latin"}),
+    "ka": frozenset({"georgian", "latin"}),
+}
+
+
+def dominant_script(text: str | None) -> str:
+    """文本的主导文字系统（如 latin / han / cyrillic）；无主导或无字母时返回空串。
+
+    阈值与 detect_language 的 dominant_ratio 一致，二者对"这段文本属于哪套书写系统"
+    的判断因此保持同一口径。
+    """
+    scripts = _letter_scripts(_normalize_for_detection(text))
+    total = sum(scripts.values())
+    if total == 0:
+        return ""
+    script, count = scripts.most_common(1)[0]
+    return script if count / total >= 0.6 else ""
+
+
+def expected_scripts_for(text: str | None) -> frozenset[str] | None:
+    """由客户原文推导回复额外允许的文字系统：主导文字系统 ∪ 拉丁（品牌名、URL 等）。
+
+    结果与按语言查表的结果取并集，只放宽不收紧——日语这类混合书写系统的语言，
+    客户原文的主导脚本可能只是 kana，绝不能因此把回复里的 han 判成越界。
+    判不出主导文字系统时返回 None。
+    """
+    script = dominant_script(text)
+    return frozenset({script, "latin"}) if script else None
+
+
+def reply_language_matches(
+    expected: str,
+    text: str,
+    *,
+    extra_allowed_scripts: frozenset[str] | None = None,
+) -> tuple[bool, str]:
     observed_detection = detect_language(text)
     observed = observed_detection.tag
     if not observed_detection.is_reliable or not languages_match(expected, observed):
@@ -411,37 +493,9 @@ def reply_language_matches(expected: str, text: str) -> tuple[bool, str]:
     if total == 0:
         return True, observed
     primary = expected.split("-", 1)[0].casefold()
-    allowed_scripts = {
-        "zh": {"han", "latin"},
-        "ja": {"kana", "han", "latin"},
-        "ko": {"hangul", "han", "latin"},
-        "ar": {"arabic", "latin"},
-        "fa": {"arabic", "latin"},
-        "ur": {"arabic", "latin"},
-        "ru": {"cyrillic", "latin"},
-        "uk": {"cyrillic", "latin"},
-        "bg": {"cyrillic", "latin"},
-        "th": {"thai", "latin"},
-        "el": {"greek", "latin"},
-        "hi": {"devanagari", "latin"},
-        "mr": {"devanagari", "latin"},
-        "bn": {"bengali", "latin"},
-        "he": {"hebrew", "latin"},
-        "pa": {"gurmukhi", "latin"},
-        "gu": {"gujarati", "latin"},
-        "ta": {"tamil", "latin"},
-        "te": {"telugu", "latin"},
-        "kn": {"kannada", "latin"},
-        "ml": {"malayalam", "latin"},
-        "or": {"odia", "latin"},
-        "si": {"sinhala", "latin"},
-        "lo": {"lao", "latin"},
-        "my": {"myanmar", "latin"},
-        "am": {"ethiopic", "latin"},
-        "km": {"khmer", "latin"},
-        "hy": {"armenian", "latin"},
-        "ka": {"georgian", "latin"}
-    }.get(primary, {"latin"})
+    allowed_scripts = _LANGUAGE_ALLOWED_SCRIPTS.get(primary, frozenset({"latin"}))
+    if extra_allowed_scripts:
+        allowed_scripts = allowed_scripts | extra_allowed_scripts
     disallowed = sum(count for script, count in scripts.items() if script not in allowed_scripts)
     if disallowed / total > 0.1:
         return False, observed

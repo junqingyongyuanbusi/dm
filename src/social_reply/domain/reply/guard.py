@@ -6,7 +6,18 @@ from dataclasses import replace
 
 from social_reply.domain.platform_accounts import PLATFORM_CAPABILITY_SPECS
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
-from social_reply.domain.reply.language import reply_language_matches
+from social_reply.domain.reply.language import (
+    dominant_script,
+    expected_scripts_for,
+    reply_language_matches,
+)
+
+# 语言校验强度。strict：语种由确定性检测判定，可复核，沿用完整的语言身份断言。
+# lenient：语种由模型判定，确定性检测复核不了它（罕见语言、或近亲语言二次确认），
+# 退到文字系统一致性，语义忠实度由 grounding verifier 承担——投递层已强制
+# grounding_verified is True 才放行，安全链条不因此断裂。
+LANGUAGE_VERIFICATION_STRICT = "strict"
+LANGUAGE_VERIFICATION_LENIENT = "lenient"
 
 # Account numbers, long digit strings, and email addresses must not be echoed.
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
@@ -229,6 +240,35 @@ def _downgrade(decision: ReplyDecision, code: str) -> ReplyDecision:
     )
 
 
+def _fact_tokens_match(candidate: str, approved: str, language: str) -> tuple[bool, bool]:
+    """比对候选回复与英语批准答案的事实 token。
+
+    返回 (数值层是否一致, 时间单位是否已校验)。
+
+    数值、货币、百分号与语言无关，永远严格比对——这是防篡改的核心。时间单位依赖
+    `_TIME_UNIT_PATTERNS` 的逐语言词表，而该词表覆盖不全（实测德语、意大利语、
+    越南语、土耳其语、荷兰语、波兰语、瑞典语的"工作日"都识别不出）。对这些语言
+    按"未校验"处理而非误判为篡改：调用方记 reason code，由 grounding verifier 兜底
+    （已用对抗样本验证其能拦下单位与数值篡改）。
+
+    注意只有"候选侧完全识别不出单位"才降级；候选侧识别出了但与批准答案不同
+    （如 days → 小时），仍是确凿的篡改，照旧拦截。
+    """
+    candidate_tokens = factual_tokens(candidate, language=language)
+    approved_tokens = factual_tokens(approved, language="en")
+    if Counter(token[:3] for token in candidate_tokens) != Counter(
+        token[:3] for token in approved_tokens
+    ):
+        return False, True
+    candidate_units = Counter(token[3] for token in candidate_tokens if token[3])
+    approved_units = Counter(token[3] for token in approved_tokens if token[3])
+    if candidate_units == approved_units:
+        return True, True
+    if not candidate_units and approved_units:
+        return True, False
+    return False, True
+
+
 def run_final_guard(
     decision: ReplyDecision,
     platform: str,
@@ -239,6 +279,8 @@ def run_final_guard(
     approved_localization_text: str | None = None,
     approved_localization_text_hash: str | None = None,
     approved_localization_protected_values: tuple[str, ...] = (),
+    customer_text: str | None = None,
+    language_verification: str = LANGUAGE_VERIFICATION_STRICT,
 ) -> ReplyDecision:
     """纯确定性输出闸门；任一项失败降级为 handoff 并记录 reason_code。
     仅对 auto_reply 生效——其它 action 原样返回。"""
@@ -266,18 +308,40 @@ def run_final_guard(
         and text == approved_official_contact_reply
     ) or approved_localization
     if expected_reply_language != "und":
-        language_ok, observed_language = reply_language_matches(expected_reply_language, text)
-        if observed_language == "und" and approved_contact:
-            observed_language = expected_reply_language
-            language_ok = True
-        decision = replace(decision, reply_language=observed_language)
-        if not language_ok:
-            return _downgrade(decision, "GUARD_LANGUAGE_MISMATCH")
+        if language_verification == LANGUAGE_VERIFICATION_LENIENT:
+            # 语种是模型判定的，确定性检测复核不了；只在能拿到确凿的文字系统冲突时拦截。
+            # reply_language 必须落成目标语言而非 und——投递层对 und 是硬拒绝。
+            decision = replace(
+                decision,
+                reply_language=expected_reply_language,
+                reason_codes=decision.reason_codes + ("LANGUAGE_MODEL_ATTESTED",),
+            )
+            reply_script = dominant_script(text)
+            customer_script = dominant_script(customer_text)
+            if customer_script and reply_script and reply_script != customer_script:
+                return _downgrade(decision, "GUARD_LANGUAGE_SCRIPT_MISMATCH")
+        else:
+            language_ok, observed_language = reply_language_matches(
+                expected_reply_language,
+                text,
+                extra_allowed_scripts=expected_scripts_for(customer_text),
+            )
+            if observed_language == "und" and approved_contact:
+                observed_language = expected_reply_language
+                language_ok = True
+            decision = replace(decision, reply_language=observed_language)
+            if not language_ok:
+                return _downgrade(decision, "GUARD_LANGUAGE_MISMATCH")
     if approved_knowledge_reply is not None:
-        if Counter(factual_tokens(text, language=expected_reply_language)) != Counter(
-            factual_tokens(approved_knowledge_reply, language="en")
-        ):
+        facts_ok, units_verified = _fact_tokens_match(
+            text, approved_knowledge_reply, expected_reply_language
+        )
+        if not facts_ok:
             return _downgrade(decision, "GUARD_KNOWLEDGE_FACT_MISMATCH")
+        if not units_verified:
+            decision = replace(
+                decision, reason_codes=decision.reason_codes + ("FACT_UNIT_UNVERIFIED",)
+            )
         if set(protected_entities(text)) != set(protected_entities(approved_knowledge_reply)):
             return _downgrade(decision, "GUARD_KNOWLEDGE_ENTITY_MISMATCH")
     if has_contact_like(text) and not approved_contact:
