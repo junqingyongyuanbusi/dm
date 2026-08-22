@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 
 from apps.api.main import create_app
 from social_reply.domain.automation.state_machine import ensure_state
@@ -2426,14 +2426,16 @@ async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatc
 
 
 async def test_knowledge_explicit_publish_unpublish_is_audited_and_idempotent(session, migrated_db):
+    # 用普通文档：official-contact 文档已不可发布，用它测不了发布幂等性，
+    # 那条规则由 test_official_contact_knowledge_cannot_be_published 单独覆盖。
     doc = models.KnowledgeDocument(
         tenant_id="default",
         brand_id="b1",
         platform="telegram",
-        question="official contact",
-        reply="support@example.com",
+        question="refund timing",
+        reply="Refunds are processed within a few business days.",
         status="draft",
-        is_official_contact=True,
+        is_official_contact=False,
     )
     session.add(doc)
     await session.commit()
@@ -2476,10 +2478,47 @@ async def test_knowledge_explicit_publish_unpublish_is_audited_and_idempotent(se
         "to": "published",
         "brand": "b1",
         "platform": "telegram",
-        "is_official_contact": True,
+        "is_official_contact": False,
     }
     assert audits[1].detail["from"] == "published"
     assert audits[1].detail["to"] == "draft"
+
+
+async def test_official_contact_knowledge_cannot_be_published(session, migrated_db):
+    # official-contact 事实只允许确定性 verbatim 渲染，发布路径一律拒绝，
+    # 且不得留下发布审计——否则审计流水会显示一次并未发生的发布。
+    doc = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        question="official contact",
+        reply="support@example.com",
+        status="draft",
+        is_official_contact=True,
+    )
+    session.add(doc)
+    await session.commit()
+    doc_id = doc.id
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        rejected = await client.post(
+            f"/admin/knowledge/{doc_id}/status",
+            data={"csrf_token": csrf, "target": "published"},
+        )
+    assert rejected.status_code == 409
+    session.expire_all()
+    assert (await session.get(models.KnowledgeDocument, doc_id)).status == "draft"
+    assert (
+        await session.scalar(
+            select(func.count())
+            .select_from(models.AuditLog)
+            .where(
+                models.AuditLog.subject_id == str(doc_id),
+                models.AuditLog.action == "PUBLISH_KNOWLEDGE",
+            )
+        )
+    ) == 0
 
 
 async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and_idempotent(
@@ -2892,19 +2931,19 @@ async def test_draft_knowledge_official_contact_classification_is_audited(sessio
             f"/admin/knowledge/{doc_id}/official-contact",
             data={"csrf_token": csrf, "target": "true"},
         )
-        await client.post(
+        # 分类成 official-contact 之后就不再可发布，原先"发布后禁止改分类"的
+        # 断言对这类文档已不可达；改为直接锁死发布被拒。禁止改分类那条规则由
+        # test_published_knowledge_cannot_be_reclassified 用普通文档覆盖。
+        publish_attempt = await client.post(
             f"/admin/knowledge/{doc_id}/status",
             data={"csrf_token": csrf, "target": "published"},
         )
-        published_change = await client.post(
-            f"/admin/knowledge/{doc_id}/official-contact",
-            data={"csrf_token": csrf, "target": "false"},
-        )
     assert classified.status_code == same_target.status_code == 303
-    assert published_change.status_code == 409
+    assert publish_attempt.status_code == 409
     session.expire_all()
     stored = await session.get(models.KnowledgeDocument, doc_id)
     assert stored.is_official_contact is True
+    assert stored.status == "draft"
     audits = (
         (
             await session.execute(
@@ -2926,6 +2965,40 @@ async def test_draft_knowledge_official_contact_classification_is_audited(sessio
         "status": "draft",
         "content_hash": "c" * 64,
     }
+
+
+async def test_published_knowledge_cannot_be_reclassified(session, migrated_db):
+    # 已发布文档禁止改 official-contact 分类（必须先下架）。这条规则原先由
+    # test_draft_knowledge_official_contact_classification_is_audited 顺带覆盖，
+    # 但 official-contact 文档已不可发布，改用普通文档保住这份覆盖。
+    doc = models.KnowledgeDocument(
+        tenant_id="default",
+        brand_id="b1",
+        question="refund timing",
+        reply="Refunds are processed within a few business days.",
+        status="draft",
+        is_official_contact=False,
+    )
+    session.add(doc)
+    await session.commit()
+    doc_id = doc.id
+
+    async with _app_client() as client:
+        csrf = await _login(client)
+        published = await client.post(
+            f"/admin/knowledge/{doc_id}/status",
+            data={"csrf_token": csrf, "target": "published"},
+        )
+        reclassify = await client.post(
+            f"/admin/knowledge/{doc_id}/official-contact",
+            data={"csrf_token": csrf, "target": "true"},
+        )
+    assert published.status_code == 303
+    assert reclassify.status_code == 409
+    session.expire_all()
+    stored = await session.get(models.KnowledgeDocument, doc_id)
+    assert stored.status == "published"
+    assert stored.is_official_contact is False
 
 
 async def test_knowledge_status_is_tenant_scoped_and_target_is_explicit(session, migrated_db):
