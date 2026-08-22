@@ -49,11 +49,19 @@ class _CrossLingualTestEmbedder:
 
 
 class _RuntimeLLM:
-    def __init__(self, replies, *, faithful=True, translated_query=None):
+    def __init__(
+        self,
+        replies,
+        *,
+        faithful=True,
+        translated_query=None,
+        detected_language=None,
+    ):
         self.replies = replies
         self.faithful = faithful
         self.grounding_verifier_id = "runtime-grounding-test"
         self.translated_query = translated_query
+        self.detected_language = detected_language
 
     async def decide(self, context):
         return ReplyDecision(
@@ -67,6 +75,9 @@ class _RuntimeLLM:
         return self.faithful
     async def translate_to_english(self, text):
         return self.translated_query
+
+    async def detect_language_tag(self, text):
+        return self.detected_language
 
 class _RaisingLLM:
     async def decide(self, context):
@@ -481,3 +492,68 @@ async def test_bot_draft_private_note_survives_runtime_preflight(
         message_type=outbox.message_type,
     )
     assert result is None
+
+
+# 尼泊尔语：detect_language 主动 fail-closed（_NEPALI_HINTS），确定性检测判不出。
+# 这条链路验证 llm_fallback → lenient 输出闸门 → 投递闸门 的完整自洽性。
+_NE_QUERY = "म पैसा फिर्ता कहिले पाउँछु?"
+_NE_REPLY = "फिर्ता सामान्यतया 3 देखि 5 कार्य दिन लाग्छ।"
+
+
+async def test_llm_resolved_language_passes_lenient_guard_and_outbox(
+    session, multilingual_runtime
+):
+    await _seed_english_policy(session)
+    runner._llm = _RuntimeLLM({"ne": _NE_REPLY}, detected_language="ne")
+
+    conversation_id, outbox_id = await _run(session, text=_NE_QUERY)
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+
+    assert outbox_id is not None, (decision.reason_codes, decision.request_language)
+    assert decision.action == "auto_reply"
+    assert decision.request_language_source == "llm_fallback"
+    assert decision.request_language == "ne"
+    # 投递闸门对 und 是硬拒绝，lenient 模式必须落成真实语言标签。
+    assert decision.reply_language == "ne"
+    assert decision.resolved_locale == "ne"
+    assert "LANGUAGE_MODEL_ATTESTED" in decision.reason_codes
+    assert decision.grounding_verified is True
+
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == "SENT"
+    assert outbox.payload["text"] == _NE_REPLY
+    assert _SENT_TEXTS == [_NE_REPLY]
+
+    # 投递前复核也必须放行，确认 guard 与 outbox 两侧对 lenient 的语义一致。
+    assert (
+        await outbox_module._localization_send_preflight(
+            session,
+            outbox_id=outbox_id,
+            platform_account_id=(
+                await session.scalar(
+                    select(models.Conversation.platform_account_id).where(
+                        models.Conversation.id == conversation_id
+                    )
+                )
+            ),
+            payload_text=outbox.payload["text"],
+            message_type=outbox.message_type,
+        )
+        is None
+    )
+
+
+async def test_llm_language_fallback_unavailable_keeps_unknown_language_handoff(
+    session, multilingual_runtime
+):
+    # 兜底能力不可用时必须退回原有的 fail-closed 行为，而不是猜一个语言。
+    await _seed_english_policy(session)
+    runner._llm = _RuntimeLLM({"ne": _NE_REPLY}, detected_language=None)
+
+    conversation_id, outbox_id = await _run(session, text=_NE_QUERY)
+
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert "UNKNOWN_LANGUAGE" in decision.reason_codes
+    await _assert_handoff(session, conversation_id, "UNKNOWN_LANGUAGE")

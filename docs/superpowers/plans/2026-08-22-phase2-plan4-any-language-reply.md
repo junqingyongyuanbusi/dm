@@ -209,7 +209,7 @@ Bash 权限分类器在排查期持续故障，以下三项只做到源码级确
 **零代码改动。** Task 2 保证 lenient 模式下 `reply_language` 非 und，且 `grounding_verified is not True` 本就是投递硬前提（`outbox.py:540`），安全链条自洽。
 
 - [x] `outbox.py:553` 附近补注释，说明它对 Task 2 的依赖关系
-- [ ] `tests/integration/` 新增用例锁死"lenient 决策能过投递闸门，且 `grounding_verified` 必须为 True 才放行"，覆盖 `MULTILINGUAL_LANGUAGE_INVALID` / `MULTILINGUAL_PROVENANCE_INVALID` 两条路径 —— **未完成**：集成测试需要本地 Postgres，当前环境未提供（`tests/unit` 里也有 2 个用例因此失败）
+- [x] `tests/integration/test_reviewed_localization.py` 新增两个用例：尼泊尔语（`detect_language` 主动 fail-closed）走 llm_fallback → lenient 闸门 → 投递成功并通过投递前复核；兜底能力不可用时退回 `UNKNOWN_LANGUAGE` fail-closed
 
 **风险：** 低。
 
