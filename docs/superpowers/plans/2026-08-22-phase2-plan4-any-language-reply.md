@@ -223,24 +223,34 @@ Bash 权限分类器在排查期持续故障，以下三项只做到源码级确
 
 根因已定位并复现：历史里只要出现**一条从未被回答的实质性问题**（本案是「金融庁のライセンスあるって言ってるけど、WikiFXには出てこない。どっちが正しいの？」，两次都被 handoff、从无 outbound 回复），模型就会把当前消息的 intent 判成那条旧问题，再按 contract「涉及 brokers/regulators/licenses 的事实必须有知识明确支持，否则 handoff」转人工。实测：真实 20 轮历史 → handoff 4/4；只放 1 条未回答的牌照问题 + 当前消息 → handoff 3/3；**只保留形成过"问—答"配对的轮次（13 轮）→ auto_reply 4/4**。
 
-- [ ] `_fetch_history` 只保留已应答的问答对，未被回复的 inbound 不进 prompt。语义上也成立：那些问题已转人工，不属于机器人的上下文
-- [ ] 也可考虑保留但标注（如 `[已转人工，本轮无需处理]`），信息不丢失——需实测确认模型是否买账，未验证前不采用
-- [ ] 回归测试锁死"历史含未应答实质问题时，当前问候仍能自动回复"
-- [ ] 验证通过后把 `CONVERSATION_HISTORY_LIMIT` 恢复为默认 20
+- [x] 只保留已应答的问答对，未被回复的 inbound 不进 prompt
+
+  > **实施时修正了落点**：过滤没有放进 `_fetch_history`，而是放在调用点。原因是
+  > `detect_customer_language` 的历史回退**需要**那些未应答的客户消息——它们仍是
+  > 客户语种的有效证据。放进 `_fetch_history` 会连语言检测一起削弱，且会破坏
+  > `tests/integration/test_fetch_history.py` 里 4 个测机制（排序/预算/脱敏）的用例。
+  > 现在 runner 保留完整 `history` 供语言解析，另用 `model_history = _answered_turns(history)` 供生成。
+- [~] 保留但标注（如 `[已转人工，本轮无需处理]`）的替代方案 —— **未采用**：直接过滤已实测有效，按 YAGNI 不引入更复杂的标注协议
+- [x] 回归测试锁死"历史含未应答实质问题时，当前问候仍能自动回复"（`tests/unit/test_model_history.py`，6 个用例）
+- [ ] 验证通过后把 `CONVERSATION_HISTORY_LIMIT` 恢复为默认 20 —— **必须在新代码部署到 Railway 之后**，否则旧代码没有过滤逻辑，会立刻退回原来的 handoff 问题
 
 **风险：** 低。改动局限在 `_fetch_history`，且有明确的实测基线可比对。
 
 ---
 
-## Task 5：清理与可观测性
+## Task 5：清理与文档同步
 
 **Files:** Modify `docs/configuration.md`、`docs/proposals/multilingual-knowledge-replies-adr.md`；Railway 环境变量
 
-- [ ] 删除 Railway 三个服务上的死配置：`MULTILINGUAL_SUPPORTED_LANGUAGES`、`MULTILINGUAL_EXPERIMENTAL_MIN_SIMILARITY`、`MULTILINGUAL_EXPERIMENTAL_MIN_MARGIN`、`MULTILINGUAL_EXPERIMENTAL_REPLY_ENABLED`、`MULTILINGUAL_EXPERIMENTAL_ACCOUNT_IDS`（代码零引用，`docs/production-migration.md:82` 已声明移除）
-- [ ] 把 `api` / `scheduler` 上仍是旧值 0.8/0.08 的两个阈值与 worker 对齐
-- [ ] 补决策可观测性：模型自选 handoff 时 `reason_codes` 目前只有 `OPENAI`，看不出模型判的 intent 与理由（本次定位完全靠本地复现）。把模型返回的 `intent` / `confidence` 落进决策记录
-- [ ] `docs/configuration.md` 记录新的语言解析级联与 lenient 闸门语义
-- [ ] `docs/proposals/multilingual-knowledge-replies-adr.md` 补充本次决策
+- [x] 删除 Railway 三个服务上的死配置（5 个 × 3 服务 = 15 项，已全部清零并复核）
+- [x] 把 `api` / `scheduler` 的阈值与 worker 对齐（三个服务现均为 0.55 / 0.0）
+- [x] ~~补决策可观测性：把模型返回的 `intent` / `confidence` 落进决策记录~~ —— **无需改动，此前的判断是错的**。`persist.py:192/194` 一直在写这两个字段，我先前查库时只是没 select 它们。
+
+  > 生产数据反而直接印证了 Task 4 的诊断：`2026-08-22 04:30` 那条消息文本是「こんにちは」，落库的 `intent` 却是 `verify_broker_license`、`confidence=0.95`。意图漂移在库里有据可查，不必靠本地复现。
+  >
+  > 真正缺的是**各闸门判定值**的记录——`NO_STRONG_KNOWLEDGE_MATCH` 那几行 `intent` 为 NULL，因为决策没进 LLM。这属于检索侧可观测性，归到闸门 2 的后续工作。
+- [x] `docs/configuration.md` 新增 Language resolution / Output guard verification strength / Conversation history 三节
+- [x] `docs/proposals/multilingual-knowledge-replies-adr.md` 新增「2026-08-22 已实施的增量决策」，回填四条与 ADR 原判断相关的新证据
 
 **风险：** 低。
 

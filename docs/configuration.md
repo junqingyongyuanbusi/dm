@@ -204,16 +204,73 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
-The runtime accepts any language that the fail-closed detector can identify. The current message is
-preferred; an ambiguous short message may inherit the most recent reliably detected customer message,
-never an assistant reply. Unknown or mixed-language messages hand off. Chinese text with identifiable
-simplified/traditional evidence is checked against that writing system; shared Han-only text remains
-neutral `zh`.
+### Language resolution
+
+The runtime replies in whatever language it resolves for the customer message, with no language
+allowlist anywhere in the code. Resolution is a three-stage cascade:
+
+1. **Deterministic detection** (`domain/reply/language.py`) — writing-system rules plus Lingua.
+   Pure, synchronous, and shared with knowledge import, localization checks and Outbox validation,
+   so its behaviour must not drift.
+2. **LLM fallback** (`application/reply_decision/language_resolution.py`) — consulted when the
+   deterministic result is `und`, or when it lands on a known-confusable sibling pair. Lingua only
+   ever chooses between Hindi and Marathi on Devanagari text and returns confident wrong answers on
+   short input, and confidence cannot separate those errors: a misdetected `नमस्ते` scored 0.624
+   while correctly detected Russian scored 0.383. The trigger is therefore the candidate set, not a
+   confidence threshold. Messages with no meaningful letters (emoji, digits, bare links) never reach
+   the model.
+3. **Give up** — still `und`, so the decision hands off with `UNKNOWN_LANGUAGE`.
+
+The resolved provenance is stored in `reply_decisions.request_language_source` as
+`current_message`, `recent_user_history` or `llm_fallback`.
+
+There is no configuration for the fallback. It reuses the existing `OPENAI_*` settings and the
+grounding timeout, and switches itself off when the client cannot detect languages — the same
+convention as `translate_to_english`.
+
+### Output guard verification strength
+
+`run_final_guard` grades its language check by that provenance:
+
+- **strict** (deterministic detection) — unchanged full language-identity assertion.
+- **lenient** (`llm_fallback`) — the deterministic detector cannot review a language it could not
+  identify in the first place, so the guard falls back to writing-system consistency between the
+  customer message and the reply, tags the decision `LANGUAGE_MODEL_ATTESTED`, and leaves semantic
+  fidelity to the grounding verifier. Outbox already refuses to send unless `grounding_verified` is
+  true, so the chain stays closed. Lenient decisions must write a real language tag into
+  `reply_language`; `und` is rejected at delivery.
+
+Allowed writing systems are the per-language table **union** the customer message's dominant script.
+The table alone cannot keep up — it lists `ru`/`uk`/`bg` but omits Macedonian, Serbian, Belarusian,
+Kazakh and Mongolian, all of which the detector identifies correctly and the guard used to reject.
+The union only widens: Japanese mixes kana and Han, so replacing the table with the customer's
+dominant script would wrongly reject Han characters in the reply.
+
+Numbers, currencies and percentages are always compared strictly against the approved English
+answer. Time units are compared only when the target language's unit words are recognised —
+`de`, `it`, `vi`, `tr`, `nl`, `pl` and `sv` are not in the pattern table, so those replies are
+tagged `FACT_UNIT_UNVERIFIED` and left to the grounding verifier rather than being mistaken for
+tampering. A recognised but *different* unit is still a mismatch and is blocked.
+
+### Conversation history
+
+History fed to the model keeps only turns that formed a question-answer pair. Customer messages
+that were never answered have already gone to a human and are not the bot's context; leaving them
+in makes the model adopt the stale intent — a real conversation where one unanswered licence
+question preceded a plain greeting produced handoff 4/4, and 4/4 auto-reply once filtered.
+
+The filter applies only to model context. Language resolution still sees the full history, because
+unanswered customer messages remain valid evidence of the customer's language.
 
 Multilingual runtime generation requires only `KNOWLEDGE_RETRIEVAL_ENABLED=true` and
 `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true`. It retrieves verified-English knowledge in code, uses a
 protected query-translation retry when needed, and relies on the existing language, grounding,
 contact, kill-switch, and Outbox guards. It does not require a calibration report or language allowlist.
+
+Note that the lexical arm of hybrid retrieval indexes the English question with the `simple`
+text-search configuration, so it contributes nothing for non-English queries; those fall back to
+pure vector search until the query-translation retry produces English text.
+
 ## Scheduler and reconciliation settings
 
 The scheduler reads one validated settings snapshot at startup. X reconciliation functions also read
