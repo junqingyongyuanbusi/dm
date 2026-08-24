@@ -45,6 +45,16 @@ async def test_llm_fallback_resolves_short_latin_greeting():
 
 
 @pytest.mark.asyncio
+async def test_llm_attestation_redacts_pii_before_external_call():
+    llm = _FakeLLM(tag="es")
+    result = await resolve_customer_language(
+        "Hola support@example.com 1234 5678",
+        llm=llm,
+    )
+    assert result.tag == "es"
+    assert llm.calls == ["Hola [REDACTED_EMAIL] [REDACTED_NUMBER]"]
+
+@pytest.mark.asyncio
 async def test_llm_fallback_resolves_language_outside_deterministic_coverage():
     # 尼泊尔语被 detect_language 主动 fail-closed，兜底后应可回复。
     llm = _FakeLLM(tag="ne")

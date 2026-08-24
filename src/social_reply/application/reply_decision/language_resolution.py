@@ -13,6 +13,7 @@ und 结果，上游按现有的 UNKNOWN_LANGUAGE 转人工处理。
 
 import logging
 
+from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.language import (
     AMBIGUOUS_CHINESE,
     LanguageDetection,
@@ -47,7 +48,7 @@ async def _attest_with_llm(llm: LLMClient | None, text: str | None) -> LanguageD
     if detect is None:
         return None
     try:
-        tag = await detect(text or "")
+        tag = await detect(redact_pii(text or ""))
     except Exception:
         logger.exception("language attestation failed; falling back")
         return None
