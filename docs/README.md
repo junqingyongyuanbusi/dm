@@ -21,7 +21,8 @@ or live provider E2E has been validated.
   rollout requirements.
 - [Reliability fault drills](reliability-drills.md): repeatable queue-loss, crash, lease, takeover,
   retry-exhaustion and recovery validation.
-- [Railway release script](../scripts/publish_railway_release.sh): the required Docker Hub publish and production rollout entrypoint.
+- [Production source workflow](../.github/workflows/deploy-production.yml): the protected, commit-pinned `dev` release entrypoint; its internal implementation is [publish_railway_release.sh](../scripts/publish_railway_release.sh).
+- [Migration-aware Docker release](../scripts/publish_railway_docker_release.sh): preserved immutable-image and compatibility-image machinery for explicitly reviewed Alembic releases, not the normal code-release path.
 - [Migration-compatible Railway rollback](../scripts/rollback_railway_migration_compatible.sh): restores the predecessor application on the additive current schema using the release manifest's compatible digest.
 
 When documents disagree, executable code and Alembic migrations define behavior. Update the current

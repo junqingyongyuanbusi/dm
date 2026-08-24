@@ -4,7 +4,10 @@
 
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca AS base
 
-ARG RELEASE_SHA=unknown
+# Railway GitHub-source builds inject RAILWAY_GIT_COMMIT_SHA as a build variable. Explicit
+# RELEASE_SHA (used by CI and the legacy Docker path) still takes precedence.
+ARG RAILWAY_GIT_COMMIT_SHA=unknown
+ARG RELEASE_SHA=${RAILWAY_GIT_COMMIT_SHA}
 ARG BUILD_DATE=unknown
 ARG SOURCE_URL=https://github.com/junqingyongyuanbusi/dm
 LABEL org.opencontainers.image.revision="${RELEASE_SHA}" \

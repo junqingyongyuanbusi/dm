@@ -1,5 +1,8 @@
+import io
+import json
+
 import pytest
-from scripts.validate_railway_config import validate
+from scripts.validate_railway_config import _variables_from_json, validate
 
 _REQUIRED = {
     "DATABASE_URL": "postgresql://db",
@@ -52,6 +55,19 @@ def _variables(**overrides: dict[str, str]) -> dict[str, dict[str, str]]:
 
 def test_validate_accepts_consistent_production_configuration():
     validate(_variables(), public_base_url="https://relay.example.com")
+
+
+def test_variables_json_mode_preserves_rendered_values(tmp_path):
+    path = tmp_path / "variables.json"
+    expected = _variables()
+    path.write_text(json.dumps(expected))
+    assert _variables_from_json(str(path)) == expected
+
+
+def test_variables_json_mode_accepts_stdin(monkeypatch):
+    expected = _variables()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(expected)))
+    assert _variables_from_json("-") == expected
 
 
 def test_validate_accepts_runtime_multilingual_generation() -> None:

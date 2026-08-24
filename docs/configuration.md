@@ -8,6 +8,28 @@ Use `.env.example` for local development only. Production configuration is store
 platform and validated by `scripts/validate_railway_config.py` during every release. API, Worker, and
 Scheduler must use the same application settings unless a variable is explicitly deployment-role-only.
 
+## Production deployment source
+
+The existing Railway `reply-core / production` services build from GitHub repository
+`junqingyongyuanbusi/dm`. API, Worker and Scheduler use the `dev` history and the repository-root
+`Dockerfile`; `SERVICE_ROLE` remains `api`, `worker` and `scheduler` respectively. Railway native
+GitHub autodeploy and deployment triggers stay disabled so they cannot bypass the coordinated
+release order.
+
+`.github/workflows/deploy-production.yml` is the only automatic source-release trigger. It waits for
+the exact push SHA's CI run, then `scripts/publish_railway_release.sh` deploys that immutable commit
+through Railway's commit-pinned API in API → `/healthz` → Worker → Scheduler order. A production
+project token is stored only as the GitHub Actions `RAILWAY_TOKEN` secret; it must never be copied to
+Railway variables, repository files or logs.
+
+The release script reads rendered variables for real Pydantic Settings validation and separately
+fingerprints unrendered Railway references. Source changes and releases must preserve all existing
+variables, `${{Postgres.DATABASE_URL}}` / `${{Redis.REDIS_URL}}` references, domains, replica/restart
+configuration and role assignments. Only API may have public domains.
+
+Automatic source release intentionally refuses changes under `migrations/` or to `alembic.ini`.
+Those commits require the migration-aware procedure in `docs/production-migration.md`; CI success
+alone does not authorize applying a new schema graph to production.
 ## Core and security
 
 | Variable | Code default | Requirement / owner |

@@ -28,7 +28,7 @@ def test_entrypoint_rejects_missing_role():
 
 
 def test_release_requires_app_and_state_service_colocation():
-    script = Path("scripts/publish_railway_release.sh").read_text()
+    script = Path("scripts/publish_railway_docker_release.sh").read_text()
     assert "RAILWAY_COLOCATED_SERVICES=(api worker scheduler Postgres Redis)" in script
     assert 'RAILWAY_REGION="us-east4-eqdc4a"' in script
     assert script.count("validate_railway_colocation") == 3
@@ -51,6 +51,43 @@ def test_release_requires_app_and_state_service_colocation():
     assert '--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"' in script
     assert "invalid inherited release lock descriptor" in script
     assert script.rindex("require_target_latest") < script.index('write_manifest "completed"')
+
+
+def test_source_release_is_commit_pinned_ordered_and_fail_closed():
+    script = Path("scripts/publish_railway_release.sh").read_text()
+    assert "serviceInstanceDeployV2" in script
+    assert "commitSha: $commitSha" in script
+    assert "Project-Access-Token" in script
+    assert "native Railway autodeploy must be disabled" in script
+    assert "automatic source release refuses Alembic graph changes" in script
+    assert "git merge-base --is-ancestor" in script
+    assert "target must advance production dev history" in script
+    assert "validate_railway_config" in script
+    assert "validate_railway_colocation" in script
+    assert "configuration_fingerprint" in script
+    api = script.index("if service_needs_deploy api")
+    health = script.index("wait_for_api_health", api)
+    worker = script.index("if service_needs_deploy worker")
+    scheduler = script.index("if service_needs_deploy scheduler")
+    assert api < health < worker < scheduler
+    assert script.count("service_needs_deploy") >= 4
+    assert 'status" != "SUCCESS" || "$commit_hash" != "$release_sha"' in script
+    assert 'response="$(graphql_mutation "$query" "$variables")"' in script
+    assert "production source mutation is authorized only" in script
+    assert Path("scripts/publish_railway_release.sh").stat().st_mode & 0o111
+    assert Path("scripts/publish_railway_docker_release.sh").stat().st_mode & 0o111
+
+
+def test_production_workflow_cannot_cancel_an_active_rollout():
+    workflow = Path(".github/workflows/deploy-production.yml").read_text()
+    assert "group: production-source-release" in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert "timeout-minutes: 120" in workflow
+    assert 'PRODUCTION_DEPLOY_AUTHORIZED: "true"' in workflow
+    assert "vars.RAILWAY_SOURCE_DEPLOY_ENABLED == 'true'" in workflow
+    assert "Wait for exact CI run" in workflow
+    assert "Recheck freshness before production mutation" in workflow
+    assert "steps.final-freshness.outputs.stale != 'true'" in workflow
 
 
 def test_migration_compatible_rollback_retags_latest_and_redeploys_in_order():

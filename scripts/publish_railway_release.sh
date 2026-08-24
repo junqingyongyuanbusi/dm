@@ -1,56 +1,57 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly IMAGE_REPO="zhiyangxiaozi/reply-core"
+readonly RAILWAY_API_URL="https://backboard.railway.com/graphql/v2"
 readonly RAILWAY_PROJECT_ID="abcf3199-e5ac-415b-a22e-062206390331"
-readonly RAILWAY_PROJECT_NAME="reply-core"
+readonly RAILWAY_ENVIRONMENT_ID="db0d6750-eb77-40ee-8a79-f706cd1f828a"
 readonly RAILWAY_ENVIRONMENT="production"
-readonly RAILWAY_REGION="us-east4-eqdc4a"
+readonly RAILWAY_REPOSITORY="junqingyongyuanbusi/dm"
 readonly PUBLIC_BASE_URL="https://relay.nexory.top"
-readonly SOURCE_URL="https://github.com/junqingyongyuanbusi/dm"
-readonly DEPLOY_TIMEOUT_SECONDS="${DEPLOY_TIMEOUT_SECONDS:-900}"
-readonly CI_TIMEOUT_SECONDS="${CI_TIMEOUT_SECONDS:-1200}"
+readonly DEPLOY_TIMEOUT_SECONDS="${DEPLOY_TIMEOUT_SECONDS:-1200}"
+readonly API_HEALTH_TIMEOUT_SECONDS="${API_HEALTH_TIMEOUT_SECONDS:-180}"
 readonly RAILWAY_SERVICES=(api worker scheduler)
 readonly RAILWAY_COLOCATED_SERVICES=(api worker scheduler Postgres Redis)
+readonly API_SERVICE_ID="b84107eb-c945-4279-92aa-c4691532d9ec"
+readonly WORKER_SERVICE_ID="71034ef8-cb9c-44e6-b4da-2b3f9869cd4e"
+readonly SCHEDULER_SERVICE_ID="4646baef-e71f-4ffe-b4e2-244afdeec6ce"
+readonly POSTGRES_SERVICE_ID="ebf477d5-2b8b-4998-bb55-e17fc9ee88a7"
+readonly REDIS_SERVICE_ID="108a4b7b-23bb-45f3-9125-17a718646dca"
+readonly RAILWAY_REGION="us-east4-eqdc4a"
 
 usage() {
   cat <<'EOF'
-Publish the current clean dev commit to Docker Hub and deploy it to Railway.
+Deploy one exact Git commit from the connected GitHub source to Railway production.
 
-Required state:
-  - current branch is dev
-  - worktree is clean
-  - HEAD equals origin/dev
-  - every GitHub Actions CI run for HEAD succeeded
-  - Docker Hub, GitHub CLI, and Railway CLI authentication are available
+Usage:
+  scripts/publish_railway_release.sh --sha=<40-character-sha>
 
-Fixed production targets:
-  - Docker Hub: zhiyangxiaozi/reply-core
-  - Railway: reply-core / production / api + worker + scheduler
-  - Public API: https://relay.nexory.top
+Contract:
+  - deploys an exact commit through Railway serviceInstanceDeployV2
+  - refuses commits that change migrations/ or alembic.ini
+  - requires native Railway GitHub autodeploy to be disabled
+  - deploys API, verifies /healthz, then Worker, then Scheduler
+  - verifies all three deployment metadata records contain the requested commitHash
 
-Optional environment variables:
-  BUILDX_BUILDER             Explicit Docker Buildx builder
-  DEPLOY_TIMEOUT_SECONDS     Per-service deployment timeout (default: 900)
-  CI_TIMEOUT_SECONDS         CI wait timeout (default: 1200)
+Authentication:
+  - mutation is authorized only inside .github/workflows/deploy-production.yml
+  - RAILWAY_TOKEN must be a production-scoped Railway project token
+
+The one-time image-to-source bootstrap is an operator migration with separately captured digest and
+OCI revision evidence; this workflow-internal script only runs after all three roles have source
+commitHash provenance.
+
+Commits that change the Alembic graph fail closed. Use the separately reviewed migration-aware
+procedure in docs/production-migration.md; never deploy an older raw source commit after a new
+schema head has reached production.
 EOF
 }
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  usage
-  exit 0
-fi
-if [[ $# -ne 0 ]]; then
-  usage >&2
-  exit 2
-fi
-
 log() {
-  printf '[release] %s\n' "$*" >&2
+  printf '[source-release] %s\n' "$*" >&2
 }
 
 fail() {
-  printf '[release] ERROR: %s\n' "$*" >&2
+  printf '[source-release] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -58,394 +59,347 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
-for command_name in git docker railway gh jq curl date awk python3 uv; do
+for command_name in git jq curl uv; do
   require_command "$command_name"
 done
-for timeout_name in DEPLOY_TIMEOUT_SECONDS CI_TIMEOUT_SECONDS; do
-  timeout_value="${!timeout_name}"
-  [[ "$timeout_value" =~ ^[1-9][0-9]*$ ]] \
-    || fail "$timeout_name must be a positive decimal integer"
+
+release_sha=""
+for argument in "$@"; do
+  case "$argument" in
+    --sha=*) release_sha="${argument#*=}" ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      fail "unknown argument: $argument"
+      ;;
+  esac
 done
 
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "not inside a Git repository"
-cd "$repo_root"
-mkdir -p .run dist
-release_lock="$repo_root/.run/publish-railway-release.lock"
-script_path="$repo_root/scripts/publish_railway_release.sh"
-if [[ "${DM_RELEASE_LOCK_HELD:-}" != "1" ]]; then
-  exec python3 - "$release_lock" "$script_path" "$@" <<'PY'
-import fcntl
-import os
-import sys
+[[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || fail "--sha must be a full lowercase Git SHA"
+for timeout_name in DEPLOY_TIMEOUT_SECONDS API_HEALTH_TIMEOUT_SECONDS; do
+  timeout_value="${!timeout_name}"
+  [[ "$timeout_value" =~ ^[1-9][0-9]*$ ]] || fail "$timeout_name must be positive"
+done
 
-lock_path, script_path, *args = sys.argv[1:]
-with open(lock_path, "a+", encoding="ascii") as lock_file:
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(f"[release] ERROR: another local Railway release or rollback is running: {lock_path}", file=sys.stderr)
-        raise SystemExit(1)
-    os.set_inheritable(lock_file.fileno(), True)
-    environment = dict(os.environ)
-    environment["DM_RELEASE_LOCK_HELD"] = "1"
-    environment["DM_RELEASE_LOCK_FD"] = str(lock_file.fileno())
-    os.execve(script_path, [script_path, *args], environment)
-PY
-else
-  lock_fd="${DM_RELEASE_LOCK_FD:-}"
-  [[ "$lock_fd" =~ ^[0-9]+$ ]] || fail "invalid inherited release lock descriptor"
-  python3 - "$lock_fd" "$release_lock" <<'PY'
-import fcntl
-import os
-import sys
+git cat-file -e "${release_sha}^{commit}" 2>/dev/null \
+  || fail "release commit is unavailable in this checkout: $release_sha"
+git fetch --quiet origin dev
+git merge-base --is-ancestor "$release_sha" origin/dev \
+  || fail "release commit is not reachable from origin/dev: $release_sha"
 
-fd = int(sys.argv[1])
-lock_path = sys.argv[2]
-try:
-    fd_stat = os.fstat(fd)
-    path_stat = os.stat(lock_path)
-    if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-        raise OSError("inherited descriptor does not match release lock")
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except (OSError, BlockingIOError) as exc:
-    print(f"[release] ERROR: invalid inherited release lock: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-fi
+[[ "${GITHUB_ACTIONS:-}" == "true" && "${PRODUCTION_DEPLOY_AUTHORIZED:-}" == "true" ]] \
+  || fail "production source mutation is authorized only from the protected GitHub Actions workflow"
+[[ -n "${RAILWAY_TOKEN:-}" ]] || fail "RAILWAY_TOKEN is required"
 
-branch="$(git branch --show-current)"
-[[ "$branch" == "dev" ]] || fail "release branch must be dev, got: ${branch:-detached}"
-
-revalidate_dev_head() {
-  [[ -z "$(git status --porcelain)" ]] || fail "worktree must be clean before release"
-  git fetch --quiet origin dev
-  local head_sha origin_sha
-  head_sha="$(git rev-parse HEAD)"
-  origin_sha="$(git rev-parse origin/dev)"
-  [[ "$head_sha" == "$origin_sha" ]] || fail "HEAD must equal current origin/dev before release"
-  [[ "$head_sha" == "$full_sha" ]] || fail "HEAD changed during release"
-}
-
-full_sha="$(git rev-parse HEAD)"
-[[ "$full_sha" =~ ^[0-9a-f]{40}$ ]] || fail "invalid Git SHA: $full_sha"
-short_sha="${full_sha:0:12}"
-sha_ref="${IMAGE_REPO}:${full_sha}"
-latest_ref="${IMAGE_REPO}:latest"
-rollback_ref="${IMAGE_REPO}:railway-pre-${short_sha}"
-rollback_compatible_ref="${IMAGE_REPO}:railway-compat-pre-${short_sha}"
-manifest_path="dist/release-${full_sha}.json"
-revalidate_dev_head
-
-wait_for_ci() {
-  local deadline=$((SECONDS + CI_TIMEOUT_SECONDS))
-  local runs
-  while (( SECONDS < deadline )); do
-    if ! runs="$(gh run list --commit "$full_sha" --workflow CI --limit 20 \
-      --json databaseId,status,conclusion,url)"; then
-      fail "GitHub CLI could not read CI runs for $full_sha"
-    fi
-    if jq -e 'length > 0 and all(.[]; .status == "completed" and .conclusion == "success")' \
-      >/dev/null <<<"$runs"; then
-      jq -r '.[] | "[release] CI success: \(.databaseId) \(.url)"' <<<"$runs"
-      return 0
-    fi
-    if jq -e 'any(.[]; .status == "completed" and .conclusion != "success")' \
-      >/dev/null <<<"$runs"; then
-      jq -r '.[] | "[release] CI \(.status)/\(.conclusion): \(.databaseId) \(.url)"' \
-        <<<"$runs" >&2
-      fail "at least one CI run failed for $full_sha"
-    fi
-    sleep 10
-  done
-  fail "timed out waiting for CI on $full_sha"
-}
-
-image_state() {
-  local reference="$1"
-  local output status
-  set +e
-  output="$(docker buildx imagetools inspect "$reference" 2>&1)"
-  status=$?
-  set -e
-  if [[ $status -eq 0 ]]; then
-    printf '%s\n' "exists"
-    return 0
+graphql_request() {
+  local request_kind="$1"
+  local query="$2"
+  local variables="$3"
+  local response payload
+  local -a curl_options=(-fsS)
+  payload="$(jq -cn --arg query "$query" --argjson variables "$variables" \
+    '{query: $query, variables: $variables}')"
+  if [[ "$request_kind" == "query" ]]; then
+    curl_options+=(--retry 3 --retry-all-errors)
+  elif [[ "$request_kind" != "mutation" ]]; then
+    fail "unknown GraphQL request kind: $request_kind"
   fi
-  if [[ "$output" == "ERROR: ${reference}: not found" \
-    || "$output" == "ERROR: docker.io/${reference}: not found" ]]; then
-    printf '%s\n' "absent"
-    return 0
+  response="$(curl "${curl_options[@]}" \
+    -H "Project-Access-Token: ${RAILWAY_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    --data "$payload" \
+    "$RAILWAY_API_URL")" || {
+      if [[ "$request_kind" == "mutation" ]]; then
+        fail "Railway mutation result is unknown; inspect deployment state before retrying"
+      fi
+      fail "Railway GraphQL query failed"
+    }
+  if jq -e '(.errors // []) | length > 0' >/dev/null <<<"$response"; then
+    jq -c '.errors' <<<"$response" >&2
+    fail "Railway GraphQL returned errors"
   fi
-  printf '[release] ERROR: could not inspect %s: %s\n' "$reference" "$output" >&2
-  return 1
+  printf '%s\n' "$response"
 }
 
-image_digest() {
-  local reference="$1"
-  local output digest
-  if ! output="$(docker buildx imagetools inspect "$reference" 2>&1)"; then
-    fail "could not inspect image digest for $reference: $output"
-  fi
-  digest="$(awk '/^Digest:/ {print $2; exit}' <<<"$output")"
-  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail "invalid registry digest for $reference: ${digest:-missing}"
-  printf '%s\n' "$digest"
+graphql() {
+  graphql_request query "$1" "$2"
 }
 
-image_metadata() {
-  docker buildx imagetools inspect "$1" --format '{{json .Image}}'
+graphql_mutation() {
+  graphql_request mutation "$1" "$2"
 }
 
-image_revision() {
-  jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' \
-    <<<"$(image_metadata "$1")"
+service_id() {
+  case "$1" in
+    api) printf '%s\n' "$API_SERVICE_ID" ;;
+    worker) printf '%s\n' "$WORKER_SERVICE_ID" ;;
+    scheduler) printf '%s\n' "$SCHEDULER_SERVICE_ID" ;;
+    Postgres) printf '%s\n' "$POSTGRES_SERVICE_ID" ;;
+    Redis) printf '%s\n' "$REDIS_SERVICE_ID" ;;
+    *) fail "unknown service: $1" ;;
+  esac
 }
 
-verify_sha_image() {
-  local reference="$1"
-  local metadata revision source image_os architecture
-  metadata="$(image_metadata "$reference")"
-  revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
-  source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
-  image_os="$(jq -r '.os // ""' <<<"$metadata")"
-  architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
-  [[ "$revision" == "$full_sha" ]] || fail "$reference has unexpected OCI revision: $revision"
-  [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
-  [[ "$image_os/$architecture" == "linux/amd64" ]] \
-    || fail "$reference has unexpected platform: $image_os/$architecture"
+service_state() {
+  local service="$1"
+  local id variables query
+  id="$(service_id "$service")"
+  variables="$(jq -cn \
+    --arg projectId "$RAILWAY_PROJECT_ID" \
+    --arg environmentId "$RAILWAY_ENVIRONMENT_ID" \
+    --arg serviceId "$id" \
+    '{projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId}')"
+  query='query ServiceState($projectId: String!, $environmentId: String!, $serviceId: String!) {
+    serviceInstance(environmentId: $environmentId, serviceId: $serviceId) {
+      serviceName
+      source { repo image }
+      numReplicas
+      region
+      restartPolicyType
+      restartPolicyMaxRetries
+      domains {
+        customDomains { domain targetPort }
+        serviceDomains { domain targetPort }
+      }
+      activeDeployments { id status meta }
+      latestDeployment { id status meta }
+    }
+    renderedVariables: variables(
+      projectId: $projectId,
+      environmentId: $environmentId,
+      serviceId: $serviceId
+    )
+    unrenderedVariables: variables(
+      projectId: $projectId,
+      environmentId: $environmentId,
+      serviceId: $serviceId,
+      unrendered: true
+    )
+    serviceInstanceAutoDeployStatus(
+      projectId: $projectId,
+      environmentId: $environmentId,
+      serviceId: $serviceId
+    ) { enabled canEnable reason }
+    deploymentTriggers(
+      projectId: $projectId,
+      environmentId: $environmentId,
+      serviceId: $serviceId
+    ) { edges { node { id branch repository checkSuites } } }
+  }'
+  graphql "$query" "$variables"
 }
 
-verify_predecessor_image() {
-  local reference="$1"
-  local expected="$2"
-  local metadata revision source image_os architecture digest
-  digest="$(image_digest "$reference")"
-  [[ "$digest" == "$expected" ]] || fail "$reference has unexpected digest: $digest"
-  metadata="$(image_metadata "$reference")"
-  revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
-  source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
-  image_os="$(jq -r '.os // ""' <<<"$metadata")"
-  architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
-  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || fail "$reference has invalid app revision: $revision"
-  [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
-  [[ "$image_os/$architecture" == "linux/amd64" ]] \
-    || fail "$reference has unexpected platform: $image_os/$architecture"
+validate_source_contract() {
+  local service="$1"
+  local state repo image autodeploy trigger_count
+  state="$(service_state "$service")"
+  repo="$(jq -r '.data.serviceInstance.source.repo // ""' <<<"$state")"
+  image="$(jq -r '.data.serviceInstance.source.image // ""' <<<"$state")"
+  autodeploy="$(jq -r '.data.serviceInstanceAutoDeployStatus.enabled' <<<"$state")"
+  trigger_count="$(jq -r '.data.deploymentTriggers.edges | length' <<<"$state")"
+  [[ "$repo" == "$RAILWAY_REPOSITORY" ]] \
+    || fail "$service source repo is ${repo:-none}, expected $RAILWAY_REPOSITORY"
+  [[ -z "$image" ]] || fail "$service still has image source $image"
+  [[ "$autodeploy" == "false" ]] \
+    || fail "$service native Railway autodeploy must be disabled"
+  [[ "$trigger_count" == "0" ]] \
+    || fail "$service has $trigger_count native deployment trigger(s); only GitHub Actions may deploy"
 }
 
-verify_rollback_compatible_image() {
-  local reference="$1"
-  local base_digest="$2"
-  local app_revision="$3"
-  local metadata revision source image_os architecture purpose labeled_base labeled_target database_head
-  metadata="$(image_metadata "$reference")"
-  revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
-  source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
-  purpose="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-purpose"] // ""' <<<"$metadata")"
-  labeled_base="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-base-digest"] // ""' <<<"$metadata")"
-  labeled_target="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-target-release"] // ""' <<<"$metadata")"
-  database_head="$(jq -r '.config.Labels["com.nexory.reply-core.database-head"] // ""' <<<"$metadata")"
-  image_os="$(jq -r '.os // ""' <<<"$metadata")"
-  architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
-  [[ "$revision" == "$app_revision" ]] \
-    || fail "$reference has unexpected predecessor app revision: $revision"
-  [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
-  [[ "$purpose" == "migration-compatible-predecessor" ]] \
-    || fail "$reference has unexpected rollback purpose: $purpose"
-  [[ "$labeled_base" == "$base_digest" ]] \
-    || fail "$reference has unexpected rollback base digest: $labeled_base"
-  [[ "$labeled_target" == "$full_sha" ]] \
-    || fail "$reference has unexpected target release: $labeled_target"
-  [[ "$database_head" == "c3e7a9f1b204" ]] \
-    || fail "$reference has unexpected database head: $database_head"
-  [[ "$image_os/$architecture" == "linux/amd64" ]] \
-    || fail "$reference has unexpected platform: $image_os/$architecture"
+configuration_fingerprint() {
+  local service="$1"
+  service_state "$service" \
+    | uv run python scripts/railway_source_config_snapshot.py fingerprint
 }
 
-select_builder() {
-  if [[ -n "${BUILDX_BUILDER:-}" ]]; then
-    printf '%s\n' "$BUILDX_BUILDER"
-    return
-  fi
-  local candidate
-  for candidate in orbstack default; do
-    if docker buildx inspect "$candidate" >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-}
-
-prepare_rollback_compatible_image() {
-  local reference="$1"
-  local base_digest="$2"
-  local app_revision="$3"
-  local state builder_name build_date digest
-  local -a builder_args
-  state="$(image_state "$reference")"
-  if [[ "$state" == "exists" ]]; then
-    verify_rollback_compatible_image "$reference" "$base_digest" "$app_revision"
-  else
-    revalidate_dev_head
-    builder_name="$(select_builder)"
-    builder_args=()
-    if [[ -n "$builder_name" ]]; then
-      builder_args=(--builder "$builder_name")
-    fi
-    build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    log "building and pushing migration-compatible rollback image: $reference"
-    docker buildx build \
-      "${builder_args[@]}" \
-      --file deploy/Dockerfile.migration-compatible-rollback \
-      --platform linux/amd64 \
-      --provenance=false \
-      --build-arg "BASE_IMAGE=${IMAGE_REPO}@${base_digest}" \
-      --build-arg "APP_REVISION=${app_revision}" \
-      --build-arg "TARGET_RELEASE_SHA=${full_sha}" \
-      --build-arg "BUILD_DATE=${build_date}" \
-      --build-arg "SOURCE_URL=${SOURCE_URL}" \
-      --build-arg "BASE_DIGEST=${base_digest}" \
-      --tag "$reference" \
-      --push \
-      . >&2
-    verify_rollback_compatible_image "$reference" "$base_digest" "$app_revision"
-  fi
-  digest="$(image_digest "$reference")"
-  [[ "$digest" != "$expected_digest" ]] \
-    || fail "rollback-compatible image unexpectedly matches target digest"
-  printf '%s\n' "$digest"
-}
-
-railway_status_json() {
-  railway status \
-    --project "$RAILWAY_PROJECT_ID" \
-    --environment "$RAILWAY_ENVIRONMENT" \
-    --json
+validate_role_configuration() {
+  local service="$1"
+  local expected_role="$2"
+  local state role testing public_base_url
+  state="$(service_state "$service")"
+  role="$(jq -r '.data.renderedVariables.SERVICE_ROLE // ""' <<<"$state")"
+  testing="$(jq -r '.data.renderedVariables.TESTING // ""' <<<"$state" | tr '[:upper:]' '[:lower:]')"
+  public_base_url="$(jq -r '.data.renderedVariables.PUBLIC_BASE_URL // ""' <<<"$state")"
+  [[ "$role" == "$expected_role" ]] \
+    || fail "$service SERVICE_ROLE is ${role:-missing}, expected $expected_role"
+  [[ "$testing" == "false" ]] || fail "$service TESTING must be false"
+  [[ "${public_base_url%/}" == "$PUBLIC_BASE_URL" ]] \
+    || fail "$service PUBLIC_BASE_URL does not match $PUBLIC_BASE_URL"
+  jq -e '
+    (.data.renderedVariables.DATABASE_URL // "") != "" and
+    (.data.renderedVariables.REDIS_URL // "") != "" and
+    (.data.renderedVariables.PLATFORM_SECRET_KEYS // "") != ""
+  ' >/dev/null <<<"$state" || fail "$service is missing shared production variables"
 }
 
 validate_railway_config() {
-  if ! uv run --frozen --no-dev python scripts/validate_railway_config.py \
-    "$RAILWAY_PROJECT_ID" \
-    "$RAILWAY_ENVIRONMENT" \
-    "$PUBLIC_BASE_URL"; then
+  local api_variables worker_variables scheduler_variables
+  api_variables="$(service_state api | jq -c '.data.renderedVariables')"
+  worker_variables="$(service_state worker | jq -c '.data.renderedVariables')"
+  scheduler_variables="$(service_state scheduler | jq -c '.data.renderedVariables')"
+  if ! jq -n \
+    --argjson api "$api_variables" \
+    --argjson worker "$worker_variables" \
+    --argjson scheduler "$scheduler_variables" \
+    '{api: $api, worker: $worker, scheduler: $scheduler}' \
+    | uv run python scripts/validate_railway_config.py \
+      --variables-json - "$PUBLIC_BASE_URL"; then
     fail "Railway service variables failed the production consistency check"
   fi
   log "verified Railway role assignment and shared production configuration"
 }
 
-validate_railway_target() {
-  local status_json
-  status_json="$(railway_status_json)"
-  [[ "$(jq -r '.id // ""' <<<"$status_json")" == "$RAILWAY_PROJECT_ID" ]] \
-    || fail "Railway project ID does not match $RAILWAY_PROJECT_ID"
-  [[ "$(jq -r '.name // ""' <<<"$status_json")" == "$RAILWAY_PROJECT_NAME" ]] \
-    || fail "Railway project name does not match $RAILWAY_PROJECT_NAME"
-  jq -e --arg environment "$RAILWAY_ENVIRONMENT" \
-    '.environments.edges | any(.node.name == $environment)' >/dev/null <<<"$status_json" \
-    || fail "Railway environment not found: $RAILWAY_ENVIRONMENT"
-}
-
-railway_service_node() {
-  local service="$1"
-  railway_status_json | jq \
-    --arg environment "$RAILWAY_ENVIRONMENT" \
-    --arg service "$service" '
-      .environments.edges[]
-      | select(.node.name == $environment)
-      | .node.serviceInstances.edges[].node
-      | select(.serviceName == $service)
-    '
-}
-
-railway_source_image() {
-  railway_service_node "$1" | jq -r '.source.image // ""'
-}
-
 active_region() {
-  railway_status_json | python3 scripts/railway_active_region.py "$RAILWAY_ENVIRONMENT" "$1"
+  local service="$1"
+  local state
+  state="$(service_state "$service")"
+  jq -er '
+    [
+      .data.serviceInstance.activeDeployments[]
+      | select(.status == "SUCCESS")
+      | (.meta.serviceManifest.deploy.multiRegionConfig // {})
+      | to_entries[]
+      | select((.value.numReplicas // 0) > 0)
+      | .key
+    ]
+    | unique
+    | select(length == 1)
+    | .[0]
+  ' <<<"$state"
 }
 
 validate_railway_colocation() {
-  local service service_region
+  local service region
   for service in "${RAILWAY_COLOCATED_SERVICES[@]}"; do
-    service_region="$(active_region "$service")" \
-      || fail "could not determine the sole active Railway region for $service"
-    [[ "$service_region" == "$RAILWAY_REGION" ]] \
-      || fail "Railway $service region $service_region does not match $RAILWAY_REGION"
+    region="$(active_region "$service")" \
+      || fail "could not determine the sole active region for $service"
+    [[ "$region" == "$RAILWAY_REGION" ]] \
+      || fail "$service region $region does not match $RAILWAY_REGION"
   done
-  log "verified Railway colocation: ${RAILWAY_COLOCATED_SERVICES[*]} -> $RAILWAY_REGION"
+  log "verified Railway colocation in $RAILWAY_REGION"
 }
 
-active_deployment_json() {
-  railway_service_node "$1" | jq '
-    .activeDeployments
-    | map(select(.status == "SUCCESS"))
-    | first
+current_commit_for_service() {
+  local service="$1"
+  service_state "$service" | jq -r '
+    ([
+      .data.serviceInstance.activeDeployments[]
+      | select(.status == "SUCCESS")
+      | .meta.commitHash // empty
+    ] | first) // ""
   '
 }
 
-latest_deployment_json() {
+current_deployment_id() {
   local service="$1"
-  railway deployment list \
-    --project "$RAILWAY_PROJECT_ID" \
-    --environment "$RAILWAY_ENVIRONMENT" \
-    --service "$service" \
-    --limit 1 \
-    --json | jq '.[0]'
+  service_state "$service" | jq -r '.data.serviceInstance.latestDeployment.id // ""'
 }
 
-deployment_for_digest_json() {
+resolve_predecessor_sha() {
+  local api_sha worker_sha scheduler_sha sha common_sha
+  api_sha="$(current_commit_for_service api)"
+  worker_sha="$(current_commit_for_service worker)"
+  scheduler_sha="$(current_commit_for_service scheduler)"
+  for sha_name in api_sha worker_sha scheduler_sha; do
+    sha="${!sha_name}"
+    [[ -n "$sha" ]] \
+      || fail "production source deployment metadata lacks commitHash; bootstrap is incomplete"
+    git cat-file -e "${sha}^{commit}" 2>/dev/null \
+      || fail "production commit is unavailable in this checkout: $sha"
+    git merge-base --is-ancestor "$sha" "$release_sha" \
+      || fail "target must advance production dev history; use a reviewed revert commit"
+    if ! git diff --quiet "$sha" "$release_sha" -- migrations alembic.ini; then
+      git diff --name-status "$sha" "$release_sha" -- migrations alembic.ini >&2
+      fail "automatic source release refuses Alembic graph changes; use the migration-aware runbook"
+    fi
+  done
+  common_sha="$(git merge-base --octopus "$api_sha" "$worker_sha" "$scheduler_sha" "$release_sha")"
+  [[ "$common_sha" =~ ^[0-9a-f]{40}$ ]] || fail "could not resolve production predecessor"
+  printf '%s\n' "$common_sha"
+}
+
+service_needs_deploy() {
   local service="$1"
-  local digest="$2"
-  railway deployment list \
-    --project "$RAILWAY_PROJECT_ID" \
-    --environment "$RAILWAY_ENVIRONMENT" \
-    --service "$service" \
-    --limit 100 \
-    --json | jq --arg digest "$digest" '
-      map(
-        select(
-          (.status == "SUCCESS" or .status == "REMOVED")
-          and .meta.imageDigest == $digest
-        )
-      )
-      | first
-    '
+  local state status commit_hash
+  state="$(service_state "$service")"
+  status="$(jq -r '.data.serviceInstance.latestDeployment.status // ""' <<<"$state")"
+  commit_hash="$(jq -r '.data.serviceInstance.latestDeployment.meta.commitHash // ""' <<<"$state")"
+  [[ "$status" != "SUCCESS" || "$commit_hash" != "$release_sha" ]]
+}
+
+validate_migration_graph_unchanged() {
+  local predecessor_sha="$1"
+  git cat-file -e "${predecessor_sha}^{commit}" 2>/dev/null \
+    || fail "predecessor commit is unavailable: $predecessor_sha"
+  if ! git diff --quiet "$predecessor_sha" "$release_sha" -- migrations alembic.ini; then
+    git diff --name-status "$predecessor_sha" "$release_sha" -- migrations alembic.ini >&2
+    fail "automatic source release refuses Alembic graph changes; use the migration-aware runbook"
+  fi
+  log "migration graph unchanged from $predecessor_sha to $release_sha"
+}
+
+deploy_service() {
+  local service="$1"
+  local id variables query response deployment_id
+  id="$(service_id "$service")"
+  variables="$(jq -cn \
+    --arg environmentId "$RAILWAY_ENVIRONMENT_ID" \
+    --arg serviceId "$id" \
+    --arg commitSha "$release_sha" \
+    '{environmentId: $environmentId, serviceId: $serviceId, commitSha: $commitSha}')"
+  query='mutation DeployService($environmentId: String!, $serviceId: String!, $commitSha: String!) {
+    serviceInstanceDeployV2(
+      environmentId: $environmentId,
+      serviceId: $serviceId,
+      commitSha: $commitSha
+    )
+  }'
+  response="$(graphql_mutation "$query" "$variables")"
+  deployment_id="$(jq -er '.data.serviceInstanceDeployV2' <<<"$response")" \
+    || fail "Railway did not return a deployment ID for $service"
+  log "$service deployment queued: $deployment_id"
+  printf '%s\n' "$deployment_id"
 }
 
 wait_for_deployment() {
   local service="$1"
-  local previous_id="$2"
-  local expected_digest="$3"
+  local deployment_id="$2"
   local deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
-  local deployment deployment_id deployment_status deployment_digest
-
+  local variables query response status commit_hash
+  variables="$(jq -cn --arg id "$deployment_id" '{id: $id}')"
+  query='query Deployment($id: String!) { deployment(id: $id) { id status meta } }'
   while (( SECONDS < deadline )); do
-    deployment="$(latest_deployment_json "$service")"
-    deployment_id="$(jq -r '.id // ""' <<<"$deployment")"
-    deployment_status="$(jq -r '.status // ""' <<<"$deployment")"
-    deployment_digest="$(jq -r '.meta.imageDigest // ""' <<<"$deployment")"
-    if [[ -n "$deployment_id" && "$deployment_id" != "$previous_id" ]]; then
-      case "$deployment_status" in
-        SUCCESS)
-          [[ "$deployment_digest" == "$expected_digest" ]] \
-            || fail "$service deployed $deployment_digest, expected $expected_digest"
-          printf '%s\n' "$deployment_id"
-          return 0
-          ;;
-        FAILED|CRASHED|REMOVED)
-          fail "$service deployment $deployment_id ended with $deployment_status"
-          ;;
-      esac
-    fi
-    sleep 5
+    response="$(graphql "$query" "$variables")"
+    status="$(jq -r '.data.deployment.status // ""' <<<"$response")"
+    case "$status" in
+      SUCCESS)
+        commit_hash="$(jq -r '.data.deployment.meta.commitHash // ""' <<<"$response")"
+        [[ "$commit_hash" == "$release_sha" ]] \
+          || fail "$service deployment provenance is ${commit_hash:-missing}, expected $release_sha"
+        log "$service deployment succeeded at $release_sha: $deployment_id"
+        return 0
+        ;;
+      FAILED|CRASHED|REMOVED|SKIPPED|SLEEPING)
+        fail "$service deployment $deployment_id ended with $status"
+        ;;
+      QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL|"") ;;
+      *) fail "$service deployment $deployment_id returned unknown status $status" ;;
+    esac
+    sleep 10
   done
-  fail "timed out waiting for Railway service: $service"
+  fail "timed out waiting for $service deployment $deployment_id"
 }
 
 wait_for_api_health() {
-  local deadline=$((SECONDS + 180))
+  local deadline=$((SECONDS + API_HEALTH_TIMEOUT_SECONDS))
+  local response
   while (( SECONDS < deadline )); do
-    if [[ "$(curl -fsS "${PUBLIC_BASE_URL}/healthz" 2>/dev/null || true)" == '{"status":"ok"}' ]]; then
+    response="$(curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/healthz" 2>/dev/null || true)"
+    if [[ "$response" == '{"status":"ok"}' ]]; then
+      log "API health check passed: ${PUBLIC_BASE_URL}/healthz"
       return 0
     fi
     sleep 3
@@ -453,293 +407,93 @@ wait_for_api_health() {
   fail "API health check failed: ${PUBLIC_BASE_URL}/healthz"
 }
 
-write_manifest() {
-  local release_status="$1"
-  local manifest_tmp
-  manifest_tmp="$(mktemp "${manifest_path}.tmp.XXXXXX")"
-  jq -n \
-    --arg status "$release_status" \
-    --arg git_sha "$full_sha" \
-    --arg image_repository "$IMAGE_REPO" \
-    --arg sha_tag "$sha_ref" \
-    --arg latest_tag "$latest_ref" \
-    --arg digest "${expected_digest:-}" \
-    --arg previous_digest "${previous_digest:-}" \
-    --arg rollback_tag "$rollback_ref" \
-    --arg previous_app_revision "${previous_app_revision:-}" \
-    --arg rollback_compatible_tag "$rollback_compatible_ref" \
-    --arg rollback_compatible_digest "${rollback_compatible_digest:-}" \
-    --arg rollback_schema_head "c3e7a9f1b204" \
-    --arg previous_api_deployment_id "${previous_api_deployment_id:-}" \
-    --arg previous_worker_deployment_id "${previous_worker_deployment_id:-}" \
-    --arg previous_scheduler_deployment_id "${previous_scheduler_deployment_id:-}" \
-    --arg api_deployment_id "${api_deployment_id:-}" \
-    --arg worker_deployment_id "${worker_deployment_id:-}" \
-    --arg scheduler_deployment_id "${scheduler_deployment_id:-}" \
-    --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{
-      status: $status,
-      git_sha: $git_sha,
-      image_repository: $image_repository,
-      sha_tag: $sha_tag,
-      latest_tag: $latest_tag,
-      digest: $digest,
-      previous_digest: $previous_digest,
-      rollback_tag: $rollback_tag,
-      migration_compatible_rollback: {
-        tag: $rollback_compatible_tag,
-        digest: $rollback_compatible_digest,
-        predecessor_app_revision: $previous_app_revision,
-        database_head: $rollback_schema_head
-      },
-      previous_railway: {
-        api_deployment_id: $previous_api_deployment_id,
-        worker_deployment_id: $previous_worker_deployment_id,
-        scheduler_deployment_id: $previous_scheduler_deployment_id
-      },
-      railway: {
-        api_deployment_id: $api_deployment_id,
-        worker_deployment_id: $worker_deployment_id,
-        scheduler_deployment_id: $scheduler_deployment_id
-      },
-      updated_at: $updated_at
-    }' >"$manifest_tmp" \
-    || { rm -f "$manifest_tmp"; fail "could not render release manifest"; }
-  jq -e . "$manifest_tmp" >/dev/null \
-    || { rm -f "$manifest_tmp"; fail "release manifest is not valid JSON"; }
-  python3 - "$manifest_tmp" "$manifest_path" <<'PY'
-import os
-import sys
-
-source, destination = sys.argv[1:]
-with open(source, "rb") as manifest_file:
-    os.fsync(manifest_file.fileno())
-os.replace(source, destination)
-directory_fd = os.open(os.path.dirname(destination) or ".", os.O_RDONLY)
-try:
-    os.fsync(directory_fd)
-finally:
-    os.close(directory_fd)
-PY
+verify_final_state() {
+  local service state status commit_hash
+  for service in "${RAILWAY_SERVICES[@]}"; do
+    validate_source_contract "$service"
+    state="$(service_state "$service")"
+    status="$(jq -r '.data.serviceInstance.latestDeployment.status // ""' <<<"$state")"
+    commit_hash="$(jq -r '.data.serviceInstance.latestDeployment.meta.commitHash // ""' <<<"$state")"
+    [[ "$status" == "SUCCESS" ]] || fail "$service latest deployment is $status"
+    [[ "$commit_hash" == "$release_sha" ]] \
+      || fail "$service latest deployment is ${commit_hash:-missing}, expected $release_sha"
+  done
 }
 
-log "release commit: $full_sha"
-wait_for_ci
-revalidate_dev_head
-validate_railway_target
+for service in "${RAILWAY_SERVICES[@]}"; do
+  validate_source_contract "$service"
+done
+validate_role_configuration api api
+validate_role_configuration worker worker
+validate_role_configuration scheduler scheduler
 validate_railway_config
 validate_railway_colocation
+api_config_before="$(configuration_fingerprint api)"
+worker_config_before="$(configuration_fingerprint worker)"
+scheduler_config_before="$(configuration_fingerprint scheduler)"
+predecessor_sha="$(resolve_predecessor_sha)"
+validate_migration_graph_unchanged "$predecessor_sha"
 
-for service in "${RAILWAY_SERVICES[@]}"; do
-  source_image="$(railway_source_image "$service")"
-  if [[ "$source_image" != "$latest_ref" && "$source_image" != "docker.io/${latest_ref}" ]]; then
-    fail "Railway $service source must be $latest_ref, got: ${source_image:-none}"
-  fi
-done
+mkdir -p dist
+manifest_path="dist/source-release-${release_sha}.json"
+jq -n \
+  --arg status deploying \
+  --arg release_sha "$release_sha" \
+  --arg predecessor_sha "$predecessor_sha" \
+  --arg environment "$RAILWAY_ENVIRONMENT" \
+  --arg repository "$RAILWAY_REPOSITORY" \
+  '{status: $status, release_sha: $release_sha, predecessor_sha: $predecessor_sha,
+    environment: $environment, repository: $repository}' >"$manifest_path"
 
-sha_image_state="$(image_state "$sha_ref")"
-if [[ "$sha_image_state" == "exists" ]]; then
-  verify_sha_image "$sha_ref"
-  log "verified existing immutable SHA image: $sha_ref"
+if service_needs_deploy api; then
+  api_deployment_id="$(deploy_service api)"
+  wait_for_deployment api "$api_deployment_id"
 else
-  revalidate_dev_head
-  builder_name="$(select_builder)"
-  builder_args=()
-  if [[ -n "$builder_name" ]]; then
-    builder_args=(--builder "$builder_name")
-  fi
-  build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  log "building and pushing $sha_ref for linux/amd64"
-  docker buildx build \
-    "${builder_args[@]}" \
-    --platform linux/amd64 \
-    --provenance=false \
-    --build-arg "RELEASE_SHA=$full_sha" \
-    --build-arg "BUILD_DATE=$build_date" \
-    --build-arg "SOURCE_URL=$SOURCE_URL" \
-    --tag "$sha_ref" \
-    --push \
-    .
-  verify_sha_image "$sha_ref"
+  api_deployment_id="$(current_deployment_id api)"
+  log "api already runs $release_sha; keeping deployment $api_deployment_id"
 fi
-
-expected_digest="$(image_digest "$sha_ref")"
-rollback_image_state="$(image_state "$rollback_ref")"
-rollback_digest=""
-if [[ "$rollback_image_state" == "exists" ]]; then
-  rollback_digest="$(image_digest "$rollback_ref")"
-fi
-active_api="$(active_deployment_json api)"
-active_worker="$(active_deployment_json worker)"
-active_scheduler="$(active_deployment_json scheduler)"
-active_api_id="$(jq -r '.id // ""' <<<"$active_api")"
-active_worker_id="$(jq -r '.id // ""' <<<"$active_worker")"
-active_scheduler_id="$(jq -r '.id // ""' <<<"$active_scheduler")"
-active_api_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active_api")"
-active_worker_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active_worker")"
-active_scheduler_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active_scheduler")"
-for active_value in \
-  "$active_api_id" \
-  "$active_worker_id" \
-  "$active_scheduler_id" \
-  "$active_api_digest" \
-  "$active_worker_digest" \
-  "$active_scheduler_digest"; do
-  [[ -n "$active_value" ]] || fail "Railway has incomplete active deployment metadata"
-done
-for active_digest in "$active_api_digest" "$active_worker_digest" "$active_scheduler_digest"; do
-  [[ "$active_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail "Railway has an invalid active image digest: $active_digest"
-done
-
-if [[ -n "$rollback_digest" ]]; then
-  previous_digest="$rollback_digest"
-  [[ "$previous_digest" != "$expected_digest" ]] \
-    || fail "rollback tag unexpectedly points to the target release"
-else
-  previous_digest="$active_api_digest"
-  [[ "$active_worker_digest" == "$previous_digest" \
-    && "$active_scheduler_digest" == "$previous_digest" ]] \
-    || fail "mixed Railway digests require an existing immutable rollback tag"
-  [[ "$previous_digest" != "$expected_digest" ]] \
-    || fail "cannot reconstruct the predecessor after all roles reached the target digest"
-  revalidate_dev_head
-  rollback_image_state="$(image_state "$rollback_ref")"
-  if [[ "$rollback_image_state" == "exists" ]]; then
-    rollback_digest="$(image_digest "$rollback_ref")"
-    [[ "$rollback_digest" == "$previous_digest" ]] \
-      || fail "rollback tag appeared concurrently with an unexpected digest"
-  else
-    log "retaining immutable rollback image: $rollback_ref -> $previous_digest"
-    docker buildx imagetools create --prefer-index=false \
-      --tag "$rollback_ref" "${IMAGE_REPO}@${previous_digest}" >/dev/null
-    rollback_digest="$(image_digest "$rollback_ref")"
-    [[ "$rollback_digest" == "$previous_digest" ]] \
-      || fail "rollback tag digest does not match the active predecessor"
-  fi
-fi
-
-for service in "${RAILWAY_SERVICES[@]}"; do
-  case "$service" in
-    api) current_digest="$active_api_digest" ;;
-    worker) current_digest="$active_worker_digest" ;;
-    scheduler) current_digest="$active_scheduler_digest" ;;
-  esac
-  if [[ "$current_digest" != "$previous_digest" && "$current_digest" != "$expected_digest" ]]; then
-    fail "$service is on unrelated digest $current_digest"
-  fi
-done
-
-previous_api_deployment_id="$(jq -r '.id // ""' \
-  <<<"$(deployment_for_digest_json api "$previous_digest")")"
-previous_worker_deployment_id="$(jq -r '.id // ""' \
-  <<<"$(deployment_for_digest_json worker "$previous_digest")")"
-previous_scheduler_deployment_id="$(jq -r '.id // ""' \
-  <<<"$(deployment_for_digest_json scheduler "$previous_digest")")"
-for previous_id in \
-  "$previous_api_deployment_id" \
-  "$previous_worker_deployment_id" \
-  "$previous_scheduler_deployment_id"; do
-  [[ -n "$previous_id" ]] || fail "could not retain all predecessor Railway deployment IDs"
-done
-
-verify_predecessor_image "${IMAGE_REPO}@${previous_digest}" "$previous_digest"
-previous_app_revision="$(image_revision "${IMAGE_REPO}@${previous_digest}")"
-[[ "$previous_app_revision" =~ ^[0-9a-f]{40}$ ]] \
-  || fail "predecessor image has invalid OCI revision: ${previous_app_revision:-missing}"
-rollback_compatible_digest="$(prepare_rollback_compatible_image \
-  "$rollback_compatible_ref" "$previous_digest" "$previous_app_revision")"
-[[ "$rollback_compatible_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
-  || fail "invalid migration-compatible rollback digest: $rollback_compatible_digest"
-log "verifying target and migration-compatible predecessor against an isolated a6 database"
-scripts/verify_migration_compatible_rollback.sh \
-  "${IMAGE_REPO}@${expected_digest}" \
-  "${IMAGE_REPO}@${rollback_compatible_digest}"
-[[ "$(image_digest "$rollback_compatible_ref")" == "$rollback_compatible_digest" ]] \
-  || fail "migration-compatible rollback tag changed during smoke test"
-verify_rollback_compatible_image \
-  "${IMAGE_REPO}@${rollback_compatible_digest}" "$previous_digest" "$previous_app_revision"
-write_manifest "prepared"
-
-initial_latest_digest="$(image_digest "$latest_ref")"
-if [[ "$initial_latest_digest" != "$previous_digest" && "$initial_latest_digest" != "$expected_digest" ]]; then
-  fail "Docker Hub latest changed to unrelated digest $initial_latest_digest"
-fi
-write_manifest "deploying"
-if [[ "$initial_latest_digest" != "$expected_digest" ]]; then
-  revalidate_dev_head
-  [[ "$(image_digest "$latest_ref")" == "$initial_latest_digest" ]] \
-    || fail "Docker Hub latest changed concurrently before promotion"
-  verify_sha_image "$sha_ref"
-  [[ "$(image_digest "$sha_ref")" == "$expected_digest" ]] \
-    || fail "target SHA tag changed before promotion"
-  log "promoting the exact target digest to $latest_ref"
-  docker buildx imagetools create --prefer-index=false \
-    --tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}" >/dev/null
-fi
-latest_digest="$(image_digest "$latest_ref")"
-[[ "$latest_digest" == "$expected_digest" ]] \
-  || fail "latest digest $latest_digest does not match SHA digest $expected_digest"
-require_target_latest() {
-  local latest_digest
-  latest_digest="$(image_digest "$latest_ref")"
-  [[ "$latest_digest" == "$expected_digest" ]] \
-    || fail "Docker Hub latest changed during release: $latest_digest"
-}
-
-deploy_role() {
-  local service="$1"
-  local active active_id active_digest before_id deployment_id
-  require_target_latest
-  active="$(active_deployment_json "$service")"
-  active_id="$(jq -r '.id // ""' <<<"$active")"
-  active_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
-  if [[ "$active_digest" == "$expected_digest" ]]; then
-    log "$service already runs the target digest: $active_id"
-    printf '%s\n' "$active_id"
-    return 0
-  fi
-  [[ "$active_digest" == "$previous_digest" ]] \
-    || fail "$service cannot resume from digest $active_digest"
-  before_id="$(jq -r '.id // ""' <<<"$(latest_deployment_json "$service")")"
-  require_target_latest
-  log "redeploying Railway $service from source"
-  railway redeploy \
-    --project "$RAILWAY_PROJECT_ID" \
-    --environment "$RAILWAY_ENVIRONMENT" \
-    --service "$service" \
-    --from-source \
-    --yes \
-    --json >/dev/null
-  deployment_id="$(wait_for_deployment "$service" "$before_id" "$expected_digest")"
-  printf '%s\n' "$deployment_id"
-}
-
-api_deployment_id="$(deploy_role api)"
 wait_for_api_health
-log "API ready: $api_deployment_id"
-worker_deployment_id="$(deploy_role worker)"
-log "Worker ready: $worker_deployment_id"
-scheduler_deployment_id="$(deploy_role scheduler)"
-log "Scheduler ready: $scheduler_deployment_id"
-require_target_latest
-
-final_latest_digest="$(image_digest "$latest_ref")"
-[[ "$final_latest_digest" == "$expected_digest" ]] \
-  || fail "Docker Hub latest changed during Railway rollout"
-for service in "${RAILWAY_SERVICES[@]}"; do
-  active="$(active_deployment_json "$service")"
-  final_id="$(jq -r '.id // ""' <<<"$active")"
-  final_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
-  [[ -n "$final_id" && "$final_digest" == "$expected_digest" ]] \
-    || fail "$service active deployment does not match $expected_digest"
-done
+if service_needs_deploy worker; then
+  worker_deployment_id="$(deploy_service worker)"
+  wait_for_deployment worker "$worker_deployment_id"
+else
+  worker_deployment_id="$(current_deployment_id worker)"
+  log "worker already runs $release_sha; keeping deployment $worker_deployment_id"
+fi
+if service_needs_deploy scheduler; then
+  scheduler_deployment_id="$(deploy_service scheduler)"
+  wait_for_deployment scheduler "$scheduler_deployment_id"
+else
+  scheduler_deployment_id="$(current_deployment_id scheduler)"
+  log "scheduler already runs $release_sha; keeping deployment $scheduler_deployment_id"
+fi
+verify_final_state
+validate_role_configuration api api
+validate_role_configuration worker worker
+validate_role_configuration scheduler scheduler
 validate_railway_config
 validate_railway_colocation
-revalidate_dev_head
-require_target_latest
-write_manifest "completed"
+[[ "$(configuration_fingerprint api)" == "$api_config_before" ]] \
+  || fail "api variables, domains, replicas, region, or restart policy changed during release"
+[[ "$(configuration_fingerprint worker)" == "$worker_config_before" ]] \
+  || fail "worker variables, domains, replicas, region, or restart policy changed during release"
+[[ "$(configuration_fingerprint scheduler)" == "$scheduler_config_before" ]] \
+  || fail "scheduler variables, domains, replicas, region, or restart policy changed during release"
 
-log "release complete: $full_sha -> $expected_digest"
-log "migration-compatible rollback: $rollback_compatible_ref -> $rollback_compatible_digest"
-log "release manifest: $manifest_path"
+jq -n \
+  --arg status completed \
+  --arg release_sha "$release_sha" \
+  --arg predecessor_sha "$predecessor_sha" \
+  --arg environment "$RAILWAY_ENVIRONMENT" \
+  --arg repository "$RAILWAY_REPOSITORY" \
+  --arg api_deployment_id "$api_deployment_id" \
+  --arg worker_deployment_id "$worker_deployment_id" \
+  --arg scheduler_deployment_id "$scheduler_deployment_id" \
+  '{status: $status, release_sha: $release_sha, predecessor_sha: $predecessor_sha,
+    environment: $environment, repository: $repository,
+    railway: {api_deployment_id: $api_deployment_id,
+      worker_deployment_id: $worker_deployment_id,
+      scheduler_deployment_id: $scheduler_deployment_id}}' >"$manifest_path"
+
+log "source release completed: $release_sha"
+cat "$manifest_path"
