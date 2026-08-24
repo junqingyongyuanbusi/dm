@@ -87,8 +87,8 @@ done
 git cat-file -e "${release_sha}^{commit}" 2>/dev/null \
   || fail "release commit is unavailable in this checkout: $release_sha"
 git fetch --quiet origin dev
-git merge-base --is-ancestor "$release_sha" origin/dev \
-  || fail "release commit is not reachable from origin/dev: $release_sha"
+[[ "$(git rev-parse origin/dev)" == "$release_sha" ]] \
+  || fail "release commit is stale; origin/dev moved before production mutation"
 
 [[ "${GITHUB_ACTIONS:-}" == "true" && "${PRODUCTION_DEPLOY_AUTHORIZED:-}" == "true" ]] \
   || fail "production source mutation is authorized only from the protected GitHub Actions workflow"
@@ -433,6 +433,10 @@ worker_config_before="$(configuration_fingerprint worker)"
 scheduler_config_before="$(configuration_fingerprint scheduler)"
 predecessor_sha="$(resolve_predecessor_sha)"
 validate_migration_graph_unchanged "$predecessor_sha"
+
+git fetch --quiet origin dev
+[[ "$(git rev-parse origin/dev)" == "$release_sha" ]] \
+  || fail "release commit became stale during preflight; no production mutation was made"
 
 mkdir -p dist
 manifest_path="dist/source-release-${release_sha}.json"
