@@ -53,6 +53,24 @@ _SCOPES = {
         "pages_show_list,pages_manage_metadata,instagram_basic,instagram_manage_messages"
     ),
 }
+_FACEBOOK_COMMENT_SCOPES = (
+    "pages_read_engagement",
+    "pages_read_user_content",
+    "pages_manage_engagement",
+)
+_INSTAGRAM_COMMENT_SCOPES = (
+    "pages_read_engagement",
+    "instagram_manage_comments",
+)
+
+
+def _oauth_scopes(platform: str) -> str:
+    scopes = _SCOPES[platform].split(",")
+    if platform == "facebook" and get_settings().meta_comment_reply_enabled:
+        scopes.extend(_FACEBOOK_COMMENT_SCOPES)
+    if platform == "instagram" and get_settings().meta_comment_reply_enabled:
+        scopes.extend(_INSTAGRAM_COMMENT_SCOPES)
+    return ",".join(scopes)
 
 
 def _graph_client(**kwargs) -> httpx.AsyncClient:
@@ -161,7 +179,8 @@ async def meta_oauth_start(request: Request) -> Response:
                 "redirect_uri": admin_callback_url("/admin/oauth/meta/callback"),
                 "state": state_token,
                 "response_type": "code",
-                "scope": _SCOPES[platform],
+                "scope": _oauth_scopes(platform),
+                **({"auth_type": "rerequest"} if get_settings().meta_comment_reply_enabled else {}),
             },
             quote_via=quote,
         )
@@ -295,7 +314,7 @@ async def _picker(request: Request, candidates: list[dict], context: dict) -> Re
         for index, candidate in enumerate(candidates)
     )
     label = "Instagram 账号" if context["platform"] == "instagram" else "Facebook Page"
-    body = f"""<a class="back" href="/admin/accounts">← 返回账号页</a>
+    body = f"""<a class="back" href="/admin/integrations/accounts">← 返回平台账号</a>
 <section class="card"><h1 style="font-size:24px">选择要接入的 {label}</h1>
 <form method="post" action="/admin/oauth/meta/select">
 <input type="hidden" name="csrf_token" value="{csrf}">
@@ -364,7 +383,8 @@ async def _finalize(
     principal: Principal,
 ) -> Response:
     platform = context["platform"]
-    if not get_settings().platform_integration_enabled(platform):
+    settings = get_settings()
+    if not settings.platform_integration_enabled(platform):
         return notice("平台集成已关闭", "提交接入前该平台已被关闭。", status_code=503)
     if platform == "instagram":
         external_account_id = candidate["ig_id"]
@@ -374,6 +394,7 @@ async def _finalize(
     else:
         external_account_id = candidate["id"]
         display_name = candidate["name"]
+    enable_comments = settings.meta_comment_reply_enabled
     submission = {
         "name": display_name,
         "external_account_id": external_account_id,
@@ -383,7 +404,7 @@ async def _finalize(
         "instagram_login_mode": "facebook_login",
         "page_id": candidate["id"],
         "enable_dm": True,
-        "enable_comments": False,
+        "enable_comments": enable_comments,
         "automation_default": "BOT_DRAFT_ONLY",
         "access_token": candidate["access_token"],
         "app_secret": app.app_secret,

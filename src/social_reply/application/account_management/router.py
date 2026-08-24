@@ -1,11 +1,20 @@
 import logging
 import secrets
+import unicodedata
 import uuid
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import select
 
 from social_reply.application.account_management.jobs import (
@@ -14,6 +23,24 @@ from social_reply.application.account_management.jobs import (
     submit_provisioning_job,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.connectors.email.contracts import (
+    MAX_EMAIL_CREDENTIAL_CHARS,
+    MAX_EMAIL_MAILBOX_CHARS,
+    MAX_SENDER_NAME_CHARS,
+    normalize_email_address,
+    validate_email_account_text,
+)
+from social_reply.connectors.email.network import (
+    EmailNetworkError,
+    normalize_hostname,
+    require_allowed_host,
+    validate_port,
+)
+from social_reply.connectors.feishu.contracts import (
+    FEISHU_API_BASE_URL,
+    FEISHU_APP_ID_PATTERN,
+    FEISHU_GROUP_MODE,
+)
 from social_reply.domain.platform_accounts import (
     ACTIVE_ACCOUNT_STATUS,
     DISABLED_ACCOUNT_STATUS,
@@ -31,9 +58,22 @@ class _StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+_ACCOUNT_SCOPE_PATTERN = r"^[A-Za-z0-9_-]+$"
+
+
 class _BaseAccountRequest(_StrictRequest):
-    tenant_id: str = Field(default="default", min_length=1, max_length=64)
-    brand_id: str = Field(default="default", min_length=1, max_length=64)
+    tenant_id: str = Field(
+        default="default",
+        min_length=1,
+        max_length=64,
+        pattern=_ACCOUNT_SCOPE_PATTERN,
+    )
+    brand_id: str = Field(
+        default="default",
+        min_length=1,
+        max_length=64,
+        pattern=_ACCOUNT_SCOPE_PATTERN,
+    )
     name: str | None = Field(default=None, min_length=1, max_length=255)
     public_id: str | None = Field(default=None, min_length=1, max_length=128)
     automation_default: Literal["BOT_ACTIVE", "BOT_DRAFT_ONLY"] = "BOT_DRAFT_ONLY"
@@ -63,14 +103,17 @@ class MetaAccountRequest(_BaseAccountRequest):
 
     @model_validator(mode="after")
     def _validate_meta_request(self) -> "MetaAccountRequest":
+        settings = get_settings()
         if not self.app_id and not self.app_public_id:
             raise ValueError("app_id 或 app_public_id 至少填写一个")
-        if not self.enable_dm or self.enable_comments:
-            raise ValueError("当前 Meta 接入仅允许文本私信")
-        if not get_settings().meta_automation_default_allowed(
-            self.platform, self.automation_default
-        ):
-            raise ValueError("Meta 接入必须使用 BOT_DRAFT_ONLY（未开启 META_AUTO_REPLY_ENABLED）")
+        if not self.enable_dm:
+            raise ValueError("Meta 接入必须启用文本私信")
+        if "enable_comments" not in self.model_fields_set:
+            self.enable_comments = settings.meta_comment_reply_enabled
+        if self.enable_comments and not settings.meta_comment_reply_enabled:
+            raise ValueError("Meta 评论回复未启用")
+        if self.automation_default != "BOT_DRAFT_ONLY":
+            raise ValueError("新接入的 Meta 账号必须使用 BOT_DRAFT_ONLY")
         if self.platform == "facebook" and self.instagram_login_mode != "facebook_login":
             raise ValueError("Facebook 账号必须使用 facebook_login")
         if (
@@ -112,6 +155,80 @@ class XAccountRequest(_BaseAccountRequest):
     access_token_secret: SecretStr
     environment: str = Field(default="oauth", min_length=1, max_length=128)
     xchat_pin: SecretStr | None = None
+
+
+class EmailAccountRequest(_BaseAccountRequest):
+    email_address: str
+    # Validate secret content only after authentication, tenant authorization, and the feature
+    # gate. Pydantic includes a failing field's raw input in 422 details, so these fields must not
+    # raise schema-validation errors containing provider credentials.
+    username: Any = Field(json_schema_extra={"writeOnly": True})
+    password: Any = Field(json_schema_extra={"writeOnly": True})
+    automation_default: str = Field(default="BOT_DRAFT_ONLY", max_length=64)
+    imap_host: str
+    imap_port: int = 993
+    mailbox: str = Field(default="INBOX", min_length=1, max_length=MAX_EMAIL_MAILBOX_CHARS)
+    smtp_host: str
+    smtp_port: int | None = None
+    smtp_security: Literal["ssl", "starttls"] = "ssl"
+    from_name: str | None = Field(default=None, min_length=1, max_length=MAX_SENDER_NAME_CHARS)
+    internal_domain_policy: Literal["ignore", "allow"] = "ignore"
+
+    @field_validator("email_address")
+    @classmethod
+    def _canonicalize_email_address(cls, value: str) -> str:
+        return normalize_email_address(value)
+
+    @field_validator("imap_host", "smtp_host")
+    @classmethod
+    def _canonicalize_email_host(cls, value: str) -> str:
+        return normalize_hostname(value)
+
+    @field_validator("imap_port")
+    @classmethod
+    def _validate_imap_port(cls, value: int) -> int:
+        return validate_port(value)
+
+    @field_validator("smtp_port")
+    @classmethod
+    def _validate_smtp_port(cls, value: int | None) -> int | None:
+        return validate_port(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _default_smtp_port(self) -> "EmailAccountRequest":
+        if self.smtp_port is None:
+            self.smtp_port = 465 if self.smtp_security == "ssl" else 587
+        return self
+
+    @field_validator("mailbox", "from_name")
+    @classmethod
+    def _validate_email_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError("email_control_character_forbidden")
+        if not value.strip():
+            raise ValueError("email_text_blank")
+        return value
+
+
+class FeishuAccountRequest(_BaseAccountRequest):
+    app_id: str = Field(pattern=FEISHU_APP_ID_PATTERN)
+    app_secret: SecretStr = Field(min_length=1, max_length=512)
+    verification_token: SecretStr = Field(min_length=1, max_length=512)
+    encrypt_key: SecretStr = Field(min_length=1, max_length=512)
+    api_base_url: Literal[FEISHU_API_BASE_URL] = FEISHU_API_BASE_URL
+    group_mode: Literal[FEISHU_GROUP_MODE] = FEISHU_GROUP_MODE
+
+    @model_validator(mode="after")
+    def _validate_feishu_request(self) -> "FeishuAccountRequest":
+        for field_name in ("app_secret", "verification_token", "encrypt_key"):
+            value = getattr(self, field_name).get_secret_value()
+            if not value.strip():
+                raise ValueError(f"blank_{field_name}")
+        if self.automation_default != "BOT_DRAFT_ONLY":
+            raise ValueError("新接入的 Feishu 账号必须使用 BOT_DRAFT_ONLY")
+        return self
 
 
 class ProvisioningJobResponse(BaseModel):
@@ -160,19 +277,29 @@ def _require_platform_enabled(platform: str) -> None:
         raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
 
 
+def _validate_email_request_after_gates(
+    request: EmailAccountRequest,
+    *,
+    allowed_hosts: frozenset[str],
+) -> None:
+    if request.automation_default != "BOT_DRAFT_ONLY":
+        raise HTTPException(status_code=422, detail="email_requires_bot_draft_only")
+    try:
+        validate_email_account_text(request.username, maximum=MAX_EMAIL_CREDENTIAL_CHARS)
+        validate_email_account_text(request.password, maximum=MAX_EMAIL_CREDENTIAL_CHARS)
+        validate_email_account_text(request.mailbox, maximum=MAX_EMAIL_MAILBOX_CHARS)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_email_account_request") from exc
+    try:
+        require_allowed_host(request.imap_host, allowed_hosts)
+        require_allowed_host(request.smtp_host, allowed_hosts)
+    except EmailNetworkError as exc:
+        raise HTTPException(status_code=422, detail="email_hostname_not_allowed") from exc
+
+
 def _split_request(platform: str, request: BaseModel) -> tuple[dict, dict[str, str]]:
     values = request.model_dump()
-    for key in (
-        "token",
-        "access_token",
-        "app_secret",
-        "verify_token",
-        "consumer_key",
-        "consumer_secret",
-        "access_token_secret",
-        "xchat_pin",
-    ):
-        value = values.get(key)
+    for key, value in values.items():
         if isinstance(value, SecretStr):
             values[key] = value.get_secret_value()
     return split_submission(platform, values)
@@ -243,6 +370,65 @@ async def create_or_update_whatsapp_account(
         tenant_id=request.tenant_id,
         brand_id=request.brand_id,
         platform="whatsapp",
+        actor=principal.actor,
+        request=payload,
+        secrets=secrets_bundle,
+    )
+    await _enqueue(job_id)
+    return _job_response(job_id)
+
+
+@router.post("/email", response_model=ProvisioningJobResponse, status_code=202)
+async def create_or_update_email_account(
+    request: Request,
+    principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
+) -> ProvisioningJobResponse:
+    try:
+        raw_request = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        raise HTTPException(status_code=422, detail="invalid_email_account_request") from None
+    if not isinstance(raw_request, dict):
+        raise HTTPException(status_code=422, detail="invalid_email_account_request")
+    tenant_id = raw_request.get("tenant_id", "default")
+    if not isinstance(tenant_id, str):
+        raise HTTPException(status_code=422, detail="invalid_email_account_request")
+    principal.require_tenant(tenant_id)
+    settings = get_settings()
+    if not settings.platform_integration_enabled("email"):
+        raise HTTPException(status_code=503, detail="email_integration_disabled")
+    try:
+        email_request = EmailAccountRequest.model_validate(raw_request)
+    except (ValidationError, ValueError):
+        raise HTTPException(status_code=422, detail="invalid_email_account_request") from None
+    _validate_email_request_after_gates(
+        email_request,
+        allowed_hosts=settings.email_allowed_hosts,
+    )
+    payload, secrets_bundle = _split_request("email", email_request)
+    job_id = await submit_provisioning_job(
+        tenant_id=email_request.tenant_id,
+        brand_id=email_request.brand_id,
+        platform="email",
+        actor=principal.actor,
+        request=payload,
+        secrets=secrets_bundle,
+    )
+    await _enqueue(job_id)
+    return _job_response(job_id)
+
+
+@router.post("/feishu", response_model=ProvisioningJobResponse, status_code=202)
+async def create_or_update_feishu_account(
+    request: FeishuAccountRequest,
+    principal: Annotated[ControlPrincipal, Depends(require_control_api_key)],
+) -> ProvisioningJobResponse:
+    principal.require_tenant(request.tenant_id)
+    _require_platform_enabled("feishu")
+    payload, secrets_bundle = _split_request("feishu", request)
+    job_id = await submit_provisioning_job(
+        tenant_id=request.tenant_id,
+        brand_id=request.brand_id,
+        platform="feishu",
         actor=principal.actor,
         request=payload,
         secrets=secrets_bundle,

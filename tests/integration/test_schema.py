@@ -24,11 +24,18 @@ EXPECTED_TABLES = {
     "sync_runs",
     "sync_gaps",
     "automation_states",
+    "human_work_items",
+    "tenant_feishu_handoff_configs",
+    "feishu_handoff_operators",
+    "handoff_notification_intents",
+    "feishu_card_action_receipts",
     "outbox_messages",
     "audit_logs",
     "provisioning_jobs",
     "decision_jobs",
     "reply_decisions",
+    "evaluation_runs",
+    "evaluation_decisions",
     "delivery_attempts",
 }
 
@@ -127,6 +134,7 @@ async def test_poll_raw_event_journal_columns_and_indexes_exist(migrated_db):
         "ix_raw_events_account_received",
         "ix_raw_events_processing_due",
         "ix_raw_events_tenant_status_received",
+        "uq_raw_events_feishu_webhook_external_event",
     } <= indexes
 
 
@@ -159,6 +167,54 @@ async def test_platform_sync_tables_have_constraints_and_indexes(migrated_db):
         "ix_sync_gaps_retry",
         "uq_sync_gaps_active_checkpoint",
     } <= gap_indexes
+
+
+async def test_feishu_handoff_notification_schema(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        work_columns = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='human_work_items'"
+                )
+            )
+        }
+        intent_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='handoff_notification_intents'"
+                )
+            )
+        }
+        intent_indexes = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE tablename='handoff_notification_intents'"
+                )
+            )
+        }
+    assert {"resolved_actor", "resolution_evidence", "resolution_outbox_id"} <= work_columns
+    assert {
+        "ck_handoff_notification_intents_status",
+        "ck_handoff_notification_intents_card_state",
+        "ck_handoff_notification_intents_revisions",
+        "ck_handoff_notification_intents_sending_lease",
+        "fk_handoff_notification_intents_tenant_work",
+        "fk_handoff_notification_intents_tenant_conversation",
+        "fk_handoff_notification_intents_tenant_config",
+        "fk_handoff_notification_intents_tenant_account",
+    } <= intent_constraints
+    assert {
+        "ix_handoff_notification_intents_due",
+        "ix_handoff_notification_intents_tenant_status",
+        "ix_handoff_notification_intents_provider_message",
+    } <= intent_indexes
 
 
 async def test_admin_health_indexes_exist(migrated_db):
@@ -223,6 +279,99 @@ async def test_platform_account_contract_rejects_invalid_rows(session, overrides
         await session.execute(insert(models.PlatformAccount).values(**values))
         await session.commit()
     await session.rollback()
+
+
+async def test_platform_account_contract_accepts_email(session):
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="email",
+            name="email-contract",
+            status="active",
+            capability={"dm": True, "max_text_length": 4000},
+        )
+    )
+    await session.commit()
+    assert (await session.get(models.PlatformAccount, account_id)).platform == "email"
+
+
+async def test_email_checkpoint_scope_and_uidvalidity_gap_contract(session):
+    account_id = uuid.uuid4()
+    checkpoint_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="email",
+            name="email-sync-contract",
+            status="active",
+            capability={"dm": True, "max_text_length": 4000},
+        )
+    )
+    await session.execute(
+        insert(models.PlatformCheckpoint).values(
+            id=checkpoint_id,
+            tenant_id="default",
+            platform_account_id=account_id,
+            stream="EMAIL_IMAP",
+            scope_key="",
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.PlatformCheckpoint).values(
+                id=uuid.uuid4(),
+                tenant_id="default",
+                platform_account_id=account_id,
+                stream="EMAIL_IMAP",
+                scope_key="INBOX",
+            )
+        )
+        await session.commit()
+    await session.rollback()
+
+    run_id = uuid.uuid4()
+    await session.execute(
+        insert(models.SyncRun).values(
+            id=run_id,
+            checkpoint_id=checkpoint_id,
+            claim_token=uuid.uuid4(),
+            mode="POLL",
+            status="GAPPED",
+        )
+    )
+    await session.execute(
+        insert(models.SyncGap).values(
+            checkpoint_id=checkpoint_id,
+            sync_run_id=run_id,
+            gap_type="EMAIL_UIDVALIDITY_CHANGED",
+            status="OPEN",
+        )
+    )
+    await session.commit()
+
+
+async def test_platform_account_contract_accepts_feishu(session):
+    account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="feishu",
+            name="feishu-contract",
+            status="active",
+            capability={"dm": True, "mentions": True, "max_text_length": 4000},
+        )
+    )
+    await session.commit()
+    assert (await session.get(models.PlatformAccount, account_id)).platform == "feishu"
 
 
 async def test_platform_account_model_defaults_to_canonical_active_status(session):
@@ -341,6 +490,7 @@ async def test_delivery_attempts_and_outbox_index(migrated_db):
         }
     assert {"id", "outbox_id", "attempt_no", "outcome", "error_code", "created_at"} <= cols
     assert any("conversation" in name and "status" in name for name in idx)
+    assert "ix_outbox_email_bot_sent_account_time" in idx
 
 
 async def test_all_core_tables_exist(migrated_db):
@@ -446,6 +596,127 @@ async def test_normalized_events_dedup_constraint(migrated_db, session):
             insert(models.NormalizedEvent).values(**{**values, "id": uuid.uuid4()})
         )
         await session.commit()
+
+
+async def test_human_work_items_enforce_tenant_and_claim_assignment(session, migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        work_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='human_work_items'"
+                )
+            )
+        }
+        conversation_constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='conversations'"
+                )
+            )
+        }
+    assert {
+        "ck_human_work_items_claimed_assignment",
+        "fk_human_work_items_tenant_conversation",
+    } <= work_constraints
+    assert "uq_conversations_tenant_id_id" in conversation_constraints
+
+    account_id, contact_id, conversation_id = (uuid.uuid4() for _ in range(3))
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="tenant-a",
+            brand_id="b1",
+            platform="telegram",
+            name="human-work-schema",
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="tenant-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            external_user_id="human-work-schema",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            tenant_id="tenant-a",
+            brand_id="b1",
+            platform="telegram",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"schema:{conversation_id}",
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.HumanWorkItem).values(
+                tenant_id="tenant-a",
+                conversation_id=conversation_id,
+                status="CLAIMED",
+                reason_code="TEST",
+            )
+        )
+        await session.commit()
+    await session.rollback()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            insert(models.HumanWorkItem).values(
+                tenant_id="tenant-b",
+                conversation_id=conversation_id,
+                status="WAITING",
+                reason_code="TEST",
+            )
+        )
+        await session.commit()
+    await session.rollback()
+
+
+async def test_prompt_and_knowledge_governance_schema_matches_contract(migrated_db):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        columns = {
+            (row.table_name, row.column_name): row
+            for row in await conn.execute(
+                text(
+                    "SELECT table_name, column_name, is_nullable, column_default, data_type "
+                    "FROM information_schema.columns "
+                    "WHERE (table_name='reply_prompts' AND column_name='voice_preferences') "
+                    "OR (table_name='knowledge_documents' "
+                    "AND column_name IN ('status', 'is_official_contact'))"
+                )
+            )
+        }
+        constraints = {
+            row[0]
+            for row in await conn.execute(
+                text(
+                    "SELECT constraint_name FROM information_schema.table_constraints "
+                    "WHERE table_name='knowledge_documents'"
+                )
+            )
+        }
+    voice = columns[("reply_prompts", "voice_preferences")]
+    knowledge_status = columns[("knowledge_documents", "status")]
+    official = columns[("knowledge_documents", "is_official_contact")]
+    assert voice.is_nullable == "NO"
+    assert voice.data_type == "jsonb"
+    assert all(value in voice.column_default for value in ("professional", "concise", "never"))
+    assert knowledge_status.is_nullable == "NO"
+    assert "draft" in knowledge_status.column_default
+    assert official.is_nullable == "NO"
+    assert official.column_default == "false"
+    assert "ck_knowledge_documents_status" in constraints
 
 
 async def test_metadata_matches_migrations(migrated_db):

@@ -1,12 +1,21 @@
+import logging
+import time
 from dataclasses import dataclass, replace
 
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
-from social_reply.domain.reply.guard import redact_pii, run_final_guard
-from social_reply.domain.reply.llm import LLMClient, LLMContext
+from social_reply.domain.messages.canonical import ChannelType
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
+from social_reply.domain.reply.guard import (
+    LANGUAGE_VERIFICATION_STRICT,
+    redact_pii,
+    run_final_guard,
+)
+from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, LLMClient, LLMContext
+from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
 from social_reply.domain.reply.rules import apply_rules
+from social_reply.domain.reply.voice import VoicePreferences
 
-# 低置信度的 LLM handoff 不应让会话静默，也不应永久锁死等待人工。
-LLM_HANDOFF_FALLBACK_TEXT = "抱歉，我暂时无法准确回答这个问题。请换一种说法或提供更多信息。"
+logger = logging.getLogger(__name__)
+_GROUNDING_VERIFIER_VERSION = "grounding-v1"
 
 
 @dataclass(frozen=True)
@@ -22,26 +31,39 @@ class DecisionSnapshot:
     conversation_key: str
     automation_state: str
     state_version: int
+    channel_type: ChannelType = ChannelType.DM
+    has_unsupported_attachment: bool = False
 
 
 async def run_decision_pipeline(
     snapshot: DecisionSnapshot,
     *,
-    llm: LLMClient,
+    llm: LLMClient | None,
     killswitch,
     knowledge: tuple[str, ...] = (),
     require_knowledge: bool = False,
     verbatim_reply: str | None = None,
+    approved_official_contact_reply: str | None = None,
+    approved_knowledge_reply: str | None = None,
+    approved_localization: ApprovedLocalizationArtifact | None = None,
+    verbatim_after_decision: str | None = None,
+    forced_decision: ReplyDecision | None = None,
+    target_language: str = "und",
+    apply_legacy_rules: bool = True,
     history: tuple[tuple[str, str], ...] = (),
-    persona: str | None = None,
+    voice_preferences: VoicePreferences | None = None,
+    email_auto_reply_allowed: bool = True,
+    language_verification: str = LANGUAGE_VERIFICATION_STRICT,
 ) -> ReplyDecision:
     """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
     verbatim_reply 非空时（知识库命中且开模板直答）原文返回模板回复，不调 LLM。"""
-    # Human takeover suppresses all automated decisions.
-    if snapshot.automation_state == "HUMAN_ACTIVE":
+    # Only active automation modes are allowed to spend model capacity or create decisions.
+    if snapshot.automation_state not in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}:
         return ReplyDecision(
-            action=ReplyAction.IGNORE, reason_codes=("HUMAN_ACTIVE",), source="rule"
+            action=ReplyAction.IGNORE,
+            reason_codes=(snapshot.automation_state,),
+            source="rule",
         )
 
     # 全局/品牌/账号急停：降级为草稿（仍生成供人工参考，但不外发）。
@@ -51,6 +73,14 @@ async def run_decision_pipeline(
             snapshot.brand_id, snapshot.account_id, snapshot.tenant_id
         )
     except Exception:
+        logger.exception(
+            "kill switch lookup failed; decision downgraded to draft",
+            extra={
+                "tenant_id": snapshot.tenant_id,
+                "brand_id": snapshot.brand_id,
+                "account_id": snapshot.account_id,
+            },
+        )
         return ReplyDecision(
             action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH_UNAVAILABLE",), source="rule"
         )
@@ -58,9 +88,42 @@ async def run_decision_pipeline(
         return ReplyDecision(action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH",), source="rule")
 
     # 确定性安全规则（空消息/风险词）优先于一切
-    ruled = apply_rules(snapshot.text)
-    if ruled is not None:
+    ruled = apply_rules(snapshot.text) if apply_legacy_rules else None
+    if snapshot.has_unsupported_attachment:
+        decision = ReplyDecision(
+            action=ReplyAction.HANDOFF,
+            reason_codes=("UNSUPPORTED_ATTACHMENT",),
+            source="rule",
+        )
+    elif ruled is not None:
         decision = ruled
+    elif forced_decision is not None:
+        decision = forced_decision
+    elif approved_localization is not None:
+        if (
+            not approved_localization.auto_reply_allowed
+            or not approved_localization.has_valid_text_hash()
+        ):
+            decision = ReplyDecision(
+                action=ReplyAction.HANDOFF,
+                reason_codes=("INVALID_APPROVED_LOCALIZATION",),
+                source="rule",
+            )
+        else:
+            decision = ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text=approved_localization.text,
+                intent="approved_knowledge_localization",
+                confidence=1.0,
+                reason_codes=("KNOWLEDGE_LOCALIZATION",),
+                source="knowledge_localization",
+                reply_language=approved_localization.locale,
+                resolved_locale=approved_localization.locale,
+                knowledge_localization_id=approved_localization.id,
+                knowledge_localization_release_id=approved_localization.release_id,
+                knowledge_localization_text_hash=approved_localization.text_hash,
+                knowledge_localization_source_hash=approved_localization.source_content_hash,
+            )
     elif verbatim_reply is not None:
         # Exact templates bypass the LLM so approved wording is preserved.
         decision = ReplyDecision(
@@ -82,37 +145,140 @@ async def run_decision_pipeline(
             for role, text in history
             if role in {"user", "assistant"} and text
         )
-        decision = await llm.decide(
-            LLMContext(
-                text=redact_pii(snapshot.text or ""),
-                conversation_key=snapshot.conversation_key,
-                knowledge=knowledge,
-                history=safe_history,
-                persona=persona,
+        if llm is None:
+            decision = ReplyDecision(
+                action=ReplyAction.HANDOFF,
+                reason_codes=("LLM_UNAVAILABLE",),
+                source="rule",
             )
-        )
+        else:
+            decision = await llm.decide(
+                LLMContext(
+                    text=redact_pii(snapshot.text or ""),
+                    conversation_key=snapshot.conversation_key,
+                    knowledge=knowledge,
+                    history=safe_history,
+                    voice_preferences=voice_preferences,
+                    target_language=target_language,
+                    approved_verbatim_available=verbatim_after_decision is not None,
+                )
+            )
         if knowledge:
             # Preserve whether retrieved knowledge influenced the model decision.
             decision = replace(decision, reason_codes=decision.reason_codes + ("KNOWLEDGE_HIT",))
 
-    # 仅把 LLM 自身给出的 handoff 转为公开兜底；风险词与知识不足是确定性规则（source=rule），
-    # 必须保持 handoff。Guard 失败发生在下一步，其 source=guard，因此不会被这里回滚。
-    if decision.action is ReplyAction.HANDOFF and decision.source == "llm":
-        decision = ReplyDecision(
-            action=ReplyAction.AUTO_REPLY,
-            reply_text=LLM_HANDOFF_FALLBACK_TEXT,
-            reason_codes=decision.reason_codes + ("LLM_HANDOFF_FALLBACK",),
-            source="rule",
+    if verbatim_after_decision is not None and decision.action is ReplyAction.AUTO_REPLY:
+        if decision.reply_text != APPROVED_VERBATIM_SENTINEL:
+            decision = replace(
+                decision,
+                action=ReplyAction.HANDOFF,
+                reply_text=None,
+                source="guard",
+                reason_codes=decision.reason_codes + ("VERBATIM_SENTINEL_MISSING",),
+            )
+        else:
+            decision = replace(
+                decision,
+                reply_text=verbatim_after_decision,
+                source="knowledge",
+                reason_codes=decision.reason_codes + ("KNOWLEDGE_VERBATIM",),
+            )
+    # Customer sends are public at this boundary; delivery channels own effective visibility.
+    if (
+        decision.action is ReplyAction.AUTO_REPLY
+        and decision.reply_visibility is not Visibility.PUBLIC
+    ):
+        if snapshot.platform in {"facebook", "instagram"} and (
+            snapshot.channel_type is ChannelType.COMMENT
+        ):
+            reason = (
+                "FACEBOOK_COMMENT_PUBLIC"
+                if snapshot.platform == "facebook"
+                else "INSTAGRAM_COMMENT_PUBLIC"
+            )
+        else:
+            reason = "AUTO_REPLY_VISIBILITY_PUBLIC"
+        decision = replace(
+            decision,
+            reply_visibility=Visibility.PUBLIC,
+            reason_codes=decision.reason_codes + (reason,),
         )
 
     # 输出侧闸门
-    decision = run_final_guard(decision, snapshot.platform)
+    decision = run_final_guard(
+        decision,
+        snapshot.platform,
+        approved_official_contact_reply=approved_official_contact_reply,
+        expected_reply_language=target_language,
+        approved_knowledge_reply=approved_knowledge_reply,
+        approved_localization_text=(approved_localization.text if approved_localization else None),
+        approved_localization_text_hash=(
+            approved_localization.text_hash if approved_localization else None
+        ),
+        approved_localization_protected_values=(
+            approved_localization.protected_values if approved_localization else ()
+        ),
+        customer_text=snapshot.text,
+        language_verification=language_verification,
+    )
 
+    if (
+        target_language != "und"
+        and approved_knowledge_reply is not None
+        and verbatim_after_decision is None
+        and approved_localization is None
+        and decision.action is ReplyAction.AUTO_REPLY
+    ):
+        faithful = False
+        verifier = getattr(llm, "verify_grounding", None) if llm is not None else None
+        verification_started = time.perf_counter()
+        if verifier is not None:
+            try:
+                faithful = await verifier(
+                    approved_reply=approved_knowledge_reply,
+                    candidate_reply=decision.reply_text or "",
+                    target_language=target_language,
+                )
+            except Exception:
+                logger.exception("grounding verifier failed; decision downgraded to handoff")
+        decision = replace(
+            decision,
+            grounding_verified=faithful,
+            grounding_verifier_version=getattr(
+                llm,
+                "grounding_verifier_id",
+                _GROUNDING_VERIFIER_VERSION,
+            ),
+            grounding_latency_ms=(time.perf_counter() - verification_started) * 1000,
+        )
+        if not faithful:
+            decision = replace(
+                decision,
+                action=ReplyAction.HANDOFF,
+                reply_text=None,
+                source="guard",
+                reason_codes=decision.reason_codes + ("GUARD_KNOWLEDGE_SEMANTIC_MISMATCH",),
+            )
     # 草稿降级必须是管线的最后一步：任何把 action 改回 AUTO_REPLY 的兜底都要排在它前面，
     # 否则决策会以 auto_reply 落库——BOT_DRAFT_ONLY 下既不外发，也进不了 admin 待审队列。
     # Persistence creates a public Outbox only when state and version still match BOT_ACTIVE.
     # Keep this draft downgrade separate from that send-time race check.
     if snapshot.automation_state == "BOT_DRAFT_ONLY" and decision.action is ReplyAction.AUTO_REPLY:
-        decision = replace(decision, action=ReplyAction.DRAFT)
+        decision = replace(
+            decision,
+            action=ReplyAction.DRAFT,
+            reply_visibility=Visibility.PRIVATE,
+        )
+    elif (
+        snapshot.platform == "email"
+        and not email_auto_reply_allowed
+        and decision.action is ReplyAction.AUTO_REPLY
+    ):
+        decision = replace(
+            decision,
+            action=ReplyAction.DRAFT,
+            reply_visibility=Visibility.PRIVATE,
+            reason_codes=decision.reason_codes + ("EMAIL_AUTO_REPLY_DISABLED",),
+        )
 
     return decision

@@ -2,9 +2,13 @@ import logging
 import uuid
 
 import dramatiq
-from sqlalchemy import case, select, update
+from sqlalchemy import case, update
 
 import social_reply.infrastructure.queue.broker  # noqa: F401  确保 broker 先初始化
+from social_reply.application.reply_decision.jobs import (
+    load_raw_event_decision_statuses,
+    raw_event_decision_status,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.actor_loop import run_on_actor_loop
@@ -14,24 +18,8 @@ logger = logging.getLogger(__name__)
 
 async def _processing_status(raw_event_id: uuid.UUID) -> str:
     async with get_session_factory()() as session:
-        statuses = set(
-            (
-                await session.execute(
-                    select(models.DecisionJob.status).where(
-                        models.DecisionJob.raw_event_id == raw_event_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-    if "NEEDS_REVIEW" in statuses:
-        return "DECISION_NEEDS_REVIEW"
-    if "DEFERRED_CHATWOOT" in statuses:
-        return "DECISION_DEFERRED"
-    if statuses - {"COMPLETED"}:
-        return "DECISION_PENDING"
-    return "PROCESSED"
+        statuses = await load_raw_event_decision_statuses(session, raw_event_id)
+    return raw_event_decision_status(statuses)
 
 
 async def _process_events(
@@ -68,8 +56,15 @@ async def _process_events(
             .values(
                 processing_status=case(
                     (
-                        models.RawEvent.processing_status == "DECISION_NEEDS_REVIEW",
-                        "DECISION_NEEDS_REVIEW",
+                        models.RawEvent.processing_status.in_(
+                            (
+                                "PENDING",
+                                "INITIAL_DISPATCH_RETRY",
+                                "INITIAL_DISPATCHING",
+                                "DECISION_NEEDS_REVIEW",
+                            )
+                        ),
+                        models.RawEvent.processing_status,
                     ),
                     else_=processing_status,
                 )
@@ -101,8 +96,15 @@ async def _mark_failed(
             .values(
                 processing_status=case(
                     (
-                        models.RawEvent.processing_status == "DECISION_NEEDS_REVIEW",
-                        "DECISION_NEEDS_REVIEW",
+                        models.RawEvent.processing_status.in_(
+                            (
+                                "PENDING",
+                                "INITIAL_DISPATCH_RETRY",
+                                "INITIAL_DISPATCHING",
+                                "DECISION_NEEDS_REVIEW",
+                            )
+                        ),
+                        models.RawEvent.processing_status,
                     ),
                     else_="FAILED",
                 )

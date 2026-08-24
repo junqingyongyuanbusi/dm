@@ -1,9 +1,11 @@
-from social_reply.application.reply_decision.pipeline import (
-    DecisionSnapshot,
-    run_decision_pipeline,
-)
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
-from social_reply.domain.reply.llm import StubLLMClient
+import pytest
+
+from social_reply.application.reply_decision.jobs import snapshot_from_dict, snapshot_to_dict
+from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
+from social_reply.domain.messages.canonical import ChannelType
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
+from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, StubLLMClient
+from social_reply.domain.reply.voice import DEFAULT_VOICE_PREFERENCES
 
 
 class _OpenSwitch:
@@ -21,17 +23,19 @@ class _BrokenSwitch:
         raise ConnectionError("redis down")
 
 
-def _snap(state="BOT_ACTIVE", text="请问怎么改邮箱"):
-    return DecisionSnapshot(
-        text=text,
-        platform="telegram",
-        tenant_id="default",
-        brand_id="b1",
-        account_id="acc1",
-        conversation_key="telegram:acc1:9",
-        automation_state=state,
-        state_version=1,
-    )
+def _snap(state="BOT_ACTIVE", text="请问怎么改邮箱", **overrides):
+    values = {
+        "text": text,
+        "platform": "telegram",
+        "tenant_id": "default",
+        "brand_id": "b1",
+        "account_id": "acc1",
+        "conversation_key": "telegram:acc1:9",
+        "automation_state": state,
+        "state_version": 1,
+    }
+    values.update(overrides)
+    return DecisionSnapshot(**values)
 
 
 async def test_bot_active_normal_question_auto_replies_via_llm():
@@ -58,10 +62,12 @@ async def test_llm_context_redacts_current_and_history_pii():
         llm=_CaptureLLM(),
         killswitch=_OpenSwitch(),
         history=(("user", "手机号 138 0013 8000"),),
+        voice_preferences=DEFAULT_VOICE_PREFERENCES,
     )
     context = captured["context"]
     assert context.text == "邮箱 [REDACTED_EMAIL]"
     assert context.history == (("user", "手机号 [REDACTED_NUMBER]"),)
+    assert context.voice_preferences == DEFAULT_VOICE_PREFERENCES
 
 
 async def test_human_active_forces_ignore():
@@ -72,11 +78,57 @@ async def test_human_active_forces_ignore():
     assert "HUMAN_ACTIVE" in d.reason_codes
 
 
-async def test_draft_only_downgrades_auto_reply_to_draft():
+@pytest.mark.parametrize(
+    ("email_enabled", "email_auto_reply_enabled", "expected_action"),
+    [
+        (False, False, ReplyAction.DRAFT),
+        (False, True, ReplyAction.DRAFT),
+        (True, False, ReplyAction.DRAFT),
+        (True, True, ReplyAction.AUTO_REPLY),
+    ],
+)
+async def test_email_decision_gate_requires_enabled_and_auto_reply(
+    email_enabled, email_auto_reply_enabled, expected_action
+):
+    decision = await run_decision_pipeline(
+        _snap(platform="email"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        email_auto_reply_allowed=email_enabled and email_auto_reply_enabled,
+    )
+    assert decision.action is expected_action
+    if expected_action is ReplyAction.DRAFT:
+        assert decision.reply_visibility is Visibility.PRIVATE
+        assert decision.reason_codes[-1] == "EMAIL_AUTO_REPLY_DISABLED"
+
+
+async def test_email_auto_reply_gate_does_not_change_handoff():
+    decision = await run_decision_pipeline(
+        _snap(platform="email", text="我要起诉你们"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        email_auto_reply_allowed=False,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert "EMAIL_AUTO_REPLY_DISABLED" not in decision.reason_codes
+
+
+async def test_non_email_auto_reply_ignores_email_gate():
+    decision = await run_decision_pipeline(
+        _snap(platform="telegram"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        email_auto_reply_allowed=False,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+
+
+async def test_draft_only_downgrades_auto_reply_to_private_draft():
     d = await run_decision_pipeline(
         _snap(state="BOT_DRAFT_ONLY"), llm=StubLLMClient(), killswitch=_OpenSwitch()
     )
     assert d.action is ReplyAction.DRAFT
+    assert d.reply_visibility is Visibility.PRIVATE
 
 
 async def test_killswitch_forces_draft():
@@ -93,11 +145,11 @@ async def test_risk_word_handoff_before_llm():
     assert "RISK_WORD" in d.reason_codes
 
 
-async def test_killswitch_error_fails_closed_to_draft():
-    # kill switch 是安全控制：无法验证急停状态时必须 fail-closed（降级草稿，不外发）
+async def test_killswitch_error_fails_closed_to_draft(caplog):
     d = await run_decision_pipeline(_snap(), llm=StubLLMClient(), killswitch=_BrokenSwitch())
     assert d.action is ReplyAction.DRAFT
     assert "KILLSWITCH_UNAVAILABLE" in d.reason_codes
+    assert "kill switch lookup failed" in caplog.text
 
 
 async def test_verbatim_reply_returns_template_text_without_llm():
@@ -118,6 +170,56 @@ async def test_verbatim_reply_returns_template_text_without_llm():
     assert "KNOWLEDGE_VERBATIM" in d.reason_codes
 
 
+async def test_verbatim_auto_reply_with_pii_is_blocked_by_final_guard():
+    d = await run_decision_pipeline(
+        _snap(text="contact details"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        verbatim_reply="Email alice@example.com",
+    )
+
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reply_text is None
+    assert "GUARD_PII_LEAK" in d.reason_codes
+
+
+async def test_approved_official_contact_verbatim_reply_passes_final_guard():
+    template = "Official support: support@example.com"
+    decision = await run_decision_pipeline(
+        _snap(text="official contact"),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        verbatim_reply=template,
+        approved_official_contact_reply=template,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_text == template
+    assert decision.source == "knowledge"
+
+
+async def test_llm_copy_of_approved_contact_is_still_blocked():
+    template = "Official support: support@example.com"
+
+    class _CopyingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text=template,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(text="official contact"),
+        llm=_CopyingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=(template,),
+        approved_official_contact_reply=template,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert "GUARD_PII_LEAK" in decision.reason_codes
+
+
 async def test_risk_word_beats_verbatim_template():
     # 安全规则优先：风险词即使命中模板也必须转人工
     d = await run_decision_pipeline(
@@ -136,24 +238,21 @@ class _HandoffLLM:
         return ReplyDecision(action=ReplyAction.HANDOFF, reason_codes=("OPENAI",), source="llm")
 
 
-async def test_llm_handoff_falls_back_to_auto_reply_when_bot_active():
+async def test_llm_handoff_remains_handoff_when_bot_active():
     d = await run_decision_pipeline(_snap(), llm=_HandoffLLM(), killswitch=_OpenSwitch())
-    assert d.action is ReplyAction.AUTO_REPLY
-    assert "LLM_HANDOFF_FALLBACK" in d.reason_codes
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reason_codes == ("OPENAI",)
 
 
-async def test_llm_handoff_fallback_still_downgrades_under_draft_only():
-    # 兜底把 handoff 改回 auto_reply，若排在草稿降级之后，决策会以 auto_reply 落库：
-    # BOT_DRAFT_ONLY 下既不外发，也进不了只查 action=draft 的 admin 待审队列。
+async def test_llm_handoff_remains_handoff_under_draft_only():
     d = await run_decision_pipeline(
         _snap(state="BOT_DRAFT_ONLY"), llm=_HandoffLLM(), killswitch=_OpenSwitch()
     )
-    assert d.action is ReplyAction.DRAFT
-    assert "LLM_HANDOFF_FALLBACK" in d.reason_codes
-    assert d.reply_text
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reason_codes == ("OPENAI",)
 
 
-async def test_guard_downgrade_is_not_reverted_by_the_handoff_fallback():
+async def test_guard_downgrade_remains_handoff():
     class _PiiLLM:
         async def decide(self, context):
             return ReplyDecision(
@@ -174,3 +273,239 @@ async def test_rule_handoff_is_not_converted_to_auto_reply():
     )
     assert d.action is ReplyAction.HANDOFF
     assert "LLM_HANDOFF_FALLBACK" not in d.reason_codes
+
+
+async def test_unsupported_attachment_hands_off_without_calling_llm():
+    class _UnexpectedLLM:
+        async def decide(self, context):
+            raise AssertionError("LLM must not be called for unsupported attachments")
+
+    d = await run_decision_pipeline(
+        _snap(text=None, has_unsupported_attachment=True),
+        llm=_UnexpectedLLM(),
+        killswitch=_OpenSwitch(),
+    )
+    assert d.action is ReplyAction.HANDOFF
+    assert d.reason_codes == ("UNSUPPORTED_ATTACHMENT",)
+
+
+@pytest.mark.parametrize("state", ["HANDOFF_PENDING", "HUMAN_ACTIVE", "BOT_COOLDOWN", "CLOSED"])
+async def test_non_automation_states_do_not_call_llm(state):
+    class _UnexpectedLLM:
+        async def decide(self, context):
+            raise AssertionError("LLM must not be called while automation is paused")
+
+    d = await run_decision_pipeline(
+        _snap(state=state), llm=_UnexpectedLLM(), killswitch=_OpenSwitch()
+    )
+    assert d.action is ReplyAction.IGNORE
+    assert d.reason_codes == (state,)
+
+
+async def test_private_safe_auto_reply_becomes_public_before_guard():
+    class _PrivateLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Safe customer reply",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(_snap(), llm=_PrivateLLM(), killswitch=_OpenSwitch())
+
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_visibility is Visibility.PUBLIC
+    assert decision.reason_codes == ("AUTO_REPLY_VISIBILITY_PUBLIC",)
+
+
+async def test_private_auto_reply_with_pii_hands_off_on_any_channel():
+    class _PrivatePiiLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Email alice@example.com",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(_snap(), llm=_PrivatePiiLLM(), killswitch=_OpenSwitch())
+
+    assert decision.reply_visibility is Visibility.PUBLIC
+    assert decision.action is ReplyAction.HANDOFF
+    assert "AUTO_REPLY_VISIBILITY_PUBLIC" in decision.reason_codes
+    assert "GUARD_PII_LEAK" in decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("platform", "reason"),
+    [
+        ("facebook", "FACEBOOK_COMMENT_PUBLIC"),
+        ("instagram", "INSTAGRAM_COMMENT_PUBLIC"),
+    ],
+)
+async def test_meta_comment_forces_public_visibility_before_guard(platform, reason):
+    class _PrivateLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="公开答复",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(
+            platform=platform,
+            channel_type=ChannelType.COMMENT,
+        ),
+        llm=_PrivateLLM(),
+        killswitch=_OpenSwitch(),
+    )
+
+    assert decision.reply_visibility is Visibility.PUBLIC
+    assert reason in decision.reason_codes
+
+
+@pytest.mark.parametrize("platform", ["facebook", "instagram"])
+async def test_meta_comment_private_pii_is_blocked_after_becoming_public(platform):
+    class _PrivatePiiLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="请联系 alice@example.com",
+                reply_visibility=Visibility.PRIVATE,
+                source="llm",
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(platform=platform, channel_type=ChannelType.COMMENT),
+        llm=_PrivatePiiLLM(),
+        killswitch=_OpenSwitch(),
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert "GUARD_PII_LEAK" in decision.reason_codes
+
+
+def test_decision_snapshot_channel_type_round_trips_and_old_jobs_default_to_dm():
+    comment = _snap(platform="facebook", channel_type=ChannelType.COMMENT)
+    serialized = snapshot_to_dict(comment)
+
+    assert snapshot_from_dict(serialized).channel_type is ChannelType.COMMENT
+    serialized.pop("channel_type")
+    assert snapshot_from_dict(serialized).channel_type is ChannelType.DM
+
+
+def test_decision_snapshot_attachment_flag_round_trips():
+    snapshot = _snap(has_unsupported_attachment=True)
+    assert snapshot_from_dict(snapshot_to_dict(snapshot)).has_unsupported_attachment is True
+
+
+async def test_approved_verbatim_is_rendered_only_after_safe_action_sentinel():
+    class SentinelLLM:
+        async def decide(self, context):
+            assert context.approved_verbatim_available is True
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text=APPROVED_VERBATIM_SENTINEL,
+                confidence=0.99,
+            )
+
+    template = "support@example.com"
+    decision = await run_decision_pipeline(
+        _snap(text="How can I contact official support?"),
+        llm=SentinelLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("Official support email: support@example.com",),
+        approved_official_contact_reply=template,
+        approved_knowledge_reply=template,
+        verbatim_after_decision=template,
+        target_language="en",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_text == template
+    assert decision.source == "knowledge"
+    assert "KNOWLEDGE_VERBATIM" in decision.reason_codes
+
+
+async def test_approved_verbatim_missing_sentinel_fails_closed():
+    class WrongTextLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="I copied support@example.com",
+                confidence=0.99,
+            )
+
+    decision = await run_decision_pipeline(
+        _snap(text="How can I contact official support?"),
+        llm=WrongTextLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("Official support email: support@example.com",),
+        approved_official_contact_reply="support@example.com",
+        approved_knowledge_reply="support@example.com",
+        verbatim_after_decision="support@example.com",
+        target_language="en",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert "VERBATIM_SENTINEL_MISSING" in decision.reason_codes
+
+
+@pytest.mark.parametrize("verifier_result", [False, RuntimeError("verifier unavailable")])
+async def test_grounding_verifier_fails_closed(verifier_result):
+    class GroundingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="退款通常需要 3 到 5 个工作日。",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            if isinstance(verifier_result, Exception):
+                raise verifier_result
+            return verifier_result
+
+    decision = await run_decision_pipeline(
+        _snap(text="退款多久到账？"),
+        llm=GroundingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds usually take 3–5 business days.",
+        target_language="zh-Hans",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.grounding_verified is False
+    assert decision.grounding_verifier_version == "grounding-v1"
+    assert "GUARD_KNOWLEDGE_SEMANTIC_MISMATCH" in decision.reason_codes
+
+
+async def test_grounding_verifier_accepts_faithful_localization():
+    class GroundingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="退款通常需要 3 到 5 个工作日。",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            return True
+
+    decision = await run_decision_pipeline(
+        _snap(text="退款多久到账？"),
+        llm=GroundingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds usually take 3–5 business days.",
+        target_language="zh-Hans",
+        apply_legacy_rules=False,
+    )
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.grounding_verified is True
+    assert decision.grounding_verifier_version == "grounding-v1"

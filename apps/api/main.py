@@ -7,14 +7,23 @@ from fastapi.staticfiles import StaticFiles
 
 from social_reply.application.account_management.admin import router as admin_router
 from social_reply.application.account_management.admin_console import router as admin_console_router
+from social_reply.application.account_management.feishu_handoff_admin import (
+    router as feishu_handoff_admin_router,
+)
 from social_reply.application.account_management.oauth import router as oauth_router
 from social_reply.application.account_management.router import router as account_management_router
 from social_reply.application.account_management.users import router as admin_users_router
+from social_reply.connectors.feishu.router import router as feishu_router
 from social_reply.connectors.meta.router import router as meta_router
 from social_reply.connectors.telegram.router import router as telegram_router
 from social_reply.shared.config import Settings, get_settings
 
 _X_OAUTH_CALLBACK_PATH = "/admin/oauth/x/callback"
+_OAUTH_CALLBACK_PATHS = {
+    _X_OAUTH_CALLBACK_PATH,
+    "/admin/oauth/meta/callback",
+    "/admin/oauth/instagram/callback",
+}
 _X_OAUTH_CALLBACK_PATHS = {_X_OAUTH_CALLBACK_PATH, f"{_X_OAUTH_CALLBACK_PATH}/"}
 
 
@@ -23,13 +32,17 @@ class OAuthCallbackAccessLogFilter(logging.Filter):
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
             path = args[2]
-            if any(
-                path == callback_path or path.startswith(f"{callback_path}?")
-                for callback_path in _X_OAUTH_CALLBACK_PATHS
-            ):
-                redacted = list(args)
-                redacted[2] = _X_OAUTH_CALLBACK_PATH
-                record.args = tuple(redacted)
+            for callback_path in _OAUTH_CALLBACK_PATHS:
+                if (
+                    path == callback_path
+                    or path == f"{callback_path}/"
+                    or path.startswith(f"{callback_path}?")
+                    or path.startswith(f"{callback_path}/?")
+                ):
+                    redacted = list(args)
+                    redacted[2] = callback_path
+                    record.args = tuple(redacted)
+                    break
         return True
 
 
@@ -60,6 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     _install_access_log_redaction()
     _install_application_logging()
     app = FastAPI(title="Reply Core")
+    app.state.settings = settings
     app.mount(
         "/static",
         StaticFiles(directory=str(files("social_reply").joinpath("static"))),
@@ -95,6 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(admin_router)
     app.include_router(admin_console_router)
+    app.include_router(feishu_handoff_admin_router)
     app.include_router(admin_users_router)
     app.include_router(oauth_router)
     app.include_router(account_management_router)
@@ -104,6 +119,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(ingestion_router)
     app.include_router(telegram_router)
     app.include_router(meta_router)
+    app.include_router(feishu_router)
     if settings.x_activity_enabled:
         from social_reply.connectors.x.router import router as x_router
 

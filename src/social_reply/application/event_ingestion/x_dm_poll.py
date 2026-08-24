@@ -1,7 +1,6 @@
 """Durable X DM polling with append-only evidence and resumable gaps."""
 
 import logging
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -39,7 +38,6 @@ from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_POLL_INTERVAL_SECONDS = int(os.getenv("X_DM_POLL_INTERVAL_SECONDS", "90"))
 _last_poll_at: float | None = None
 _MAX_PAGES_PER_POLL = 3
 _CURSOR_LOOKBACK_MS = 5 * 60 * 1000
@@ -64,8 +62,9 @@ class _ReadResult:
 async def poll_x_direct_messages(*, scheduler_owner: str | None = None) -> list[str]:
     global _last_poll_at
     settings = get_settings()
+    poll_interval_seconds = settings.x_dm_poll_interval_seconds
     now = time.monotonic()
-    if _last_poll_at is not None and now - _last_poll_at < _POLL_INTERVAL_SECONDS:
+    if _last_poll_at is not None and now - _last_poll_at < poll_interval_seconds:
         return []
     _last_poll_at = now
 
@@ -96,6 +95,7 @@ async def poll_x_direct_messages(*, scheduler_owner: str | None = None) -> list[
                     account,
                     claim=claim,
                     reconcile_capability=settings.x_legacy_dm_enabled and not dm_capable,
+                    poll_interval_seconds=poll_interval_seconds,
                 )
             )
         except httpx.HTTPStatusError as exc:
@@ -103,7 +103,7 @@ async def poll_x_direct_messages(*, scheduler_owner: str | None = None) -> list[
                 claim,
                 error_code=f"X_HTTP_{exc.response.status_code}",
                 error_message=str(exc),
-                retry_after_seconds=_POLL_INTERVAL_SECONDS,
+                retry_after_seconds=poll_interval_seconds,
             )
             if exc.response.status_code == 429:
                 logger.warning("x dm poll rate-limited account=%s", account.id)
@@ -118,7 +118,7 @@ async def poll_x_direct_messages(*, scheduler_owner: str | None = None) -> list[
                 claim,
                 error_code="X_DM_POLL_FAILED",
                 error_message=str(exc),
-                retry_after_seconds=_POLL_INTERVAL_SECONDS,
+                retry_after_seconds=poll_interval_seconds,
             )
             logger.exception("x dm poll failed account=%s", account.id)
     return ingested
@@ -128,6 +128,7 @@ async def _poll_account(
     account,
     *,
     claim: ClaimedCheckpoint,
+    poll_interval_seconds: int,
     reconcile_capability: bool = False,
 ) -> list[str]:
     credentials = x_credentials(account)
@@ -156,7 +157,7 @@ async def _poll_account(
             await record_gap(
                 claim,
                 result.gap,
-                retry_after_seconds=_POLL_INTERVAL_SECONDS,
+                retry_after_seconds=poll_interval_seconds,
                 page_count=result.page_count,
                 occurrence_count=result.occurrence_count,
             )
@@ -165,7 +166,7 @@ async def _poll_account(
             claim,
             cursor=result.candidate_cursor,
             bootstrapped=True,
-            interval_seconds=_POLL_INTERVAL_SECONDS,
+            interval_seconds=poll_interval_seconds,
             page_count=result.page_count,
             occurrence_count=result.occurrence_count,
         )
@@ -199,7 +200,7 @@ async def _poll_account(
         await record_gap(
             claim,
             result.gap,
-            retry_after_seconds=_POLL_INTERVAL_SECONDS,
+            retry_after_seconds=poll_interval_seconds,
             page_count=result.page_count,
             occurrence_count=result.occurrence_count,
         )
@@ -210,7 +211,7 @@ async def _poll_account(
         claim,
         cursor=cursor,
         bootstrapped=True,
-        interval_seconds=_POLL_INTERVAL_SECONDS,
+        interval_seconds=poll_interval_seconds,
         page_count=result.page_count,
         occurrence_count=result.occurrence_count,
     )

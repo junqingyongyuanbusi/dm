@@ -1,5 +1,6 @@
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import insert, select, update
@@ -19,14 +20,19 @@ from social_reply.infrastructure.database import models
 pytestmark = pytest.mark.integration
 
 
-def _event(account_id: uuid.UUID, external_event_id: str = "event-1") -> dict:
+def _event(
+    account_id: uuid.UUID,
+    external_event_id: str = "event-1",
+    *,
+    platform: str = "telegram",
+) -> dict:
     return canonical_event_to_dict(
         CanonicalEvent(
-            platform="telegram",
+            platform=platform,
             platform_account_key=str(account_id),
             external_event_id=external_event_id,
             external_user_id="user-1",
-            conversation_key=f"telegram:{account_id}:chat-1",
+            conversation_key=f"{platform}:{account_id}:chat-1",
             text="hello",
             external_conversation_id="chat-1",
             reply_target={"chat_id": "chat-1"},
@@ -62,6 +68,19 @@ async def _seed_raw(
     )
     await session.commit()
     return raw_event_id
+
+
+def test_versioned_direct_dispatch_allows_only_feishu_webhooks():
+    account_id = uuid.uuid4()
+    context = raw_recovery.direct_dispatch_context([_event(account_id, platform="feishu")])
+    webhook_row = SimpleNamespace(source="feishu", ingress_kind="webhook", context=context)
+    poll_row = SimpleNamespace(source="feishu", ingress_kind="poll", context=context)
+
+    kind, events = raw_recovery._dispatch_spec(webhook_row)
+    assert kind == "direct"
+    assert events[0]["platform"] == "feishu"
+    with pytest.raises(ValueError, match="INITIAL_DISPATCH_SOURCE_INVALID"):
+        raw_recovery._dispatch_spec(poll_row)
 
 
 async def test_sweep_redispatches_persisted_work_after_queue_loss(session, monkeypatch):
@@ -301,7 +320,15 @@ async def test_cross_tenant_direct_metadata_fails_closed(session):
     ).first() is None
 
 
-async def test_decision_completion_does_not_overwrite_initial_retry(session, monkeypatch):
+@pytest.mark.parametrize(
+    "initial_status",
+    ["PENDING", "INITIAL_DISPATCH_RETRY", "INITIAL_DISPATCHING"],
+)
+async def test_decision_completion_does_not_overwrite_initial_dispatch(
+    session,
+    monkeypatch,
+    initial_status,
+):
     account_id, contact_id, conversation_id, message_id, job_id = (
         uuid.uuid4(),
         uuid.uuid4(),
@@ -311,7 +338,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
     )
     raw_event_id = await _seed_raw(
         session,
-        status="INITIAL_DISPATCH_RETRY",
+        status=initial_status,
         context=raw_recovery.direct_dispatch_context([_event(account_id)]),
     )
     await session.execute(
@@ -343,6 +370,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key=f"telegram:{account_id}:chat-1",
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -352,6 +380,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
             direction="inbound",
             sender_type="contact",
             text="hello",
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -361,6 +390,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
             conversation_id=conversation_id,
             message_id=message_id,
             account_id=account_id,
+            decision_generation=1,
             snapshot={
                 "text": "hello",
                 "platform": "telegram",
@@ -389,7 +419,7 @@ async def test_decision_completion_does_not_overwrite_initial_retry(session, mon
     assert await decision_jobs.process_decision_job(str(job_id)) is True
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
-    assert raw.processing_status == "INITIAL_DISPATCH_RETRY"
+    assert raw.processing_status == initial_status
     assert (await session.get(models.DecisionJob, job_id)).status == "COMPLETED"
 
 
@@ -470,6 +500,92 @@ async def test_direct_claim_completion_reaggregates_jobs_under_raw_lock(session)
     session.expire_all()
     raw = await session.get(models.RawEvent, raw_event_id)
     assert raw.processing_status == "PROCESSED"
+    assert raw.processing_claim_token is None
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (("COMPLETED", "SUPERSEDED"), "PROCESSED"),
+        (("COMPLETED", "FAILED"), "DECISION_PENDING"),
+        (("FAILED", "DEFERRED_CHATWOOT"), "DECISION_DEFERRED"),
+        (("DEFERRED_CHATWOOT", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
+    ],
+)
+async def test_direct_claim_completion_aggregates_job_priorities(session, statuses, expected):
+    raw_event_id = uuid.uuid4()
+    token = uuid.uuid4()
+    account_id, contact_id, conversation_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        insert(models.RawEvent).values(
+            id=raw_event_id,
+            source="telegram",
+            ingress_kind="webhook",
+            payload={},
+            context=raw_recovery.direct_dispatch_context([_event(account_id)]),
+            processing_status="INITIAL_DISPATCHING",
+            processing_claim_token=token,
+            processing_claim_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            processing_attempt_count=1,
+        )
+    )
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=account_id,
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="telegram",
+            name="account",
+            status="active",
+        )
+    )
+    await session.execute(
+        insert(models.Contact).values(
+            id=contact_id,
+            tenant_id="tenant-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            external_user_id="user-1",
+        )
+    )
+    await session.execute(
+        insert(models.Conversation).values(
+            id=conversation_id,
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="telegram",
+            platform_account_id=account_id,
+            contact_id=contact_id,
+            conversation_key=f"telegram:{account_id}:chat-1",
+        )
+    )
+    for status in statuses:
+        message_id = uuid.uuid4()
+        await session.execute(
+            insert(models.Message).values(
+                id=message_id,
+                conversation_id=conversation_id,
+                direction="inbound",
+                sender_type="contact",
+                text=status,
+            )
+        )
+        await session.execute(
+            insert(models.DecisionJob).values(
+                raw_event_id=raw_event_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                account_id=account_id,
+                snapshot={},
+                status=status,
+            )
+        )
+    await session.commit()
+
+    assert await raw_recovery.complete_initial_direct_claim(raw_event_id, token) is True
+    session.expire_all()
+    raw = await session.get(models.RawEvent, raw_event_id)
+    assert raw.processing_status == expected
     assert raw.processing_claim_token is None
 
 

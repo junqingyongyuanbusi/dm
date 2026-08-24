@@ -202,6 +202,37 @@ async def test_full_facebook_flow_submits_provisioning(session, meta_env):
     assert any(c.endswith("/me/accounts") for c in meta_env["calls"])
 
 
+async def test_facebook_flow_defaults_to_active_comments_when_enabled(
+    session, meta_env, monkeypatch
+):
+    await _seed_meta_app(session)
+    settings = meta.get_settings().model_copy(
+        update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(meta, "get_settings", lambda: settings)
+    meta_env["pages"]["pages"] = [{"id": "page-9", "name": "Acme", "access_token": "PAGE-TOKEN-9"}]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        start = await _run_start(client, csrf, "facebook")
+        location = start.headers["location"]
+        assert "pages_read_engagement" in location
+        assert "pages_read_user_content" in location
+        assert "pages_manage_engagement" in location
+        assert "auth_type=rerequest" in location
+        state_token = location.split("state=")[1].split("&")[0]
+        callback = await client.get(
+            f"/admin/oauth/meta/callback?code=auth-code-9&state={state_token}"
+        )
+
+    assert callback.status_code == 303
+    assert meta_env["submitted"]["request"]["enable_comments"] is True
+    assert meta_env["submitted"]["request"]["automation_default"] == "BOT_DRAFT_ONLY"
+
+
 async def test_instagram_filters_pages_without_ig_and_shows_picker(session, meta_env):
     await _seed_meta_app(session)
     meta_env["pages"]["pages"] = [
@@ -236,6 +267,41 @@ async def test_instagram_filters_pages_without_ig_and_shows_picker(session, meta
     assert "No IG Page" not in picker.text
     assert meta._PICK_COOKIE in picker.cookies
     assert not meta_env["submitted"]  # 选择前不提交
+
+
+async def test_facebook_login_instagram_keeps_draft_mode_when_comments_enabled(
+    session, meta_env, monkeypatch
+):
+    await _seed_meta_app(session)
+    settings = meta.get_settings().model_copy(
+        update={"meta_comment_reply_enabled": True, "meta_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(meta, "get_settings", lambda: settings)
+    meta_env["pages"]["pages"] = [
+        {
+            "id": "page-b",
+            "name": "Shop B",
+            "access_token": "T-B",
+            "instagram_business_account": {"id": "ig-b", "username": "shopb"},
+        }
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        start = await _run_start(client, csrf, "instagram")
+        location = start.headers["location"]
+        assert "pages_read_engagement" in location
+        assert "instagram_manage_comments" in location
+        assert "auth_type=rerequest" in location
+        state_token = location.split("state=")[1].split("&")[0]
+        callback = await client.get(f"/admin/oauth/meta/callback?code=code-ig&state={state_token}")
+
+    assert callback.status_code == 303
+    assert meta_env["submitted"]["request"]["enable_comments"] is True
+    assert meta_env["submitted"]["request"]["automation_default"] == "BOT_DRAFT_ONLY"
 
 
 async def test_instagram_picker_does_not_consume_state_when_platform_is_disabled(

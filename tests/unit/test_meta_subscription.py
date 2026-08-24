@@ -5,6 +5,7 @@ import httpx
 from social_reply.application.account_management.meta_subscription import (
     get_meta_app_subscription,
     get_meta_subscription_fields,
+    meta_app_subscription_fields,
     meta_app_subscription_object,
     meta_subscription_fields,
     reconcile_meta_app_subscription,
@@ -259,6 +260,12 @@ def test_instagram_facebook_login_never_asks_page_for_comments():
         enable_comments=True,
         instagram_login_mode="facebook_login",
     ) == ("messages",)
+
+    assert meta_app_subscription_fields(
+        platform="instagram",
+        enable_dm=True,
+        enable_comments=True,
+    ) == ("messages", "comments")
 
 
 def test_instagram_login_mode_still_subscribes_comments_directly():

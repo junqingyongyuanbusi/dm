@@ -21,6 +21,11 @@ from social_reply.infrastructure.database import models
 pytestmark = pytest.mark.integration
 
 
+def test_email_sync_contract_enums_are_canonical():
+    assert CheckpointStream.EMAIL_IMAP.value == "EMAIL_IMAP"
+    assert GapType.EMAIL_UIDVALIDITY_CHANGED.value == "EMAIL_UIDVALIDITY_CHANGED"
+
+
 async def _seed_account(session, *, config: dict | None = None) -> uuid.UUID:
     account_id = uuid.uuid4()
     await session.execute(

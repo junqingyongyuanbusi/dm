@@ -1,6 +1,66 @@
 import asyncio
+import threading
 
-from social_reply.infrastructure.queue.actor_loop import run_on_actor_loop
+from social_reply.infrastructure.queue.actor_loop import run_on_actor_loop, submit_on_actor_loop
+
+
+def test_submit_on_actor_loop_is_nonblocking_and_returns_future():
+    gate = asyncio.Event()
+
+    async def _coro():
+        await gate.wait()
+        return 42
+
+    future = submit_on_actor_loop(_coro())
+    assert not future.done()
+    run_on_actor_loop(_release(gate))
+    assert future.result(timeout=1) == 42
+
+
+async def _release(gate: asyncio.Event) -> None:
+    gate.set()
+
+
+def test_submit_on_actor_loop_future_captures_exception():
+    async def _boom():
+        raise ValueError("submit boom")
+
+    future = submit_on_actor_loop(_boom())
+    try:
+        future.result(timeout=1)
+        raise AssertionError("should have raised")
+    except ValueError as exc:
+        assert str(exc) == "submit boom"
+
+
+def test_submit_on_actor_loop_done_callback_observes_result_and_exception():
+    callbacks: list[object] = []
+    completed = threading.Event()
+
+    async def _ok():
+        return 42
+
+    async def _boom():
+        raise ValueError("callback boom")
+
+    def record(future):
+        try:
+            callbacks.append(future.result())
+        except Exception as exc:  # noqa: BLE001 - the callback records the submitted outcome
+            callbacks.append(exc)
+        if len(callbacks) == 2:
+            completed.set()
+
+    success = submit_on_actor_loop(_ok())
+    failure = submit_on_actor_loop(_boom())
+    success.add_done_callback(record)
+    failure.add_done_callback(record)
+
+    assert completed.wait(timeout=1)
+    assert 42 in callbacks
+    assert any(
+        isinstance(value, ValueError) and str(value) == "callback boom" for value in callbacks
+    )
 
 
 def test_run_on_actor_loop_executes_coroutine():

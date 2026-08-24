@@ -281,9 +281,57 @@ async def test_handoff_writes_decision_no_outbox(session):
     await session.commit()
     assert outbox_id is None
     assert (await session.execute(select(models.OutboxMessage))).first() is None
-    # handoff 把会话置 HANDOFF_PENDING
     st = (await session.execute(select(models.AutomationState))).scalar_one()
     assert st.state == "HANDOFF_PENDING"
+    work = (await session.execute(select(models.HumanWorkItem))).scalar_one()
+    intent = (await session.execute(select(models.HandoffNotificationIntent))).scalar_one()
+    assert intent.human_work_item_id == work.id
+    assert intent.conversation_id == conv_id
+    assert intent.status == "BLOCKED_CONFIG"
+    assert intent.last_error_code == "FEISHU_HANDOFF_ROUTE_MISSING"
+
+
+async def test_handoff_snapshots_enabled_feishu_notification_route(session):
+    account_id, conv_id, msg_id = await _seed(session)
+    feishu_account_id = uuid.uuid4()
+    await session.execute(
+        insert(models.PlatformAccount).values(
+            id=feishu_account_id,
+            tenant_id="default",
+            brand_id="b1",
+            platform="feishu",
+            name="support notifications",
+            status="active",
+            config={"feishu_health_status": "READY"},
+            capability={"dm": True, "mentions": True, "max_text_length": 4000},
+        )
+    )
+    config_id = uuid.uuid4()
+    await session.execute(
+        insert(models.TenantFeishuHandoffConfig).values(
+            id=config_id,
+            tenant_id="default",
+            feishu_platform_account_id=feishu_account_id,
+            destination_chat_id="oc_support",
+            enabled=True,
+            config_version=3,
+        )
+    )
+    await session.commit()
+
+    decision = ReplyDecision(action=ReplyAction.HANDOFF, reason_codes=("RISK_WORD",))
+    await persist_decision(
+        session, _snap(conv_id, account_id), conv_id, msg_id, account_id, decision, "v0"
+    )
+    await session.commit()
+
+    intent = (await session.execute(select(models.HandoffNotificationIntent))).scalar_one()
+    assert intent.status == "PENDING"
+    assert intent.notification_config_id == config_id
+    assert intent.config_version == 3
+    assert intent.feishu_platform_account_id == feishu_account_id
+    assert intent.destination_chat_id == "oc_support"
+    assert intent.last_error_code is None
 
 
 async def test_draft_writes_private_outbox(session):

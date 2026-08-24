@@ -9,6 +9,7 @@ import httpx
 
 from social_reply.application.account_management.meta_app import provision_meta_app
 from social_reply.application.account_management.meta_subscription import (
+    meta_app_subscription_fields,
     meta_app_subscription_object,
     meta_subscription_fields,
     reconcile_meta_app_subscription,
@@ -64,6 +65,8 @@ class AccountConnectionResult:
     verify_token: str | None = None
     pending_update_count: int | None = None
     last_webhook_error: str | None = None
+    bot_name: str | None = None
+    bot_status: int | None = None
     manual_steps: tuple[str, ...] = ()
 
 
@@ -227,7 +230,7 @@ async def connect_meta_account(
         raise ValueError("meta_dm_required")
     if enable_comments and not get_settings().meta_comment_reply_enabled:
         raise ValueError("meta_comment_reply_disabled")
-    if not get_settings().meta_automation_default_allowed(platform, automation_default):
+    if automation_default != "BOT_DRAFT_ONLY":
         raise ValueError("meta_requires_bot_draft_only")
     _validate_automation_default(automation_default)
     external_account_id = _require_secret(external_account_id, "external_account_id")
@@ -246,37 +249,45 @@ async def connect_meta_account(
     )
     try:
         profile = await client.get_account()
+        if str(profile.get("id")) != external_account_id:
+            raise ValueError("meta_token_account_mismatch")
+        (
+            platform_app_id,
+            resolved_app_public_id,
+            resolved_verify_token,
+            external_app_id,
+        ) = await provision_meta_app(
+            tenant_id=tenant_id,
+            app_id=app_id,
+            app_public_id=app_public_id,
+            app_name=app_name,
+            app_secret=app_secret,
+            verify_token=verify_token,
+            secrets_root=secrets_root,
+            graph_base_url=graph_base_url,
+            api_version=api_version,
+            platform_family=(
+                "instagram"
+                if platform == "instagram" and instagram_login_mode == "instagram_login"
+                else "meta"
+            ),
+        )
+        if platform == "facebook" and enable_comments:
+            await client.require_facebook_comment_permissions(app_id=external_app_id)
+        if platform == "instagram" and enable_comments:
+            await client.require_instagram_comment_permissions(app_id=external_app_id)
     finally:
         await client.aclose()
-    if str(profile.get("id")) != external_account_id:
-        raise ValueError("meta_token_account_mismatch")
-
-    (
-        platform_app_id,
-        resolved_app_public_id,
-        resolved_verify_token,
-        external_app_id,
-    ) = await provision_meta_app(
-        tenant_id=tenant_id,
-        app_id=app_id,
-        app_public_id=app_public_id,
-        app_name=app_name,
-        app_secret=app_secret,
-        verify_token=verify_token,
-        secrets_root=secrets_root,
-        graph_base_url=graph_base_url,
-        api_version=api_version,
-        platform_family=(
-            "instagram"
-            if platform == "instagram" and instagram_login_mode == "instagram_login"
-            else "meta"
-        ),
-    )
     desired_fields = meta_subscription_fields(
         platform=platform,
         enable_dm=enable_dm,
         enable_comments=enable_comments,
         instagram_login_mode=instagram_login_mode,
+    )
+    desired_app_fields = meta_app_subscription_fields(
+        platform=platform,
+        enable_dm=enable_dm,
+        enable_comments=enable_comments,
     )
     webhook_url = _webhook_url(public_base_url, f"/webhooks/meta/{resolved_app_public_id}")
     account_config = {
@@ -285,6 +296,7 @@ async def connect_meta_account(
         "instagram_login_mode": instagram_login_mode,
         **({"page_id": page_id} if page_id else {}),
         "meta_desired_subscribed_fields": list(desired_fields),
+        "meta_desired_app_subscribed_fields": list(desired_app_fields),
         "meta_subscribed_fields": [],
         "meta_health_status": "PROVISIONING",
         "meta_health_checked_at": _utc_now_iso(),
@@ -324,7 +336,7 @@ async def connect_meta_account(
             app_id=external_app_id,
             app_secret=app_secret,
             object_type=meta_app_subscription_object(platform),
-            desired_fields=desired_fields,
+            desired_fields=desired_app_fields,
             callback_url=webhook_url,
             verify_token=resolved_verify_token,
             api_version=api_version,

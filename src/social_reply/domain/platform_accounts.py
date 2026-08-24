@@ -9,6 +9,8 @@ class AccountPlatform(StrEnum):
     INSTAGRAM = "instagram"
     WHATSAPP = "whatsapp"
     X = "x"
+    FEISHU = "feishu"
+    EMAIL = "email"
 
 
 class AccountStatus(StrEnum):
@@ -62,9 +64,28 @@ PLATFORM_CAPABILITY_SPECS = {
         boolean_keys=frozenset({CapabilityKey.DM, CapabilityKey.X_CHAT, CapabilityKey.MENTIONS}),
         max_text_length=280,
     ),
+    AccountPlatform.FEISHU: PlatformCapabilitySpec(
+        boolean_keys=frozenset({CapabilityKey.DM, CapabilityKey.MENTIONS}),
+        max_text_length=4000,
+    ),
+    AccountPlatform.EMAIL: PlatformCapabilitySpec(
+        boolean_keys=frozenset({CapabilityKey.DM}),
+        max_text_length=4000,
+    ),
 }
 
 SUPPORTED_ACCOUNT_PLATFORMS = frozenset(platform.value for platform in AccountPlatform)
+PROVISIONABLE_ACCOUNT_PLATFORMS = frozenset(
+    {
+        AccountPlatform.TELEGRAM.value,
+        AccountPlatform.FACEBOOK.value,
+        AccountPlatform.INSTAGRAM.value,
+        AccountPlatform.WHATSAPP.value,
+        AccountPlatform.X.value,
+        AccountPlatform.FEISHU.value,
+        AccountPlatform.EMAIL.value,
+    }
+)
 ACTIVE_ACCOUNT_STATUS = AccountStatus.ACTIVE.value
 DISABLED_ACCOUNT_STATUS = AccountStatus.DISABLED.value
 LEGACY_CONNECTED_ACCOUNT_STATUS = "CONNECTED"
@@ -113,6 +134,18 @@ DIRECT_DESTINATION_CAPABILITIES = {
     "x_post_reply": DestinationCapabilitySpec(
         platforms=frozenset({AccountPlatform.X}),
         capability=CapabilityKey.MENTIONS,
+    ),
+    "feishu_p2p_reply": DestinationCapabilitySpec(
+        platforms=frozenset({AccountPlatform.FEISHU}),
+        capability=CapabilityKey.DM,
+    ),
+    "feishu_group_reply": DestinationCapabilitySpec(
+        platforms=frozenset({AccountPlatform.FEISHU}),
+        capability=CapabilityKey.MENTIONS,
+    ),
+    "email_reply": DestinationCapabilitySpec(
+        platforms=frozenset({AccountPlatform.EMAIL}),
+        capability=CapabilityKey.DM,
     ),
 }
 

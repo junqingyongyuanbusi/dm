@@ -71,6 +71,27 @@ def test_production_broker_configures_redis_timeouts(monkeypatch):
     )
 
 
+async def test_testing_dispatch_runs_inline_without_actor_send(monkeypatch):
+    calls: list[str] = []
+
+    class Actor:
+        def send(self, *_args):
+            raise AssertionError("testing dispatch must not call actor.send")
+
+    async def inline():
+        calls.append("inline")
+        return "processed"
+
+    monkeypatch.setattr(
+        dispatch,
+        "get_settings",
+        lambda: type("Settings", (), {"testing": True})(),
+    )
+
+    assert await dispatch.dispatch_actor(Actor(), "job-1", inline=inline) == "processed"
+    assert calls == ["inline"]
+
+
 async def test_production_dispatch_runs_actor_send_off_loop(monkeypatch):
     caller_thread = threading.get_ident()
     calls = []
@@ -87,6 +108,27 @@ async def test_production_dispatch_runs_actor_send_off_loop(monkeypatch):
     assert await dispatch.dispatch_actor(Actor(), "job-1", timeout_seconds=0.5) is None
     assert calls[0][0] == ("job-1",)
     assert calls[0][1] != caller_thread
+
+
+async def test_production_dispatch_releases_capacity_when_actor_send_fails(monkeypatch):
+    class BrokenActor:
+        def send(self, *_args):
+            raise RuntimeError("broker unavailable")
+
+    class HealthyActor:
+        def send(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        dispatch,
+        "get_settings",
+        lambda: type("Settings", (), {"testing": False})(),
+    )
+    monkeypatch.setattr(dispatch, "_DISPATCH_CAPACITY", asyncio.Semaphore(1))
+
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        await dispatch.dispatch_actor(BrokenActor(), "first")
+    assert await dispatch.dispatch_actor(HealthyActor(), "second", timeout_seconds=0.5) is None
 
 
 async def test_production_dispatch_rejects_work_beyond_capacity(monkeypatch):

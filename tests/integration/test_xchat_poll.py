@@ -8,12 +8,23 @@ from sqlalchemy import insert, select
 from social_reply.application.event_ingestion import xchat_poll
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
+from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
 
 _SELF = "1740258119773458432"
 _PEER = "1831625034739412993"
 _CONVERSATION = f"{_SELF}:{_PEER}"
+
+
+def _set_poll_settings(monkeypatch, *, interval: int = 0, max_conversations: int = 10) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "xchat_poll_interval_seconds": interval,
+            "xchat_max_conversations_per_poll": max_conversations,
+        }
+    )
+    monkeypatch.setattr(xchat_poll, "get_settings", lambda: settings)
 
 
 async def _conversation_checkpoint(session, account_id: uuid.UUID):
@@ -309,7 +320,7 @@ async def test_xchat_decrypt_failure_keeps_raw_occurrence_and_cursor(session, mo
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
     monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
     monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
-    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+    _set_poll_settings(monkeypatch)
     xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []
@@ -412,7 +423,7 @@ async def test_xchat_event_page_gap_resumes_without_advancing_early(session, mon
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
     monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
     monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
-    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+    _set_poll_settings(monkeypatch)
     xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == [
@@ -458,8 +469,7 @@ async def test_xchat_discovery_page_gap_resumes_deeper_conversations(session, mo
 
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
-    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(xchat_poll, "_MAX_CONVERSATIONS_PER_POLL", 3)
+    _set_poll_settings(monkeypatch, max_conversations=3)
     xchat_poll._last_poll_at = None
 
     assert await xchat_poll.poll_xchat_messages() == []
@@ -520,7 +530,7 @@ async def test_expired_xchat_discovery_token_restarts_from_first_page(session, m
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversations", fake_conversations)
     monkeypatch.setattr(xchat_poll.XChatClient, "read_conversation_events", fake_events)
     monkeypatch.setattr(xchat_poll, "_MAX_CONVERSATION_PAGES", 1)
-    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+    _set_poll_settings(monkeypatch)
 
     xchat_poll._last_poll_at = None
     assert await xchat_poll.poll_xchat_messages() == []
@@ -615,7 +625,7 @@ async def test_expired_xchat_event_token_restarts_from_conversation_cursor(sessi
     monkeypatch.setattr(xchat_poll.XChatClient, "get_user_public_keys", fake_public_keys)
     monkeypatch.setattr(xchat_poll, "decrypt_history", fake_decrypt)
     monkeypatch.setattr(xchat_poll, "_MAX_EVENT_PAGES", 1)
-    monkeypatch.setattr(xchat_poll, "_POLL_INTERVAL_SECONDS", 0)
+    _set_poll_settings(monkeypatch)
 
     xchat_poll._last_poll_at = None
     assert await xchat_poll.poll_xchat_messages() == ["message-200-expired-token"]

@@ -1,9 +1,15 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from social_reply.connectors.email.network import (
+    DEFAULT_EMAIL_ALLOWED_HOSTS,
+    EmailNetworkError,
+    normalize_allowed_hosts,
+)
 
 _META_PLATFORMS = {"facebook", "instagram"}
 
@@ -19,7 +25,7 @@ class Settings(BaseSettings):
     tenant_id: str = "default"
     # Literal 收紧：配错 provider 在进程启动即报错，而非每条消息决策丢失
     llm_provider: Literal["stub", "openai"] = "stub"
-    prompt_version: str = "v0-stub"
+    prompt_version: str = "v1-wikifx-multilingual"
     chatwoot_base_url: str = "http://localhost:3000"
     chatwoot_api_token: str = "dev-local-token"
     # 控制面：CONTROL_API_KEY 仅供服务间调用；浏览器管理员使用签名会话。
@@ -36,6 +42,19 @@ class Settings(BaseSettings):
     x_legacy_dm_enabled: bool = True
     x_activity_enabled: bool = True
     xchat_enabled: bool = True
+    scheduler_tick_seconds: float = Field(default=0.5, ge=0.05, le=10)
+    scheduler_core_interval_seconds: float = Field(default=3, ge=0.5, le=60)
+    scheduler_core_warn_after_seconds: float = Field(default=30, ge=1, le=3600)
+    scheduler_inspection_warn_after_seconds: float = Field(default=300, ge=1, le=7200)
+    chatwoot_reconcile_interval_seconds: int = Field(default=3, ge=1, le=3600)
+    x_dm_poll_interval_seconds: int = Field(default=90, ge=0, le=86400)
+    x_webhook_check_interval_seconds: int = Field(default=600, ge=0, le=86400)
+    xchat_poll_interval_seconds: int = Field(default=900, ge=0, le=86400)
+    xchat_max_conversations_per_poll: int = Field(default=10, ge=1, le=1000)
+    xchat_subscription_check_interval_seconds: int = Field(default=600, ge=0, le=86400)
+    xchat_recovery_sweep_interval_seconds: int = Field(default=30, ge=0, le=3600)
+    xchat_ready_probe_interval_seconds: int = Field(default=21600, ge=0, le=604800)
+    xchat_pending_probe_interval_seconds: int = Field(default=600, ge=0, le=86400)
     # 公开回复 @mention。X 开发者条款对“AI 生成并发布的回复”要求事先报批，且每次互动
     # 最多回 1 条；默认关，开启前确保已获 X 批准并已标注为自动账号。
     x_public_reply_enabled: bool = False
@@ -43,11 +62,22 @@ class Settings(BaseSettings):
     facebook_messenger_enabled: bool = True
     instagram_messaging_enabled: bool = True
     whatsapp_enabled: bool = True
+    feishu_enabled: bool = False
+    email_enabled: bool = False
+    email_auto_reply_enabled: bool = False
+    email_poll_interval_seconds: int = Field(default=60, ge=5, le=3600)
+    email_max_messages_per_poll: int = Field(default=100, ge=1, le=1000)
+    email_per_sender_daily_reply_limit: int = Field(default=5, ge=1, le=100)
+    email_network_timeout_seconds: float = Field(default=10.0, ge=1.0, le=120.0)
+    email_allowed_hosts: Annotated[frozenset[str], NoDecode] = DEFAULT_EMAIL_ALLOWED_HOSTS
+    feishu_handoff_notifications_enabled: bool = False
+    feishu_handoff_sweep_interval_seconds: float = Field(default=3, ge=0.5, le=60)
+    feishu_handoff_sender_lease_seconds: int = Field(default=30, ge=5, le=600)
+    feishu_handoff_max_attempts: int = Field(default=8, ge=1, le=100)
     # Meta 发布范围默认是「人工审核后才外发」。只有部署方完成 App Review 并显式接受
     # 自动回复的合规责任后，才能把 Meta 账号提升为 BOT_ACTIVE。
     meta_auto_reply_enabled: bool = False
-    # 公开评论回复（FB Page feed / IG comments）。需要 App 已订阅对应 webhook 字段，
-    # 且 IG 需 instagram_manage_comments、FB 需 pages_read_user_content 与 pages_manage_engagement。
+    # Facebook Page / Instagram 专业账号公开评论回复。需要对应评论权限与 webhook 字段。
     meta_comment_reply_enabled: bool = False
     facebook_app_id: str = ""
     facebook_app_secret: SecretStr = SecretStr("")
@@ -56,13 +86,18 @@ class Settings(BaseSettings):
     instagram_app_secret: SecretStr = SecretStr("")
     instagram_verify_token: SecretStr = SecretStr("")
     meta_health_check_interval_seconds: int = Field(default=600, ge=60, le=86400)
+    feishu_health_check_interval_seconds: int = Field(default=600, ge=60, le=86400)
     account_secrets_root: Path = Path(".secrets/accounts")
     platform_secret_keys: SecretStr = SecretStr("")
-    openai_api_key: str = ""
+    openai_api_key: SecretStr = SecretStr("")
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
+    # 当前 PostgreSQL pgvector 列固定为 Vector(1536)；其它维度必须使用独立版本化索引。
+    openai_embedding_dimensions: int = Field(default=1536, ge=1536, le=1536)
     openai_timeout_seconds: float = 30.0
+    openai_grounding_model: str = ""
+    grounding_verifier_timeout_seconds: float = Field(default=8.0, gt=0.0, le=30.0)
     # 知识检索：默认全关，不影响现有决策行为
     knowledge_retrieval_enabled: bool = False
     knowledge_min_similarity: float = 0.5
@@ -71,11 +106,36 @@ class Settings(BaseSettings):
     knowledge_verbatim_reply: bool = False
     # true 时检索无命中直接 HANDOFF/INSUFFICIENT_KNOWLEDGE，不调 LLM（省 token，§十三）
     require_knowledge: bool = False
+    # 多语言知识回复（运行时生成路径）：开启后，任意可检测的非英语消息在英语知识库
+    # 强命中时由 LLM 生成同语言回复；低置信度先走占位符保护的查询翻译回退。
+    # 英语事实源不变；und/检测失败、无强命中、official-contact、守卫不符一律 HANDOFF。
+    multilingual_knowledge_reply_enabled: bool = False
+    english_knowledge_only_enabled: bool = False
+    knowledge_corpus_version: str = "unversioned"
+    multilingual_calibration_report_path: Path = Path(
+        "src/social_reply/shared/multilingual-calibration.json"
+    )
+    multilingual_calibration_report_sha256: str = ""
+    knowledge_localization_release: str = "unversioned"
+    multilingual_e2e_report_path: Path = Path(
+        "src/social_reply/shared/multilingual-e2e-calibration.json"
+    )
+    multilingual_e2e_report_sha256: str = ""
+    knowledge_auto_reply_min_similarity: float = Field(default=0.8, ge=0.0, le=1.0)
+    knowledge_auto_reply_min_margin: float = Field(default=0.08, ge=0.0, le=1.0)
     # 决策时注入同会话最近历史消息（不含当前这条）；0 关闭多轮上下文。
     conversation_history_limit: int = Field(default=20, ge=0, le=50)
     # 历史总字符预算，避免长会话放大请求成本或超过模型上下文。
     conversation_history_max_chars: int = Field(default=12000, ge=0, le=50000)
     testing: bool = False
+
+    @field_validator("email_allowed_hosts", mode="before")
+    @classmethod
+    def _normalize_email_allowed_hosts(cls, value: object) -> frozenset[str]:
+        try:
+            return normalize_allowed_hosts(value)
+        except EmailNetworkError as exc:
+            raise ValueError("EMAIL_ALLOWED_HOSTS 配置无效") from exc
 
     @model_validator(mode="after")
     def _normalize_database_url(self) -> "Settings":
@@ -124,6 +184,8 @@ class Settings(BaseSettings):
         instagram_values = (self.instagram_app_id, instagram_secret)
         if any(instagram_values) and not all(instagram_values):
             raise ValueError("INSTAGRAM_APP_ID 与 INSTAGRAM_APP_SECRET 必须同时配置")
+        if self.email_enabled and not self.email_allowed_hosts:
+            raise ValueError("EMAIL_ALLOWED_HOSTS 在 EMAIL_ENABLED=true 时不能为空")
         if not self.platform_secret_key_list:
             raise ValueError("PLATFORM_SECRET_KEYS 未配置；平台凭证必须使用应用层加密")
         from social_reply.infrastructure.secret_crypto import SecretCipher
@@ -131,8 +193,17 @@ class Settings(BaseSettings):
         SecretCipher(self.platform_secret_key_list)
         if not self.testing and self.llm_provider == "stub":
             raise ValueError("LLM_PROVIDER=stub 仅允许测试环境，生产环境禁止公开测试回复")
+        if self.multilingual_knowledge_reply_enabled and not self.knowledge_retrieval_enabled:
+            raise ValueError(
+                "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
+            )
+        self.knowledge_localization_release = self.knowledge_localization_release.strip()
         # 生产环境启用 openai provider 时必须提供 API key
-        if not self.testing and self.llm_provider == "openai" and self.openai_api_key == "":
+        if (
+            not self.testing
+            and self.llm_provider == "openai"
+            and not self.openai_api_key.get_secret_value()
+        ):
             raise ValueError(
                 "OPENAI_API_KEY 未配置（LLM_PROVIDER=openai 时不能为空）；测试环境请设 TESTING=true"
             )
@@ -175,6 +246,10 @@ class Settings(BaseSettings):
             return self.whatsapp_enabled
         if platform == "x":
             return self.x_integration_enabled
+        if platform == "feishu":
+            return self.feishu_enabled
+        if platform == "email":
+            return self.email_enabled
         return True
 
     def platform_disabled_code(self, platform: str) -> str | None:
@@ -185,17 +260,19 @@ class Settings(BaseSettings):
             "instagram": "INSTAGRAM_MESSAGING_DISABLED",
             "whatsapp": "WHATSAPP_DISABLED",
             "x": "X_INTEGRATION_DISABLED",
+            "feishu": "FEISHU_DISABLED",
+            "email": "EMAIL_DISABLED",
         }.get(platform, "PLATFORM_DISABLED")
 
-    def meta_automation_default_allowed(self, platform: str, automation_default: str) -> bool:
-        """Whether this deployment lets a Meta account default to something other than draft.
-
-        Draft-only stays allowed unconditionally; the switch only unlocks BOT_ACTIVE, and it
-        must be set on API and Worker alike because provisioning runs in the Worker.
-        """
-        if platform not in _META_PLATFORMS:
+    def automation_default_allowed(self, platform: str, automation_default: str) -> bool:
+        """Whether deployment policy permits an account's requested automation default."""
+        if automation_default != "BOT_ACTIVE":
             return True
-        return automation_default == "BOT_DRAFT_ONLY" or self.meta_auto_reply_enabled
+        if platform in _META_PLATFORMS:
+            return self.meta_auto_reply_enabled
+        if platform == "email":
+            return self.email_enabled and self.email_auto_reply_enabled
+        return True
 
     @property
     def facebook_app_credentials(self) -> tuple[str, str] | None:

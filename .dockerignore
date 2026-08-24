@@ -1,6 +1,7 @@
 # 构建上下文瘦身 + 防止本地密钥/环境进镜像（安全关键）
 .git/
 .gitignore
+.worktrees/
 .venv/
 __pycache__/
 *.pyc

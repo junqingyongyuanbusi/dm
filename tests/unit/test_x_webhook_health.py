@@ -75,7 +75,15 @@ async def test_sweep_throttles_and_dedupes_by_consumer_key(monkeypatch):
 
     monkeypatch.setattr(x_webhook_health, "list_active_accounts_by_platform", fake_list)
     monkeypatch.setattr(x_webhook_health, "_check_app", fake_check)
-    monkeypatch.setattr(x_webhook_health, "_CHECK_INTERVAL_SECONDS", 3600)
+    monkeypatch.setattr(
+        x_webhook_health,
+        "get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {"x_activity_enabled": True, "x_webhook_check_interval_seconds": 3600},
+        )(),
+    )
 
     x_webhook_health._last_check_at = None
     await x_webhook_health.ensure_x_webhooks_valid()

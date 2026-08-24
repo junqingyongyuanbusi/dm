@@ -8,6 +8,7 @@ import httpx
 from social_reply.application.account_management.meta_subscription import (
     get_meta_app_subscription,
     get_meta_subscription_fields,
+    meta_app_subscription_fields,
     meta_app_subscription_object,
     meta_subscription_fields,
     reconcile_meta_app_subscription,
@@ -18,7 +19,7 @@ from social_reply.application.platform_accounts import (
     get_platform_app_runtime,
     list_active_accounts_by_platform,
 )
-from social_reply.connectors.meta.client import MetaGraphClient
+from social_reply.connectors.meta.client import MetaCommentPermissionError, MetaGraphClient
 from social_reply.domain.platform_accounts import CapabilityKey, capability_enabled
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -29,6 +30,8 @@ _last_check_at: float | None = None
 
 
 def _health_error_code(exc: Exception) -> str:
+    if isinstance(exc, MetaCommentPermissionError):
+        return "META_COMMENT_PERMISSION_REQUIRED"
     if isinstance(exc, httpx.HTTPStatusError):
         try:
             payload = exc.response.json()
@@ -174,6 +177,17 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
             enable_comments=capability_enabled(account.capability, CapabilityKey.COMMENTS),
             instagram_login_mode=login_mode,
         )
+    desired_app = tuple(
+        str(field)
+        for field in account.config.get("meta_desired_app_subscribed_fields", [])
+        if isinstance(field, str)
+    )
+    if not desired_app:
+        desired_app = meta_app_subscription_fields(
+            platform=account.platform,
+            enable_dm=capability_enabled(account.capability, CapabilityKey.DM),
+            enable_comments=capability_enabled(account.capability, CapabilityKey.COMMENTS),
+        )
     client = MetaGraphClient(
         platform=account.platform,
         access_token=access_token,
@@ -188,6 +202,14 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
         profile = await client.get_account()
         if str(profile.get("id") or "") != account.external_account_id:
             raise ValueError("meta_token_account_mismatch")
+        if account.platform == "facebook" and capability_enabled(
+            account.capability, CapabilityKey.COMMENTS
+        ):
+            await client.require_facebook_comment_permissions(app_id=app.external_app_id)
+        if account.platform == "instagram" and capability_enabled(
+            account.capability, CapabilityKey.COMMENTS
+        ):
+            await client.require_instagram_comment_permissions(app_id=app.external_app_id)
         subscription_account_id = _subscription_account_id(account)
         observed = await get_meta_subscription_fields(
             platform=account.platform,
@@ -208,8 +230,10 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
                 instagram_login_mode=login_mode,
                 graph_base_url=graph_base_url,
                 api_version=api_version,
-                enable_dm="messages" in desired,
-                enable_comments=bool({"feed", "comments"}.intersection(desired)),
+                enable_dm=capability_enabled(account.capability, CapabilityKey.DM),
+                enable_comments=capability_enabled(
+                    account.capability, CapabilityKey.COMMENTS
+                ),
             )
             observed = await get_meta_subscription_fields(
                 platform=account.platform,
@@ -228,10 +252,10 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
             app_secret=app_secret,
             verify_token=app_credentials.get("verify_token", ""),
             platform=account.platform,
-            desired=desired,
+            desired=desired_app,
             api_version=api_version,
         )
-        if not set(desired).issubset(app_observed):
+        if not set(desired_app).issubset(app_observed):
             status = "APP_SUBSCRIPTION_MISSING"
         await _save_health(
             account.id,
@@ -242,7 +266,11 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
         return str(account.id) if status != "READY" else None
     except Exception as exc:  # noqa: BLE001 - provider failures become sanitized health state
         error_code = _health_error_code(exc)
-        status = "REAUTH_REQUIRED" if error_code.endswith("_190") else "ERROR"
+        status = (
+            "REAUTH_REQUIRED"
+            if error_code.endswith("_190") or error_code == "META_COMMENT_PERMISSION_REQUIRED"
+            else "ERROR"
+        )
         await _save_health(account.id, status=status, error_code=error_code)
         logger.warning(
             "meta health check failed account=%s platform=%s code=%s",

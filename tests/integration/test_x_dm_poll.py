@@ -86,7 +86,11 @@ async def test_legacy_disabled_skips_account_without_verified_capability(session
     monkeypatch.setattr(
         x_dm_poll,
         "get_settings",
-        lambda: type("Settings", (), {"x_legacy_dm_enabled": False})(),
+        lambda: type(
+            "Settings",
+            (),
+            {"x_legacy_dm_enabled": False, "x_dm_poll_interval_seconds": 90},
+        )(),
     )
 
     class UnexpectedClient:
@@ -176,7 +180,8 @@ async def test_empty_bootstrap_does_not_drop_first_live_message(session, monkeyp
         return pages.pop(0)
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
+    settings = get_settings().model_copy(update={"x_dm_poll_interval_seconds": 0})
+    monkeypatch.setattr(x_dm_poll, "get_settings", lambda: settings)
     x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == []
     checkpoint = await _legacy_checkpoint(session, account_id)
@@ -200,7 +205,8 @@ async def test_poll_throttled_within_interval(session, monkeypatch):
         return [], None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 60)
+    settings = get_settings().model_copy(update={"x_dm_poll_interval_seconds": 60})
+    monkeypatch.setattr(x_dm_poll, "get_settings", lambda: settings)
 
     x_dm_poll._last_poll_at = None
     await x_dm_poll.poll_x_direct_messages()  # 首次真实拉取
@@ -369,7 +375,8 @@ async def test_page_budget_caps_requests_per_poll(session, monkeypatch):
         )
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
+    settings = get_settings().model_copy(update={"x_dm_poll_interval_seconds": 0})
+    monkeypatch.setattr(x_dm_poll, "get_settings", lambda: settings)
     x_dm_poll._last_poll_at = None
     ingested = await x_dm_poll.poll_x_direct_messages()
 
@@ -418,7 +425,8 @@ async def test_expired_legacy_resume_token_restarts_from_checkpoint(session, mon
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
     monkeypatch.setattr(x_dm_poll, "_MAX_PAGES_PER_POLL", 1)
-    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
+    settings = get_settings().model_copy(update={"x_dm_poll_interval_seconds": 0})
+    monkeypatch.setattr(x_dm_poll, "get_settings", lambda: settings)
 
     x_dm_poll._last_poll_at = None
     assert await x_dm_poll.poll_x_direct_messages() == ["200"]
@@ -506,7 +514,8 @@ async def test_poll_is_idempotent_on_repeat(session, monkeypatch):
         return events, None
 
     monkeypatch.setattr(x_dm_poll.XClient, "read_dm_events", fake_read)
-    monkeypatch.setattr(x_dm_poll, "_POLL_INTERVAL_SECONDS", 0)
+    settings = get_settings().model_copy(update={"x_dm_poll_interval_seconds": 0})
+    monkeypatch.setattr(x_dm_poll, "get_settings", lambda: settings)
 
     x_dm_poll._last_poll_at = None
     first = await x_dm_poll.poll_x_direct_messages()

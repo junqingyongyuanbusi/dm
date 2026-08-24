@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import delete, select
 
 from social_reply.application.account_management.auth import (
@@ -26,7 +27,12 @@ from social_reply.application.account_management.jobs import (
     retry_provisioning_job,
     submit_provisioning_job,
 )
+from social_reply.application.account_management.router import (
+    EmailAccountRequest,
+    _validate_email_request_after_gates,
+)
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -36,7 +42,7 @@ router = APIRouter(prefix="/admin", tags=["admin-web"])
 _SESSION_COOKIE = "reply_admin_session"
 _CSRF_COOKIE = "reply_admin_csrf"
 _SESSION_TTL_SECONDS = 8 * 60 * 60
-_SAFE_NEXT_PATHS = {"/admin/accounts"}
+_SAFE_NEXT_PATHS = {"/admin/accounts", "/admin/integrations/accounts"}
 _SAFE_NEXT_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -92,6 +98,14 @@ def _secure_cookie(request: Request) -> bool:
     )
 
 
+def _ensure_csrf(response: Response, request: Request, csrf: str) -> Response:
+    if not request.cookies.get(_CSRF_COOKIE):
+        response.set_cookie(
+            _CSRF_COOKIE, csrf, httponly=False, samesite="lax", secure=_secure_cookie(request)
+        )
+    return response
+
+
 async def _form(request: Request) -> dict[str, str]:
     body = (await request.body()).decode()
     return {key: values[-1] for key, values in parse_qs(body, keep_blank_values=True).items()}
@@ -104,14 +118,44 @@ def _require_csrf(request: Request, form: dict[str, str]) -> None:
         raise HTTPException(status_code=403, detail="invalid_csrf_token")
 
 
-_NAV_ITEMS = (
-    ("overview", "/admin", "总览"),
-    ("conversations", "/admin/conversations", "对话"),
-    ("decisions", "/admin/decisions", "决策"),
-    ("knowledge", "/admin/knowledge", "知识库"),
-    ("prompt", "/admin/prompt", "提示词"),
-    ("delivery", "/admin/delivery", "投递"),
-    ("accounts", "/admin/accounts", "账号"),
+def tenant_id_or_default(principal: Principal, requested: str) -> str:
+    tenant = (requested or "").strip() or principal.tenant_id or ""
+    if not tenant:
+        tenant = sorted(principal.allowed_tenants)[0]
+    if tenant not in principal.allowed_tenants:
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    return tenant
+
+
+_NAV_GROUPS = (
+    (
+        "运营",
+        (
+            ("overview", "/admin", "总览"),
+            ("inbox", "/admin/inbox", "工作队列"),
+            ("conversations", "/admin/conversations", "对话"),
+        ),
+    ),
+    (
+        "内容与策略",
+        (
+            ("knowledge", "/admin/content/knowledge", "知识库"),
+            ("brand-voice", "/admin/content/brand-voice", "品牌语气"),
+        ),
+    ),
+    (
+        "集成",
+        (
+            ("accounts", "/admin/integrations/accounts", "平台账号"),
+            ("handoff", "/admin/integrations/feishu/handoff", "Feishu 人工通知"),
+        ),
+    ),
+    (
+        "系统",
+        (
+            ("health", "/admin/system/health", "系统健康"),
+        ),
+    ),
 )
 
 
@@ -127,16 +171,44 @@ def _page(
     """Claude 风格页面外壳：暖米白底、衬线标题、赤陶橙点缀、大留白、零 JS。"""
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     logout = '<a class="nav-link" href="/admin/logout">退出</a>' if show_logout else ""
-    nav_items = _NAV_ITEMS + (("users", "/admin/users", "用户"),) if show_users else _NAV_ITEMS
-    tabs = (
+    nav_groups = _NAV_GROUPS
+    if show_users:
+        nav_groups = tuple(
+            (
+                label,
+                items
+                + (
+                    ("safety", "/admin/system/safety", "安全控制"),
+                    ("users", "/admin/system/users", "用户管理"),
+                )
+                if label == "系统"
+                else items,
+            )
+            for label, items in nav_groups
+        )
+    groups = (
         "".join(
-            f'<a class="tab{" active" if key == active else ""}" href="{href}">{label}</a>'
-            for key, href, label in nav_items
+            '<section class="nav-group">'
+            f'<span class="nav-heading">{html.escape(label)}</span>'
+            + "".join(
+                f'<a class="nav-item{" active" if key == active else ""}" '
+                f'href="{href}"{" aria-current=\'page\'" if key == active else ""}>'
+                f"{html.escape(item_label)}</a>"
+                for key, href, item_label in items
+            )
+            + "</section>"
+            for label, items in nav_groups
         )
         if show_logout
         else ""
     )
-    nav_bar = f'<nav class="tabs" aria-label="主导航">{tabs}</nav>' if tabs else ""
+    sidebar = (
+        f'<aside class="sidebar"><nav aria-label="主导航">{groups}</nav></aside>'
+        if groups
+        else ""
+    )
+    skip_link = '<a class="skip-link" href="#main-content">跳到主内容</a>' if groups else ""
+    shell_class = "app-shell app-shell-nav" if groups else "app-shell app-shell-auth"
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">{refresh}
@@ -157,16 +229,24 @@ def _page(
 }}
 *{{box-sizing:border-box}}
 body{{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}}
-header{{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--border);padding:12px 32px;display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap}}
+header{{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;gap:18px}}
 .brand{{font-family:var(--serif);font-size:19px;letter-spacing:-0.01em;white-space:nowrap}}
 .brand small{{font-family:var(--sans);font-size:12px;color:var(--muted);margin-left:10px;letter-spacing:.02em}}
-.tabs{{display:flex;gap:4px;flex-wrap:wrap}}
-.tab{{color:var(--muted);text-decoration:none;font-size:14px;padding:8px 14px;border-radius:8px;transition:color .18s,background .18s}}
-.tab:hover{{color:var(--text);background:var(--surface-2)}}
-.tab.active{{color:var(--accent);background:var(--accent-tint);font-weight:500}}
+.skip-link{{position:fixed;top:8px;left:8px;z-index:20;padding:8px 12px;border-radius:8px;background:var(--text);color:var(--surface);transform:translateY(-150%)}}
+.skip-link:focus{{transform:translateY(0)}}
+.app-shell{{display:grid;max-width:1380px;margin:0 auto}}
+.app-shell-nav{{grid-template-columns:220px minmax(0,1fr)}}
+.app-shell-auth{{grid-template-columns:minmax(0,1fr);max-width:none}}
+.app-shell-auth main{{max-width:none;padding:36px clamp(20px,5vw,72px) 72px}}
+.sidebar{{min-width:0;padding:28px 16px 72px 24px;border-right:1px solid var(--border)}}
+.nav-group{{margin-bottom:22px}}
+.nav-heading{{margin:0 10px 7px;font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}}
+.nav-item{{display:block;padding:8px 10px;border-radius:8px;color:var(--muted);font-size:14px;text-decoration:none;transition:color .18s,background .18s}}
+.nav-item:hover{{color:var(--text);background:var(--surface-2)}}
+.nav-item.active{{color:var(--accent);background:var(--accent-tint);font-weight:600}}
 .nav-link{{color:var(--muted);text-decoration:none;font-size:14px;padding:8px 12px;border-radius:8px;transition:color .18s,background .18s}}
 .nav-link:hover{{color:var(--text);background:var(--surface-2)}}
-main{{max-width:1100px;margin:0 auto;padding:36px 24px 72px}}
+main{{min-width:0;max-width:1160px;width:100%;padding:36px 32px 72px}}
 h1{{font-family:var(--serif);font-weight:600;font-size:30px;letter-spacing:-0.015em;margin:0 0 6px}}
 h2{{font-family:var(--serif);font-weight:600;font-size:21px;letter-spacing:-0.01em;margin:0 0 4px}}
 h3{{font-family:var(--serif);font-weight:600;font-size:17px;margin:0 0 2px}}
@@ -204,13 +284,31 @@ tbody tr:hover{{background:#F7F5EF}}
 .msg.out{{align-self:flex-end;background:var(--accent-tint);border-bottom-right-radius:4px}}
 .msg .meta{{font-size:11.5px;color:var(--muted);margin-top:4px}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}}
+.queue-tabs{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:20px}}
+.queue-tab{{min-width:0;padding:13px 15px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);text-decoration:none}}
+.queue-tab:hover{{background:var(--surface-2);color:var(--text)}}
+.queue-tab.active{{border-color:var(--accent);background:var(--accent-tint)}}
+.queue-tab strong{{display:block;font-size:22px;line-height:1.2;font-variant-numeric:tabular-nums}}
+.queue-tab span{{display:block;color:var(--muted);font-size:12.5px;margin-top:2px}}
+.filters{{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px;align-items:end;margin-bottom:18px}}
+.filters label{{margin-top:0}}
+.filters button{{width:100%}}
+.detail-grid{{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.75fr);gap:20px;align-items:start}}
+.detail-stack{{min-width:0}}
+.composer textarea{{min-height:124px}}
+.composer-meta{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12.5px;margin:7px 0 12px}}
+.target-choice{{display:block;padding:9px 11px;margin:7px 0;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);font-size:13px}}
+.target-choice input{{width:auto;min-height:0;margin-right:7px}}
+.audit-list{{list-style:none;padding:0;margin:0}}
+.audit-list li{{padding:10px 0;border-bottom:1px solid var(--border);font-size:13.5px}}
+.audit-list li:last-child{{border-bottom:0}}
 .channel-section{{margin:0 0 24px}}
 .channel-heading{{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:12px}}
 .channel-heading p{{margin:0;color:var(--muted);font-size:13.5px}}
-.channel-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}}
+.channel-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}}
 .channel-tile{{min-width:0;min-height:112px;padding:14px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);text-decoration:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;text-align:center;transition:border-color .18s,background .18s,box-shadow .18s,transform .18s}}
 .channel-tile:hover{{color:var(--text);border-color:var(--border-strong);background:#F7F5EF;transform:translateY(-1px)}}
-.channel-tile[aria-current="page"]{{border-color:var(--accent);box-shadow:0 0 0 2px rgba(193,95,60,.12);background:var(--accent-tint)}}
+.channel-tile[aria-current="true"]{{border-color:var(--accent);box-shadow:0 0 0 2px rgba(193,95,60,.12);background:var(--accent-tint)}}
 .channel-tile.disabled{{opacity:.56;cursor:not-allowed;background:var(--surface-2);transform:none}}
 .channel-icon{{width:42px;height:42px;display:grid;place-items:center}}
 .channel-icon img{{display:block;width:36px;height:36px;object-fit:contain}}
@@ -223,6 +321,8 @@ tbody tr:hover{{background:#F7F5EF}}
 .channel-setup-head h2{{font-family:var(--sans);font-size:18px;margin:0}}
 .channel-setup-head p{{color:var(--muted);font-size:13px;margin:1px 0 0}}
 .channel-form{{max-width:680px;padding-top:4px}}
+.channel-form-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 14px}}
+.channel-form-grid .span-2{{grid-column:1/-1}}
 .channel-meta{{display:grid;grid-template-columns:140px minmax(0,1fr);gap:7px 12px;margin:16px 0 4px;font-size:13px}}
 .channel-meta dt{{color:var(--muted)}}
 .channel-meta dd{{margin:0;min-width:0;overflow-wrap:anywhere}}
@@ -242,6 +342,8 @@ label{{display:block;font-size:13px;font-weight:500;color:var(--text);margin:14p
 input,select,textarea{{width:100%;padding:10px 12px;font-size:16px;font-family:var(--sans);color:var(--text);background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-md);min-height:44px;transition:border-color .18s,box-shadow .18s}}
 textarea{{min-height:88px;resize:vertical}}
 input:focus,select:focus,textarea:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(193,95,60,.14)}}
+.check{{display:flex;align-items:center;gap:9px;font-weight:400}}
+.check input{{width:auto;min-height:0;margin:0}}
 button{{display:inline-block;padding:10px 18px;min-height:42px;font-size:14.5px;font-weight:500;font-family:var(--sans);color:#fff;background:var(--accent);border:0;border-radius:var(--r-md);cursor:pointer;transition:background .18s}}
 button:hover{{background:var(--accent-hover)}}
 button.btn-block{{width:100%;margin-top:20px;min-height:44px;font-size:15px}}
@@ -260,6 +362,7 @@ details.collapse>.inner{{padding:0 24px 24px}}
 .banner{{padding:12px 16px;border-radius:var(--r-md);font-size:14px;margin-bottom:18px}}
 .banner.err{{background:var(--err-bg);color:var(--err-fg)}}
 .banner.ok{{background:var(--ok-bg);color:var(--ok-fg)}}
+.banner.warn{{background:var(--warn-bg);color:var(--warn-fg)}}
 .banner.info{{background:var(--info-bg);color:var(--info-fg)}}
 a{{color:var(--link)}}
 :focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}
@@ -270,15 +373,16 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 .kv th{{width:220px;text-transform:none;letter-spacing:0;font-size:13px;color:var(--muted);font-weight:500;vertical-align:top}}
 .kv td,.kv th{{border-bottom:1px solid var(--border)}}
 .kv tr:last-child td,.kv tr:last-child th{{border-bottom:0}}
-.login-wrap{{min-height:calc(100vh - 120px);display:flex;align-items:center;justify-content:center}}
-.login-card{{width:100%;max-width:400px}}
+.login-wrap{{min-height:calc(100dvh - 128px);display:flex;align-items:center;justify-content:center}}
+.login-card{{width:min(100%,400px)}}
 @media (prefers-reduced-motion:reduce){{*{{transition:none!important}}}}
+@media (max-width:900px){{.app-shell-nav{{grid-template-columns:1fr}} .sidebar{{padding:16px 14px 4px;border-right:0;border-bottom:1px solid var(--border)}} .sidebar nav{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}} .nav-group{{margin-bottom:10px}} .filters{{grid-template-columns:repeat(2,minmax(0,1fr))}} .detail-grid{{grid-template-columns:1fr}}}}
 @media (max-width:820px){{.channel-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
-@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}}}}
+@media (max-width:720px){{main{{padding:22px 14px 48px}} header{{padding:10px 14px}} .sidebar nav{{grid-template-columns:1fr}} .nav-group{{border-bottom:1px solid var(--border);padding-bottom:8px}} .nav-group:last-child{{border-bottom:0}} .card{{padding:16px}} .msg{{max-width:88%}} .channel-setup{{padding:18px 16px}} .channel-form-grid{{grid-template-columns:1fr}} .channel-form-grid .span-2{{grid-column:auto}} .channel-mode-grid{{grid-template-columns:1fr}} .channel-mode{{padding:16px 0 4px}} .channel-mode:first-child{{padding-top:0}} .channel-mode+ .channel-mode{{border-left:0;border-top:1px solid var(--border)}} .channel-mode .hint{{min-height:0}} .queue-tabs{{grid-template-columns:1fr}}}}
 @media (max-width:520px){{.channel-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}} .channel-tile{{min-height:104px}} .channel-heading{{align-items:flex-start;flex-direction:column;gap:2px}} .channel-meta{{grid-template-columns:1fr;gap:1px}} .channel-meta dd{{margin-bottom:7px}}}}
 </style></head><body>
-<header><span class="brand">Reply Core<small>Control Plane</small></span>{nav_bar}<nav>{logout}</nav></header>
-<main>{body}</main></body></html>"""
+{skip_link}<header><span class="brand">Reply Core<small>Control Plane</small></span><nav>{logout}</nav></header>
+<div class="{shell_class}">{sidebar}<main id="main-content">{body}</main></div></body></html>"""
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -518,17 +622,34 @@ def _input(
     required: bool = True,
     value: str = "",
     readonly: bool = False,
+    input_type: str | None = None,
+    inputmode: str | None = None,
+    min: int | str | None = None,
+    max: int | str | None = None,
+    autocomplete: str | None = None,
 ) -> str:
     field_id = f"f-{name}-{secrets.token_hex(3)}"  # 同名字段出现在多个表单，id 需唯一
-    required_attr = "required" if required else ""
-    input_type = "password" if secret else "text"
-    value_attr = f' value="{html.escape(value, quote=True)}"' if value else ""
-    readonly_attr = "readonly" if readonly else ""
-    return (
-        f'<label for="{field_id}">{html.escape(label)}</label>'
-        f'<input id="{field_id}" type="{input_type}" name="{name}"{value_attr} '
-        f"{required_attr} {readonly_attr}>"
-    )
+    resolved_type = input_type or ("password" if secret else "text")
+    attributes = [
+        f'id="{field_id}"',
+        f'type="{html.escape(resolved_type, quote=True)}"',
+        f'name="{html.escape(name, quote=True)}"',
+    ]
+    if value:
+        attributes.append(f'value="{html.escape(value, quote=True)}"')
+    if required:
+        attributes.append("required")
+    if readonly:
+        attributes.append("readonly")
+    for attribute, attribute_value in (
+        ("inputmode", inputmode),
+        ("min", min),
+        ("max", max),
+        ("autocomplete", autocomplete),
+    ):
+        if attribute_value is not None:
+            attributes.append(f'{attribute}="{html.escape(str(attribute_value), quote=True)}"')
+    return f'<label for="{field_id}">{html.escape(label)}</label><input {" ".join(attributes)}>'
 
 
 _STATUS_TONES = {
@@ -538,6 +659,9 @@ _STATUS_TONES = {
     "SENT": "ok",
     "READY": "ok",
     "ACTIVE": "ok",
+    "BOT_NOT_ACTIVE": "err",
+    "BOT_ID_MISMATCH": "err",
+    "CREDENTIAL_INVALID": "err",
     "published": "ok",
     "BOT_ACTIVE": "ok",
     "auto_reply": "ok",
@@ -545,6 +669,7 @@ _STATUS_TONES = {
     "WARNING": "warn",
     "ACTION": "err",
     "PENDING": "warn",
+    "WAITING": "warn",
     "PROCESSING": "warn",
     "QUEUED": "warn",
     "SENDING": "warn",
@@ -571,8 +696,15 @@ _STATUS_TONES = {
     "ERROR": "err",
     "UNKNOWN": "neutral",
     "HUMAN_ACTIVE": "info",
+    "CLAIMED": "info",
+    "EDITED": "info",
     "BOT_COOLDOWN": "neutral",
     "CLOSED": "neutral",
+    "CANCELLED": "neutral",
+    "NONE": "neutral",
+    "RESOLVED": "ok",
+    "ACCEPTED": "ok",
+    "REJECTED": "err",
     "ignore": "neutral",
 }
 
@@ -597,8 +729,56 @@ async def _submit_form(
     settings = get_settings()
     if not settings.platform_integration_enabled(platform):
         raise HTTPException(status_code=503, detail=f"{platform}_integration_disabled")
+    if platform == "email":
+        allowed_fields = set(EmailAccountRequest.model_fields) | {"csrf_token"}
+        if set(form) - allowed_fields:
+            raise HTTPException(status_code=422, detail="invalid_email_account_form_fields")
+        email_values = {key: value for key, value in form.items() if key != "csrf_token"}
+        for optional_field in (
+            "name",
+            "public_id",
+            "idempotency_key",
+            "from_name",
+            "smtp_port",
+        ):
+            if not (email_values.get(optional_field) or "").strip():
+                email_values.pop(optional_field, None)
+        try:
+            email_request = EmailAccountRequest.model_validate(email_values)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail="invalid_email_account_form") from exc
+        _validate_email_request_after_gates(
+            email_request,
+            allowed_hosts=settings.email_allowed_hosts,
+        )
+        validated_form = {"csrf_token": form.get("csrf_token", "")}
+        for key, value in email_request.model_dump().items():
+            if value is not None:
+                validated_form[key] = (
+                    value.get_secret_value() if isinstance(value, SecretStr) else value
+                )
+        form = validated_form
     if platform == "x" and (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
         raise HTTPException(status_code=422, detail="xchat_disabled")
+    if platform == "feishu":
+        from social_reply.application.account_management.feishu import (
+            FEISHU_GROUP_MODE,
+            validate_feishu_app_id,
+        )
+
+        try:
+            validate_feishu_app_id(form.get("app_id") or "")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if form.get("automation_default", "BOT_DRAFT_ONLY") != "BOT_DRAFT_ONLY":
+            raise HTTPException(status_code=422, detail="feishu_requires_bot_draft_only")
+        if form.get("api_base_url", FEISHU_API_BASE_URL) != FEISHU_API_BASE_URL:
+            raise HTTPException(status_code=422, detail="invalid_feishu_api_base_url")
+        if form.get("group_mode", FEISHU_GROUP_MODE) != FEISHU_GROUP_MODE:
+            raise HTTPException(status_code=422, detail="unsupported_feishu_group_mode")
+        for secret_name in ("app_secret", "verification_token", "encrypt_key"):
+            if not (form.get(secret_name) or "").strip():
+                raise HTTPException(status_code=422, detail=f"blank_{secret_name}")
     brand_id = form.get("brand_id", "default") or "default"
     request_data, secrets_data = split_submission(platform, form)
     job_id = await submit_provisioning_job(
@@ -618,7 +798,10 @@ async def _submit_form(
         str(job_id),
         inline=lambda: process_provisioning_job(str(job_id)),
     )
-    return RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        f"/admin/integrations/provisioning-jobs/{job_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @router.post("/connect/telegram")
@@ -645,6 +828,17 @@ async def admin_connect_x(request: Request) -> Response:
     return await _submit_form(request, "x")
 
 
+@router.post("/connect/feishu")
+async def admin_connect_feishu(request: Request) -> Response:
+    return await _submit_form(request, "feishu")
+
+
+@router.post("/connect/email")
+async def admin_connect_email(request: Request) -> Response:
+    return await _submit_form(request, "email")
+
+
+@router.get("/integrations/provisioning-jobs/{job_id}", response_class=HTMLResponse)
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
 async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
     principal = await _web_principal(request)
@@ -662,10 +856,18 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
         data["status"] = "PROCESSING"
     retry = ""
     if job.status in {"FAILED", "NEEDS_ACTION"} and requires_secret_resubmission(job):
-        retry = (
-            '<p class="muted">该任务的一次性凭证已清除。'
-            '<a href="/admin/accounts">返回账号页重新提交 PIN 或凭证</a>。</p>'
-        )
+        if job.platform == "email":
+            retry = (
+                '<p class="muted">该 Email 任务的暂存密码已清除。'
+                '<a href="/admin/integrations/accounts/new/email">'
+                "返回账号页重新提交 Email 账号和密码</a>。</p>"
+            )
+        else:
+            retry = (
+                '<p class="muted">该任务的一次性凭证已清除。'
+                '<a href="/admin/integrations/accounts">'
+                "返回账号页重新提交 PIN 或凭证</a>。</p>"
+            )
     elif job.status in {"FAILED", "NEEDS_ACTION"} and not auto_retry:
         retry = f"""<form method="post" action="/admin/jobs/{job.id}/retry" style="max-width:200px"><input type="hidden" name="csrf_token" value="{csrf}"><button>重试任务</button></form>"""
     refresh_note = '<p class="muted">任务运行中，页面每 4 秒自动刷新。</p>' if in_flight else ""
@@ -682,7 +884,7 @@ async def admin_job(request: Request, job_id: uuid.UUID) -> Response:
     return HTMLResponse(
         _page(
             "Provisioning Job",
-            f"""<a class="back" href="/admin/accounts">← 返回账号页</a>
+            f"""<a class="back" href="/admin/integrations/accounts">← 返回平台账号</a>
 <section class="card"><h1 style="font-size:24px">Provisioning Job</h1>{refresh_note}
 <div class="tablewrap"><table class="kv">{rows}</table></div>{retry}</section>""",
             refresh_seconds=4 if in_flight else 0,
@@ -703,6 +905,8 @@ async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
         job = await session.get(models.ProvisioningJob, job_id)
     if job is None or job.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
+    if requires_secret_resubmission(job):
+        raise HTTPException(status_code=409, detail="provisioning_secret_resubmission_required")
     if not get_settings().platform_integration_enabled(job.platform):
         raise HTTPException(status_code=503, detail=f"{job.platform}_integration_disabled")
     try:
@@ -717,4 +921,7 @@ async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
         str(job_id),
         inline=lambda: process_provisioning_job(str(job_id)),
     )
-    return RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        f"/admin/integrations/provisioning-jobs/{job_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )

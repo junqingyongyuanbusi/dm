@@ -1,53 +1,19 @@
-import asyncio
-import os
-import subprocess
-import sys
-import uuid
-from pathlib import Path
-
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
-
-from social_reply.shared.config import get_settings
+from tests.integration.migration_support import (
+    assert_alembic_succeeds,
+    run_alembic,
+    temporary_database,
+)
 
 pytestmark = pytest.mark.integration
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-async def _run_alembic(database_url: str, *args: str):
-    env = {**os.environ, "DATABASE_URL": database_url, "TESTING": "true"}
-    return await asyncio.to_thread(
-        subprocess.run,
-        [sys.executable, "-m", "alembic", *args],
-        cwd=_REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-async def _alembic(database_url: str, *args: str) -> None:
-    result = await _run_alembic(database_url, *args)
-    assert result.returncode == 0, result.stdout + result.stderr
-
 
 async def test_platform_account_migration_rejects_incompatible_capability():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_contract_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
-        await _alembic(database_url, "upgrade", "f3a6c1d8e250")
+    async with temporary_database("social_reply_contract") as database_url:
+        await assert_alembic_succeeds(database_url, "upgrade", "f3a6c1d8e250")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -63,34 +29,14 @@ async def test_platform_account_migration_rejects_incompatible_capability():
             )
         await engine.dispose()
 
-        result = await _run_alembic(database_url, "upgrade", "head")
+        result = await run_alembic(database_url, "upgrade", "head")
         assert result.returncode != 0
         assert "capability violates the application contract" in (result.stdout + result.stderr)
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname=:name AND pid <> pg_backend_pid()"
-                ),
-                {"name": database_name},
-            )
-            await connection.execute(text(f'DROP DATABASE IF EXISTS "{database_name}"'))
-        await admin_engine.dispose()
 
 
 async def test_meta_route_migration_rejects_cross_family_collision():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_meta_route_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
-        await _alembic(database_url, "upgrade", "c5a8e2f4d901")
+    async with temporary_database("social_reply_meta_route") as database_url:
+        await assert_alembic_succeeds(database_url, "upgrade", "c5a8e2f4d901")
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -106,29 +52,179 @@ async def test_meta_route_migration_rejects_cross_family_collision():
             )
         await engine.dispose()
 
-        result = await _run_alembic(database_url, "upgrade", "head")
+        result = await run_alembic(database_url, "upgrade", "head")
         assert result.returncode != 0
         assert "cross-family Meta webhook public_id collision" in (result.stdout + result.stderr)
-    finally:
-        async with admin_engine.connect() as connection:
+
+
+async def test_human_work_hardening_repairs_legacy_rows():
+    async with temporary_database("social_reply_human_work") as database_url:
+        await assert_alembic_succeeds(database_url, "upgrade", "a1c4e8b7f302")
+        engine = create_async_engine(database_url)
+        async with engine.begin() as connection:
             await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
+                text(
+                    "INSERT INTO platform_accounts ("
+                    "id, tenant_id, brand_id, platform, name, capability, "
+                    "config_version, automation_default, status) VALUES ("
+                    "'00000000-0000-0000-0000-000000000101', 'tenant-a', 'b1', "
+                    "'telegram', 'human-work-migration', "
+                    '\'{"dm": true, "max_text_length": 4096}\'::jsonb, '
+                    "1, 'BOT_ACTIVE', 'active')"
+                )
             )
-        await admin_engine.dispose()
+            await connection.execute(
+                text(
+                    "INSERT INTO contacts ("
+                    "id, tenant_id, platform, platform_account_id, external_user_id) "
+                    "VALUES ("
+                    "'00000000-0000-0000-0000-000000000102', 'tenant-a', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', 'u1')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO conversations ("
+                    "id, tenant_id, brand_id, platform, platform_account_id, "
+                    "contact_id, conversation_key, channel_type) VALUES "
+                    "('00000000-0000-0000-0000-000000000103', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u1', 'dm'), "
+                    "('00000000-0000-0000-0000-000000000104', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u2', 'dm'), "
+                    "('00000000-0000-0000-0000-000000000105', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u3', 'dm'), "
+                    "('00000000-0000-0000-0000-000000000106', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u4', 'dm'), "
+                    "('00000000-0000-0000-0000-000000000107', 'tenant-a', 'b1', "
+                    "'telegram', '00000000-0000-0000-0000-000000000101', "
+                    "'00000000-0000-0000-0000-000000000102', 'migration:u5', 'dm')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO automation_states ("
+                    "conversation_id, state, state_version, human_agent_id, "
+                    "resume_policy, state_changed_reason) VALUES "
+                    "('00000000-0000-0000-0000-000000000103', 'HUMAN_ACTIVE', 1, "
+                    "'user:alice', 'MANUAL', 'legacy'), "
+                    "('00000000-0000-0000-0000-000000000104', 'HUMAN_ACTIVE', 1, "
+                    "NULL, 'MANUAL', 'legacy'), "
+                    "('00000000-0000-0000-0000-000000000105', 'HUMAN_ACTIVE', 1, "
+                    "'user:bob', 'MANUAL', 'legacy'), "
+                    "('00000000-0000-0000-0000-000000000106', 'HUMAN_ACTIVE', 1, "
+                    "'user:alice', 'MANUAL', 'legacy'), "
+                    "('00000000-0000-0000-0000-000000000107', 'HUMAN_ACTIVE', 1, "
+                    "'user:bob', 'MANUAL', 'legacy')"
+                )
+            )
+        await engine.dispose()
+
+        await assert_alembic_succeeds(database_url, "upgrade", "f6c2a9d81b40")
+        engine = create_async_engine(database_url)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO admin_users ("
+                    "id, username, password_hash, tenant_id, must_change_password, status) "
+                    "VALUES "
+                    "('00000000-0000-0000-0000-000000000201', 'alice', 'test-hash', "
+                    "'tenant-a', false, 'active'), "
+                    "('00000000-0000-0000-0000-000000000202', 'bob', 'test-hash', "
+                    "'tenant-b', false, 'active')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE human_work_items SET tenant_id = 'legacy-wrong', "
+                    "assigned_user_id = CASE conversation_id "
+                    "WHEN '00000000-0000-0000-0000-000000000103' "
+                    "THEN '00000000-0000-0000-0000-000000000201'::uuid "
+                    "WHEN '00000000-0000-0000-0000-000000000105' "
+                    "THEN '00000000-0000-0000-0000-000000000202'::uuid END "
+                    "WHERE conversation_id IN ("
+                    "'00000000-0000-0000-0000-000000000103', "
+                    "'00000000-0000-0000-0000-000000000105')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE human_work_items SET "
+                    "assigned_user_id = '00000000-0000-0000-0000-000000000201' "
+                    "WHERE conversation_id IN ("
+                    "'00000000-0000-0000-0000-000000000106', "
+                    "'00000000-0000-0000-0000-000000000107')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE human_work_items SET claimed_at = NULL WHERE conversation_id = "
+                    "'00000000-0000-0000-0000-000000000106'"
+                )
+            )
+        await engine.dispose()
+
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        engine = create_async_engine(database_url)
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT conversation_id, tenant_id, status, assigned_user_id, "
+                        "assigned_actor, claimed_at, version FROM human_work_items "
+                        "ORDER BY conversation_id"
+                    )
+                )
+            ).all()
+            revision = (
+                await connection.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar_one()
+        await engine.dispose()
+
+        assert revision == "c3e7a9f1b204"
+        assert str(rows[0].conversation_id) == "00000000-0000-0000-0000-000000000103"
+        assert rows[0].tenant_id == "tenant-a"
+        assert rows[0].status == "CLAIMED"
+        assert str(rows[0].assigned_user_id) == "00000000-0000-0000-0000-000000000201"
+        assert rows[0].assigned_actor == "user:alice"
+        assert rows[0].claimed_at is not None
+        assert rows[0].version == 1
+        assert str(rows[1].conversation_id) == "00000000-0000-0000-0000-000000000104"
+        assert rows[1].tenant_id == "tenant-a"
+        assert rows[1].status == "WAITING"
+        assert rows[1].assigned_user_id is None
+        assert rows[1].assigned_actor is None
+        assert rows[1].claimed_at is None
+        assert rows[1].version == 2
+        assert str(rows[2].conversation_id) == "00000000-0000-0000-0000-000000000105"
+        assert rows[2].tenant_id == "tenant-a"
+        assert rows[2].status == "WAITING"
+        assert rows[2].assigned_user_id is None
+        assert rows[2].assigned_actor is None
+        assert rows[2].claimed_at is None
+        assert rows[2].version == 2
+        assert str(rows[3].conversation_id) == "00000000-0000-0000-0000-000000000106"
+        assert rows[3].tenant_id == "tenant-a"
+        assert rows[3].status == "WAITING"
+        assert rows[3].assigned_user_id is None
+        assert rows[3].assigned_actor is None
+        assert rows[3].claimed_at is None
+        assert rows[3].version == 2
+        assert str(rows[4].conversation_id) == "00000000-0000-0000-0000-000000000107"
+        assert rows[4].tenant_id == "tenant-a"
+        assert rows[4].status == "WAITING"
+        assert rows[4].assigned_user_id is None
+        assert rows[4].assigned_actor is None
+        assert rows[4].claimed_at is None
+        assert rows[4].version == 2
 
 
 async def test_message_history_migration_backfills_and_round_trips():
-    base_url = make_url(get_settings().database_url)
-    database_name = f"social_reply_history_{uuid.uuid4().hex[:12]}"
-    database_url = base_url.set(database=database_name).render_as_string(hide_password=False)
-    admin_engine = create_async_engine(
-        base_url.set(database="postgres"), isolation_level="AUTOCOMMIT"
-    )
-    async with admin_engine.connect() as connection:
-        await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
-
-    try:
-        await _alembic(database_url, "upgrade", "e7b2c4d9a610")
+    async with temporary_database("social_reply_history") as database_url:
+        await assert_alembic_succeeds(database_url, "upgrade", "e7b2c4d9a610")
         engine = create_async_engine(database_url)
         seed_statements = (
             """
@@ -213,7 +309,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                 await connection.execute(text(statement))
         await engine.dispose()
 
-        await _alembic(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = (
@@ -254,7 +350,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).all()
-        assert revision == "a1c4e8b7f302"
+        assert revision == "c3e7a9f1b204"
         assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {
@@ -302,8 +398,8 @@ async def test_message_history_migration_backfills_and_round_trips():
                 )
         await engine.dispose()
 
-        await _alembic(database_url, "downgrade", "e7b2c4d9a610")
-        await _alembic(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "downgrade", "e7b2c4d9a610")
+        await assert_alembic_succeeds(database_url, "upgrade", "head")
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             counts = (
@@ -316,9 +412,3 @@ async def test_message_history_migration_backfills_and_round_trips():
             ).one()
         await engine.dispose()
         assert tuple(counts) == (3, 1, 3)
-    finally:
-        async with admin_engine.connect() as connection:
-            await connection.execute(
-                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            )
-        await admin_engine.dispose()

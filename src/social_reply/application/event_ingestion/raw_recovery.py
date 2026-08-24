@@ -7,6 +7,10 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.reply_decision.jobs import (
+    load_raw_event_decision_statuses,
+    raw_event_decision_status,
+)
 from social_reply.domain.messages.canonical import canonical_event_from_dict
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -65,7 +69,7 @@ def _dispatch_spec(row: models.RawEvent) -> tuple[str, tuple[dict[str, Any], ...
         raise ValueError("INITIAL_DISPATCH_VERSION_INVALID")
     kind = dispatch.get("kind")
     if kind == "direct":
-        if row.source not in {"telegram", "meta", "x"} or row.ingress_kind != "webhook":
+        if row.source not in {"telegram", "meta", "x", "feishu"} or row.ingress_kind != "webhook":
             raise ValueError("INITIAL_DISPATCH_SOURCE_INVALID")
         values = dispatch.get("events")
         if not isinstance(values, list) or not values:
@@ -360,25 +364,8 @@ async def complete_initial_direct_claim(
             or row.processing_claim_expires_at <= now
         ):
             return False
-        statuses = set(
-            (
-                await session.execute(
-                    select(models.DecisionJob.status).where(
-                        models.DecisionJob.raw_event_id == raw_event_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if "NEEDS_REVIEW" in statuses:
-            processing_status = "DECISION_NEEDS_REVIEW"
-        elif "DEFERRED_CHATWOOT" in statuses:
-            processing_status = "DECISION_DEFERRED"
-        elif statuses - {"COMPLETED"}:
-            processing_status = "DECISION_PENDING"
-        else:
-            processing_status = "PROCESSED"
+        statuses = await load_raw_event_decision_statuses(session, raw_event_id)
+        processing_status = raw_event_decision_status(statuses)
         row.processing_status = processing_status
         row.processing_claim_token = None
         row.processing_claim_expires_at = None

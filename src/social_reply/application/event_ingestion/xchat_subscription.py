@@ -1,7 +1,6 @@
 """Reconcile X Activity subscriptions and XChat key registration state."""
 
 import logging
-import os
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -22,17 +21,10 @@ from social_reply.domain.platform_accounts import CapabilityKey, capability_enab
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-_CHECK_INTERVAL_SECONDS = int(os.getenv("XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS", "600"))
-_READY_PROBE_INTERVAL = timedelta(
-    seconds=int(os.getenv("XCHAT_READY_PROBE_INTERVAL_SECONDS", "21600"))
-)
-_PENDING_PROBE_INTERVAL = timedelta(
-    seconds=int(os.getenv("XCHAT_PENDING_PROBE_INTERVAL_SECONDS", "600"))
-)
 # 订阅对象与客户端允许创建的事件必须是同一份名单，否则会在运行时才暴露。
 _EVENT_TYPES = SUPPORTED_ACTIVITY_EVENT_TYPES
 _last_check_at: float | None = None
@@ -46,6 +38,7 @@ async def ensure_xchat_subscriptions(
     settings = get_settings()
     if settings.testing:
         return await _ensure_xchat_subscriptions_unlocked(
+            settings=settings,
             account_ids=account_ids,
             force=force,
         )
@@ -57,6 +50,7 @@ async def ensure_xchat_subscriptions(
         if acquired is not True:
             return []
         return await _ensure_xchat_subscriptions_unlocked(
+            settings=settings,
             account_ids=account_ids,
             force=force,
         )
@@ -64,15 +58,18 @@ async def ensure_xchat_subscriptions(
 
 async def _ensure_xchat_subscriptions_unlocked(
     *,
+    settings: Settings,
     account_ids: set[uuid.UUID] | None,
     force: bool,
 ) -> list[str]:
     global _last_check_at
-    settings = get_settings()
+    check_interval_seconds = settings.xchat_subscription_check_interval_seconds
+    ready_probe_interval = timedelta(seconds=settings.xchat_ready_probe_interval_seconds)
+    pending_probe_interval = timedelta(seconds=settings.xchat_pending_probe_interval_seconds)
     if not settings.x_activity_enabled:
         return []
     now = time.monotonic()
-    if not force and _last_check_at is not None and now - _last_check_at < _CHECK_INTERVAL_SECONDS:
+    if not force and _last_check_at is not None and now - _last_check_at < check_interval_seconds:
         return []
     _last_check_at = now
 
@@ -109,6 +106,8 @@ async def _ensure_xchat_subscriptions_unlocked(
                     credentials,
                     client,
                     force=force,
+                    ready_probe_interval=ready_probe_interval,
+                    pending_probe_interval=pending_probe_interval,
                 )
             desired = {
                 "dm.received": settings.x_legacy_dm_enabled
@@ -209,9 +208,15 @@ async def _reconcile_xchat_key_state(
     client: XChatClient,
     *,
     force: bool,
+    ready_probe_interval: timedelta,
+    pending_probe_interval: timedelta,
 ) -> bool:
     config = account.config or {}
-    if not force and not _probe_due(config):
+    if not force and not _probe_due(
+        config,
+        ready_probe_interval=ready_probe_interval,
+        pending_probe_interval=pending_probe_interval,
+    ):
         return config.get("xchat_registered") is True
     try:
         records = await client.get_user_public_keys(str(account.external_account_id))
@@ -232,7 +237,12 @@ async def _reconcile_xchat_key_state(
     return state.registered
 
 
-def _probe_due(config: dict) -> bool:
+def _probe_due(
+    config: dict,
+    *,
+    ready_probe_interval: timedelta,
+    pending_probe_interval: timedelta,
+) -> bool:
     value = config.get("xchat_last_probed_at")
     if not isinstance(value, str):
         return True
@@ -243,9 +253,9 @@ def _probe_due(config: dict) -> bool:
     if last_probed.tzinfo is None:
         last_probed = last_probed.replace(tzinfo=UTC)
     interval = (
-        _READY_PROBE_INTERVAL
+        ready_probe_interval
         if config.get("xchat_key_state") == XChatKeyState.READY.value
-        else _PENDING_PROBE_INTERVAL
+        else pending_probe_interval
     )
     return datetime.now(UTC) - last_probed >= interval
 

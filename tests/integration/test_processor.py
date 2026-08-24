@@ -70,6 +70,7 @@ async def test_inbound_user_message_full_chain(session):
     assert mapping.chatwoot_conversation_id == 77
     msg = (await session.execute(select(models.Message))).scalar_one()
     assert msg.direction == "inbound" and msg.chatwoot_message_id == 55
+    assert msg.decision_generation == 1
     assert msg.occurred_at == datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
     state = (await session.execute(select(models.AutomationState))).scalar_one()
     assert state.state == "BOT_DRAFT_ONLY"  # 账号默认草稿先行
@@ -90,6 +91,11 @@ async def test_duplicate_delivery_is_idempotent(session):
 
     assert await _count(session, models.NormalizedEvent) == 1
     assert await _count(session, models.Message) == 1
+    assert await _count(session, models.DecisionJob) == 1
+    conversation = (await session.execute(select(models.Conversation))).scalar_one()
+    assert conversation.decision_generation == 1
+    raw_statuses = set((await session.execute(select(models.RawEvent.processing_status))).scalars())
+    assert raw_statuses == {"PROCESSED", "SKIPPED_DUPLICATE"}
 
 
 async def test_agent_public_reply_flips_human_active(session):
@@ -105,8 +111,12 @@ async def test_agent_public_reply_flips_human_active(session):
     state = (await session.execute(select(models.AutomationState))).scalar_one()
     assert state.state == "HUMAN_ACTIVE"
     assert state.state_version == 2
-    msg_count = await _count(session, models.Message)
-    assert msg_count == 2  # 坐席消息也落库（direction=outbound, sender_type=agent）
+    conversation = (await session.execute(select(models.Conversation))).scalar_one()
+    assert conversation.decision_generation == 1  # Agent outgoing does not reserve a generation.
+    messages = (await session.execute(select(models.Message))).scalars().all()
+    assert len(messages) == 2  # The agent message is still persisted as outbound.
+    agent_message = next(message for message in messages if message.sender_type == "agent")
+    assert agent_message.decision_generation is None
 
 
 async def test_self_echo_via_outbox_is_skipped(session):

@@ -39,10 +39,23 @@ class MetaWebhookAdapter:
                 recipient_id = str((messaging.get("recipient") or {}).get("id", ""))
                 event_id = message.get("mid")
                 text = message.get("text")
+                attachments = [
+                    {
+                        "type": str(item.get("type") or "attachment"),
+                        "url": (item.get("payload") or {}).get("url"),
+                        "metadata": {
+                            key: value
+                            for key, value in (item.get("payload") or {}).items()
+                            if key != "url"
+                        },
+                    }
+                    for item in message.get("attachments", [])
+                    if isinstance(item, dict)
+                ]
                 if (
                     not sender_id
                     or not event_id
-                    or not isinstance(text, str)
+                    or (not isinstance(text, str) and not attachments)
                     or message.get("is_echo")
                     or sender_id == self._external_account_id
                     or (self._external_account_id and recipient_id != self._external_account_id)
@@ -63,6 +76,7 @@ class MetaWebhookAdapter:
                         ),
                         external_conversation_id=sender_id,
                         reply_target={"kind": "dm", "recipient_id": sender_id},
+                        attachments=attachments,
                         raw_payload=messaging,
                     )
                 )

@@ -37,6 +37,26 @@ def test_x_oauth_callback_access_log_redacts_trailing_slash_variant():
     assert "verifier" not in rendered
 
 
+def test_meta_oauth_callback_access_log_redacts_code_and_state():
+    record = _record("/admin/oauth/meta/callback?code=secret-code&state=secret-state")
+
+    assert OAuthCallbackAccessLogFilter().filter(record) is True
+    rendered = record.getMessage()
+    assert "/admin/oauth/meta/callback HTTP/1.1" in rendered
+    assert "secret-code" not in rendered
+    assert "secret-state" not in rendered
+
+
+def test_instagram_oauth_callback_access_log_redacts_code_and_state():
+    record = _record("/admin/oauth/instagram/callback/?code=secret-code&state=secret-state")
+
+    assert OAuthCallbackAccessLogFilter().filter(record) is True
+    rendered = record.getMessage()
+    assert "/admin/oauth/instagram/callback HTTP/1.1" in rendered
+    assert "secret-code" not in rendered
+    assert "secret-state" not in rendered
+
+
 def test_access_log_filter_leaves_other_paths_unchanged():
     record = _record("/healthz?verbose=true")
 

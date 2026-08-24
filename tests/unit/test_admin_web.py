@@ -18,6 +18,17 @@ async def test_admin_dashboard_redirects_to_login():
     assert response.headers["location"] == "/admin/login"
 
 
+async def test_admin_login_uses_full_width_auth_shell():
+    async with await _client() as client:
+        response = await client.get("/admin/login")
+
+    assert response.status_code == 200
+    assert '<div class="app-shell app-shell-auth"><main id="main-content">' in response.text
+    assert 'class="sidebar"' not in response.text
+    assert ".app-shell-auth{grid-template-columns:minmax(0,1fr);max-width:none}" in response.text
+    assert ".app-shell-nav{grid-template-columns:220px minmax(0,1fr)}" in response.text
+
+
 async def test_admin_login_sets_http_only_session_cookie(monkeypatch):
     from social_reply.application.account_management import admin
     from social_reply.application.account_management.auth import Principal
@@ -89,7 +100,23 @@ async def test_admin_login_accepts_only_whitelisted_next(monkeypatch):
             },
         )
         assert safe.headers["location"] == "/admin/accounts?provider=x&status=connected"
-
+        new_page = await client.get(
+            "/admin/login?next=%2Fadmin%2Fintegrations%2Faccounts%3Fprovider%3Dx%26status%3Dconnected"
+        )
+        new_csrf = client.cookies["reply_admin_csrf"]
+        assert new_page.status_code == 200
+        new_safe = await client.post(
+            "/admin/login",
+            data={
+                "csrf_token": new_csrf,
+                "username": "admin",
+                "password": "password",
+                "next": "/admin/integrations/accounts?provider=x&status=connected",
+            },
+        )
+        assert new_safe.headers["location"] == (
+            "/admin/integrations/accounts?provider=x&status=connected"
+        )
     async with await _client() as client:
         await client.get("/admin/login")
         csrf = client.cookies["reply_admin_csrf"]
@@ -207,3 +234,152 @@ async def test_admin_login_rejects_bad_csrf():
             data={"csrf_token": "bad", "username": "admin", "password": "x"},
         )
     assert response.status_code == 403
+
+
+async def test_admin_feishu_submission_preserves_csrf_tenant_and_secret_boundaries(monkeypatch):
+    from social_reply.application.account_management import admin
+    from social_reply.application.account_management.auth import Principal
+
+    captured = {}
+    principal = Principal(
+        session_id=__import__("uuid").uuid4(),
+        username="tenant-admin",
+        actor="user:tenant-admin",
+        allowed_tenants=frozenset({"tenant-a"}),
+    )
+    settings = admin.get_settings().model_copy(update={"feishu_enabled": True})
+
+    async def fake_current_principal(_request):
+        return principal
+
+    monkeypatch.setattr(admin, "get_settings", lambda: settings)
+    monkeypatch.setattr(admin, "current_principal", fake_current_principal)
+
+    async def fake_submit(**kwargs):
+        captured.update(kwargs)
+        return __import__("uuid").UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+
+    async def fake_dispatch(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(admin, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(admin, "dispatch_actor", fake_dispatch)
+    async with await _client() as client:
+        await client.get("/admin/login")
+        csrf = client.cookies["reply_admin_csrf"]
+        response = await client.post(
+            "/admin/connect/feishu",
+            data={
+                "csrf_token": csrf,
+                "tenant_id": "tenant-a",
+                "brand_id": "default",
+                "app_id": "cli_12345678",
+                "app_secret": "app-secret",
+                "verification_token": "verification-secret",
+                "encrypt_key": "encrypt-secret",
+                "group_mode": "mentions_only",
+                "automation_default": "BOT_DRAFT_ONLY",
+            },
+        )
+    assert response.status_code == 303
+    assert captured["tenant_id"] == "tenant-a"
+    assert captured["request"]["app_id"] == "cli_12345678"
+    assert captured["request"]["group_mode"] == "mentions_only"
+    assert captured["request"]["automation_default"] == "BOT_DRAFT_ONLY"
+    assert captured["secrets"] == {
+        "app_secret": "app-secret",
+        "verification_token": "verification-secret",
+        "encrypt_key": "encrypt-secret",
+    }
+
+
+async def test_admin_feishu_rejects_bad_csrf_and_other_tenant(monkeypatch):
+    from social_reply.application.account_management import admin
+    from social_reply.application.account_management.auth import Principal
+
+    principal = Principal(
+        session_id=__import__("uuid").uuid4(),
+        username="tenant-admin",
+        actor="user:tenant-admin",
+        allowed_tenants=frozenset({"tenant-a"}),
+    )
+    settings = admin.get_settings().model_copy(update={"feishu_enabled": True})
+
+    async def fake_current_principal(_request):
+        return principal
+
+    monkeypatch.setattr(admin, "get_settings", lambda: settings)
+    monkeypatch.setattr(admin, "current_principal", fake_current_principal)
+    payload = {
+        "tenant_id": "tenant-b",
+        "app_id": "cli_12345678",
+        "app_secret": "app-secret",
+        "verification_token": "verification-secret",
+        "encrypt_key": "encrypt-secret",
+        "automation_default": "BOT_DRAFT_ONLY",
+    }
+    async with await _client() as client:
+        bad_csrf = await client.post(
+            "/admin/connect/feishu",
+            data={"csrf_token": "bad", **payload},
+        )
+        await client.get("/admin/login")
+        csrf = client.cookies["reply_admin_csrf"]
+        wrong_tenant = await client.post(
+            "/admin/connect/feishu",
+            data={"csrf_token": csrf, **payload},
+        )
+    assert bad_csrf.status_code == 403
+    assert wrong_tenant.status_code == 403
+
+
+async def test_admin_feishu_enforces_gate_and_draft_only(monkeypatch):
+    from social_reply.application.account_management import admin
+    from social_reply.application.account_management.auth import Principal
+
+    principal = Principal(
+        session_id=__import__("uuid").uuid4(),
+        username="tenant-admin",
+        actor="user:tenant-admin",
+        allowed_tenants=frozenset({"tenant-a"}),
+    )
+
+    async def fake_current_principal(_request):
+        return principal
+
+    monkeypatch.setattr(admin, "current_principal", fake_current_principal)
+    base = {
+        "tenant_id": "tenant-a",
+        "app_id": "cli_12345678",
+        "app_secret": "app-secret",
+        "verification_token": "verification-secret",
+        "encrypt_key": "encrypt-secret",
+    }
+    async with await _client() as client:
+        await client.get("/admin/login")
+        csrf = client.cookies["reply_admin_csrf"]
+        disabled = await client.post(
+            "/admin/connect/feishu",
+            data={"csrf_token": csrf, **base},
+        )
+        settings = admin.get_settings().model_copy(update={"feishu_enabled": True})
+        monkeypatch.setattr(admin, "get_settings", lambda: settings)
+        active = await client.post(
+            "/admin/connect/feishu",
+            data={
+                "csrf_token": csrf,
+                **base,
+                "automation_default": "BOT_ACTIVE",
+            },
+        )
+        tampered_origin = await client.post(
+            "/admin/connect/feishu",
+            data={
+                "csrf_token": csrf,
+                **base,
+                "api_base_url": "https://attacker.example",
+            },
+        )
+    assert disabled.status_code == 503
+    assert active.status_code == 422
+    assert tampered_origin.status_code == 422

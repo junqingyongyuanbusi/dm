@@ -1,9 +1,9 @@
 import hashlib
 import secrets
 import uuid
-from pathlib import Path  # noqa: F401  secrets_root 参数签名保留（内联存储后不再使用）
+from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.domain.platform_accounts import (
@@ -194,6 +194,8 @@ async def provision_direct_account(
     platform_app_id: uuid.UUID | None = None,
     preserve_existing_webhook_secret: bool = False,
     status: str | None = None,
+    provisioning_job_id: uuid.UUID | None = None,
+    provisioning_attempt_count: int | None = None,
 ) -> tuple[uuid.UUID, str]:
     """幂等创建/更新直连账号；每个账号拥有独立凭证目录。"""
     platform = account_platform(platform).value
@@ -239,9 +241,12 @@ async def provision_direct_account(
         "webhook_secret_bundle": webhook_bundle,
         "config": {"delivery_mode": "direct", **config},
         "capability": capability,
-        "config_version": existing.config_version + 1 if existing is not None else 1,
+        "config_version": 1,
         "chatwoot_inbox_id": None,
-        "automation_default": automation_default,
+        # Reauthorization must not silently change an operator-selected automation mode.
+        "automation_default": (
+            existing.automation_default if existing is not None else automation_default
+        ),
         "status": (
             canonical_account_status(status)
             if status is not None
@@ -252,17 +257,47 @@ async def provision_direct_account(
             )
         ),
     }
+    if (provisioning_job_id is None) != (provisioning_attempt_count is None):
+        raise ValueError("provisioning_claim_fence_incomplete")
+
     async with get_session_factory()() as session:
-        account_id = (
-            await session.execute(
-                pg_insert(models.PlatformAccount)
-                .values(**values)
-                .on_conflict_do_update(
-                    index_elements=["tenant_id", "platform", "external_account_id"],
-                    set_={key: value for key, value in values.items() if key != "id"},
+        if provisioning_job_id is not None:
+            claim = (
+                await session.execute(
+                    select(models.ProvisioningJob.id)
+                    .where(
+                        models.ProvisioningJob.id == provisioning_job_id,
+                        models.ProvisioningJob.status == "PROCESSING",
+                        models.ProvisioningJob.attempt_count == provisioning_attempt_count,
+                    )
+                    .with_for_update()
                 )
-                .returning(models.PlatformAccount.id)
+            ).scalar_one_or_none()
+            if claim is None:
+                raise ValueError("provisioning_claim_lost")
+        statement = pg_insert(models.PlatformAccount).values(**values)
+        update_values = {
+            key: value
+            for key, value in values.items()
+            if key not in {"id", "public_id", "config_version"}
+        }
+        update_values["public_id"] = func.coalesce(
+            models.PlatformAccount.public_id,
+            statement.excluded.public_id,
+        )
+        update_values["config_version"] = models.PlatformAccount.config_version + 1
+        persisted = (
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["tenant_id", "platform", "external_account_id"],
+                    set_=update_values,
+                ).returning(
+                    models.PlatformAccount.id,
+                    models.PlatformAccount.public_id,
+                )
             )
-        ).scalar_one()
+        ).one()
         await session.commit()
-    return account_id, resolved_public_id
+    if persisted.public_id is None:
+        raise RuntimeError("platform_account_public_id_missing")
+    return persisted.id, persisted.public_id

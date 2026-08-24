@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Sequence,
@@ -23,6 +24,10 @@ from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from social_reply.domain.platform_accounts import ACTIVE_ACCOUNT_STATUS
+from social_reply.domain.reply.voice import (
+    CANONICAL_VOICE_PREFERENCES,
+    CANONICAL_VOICE_PREFERENCES_JSON,
+)
 
 
 class Base(DeclarativeBase):
@@ -41,6 +46,7 @@ class AdminUser(Base):
     __table_args__ = (
         UniqueConstraint("username"),
         UniqueConstraint("tenant_id"),
+        UniqueConstraint("tenant_id", "id", name="uq_admin_users_tenant_id_id"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     username: Mapped[str] = mapped_column(String(128))
@@ -109,8 +115,9 @@ class PlatformAccount(Base):
     __table_args__ = (
         UniqueConstraint("platform", "public_id"),
         UniqueConstraint("tenant_id", "platform", "external_account_id"),
+        UniqueConstraint("tenant_id", "id", name="uq_platform_accounts_tenant_id_id"),
         CheckConstraint(
-            "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x')",
+            "platform IN ('telegram', 'facebook', 'instagram', 'whatsapp', 'x', 'feishu', 'email')",
             name="ck_platform_accounts_platform",
         ),
         CheckConstraint(
@@ -158,7 +165,14 @@ class Contact(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
-    __table_args__ = (UniqueConstraint("tenant_id", "conversation_key"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "conversation_key"),
+        UniqueConstraint("tenant_id", "id", name="uq_conversations_tenant_id_id"),
+        CheckConstraint(
+            "decision_generation >= 0",
+            name="ck_conversations_decision_generation",
+        ),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     brand_id: Mapped[str] = mapped_column(Text)
@@ -167,6 +181,7 @@ class Conversation(Base):
     contact_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contacts.id"))
     conversation_key: Mapped[str] = mapped_column(Text)
     channel_type: Mapped[str] = mapped_column(Text, default="dm")
+    decision_generation: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -188,6 +203,11 @@ class Message(Base):
         UniqueConstraint("history_seq", name="uq_messages_history_seq"),
         UniqueConstraint("source_outbox_id", name="uq_messages_source_outbox_id"),
         Index("ix_messages_conversation_history", "conversation_id", "history_seq"),
+        Index(
+            "ix_messages_conversation_decision_generation",
+            "conversation_id",
+            "decision_generation",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     history_seq: Mapped[int] = mapped_column(
@@ -202,7 +222,9 @@ class Message(Base):
     chatwoot_message_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     platform_message_id: Mapped[str | None] = mapped_column(Text, index=True)
     source_outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
+    decision_generation: Mapped[int | None] = mapped_column(BigInteger)
     reply_target: Mapped[dict] = mapped_column(JSONB, default=dict)
+    attachments: Mapped[list] = mapped_column(JSONB, default=list)
     private: Mapped[bool] = mapped_column(Boolean, default=False)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -227,6 +249,15 @@ class RawEvent(Base):
             "ix_raw_events_processing_due",
             "processing_status",
             "processing_next_attempt_at",
+        ),
+        Index(
+            "uq_raw_events_feishu_webhook_external_event",
+            "platform_account_id",
+            "external_event_id",
+            unique=True,
+            postgresql_where=text(
+                "source = 'feishu' AND ingress_kind = 'webhook' AND external_event_id IS NOT NULL"
+            ),
         ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -267,12 +298,13 @@ class PlatformCheckpoint(Base):
             name="uq_platform_checkpoints_account_stream_scope",
         ),
         CheckConstraint(
-            "stream IN ('X_LEGACY_DM', 'XCHAT_DISCOVERY', 'XCHAT_CONVERSATION')",
+            "stream IN ('X_LEGACY_DM', 'XCHAT_DISCOVERY', 'XCHAT_CONVERSATION', 'EMAIL_IMAP')",
             name="ck_platform_checkpoints_stream",
         ),
         CheckConstraint(
             "(stream = 'XCHAT_CONVERSATION' AND scope_key <> '') OR "
-            "(stream <> 'XCHAT_CONVERSATION' AND scope_key = '')",
+            "(stream IN ('X_LEGACY_DM', 'XCHAT_DISCOVERY', 'EMAIL_IMAP') "
+            "AND scope_key = '')",
             name="ck_platform_checkpoints_scope",
         ),
         CheckConstraint("revision >= 0", name="ck_platform_checkpoints_revision"),
@@ -347,7 +379,8 @@ class SyncGap(Base):
     __tablename__ = "sync_gaps"
     __table_args__ = (
         CheckConstraint(
-            "gap_type IN ('PAGE_CAP', 'PAGINATION_ERROR', 'DECRYPT_ERROR')",
+            "gap_type IN ('PAGE_CAP', 'PAGINATION_ERROR', 'DECRYPT_ERROR', "
+            "'EMAIL_UIDVALIDITY_CHANGED')",
             name="ck_sync_gaps_type",
         ),
         CheckConstraint(
@@ -421,6 +454,298 @@ class AutomationState(Base):
     )
 
 
+class HumanWorkItem(Base):
+    __tablename__ = "human_work_items"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('WAITING', 'CLAIMED', 'RESOLVED', 'CANCELLED')",
+            name="ck_human_work_items_status",
+        ),
+        CheckConstraint("version >= 1", name="ck_human_work_items_version"),
+        CheckConstraint(
+            "status <> 'CLAIMED' OR (assigned_actor IS NOT NULL AND claimed_at IS NOT NULL)",
+            name="ck_human_work_items_claimed_assignment",
+        ),
+        CheckConstraint(
+            "resolution_evidence IS NULL OR resolution_evidence IN "
+            "('REPLY_CORE_CONFIRMED', 'FEISHU_OPERATOR_ATTESTED', "
+            "'ADMIN_OPERATOR_ATTESTED', 'SUPERVISOR_OVERRIDE')",
+            name="ck_human_work_items_resolution_evidence",
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_human_work_items_tenant_id_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "conversation_id"],
+            ["conversations.tenant_id", "conversations.id"],
+            name="fk_human_work_items_tenant_conversation",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "uq_human_work_items_open_conversation",
+            "conversation_id",
+            unique=True,
+            postgresql_where=text("status IN ('WAITING', 'CLAIMED')"),
+        ),
+        Index(
+            "ix_human_work_items_tenant_status_created",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
+        Index("ix_human_work_items_assigned_status", "assigned_user_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    status: Mapped[str] = mapped_column(Text, default="WAITING")
+    reason_code: Mapped[str] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="SET NULL")
+    )
+    assigned_actor: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_actor: Mapped[str | None] = mapped_column(Text)
+    resolution_evidence: Mapped[str | None] = mapped_column(Text)
+    resolution_outbox_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "outbox_messages.id",
+            name="fk_human_work_items_resolution_outbox_id",
+            ondelete="SET NULL",
+        )
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class TenantFeishuHandoffConfig(Base):
+    __tablename__ = "tenant_feishu_handoff_configs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id"),
+        UniqueConstraint("tenant_id", "id", name="uq_tenant_feishu_handoff_configs_tenant_id_id"),
+        CheckConstraint("config_version >= 1", name="ck_feishu_handoff_configs_version"),
+        CheckConstraint(
+            "length(btrim(destination_chat_id)) > 0",
+            name="ck_feishu_handoff_configs_chat_id",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_feishu_handoff_configs_tenant_account",
+            ondelete="CASCADE",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    feishu_platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    destination_chat_id: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    config_version: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    card_locale: Mapped[str] = mapped_column(Text, default="zh_cn", server_default=text("'zh_cn'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class FeishuHandoffOperator(Base):
+    __tablename__ = "feishu_handoff_operators"
+    __table_args__ = (
+        UniqueConstraint(
+            "feishu_platform_account_id",
+            "operator_open_id",
+            name="uq_feishu_handoff_operators_account_open_id",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'DISABLED')",
+            name="ck_feishu_handoff_operators_status",
+        ),
+        CheckConstraint(
+            "length(btrim(operator_open_id)) > 0",
+            name="ck_feishu_handoff_operators_open_id",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_feishu_handoff_operators_tenant_account",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "admin_user_id"],
+            ["admin_users.tenant_id", "admin_users.id"],
+            name="fk_feishu_handoff_operators_tenant_admin_user",
+        ),
+        Index("ix_feishu_handoff_operators_tenant_status", "tenant_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    feishu_platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    operator_open_id: Mapped[str] = mapped_column(Text)
+    display_name: Mapped[str | None] = mapped_column(Text)
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    can_claim: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    can_resolve: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    status: Mapped[str] = mapped_column(Text, default="ACTIVE", server_default=text("'ACTIVE'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class HandoffNotificationIntent(Base):
+    __tablename__ = "handoff_notification_intents"
+    __table_args__ = (
+        UniqueConstraint("public_id"),
+        UniqueConstraint("human_work_item_id"),
+        UniqueConstraint("provider_uuid"),
+        UniqueConstraint("tenant_id", "id", name="uq_handoff_notification_intents_tenant_id_id"),
+        CheckConstraint(
+            "status IN ('BLOCKED_CONFIG', 'PENDING', 'SENDING', 'SYNCED', "
+            "'FAILED', 'NEEDS_REVIEW', 'CANCELLED')",
+            name="ck_handoff_notification_intents_status",
+        ),
+        CheckConstraint(
+            "desired_card_state IN ('WAITING', 'CLAIMED', 'RESOLVED', 'CANCELLED')",
+            name="ck_handoff_notification_intents_card_state",
+        ),
+        CheckConstraint(
+            "desired_revision >= 1 AND delivered_revision >= 0 "
+            "AND delivered_revision <= desired_revision",
+            name="ck_handoff_notification_intents_revisions",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_handoff_notification_intents_attempt_count",
+        ),
+        CheckConstraint(
+            "(status = 'SENDING') = "
+            "(claim_token IS NOT NULL AND claim_expires_at IS NOT NULL "
+            "AND sending_revision IS NOT NULL)",
+            name="ck_handoff_notification_intents_sending_lease",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "human_work_item_id"],
+            ["human_work_items.tenant_id", "human_work_items.id"],
+            name="fk_handoff_notification_intents_tenant_work",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "conversation_id"],
+            ["conversations.tenant_id", "conversations.id"],
+            name="fk_handoff_notification_intents_tenant_conversation",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "notification_config_id"],
+            ["tenant_feishu_handoff_configs.tenant_id", "tenant_feishu_handoff_configs.id"],
+            name="fk_handoff_notification_intents_tenant_config",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_handoff_notification_intents_tenant_account",
+        ),
+        Index(
+            "ix_handoff_notification_intents_due",
+            "status",
+            "next_attempt_at",
+            "created_at",
+        ),
+        Index(
+            "ix_handoff_notification_intents_tenant_status",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
+        Index("ix_handoff_notification_intents_provider_message", "provider_message_id"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    public_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(Text)
+    human_work_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    notification_config_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    config_version: Mapped[int | None] = mapped_column(Integer)
+    feishu_platform_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    destination_chat_id: Mapped[str | None] = mapped_column(Text)
+    provider_uuid: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=uuid.uuid4)
+    provider_message_id: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        Text, default="BLOCKED_CONFIG", server_default=text("'BLOCKED_CONFIG'")
+    )
+    desired_card_state: Mapped[str] = mapped_column(
+        Text, default="WAITING", server_default=text("'WAITING'")
+    )
+    desired_revision: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    delivered_revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    action_nonce: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=uuid.uuid4)
+    sending_revision: Mapped[int | None] = mapped_column(Integer)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(Text)
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FeishuCardActionReceipt(Base):
+    __tablename__ = "feishu_card_action_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "feishu_platform_account_id",
+            "provider_event_id",
+            name="uq_feishu_card_action_receipts_account_event",
+        ),
+        CheckConstraint(
+            "action IN ('CLAIM', 'RESOLVE')",
+            name="ck_feishu_card_action_receipts_action",
+        ),
+        CheckConstraint(
+            "outcome IN ('PROCESSING', 'SUCCEEDED', 'CONFLICT', 'UNAUTHORIZED', 'MAINTENANCE')",
+            name="ck_feishu_card_action_receipts_outcome",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "feishu_platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            name="fk_feishu_card_action_receipts_tenant_account",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "notification_intent_id"],
+            ["handoff_notification_intents.tenant_id", "handoff_notification_intents.id"],
+            name="fk_feishu_card_action_receipts_tenant_intent",
+        ),
+        Index(
+            "ix_feishu_card_action_receipts_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    feishu_platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    provider_event_id: Mapped[str] = mapped_column(Text)
+    notification_intent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    operator_open_id: Mapped[str | None] = mapped_column(Text)
+    action: Mapped[str] = mapped_column(Text)
+    request_digest: Mapped[str] = mapped_column(String(64))
+    outcome: Mapped[str] = mapped_column(
+        Text, default="PROCESSING", server_default=text("'PROCESSING'")
+    )
+    response_payload: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class OutboxMessage(Base):
     __tablename__ = "outbox_messages"
     __table_args__ = (
@@ -432,6 +757,24 @@ class OutboxMessage(Base):
             "status",
             "created_at",
         ),
+        Index(
+            "ix_outbox_email_bot_sent_account_time",
+            "platform_account_id",
+            "sent_at",
+            "conversation_id",
+            postgresql_where=text(
+                "status = 'SENT' AND destination_type = 'email_reply' "
+                "AND origin_kind = 'DECISION' AND actor_kind = 'BOT'"
+            ),
+        ),
+        CheckConstraint(
+            "origin_kind IN ('DECISION', 'DRAFT_APPROVAL', 'MANUAL_REPLY', 'SYSTEM_NOTICE')",
+            name="ck_outbox_origin_kind",
+        ),
+        CheckConstraint(
+            "actor_kind IN ('BOT', 'ADMIN_HUMAN', 'SYSTEM')",
+            name="ck_outbox_actor_kind",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
@@ -441,6 +784,16 @@ class OutboxMessage(Base):
     destination_id: Mapped[str] = mapped_column(Text)
     message_type: Mapped[str] = mapped_column(Text)
     payload: Mapped[dict] = mapped_column(JSONB)
+    reply_to_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "messages.id",
+            name="fk_outbox_messages_reply_to_message_id",
+            use_alter=True,
+        )
+    )
+    origin_kind: Mapped[str] = mapped_column(Text, default="DECISION")
+    actor_kind: Mapped[str] = mapped_column(Text, default="BOT")
+    actor_id: Mapped[str | None] = mapped_column(Text)
     idempotency_key: Mapped[str] = mapped_column(Text, unique=True)
     status: Mapped[str] = mapped_column(Text, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -504,19 +857,291 @@ class ProvisioningJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_evaluation_runs_tenant_id_id"),
+        CheckConstraint(
+            "status IN ('RUNNING', 'COMPLETED', 'FAILED')",
+            name="ck_evaluation_runs_status",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING') = (completed_at IS NULL)",
+            name="ck_evaluation_runs_completed_at",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING') = (result_set_fingerprint IS NULL)",
+            name="ck_evaluation_runs_result_fingerprint",
+        ),
+        CheckConstraint(
+            "data_class = 'SYNTHETIC'",
+            name="ck_evaluation_runs_data_class",
+        ),
+        CheckConstraint(
+            "dataset_fingerprint ~ '^[0-9a-f]{64}$' "
+            "AND candidate_manifest_hash ~ '^[0-9a-f]{64}$' "
+            "AND workload_manifest_hash ~ '^[0-9a-f]{64}$' "
+            "AND execution_policy_hash ~ '^[0-9a-f]{64}$' "
+            "AND (result_set_fingerprint IS NULL OR "
+            "result_set_fingerprint ~ '^[0-9a-f]{64}$') "
+            "AND length(btrim(dataset_version)) > 0 "
+            "AND length(btrim(source_token_key_version)) > 0 "
+            "AND length(btrim(execution_policy_version)) > 0 "
+            "AND length(btrim(code_revision)) > 0",
+            name="ck_evaluation_runs_manifest",
+        ),
+        CheckConstraint(
+            "expected_decision_count >= 1",
+            name="ck_evaluation_runs_expected_count",
+        ),
+        Index(
+            "ix_evaluation_runs_tenant_status_created",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(128))
+    data_class: Mapped[str] = mapped_column(String(32))
+    dataset_fingerprint: Mapped[str] = mapped_column(String(64))
+    dataset_version: Mapped[str] = mapped_column(String(128))
+    source_token_key_version: Mapped[str] = mapped_column(String(64))
+    candidate_manifest_hash: Mapped[str] = mapped_column(String(64))
+    workload_manifest_hash: Mapped[str] = mapped_column(String(64))
+    result_set_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    execution_policy_version: Mapped[str] = mapped_column(String(64))
+    execution_policy_hash: Mapped[str] = mapped_column(String(64))
+    code_revision: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(
+        String(16), default="RUNNING", server_default=text("'RUNNING'")
+    )
+    expected_decision_count: Mapped[int] = mapped_column(Integer)
+    retention_class: Mapped[str] = mapped_column(String(32))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EvaluationDecision(Base):
+    __tablename__ = "evaluation_decisions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_evaluation_decisions_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "evaluation_run_id",
+            "source_message_token",
+            "scenario_id",
+            "candidate_contract_id",
+            name="uq_evaluation_decisions_run_source_candidate",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "evaluation_run_id"],
+            ["evaluation_runs.tenant_id", "evaluation_runs.id"],
+            name="fk_evaluation_decisions_tenant_run",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')",
+            name="ck_evaluation_decisions_status",
+        ),
+        CheckConstraint(
+            "(status IN ('PENDING', 'RUNNING')) = (completed_at IS NULL)",
+            name="ck_evaluation_decisions_completed_at",
+        ),
+        CheckConstraint(
+            "task_kind IN ('retrieval', 'language', 'action', 'rendering', 'e2e')",
+            name="ck_evaluation_decisions_task_kind",
+        ),
+        CheckConstraint(
+            "((task_kind IN ('rendering', 'e2e')) "
+            "AND delivery_surface IN ('chatwoot', 'direct')) OR "
+            "((task_kind NOT IN ('rendering', 'e2e')) AND delivery_surface IS NULL)",
+            name="ck_evaluation_decisions_delivery_surface",
+        ),
+        CheckConstraint(
+            "action IS NULL OR action IN ('auto_reply', 'draft', 'handoff', 'ignore')",
+            name="ck_evaluation_decisions_action",
+        ),
+        CheckConstraint(
+            "source_message_token ~ '^[0-9a-f]{64}$' "
+            "AND scenario_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
+            "AND input_fingerprint ~ '^[0-9a-f]{64}$' "
+            "AND candidate_contract_hash ~ '^[0-9a-f]{64}$' "
+            "AND (reply_text_hash IS NULL OR reply_text_hash ~ '^[0-9a-f]{64}$') "
+            "AND (result_fingerprint IS NULL OR result_fingerprint ~ '^[0-9a-f]{64}$') "
+            "AND length(btrim(result_schema_version)) > 0",
+            name="ck_evaluation_decisions_hashes",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(candidate_contract_manifest) = 'object' "
+            "AND candidate_contract_manifest ?& "
+            "ARRAY['contract_id','version','contract_hash','task_kind',"
+            "'result_schema_version','execution_mode'] "
+            "AND candidate_contract_manifest ->> 'contract_id' = candidate_contract_id "
+            "AND candidate_contract_manifest ->> 'version' = candidate_contract_version "
+            "AND candidate_contract_manifest ->> 'contract_hash' = candidate_contract_hash "
+            "AND candidate_contract_manifest ->> 'task_kind' = task_kind "
+            "AND candidate_contract_manifest ->> 'result_schema_version' = "
+            "result_schema_version",
+            name="ck_evaluation_decisions_contract_manifest",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_evaluation_decisions_attempt_count"),
+        CheckConstraint(
+            "COALESCE(model_invocation_count, 0) >= 0 "
+            "AND COALESCE(input_token_count, 0) >= 0 "
+            "AND COALESCE(output_token_count, 0) >= 0",
+            name="ck_evaluation_decisions_execution_counts",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING') = (claim_token IS NOT NULL AND claim_expires_at IS NOT NULL)",
+            name="ck_evaluation_decisions_running_lease",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING') OR result_fingerprint IS NOT NULL",
+            name="ck_evaluation_decisions_terminal_result",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR (result_payload IS NOT NULL "
+            "AND error_code IS NULL AND error_detail IS NULL)",
+            name="ck_evaluation_decisions_success_payload",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR ("
+            "jsonb_typeof(result_payload) = 'object' "
+            "AND jsonb_typeof(result_payload -> 'execution') = 'object' "
+            "AND (result_payload -> 'execution') ?& "
+            "ARRAY['estimated_cost_usd','input_token_count',"
+            "'model_invocation_count','output_token_count'] "
+            "AND latency_ms IS NOT NULL AND latency_ms >= 0 "
+            "AND latency_ms < 'Infinity'::double precision "
+            "AND estimated_cost_usd IS NOT NULL AND estimated_cost_usd >= 0 "
+            "AND estimated_cost_usd < 'Infinity'::double precision "
+            "AND model_invocation_count IS NOT NULL "
+            "AND input_token_count IS NOT NULL AND output_token_count IS NOT NULL "
+            "AND ((task_kind = 'retrieval' "
+            "AND result_payload ? 'ranked_candidates' "
+            "AND jsonb_typeof(result_payload -> 'ranked_candidates') = 'array') "
+            "OR (task_kind = 'language' "
+            "AND result_payload ?& ARRAY['locale','confidence','unknown','source'] "
+            "AND jsonb_typeof(result_payload -> 'locale') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'confidence') = 'number' "
+            "AND (result_payload ->> 'confidence')::double precision BETWEEN 0 AND 1 "
+            "AND jsonb_typeof(result_payload -> 'unknown') = 'boolean' "
+            "AND jsonb_typeof(result_payload -> 'source') = 'string') "
+            "OR (task_kind = 'action' "
+            "AND result_payload ?& ARRAY['action','reason_codes'] "
+            "AND jsonb_typeof(result_payload -> 'action') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'reason_codes') = 'array') "
+            "OR (task_kind = 'rendering' "
+            "AND result_payload ?& ARRAY['reply_text_hash','locale','guard_passed'] "
+            "AND jsonb_typeof(result_payload -> 'reply_text_hash') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'locale') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'guard_passed') = 'boolean') "
+            "OR (task_kind = 'e2e' "
+            "AND result_payload ?& ARRAY['action','locale','reason_codes'] "
+            "AND jsonb_typeof(result_payload -> 'action') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'locale') = 'string' "
+            "AND jsonb_typeof(result_payload -> 'reason_codes') = 'array')))",
+            name="ck_evaluation_decisions_typed_payload",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR task_kind <> 'e2e' OR "
+            "((action IN ('auto_reply','draft') AND reply_text_hash IS NOT NULL) OR "
+            "(action IN ('handoff','ignore') AND reply_text_hash IS NULL))",
+            name="ck_evaluation_decisions_e2e_reply",
+        ),
+        CheckConstraint(
+            "status <> 'SUCCEEDED' OR ("
+            "action IS NOT DISTINCT FROM (result_payload ->> 'action') "
+            "AND reason_codes = COALESCE(result_payload -> 'reason_codes', '[]'::jsonb) "
+            "AND reply_text_hash IS NOT DISTINCT FROM (result_payload ->> 'reply_text_hash') "
+            "AND estimated_cost_usd IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,estimated_cost_usd}')::double precision) "
+            "AND model_invocation_count IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,model_invocation_count}')::integer) "
+            "AND input_token_count IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,input_token_count}')::integer) "
+            "AND output_token_count IS NOT DISTINCT FROM "
+            "((result_payload #>> '{execution,output_token_count}')::integer))",
+            name="ck_evaluation_decisions_result_projection",
+        ),
+        CheckConstraint(
+            "status <> 'FAILED' OR (error_code IS NOT NULL "
+            "AND result_payload IS NULL AND action IS NULL AND reply_text_hash IS NULL "
+            "AND reason_codes = '[]'::jsonb AND estimated_cost_usd IS NULL "
+            "AND model_invocation_count IS NULL AND input_token_count IS NULL "
+            "AND output_token_count IS NULL)",
+            name="ck_evaluation_decisions_failure_payload",
+        ),
+        Index(
+            "ix_evaluation_decisions_run_status_created",
+            "evaluation_run_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_evaluation_decisions_status_claim_expiry",
+            "status",
+            "claim_expires_at",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    evaluation_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    source_message_token: Mapped[str] = mapped_column(String(64))
+    scenario_id: Mapped[str] = mapped_column(String(64))
+    candidate_contract_id: Mapped[str] = mapped_column(String(128))
+    candidate_contract_version: Mapped[str] = mapped_column(String(64))
+    candidate_contract_hash: Mapped[str] = mapped_column(String(64))
+    candidate_contract_manifest: Mapped[dict] = mapped_column(JSONB)
+    task_kind: Mapped[str] = mapped_column(String(16))
+    result_schema_version: Mapped[str] = mapped_column(String(64))
+    delivery_surface: Mapped[str | None] = mapped_column(String(16))
+    input_fingerprint: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(
+        String(16), default="PENDING", server_default=text("'PENDING'")
+    )
+    action: Mapped[str | None] = mapped_column(String(16))
+    reply_text_hash: Mapped[str | None] = mapped_column(String(64))
+    reason_codes: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    result_payload: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
+    model_invocation_count: Mapped[int | None] = mapped_column(Integer)
+    input_token_count: Mapped[int | None] = mapped_column(Integer)
+    output_token_count: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    result_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class DecisionJob(Base):
     __tablename__ = "decision_jobs"
-    __table_args__ = (Index("ix_decision_jobs_status_next_attempt", "status", "next_attempt_at"),)
+    __table_args__ = (
+        Index("ix_decision_jobs_status_next_attempt", "status", "next_attempt_at"),
+        Index("ix_decision_jobs_conversation_generation", "conversation_id", "decision_generation"),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     raw_event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("raw_events.id"))
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
     message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id"), unique=True)
     account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("platform_accounts.id"))
     snapshot: Mapped[dict] = mapped_column(JSONB)
+    decision_generation: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(Text, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -524,7 +1149,36 @@ class DecisionJob(Base):
 
 class ReplyDecision(Base):
     __tablename__ = "reply_decisions"
-    __table_args__ = (UniqueConstraint("message_id"),)
+    __table_args__ = (
+        UniqueConstraint("message_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "knowledge_localization_id", "knowledge_localization_release_id"],
+            [
+                "knowledge_localizations.tenant_id",
+                "knowledge_localizations.id",
+                "knowledge_localizations.release_id",
+            ],
+            name="fk_reply_decisions_tenant_localization",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(knowledge_localization_id IS NULL AND knowledge_localization_release_id IS NULL "
+            "AND knowledge_localization_text_hash IS NULL "
+            "AND knowledge_localization_source_hash IS NULL) OR "
+            "(knowledge_localization_id IS NOT NULL "
+            "AND knowledge_localization_release_id IS NOT NULL "
+            "AND btrim(knowledge_localization_release_id) <> '' AND resolved_locale <> 'und' "
+            "AND knowledge_localization_text_hash ~ '^[0-9a-f]{64}$' "
+            "AND knowledge_localization_source_hash ~ '^[0-9a-f]{64}$')",
+            name="ck_reply_decisions_localization_provenance",
+        ),
+        Index(
+            "ix_reply_decisions_decision_job_id",
+            "decision_job_id",
+            unique=True,
+            postgresql_where=text("decision_job_id IS NOT NULL"),
+        ),
+    )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
@@ -534,11 +1188,48 @@ class ReplyDecision(Base):
     risk_level: Mapped[str] = mapped_column(Text, default="low")
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     reply_text: Mapped[str | None] = mapped_column(Text)
+    original_reply_text: Mapped[str | None] = mapped_column(Text)
+    final_reply_text: Mapped[str | None] = mapped_column(Text)
+    review_action: Mapped[str | None] = mapped_column(Text)
+    reviewed_by: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_reason: Mapped[str | None] = mapped_column(Text)
     reply_visibility: Mapped[str] = mapped_column(Text, default="public")
     reason_codes: Mapped[list] = mapped_column(JSONB, default=list)
     source: Mapped[str] = mapped_column(Text)  # rule / llm / guard
     prompt_version: Mapped[str | None] = mapped_column(Text)
+    request_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
+    reply_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
+    resolved_locale: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
+    knowledge_localization_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    knowledge_localization_release_id: Mapped[str | None] = mapped_column(String(64))
+    knowledge_localization_text_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_localization_source_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_content_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    knowledge_chunk_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    knowledge_similarity: Mapped[float | None] = mapped_column(Float)
+    knowledge_similarity_margin: Mapped[float | None] = mapped_column(Float)
+    multilingual_shadow: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    multilingual_contract_version: Mapped[str | None] = mapped_column(String(64))
+    multilingual_shadow_evidence: Mapped[dict | None] = mapped_column(JSONB)
+    request_language_confidence: Mapped[float | None] = mapped_column(Float)
+    request_language_source: Mapped[str | None] = mapped_column(String(32))
+    knowledge_top2_content_hash: Mapped[str | None] = mapped_column(String(64))
+    knowledge_top2_similarity: Mapped[float | None] = mapped_column(Float)
+    knowledge_match_status: Mapped[str | None] = mapped_column(String(16))
+    knowledge_gate_version: Mapped[str | None] = mapped_column(String(32))
+    knowledge_min_similarity_threshold: Mapped[float | None] = mapped_column(Float)
+    knowledge_min_margin_threshold: Mapped[float | None] = mapped_column(Float)
+    grounding_verified: Mapped[bool | None] = mapped_column(Boolean)
+    grounding_verifier_version: Mapped[str | None] = mapped_column(String(128))
+    grounding_latency_ms: Mapped[float | None] = mapped_column(Float)
     state_version_at_decision: Mapped[int | None] = mapped_column(Integer)
+    decision_job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("decision_jobs.id"))
+    decision_generation: Mapped[int | None] = mapped_column(BigInteger)
+    decision_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -558,6 +1249,11 @@ class DeliveryAttempt(Base):
 class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
     __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_knowledge_documents_tenant_id_id"),
+        CheckConstraint(
+            "status IN ('draft', 'published')",
+            name="ck_knowledge_documents_status",
+        ),
         # 词法检索（BM25 近似）：question 的 tsvector GIN 索引，用于混合检索的关键词一路，
         # 补向量对专有名词（pip/broker/品牌名）召回不足的短板。'simple' 分词器不做词干/停用词，
         # 对多语言与短模板更稳（避免 english 词干把 "pips"→"pip" 误并或丢词）。
@@ -578,7 +1274,23 @@ class KnowledgeDocument(Base):
     question_tsv: Mapped[str] = mapped_column(
         TSVECTOR, Computed("to_tsvector('simple', question)", persisted=True)
     )
-    status: Mapped[str] = mapped_column(String(16), default="published")
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default=text("'draft'"))
+    is_official_contact: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    source_language: Mapped[str] = mapped_column(
+        String(35), default="und", server_default=text("'und'")
+    )
+    detected_language: Mapped[str] = mapped_column(
+        String(35), default="und", server_default=text("'und'")
+    )
+    language_detection_status: Mapped[str] = mapped_column(
+        String(16), default="unknown", server_default=text("'unknown'")
+    )
+    language_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
     source_file: Mapped[str | None] = mapped_column(String(256))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -590,6 +1302,12 @@ class KnowledgeChunk(Base):
     __tablename__ = "knowledge_chunks"
     __table_args__ = (
         UniqueConstraint("tenant_id", "content_hash"),
+        ForeignKeyConstraint(
+            ["tenant_id", "document_id"],
+            ["knowledge_documents.tenant_id", "knowledge_documents.id"],
+            name="fk_knowledge_chunks_tenant_document",
+            ondelete="CASCADE",
+        ),
         # 余弦相似度检索用 HNSW 索引
         Index(
             "ix_knowledge_chunks_embedding",
@@ -600,9 +1318,7 @@ class KnowledgeChunk(Base):
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(String(64), default="default")
-    document_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True
-    )
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
     content: Mapped[str] = mapped_column(Text)  # 展示/LLM 上下文用（question+reply 拼接）
     # 实际参与 embedding 的文本。非对称检索：只 embed question，与用户 query 同语义空间对齐，
     # 不让 answer 措辞稀释向量（见 importer）。历史行可能为 NULL（旧数据 embed 的是 content）。
@@ -613,11 +1329,95 @@ class KnowledgeChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class ReplyPrompt(Base):
-    """租户可在后台编辑的 LLM 人设段。
+class KnowledgeLocalization(Base):
+    __tablename__ = "knowledge_localizations"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_knowledge_localizations_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "release_id",
+            name="uq_knowledge_localizations_tenant_id_id_release",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "document_id"],
+            ["knowledge_documents.tenant_id", "knowledge_documents.id"],
+            name="fk_knowledge_localizations_tenant_document",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'published', 'revoked')",
+            name="ck_knowledge_localizations_status",
+        ),
+        CheckConstraint(
+            "btrim(release_id) <> ''",
+            name="ck_knowledge_localizations_release_id",
+        ),
+        CheckConstraint(
+            "status <> 'published' OR (reviewed_by IS NOT NULL AND btrim(reviewed_by) <> '' "
+            "AND reviewed_at IS NOT NULL)",
+            name="ck_knowledge_localizations_published_review",
+        ),
+        CheckConstraint(
+            "status <> 'revoked' OR (revoked_by IS NOT NULL AND btrim(revoked_by) <> '' "
+            "AND revoked_at IS NOT NULL)",
+            name="ck_knowledge_localizations_revoked_review",
+        ),
+        CheckConstraint(
+            "text_hash ~ '^[0-9a-f]{64}$' AND source_content_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_knowledge_localizations_hashes",
+        ),
+        Index(
+            "uq_knowledge_localizations_active_locale",
+            "tenant_id",
+            "document_id",
+            "release_id",
+            "locale",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
+        ),
+        Index(
+            "ix_knowledge_localizations_lookup",
+            "tenant_id",
+            "document_id",
+            "release_id",
+            "status",
+            "locale",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    release_id: Mapped[str] = mapped_column(String(64))
+    locale: Mapped[str] = mapped_column(String(35))
+    localized_text: Mapped[str] = mapped_column("text", Text)
+    text_hash: Mapped[str] = mapped_column(String(64))
+    source_content_hash: Mapped[str] = mapped_column(String(64))
+    protected_values: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    official_contact_authorized: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    auto_reply_allowed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default=text("'draft'"))
+    source_file: Mapped[str | None] = mapped_column(String(256))
+    import_batch_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_by: Mapped[str | None] = mapped_column(Text)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoke_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    只存人设：动作语义与安全不变量（防注入、PII、结构化输出契约）由代码固定追加，
-    不进数据库——否则一次误编辑就能悄无声息地废掉这些保护。
+
+class ReplyPrompt(Base):
+    """Persist finite brand-voice preferences and their old-Worker text projection.
+
+    WikiFX identity, action semantics, and safety invariants remain code-owned and are never
+    stored as editable prompt instructions.
     """
 
     __tablename__ = "reply_prompts"
@@ -625,8 +1425,15 @@ class ReplyPrompt(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(String(64), index=True)
     brand_id: Mapped[str] = mapped_column(String(64), default="default")
+    # Compatibility projection for old Workers. New code compiles this from voice_preferences
+    # and never executes database persona text as instructions.
     persona: Mapped[str] = mapped_column(Text)
-    # 每次保存自增，写进 reply_decisions.prompt_version，用于回溯某条回复出自哪版人设。
+    voice_preferences: Mapped[dict[str, str]] = mapped_column(
+        JSONB,
+        default=lambda: CANONICAL_VOICE_PREFERENCES.copy(),
+        server_default=text(f"'{CANONICAL_VOICE_PREFERENCES_JSON}'::jsonb"),
+    )
+    # Every save increments this and records it in reply_decisions.prompt_version.
     revision: Mapped[int] = mapped_column(Integer, default=1)
     updated_by: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(

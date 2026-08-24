@@ -4,14 +4,53 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from social_reply.application.reply_decision.jobs import snapshot_to_dict
+from social_reply.application.reply_decision.jobs import (
+    reserve_conversation_generation,
+    reserve_decision_job,
+)
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.domain.messages.canonical import CanonicalEvent, CanonicalEventKind
 from social_reply.domain.platform_accounts import is_active_account_status
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.advisory_locks import (
+    acquire_conversation_delivery_xact_lock,
+)
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
+
+
+async def _lock_and_validate_raw_event(
+    session: AsyncSession,
+    raw_event_id: uuid.UUID,
+    account: models.PlatformAccount,
+    *,
+    claim_token: str | None,
+) -> bool | None:
+    raw_event = (
+        await session.execute(
+            select(models.RawEvent).where(models.RawEvent.id == raw_event_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if raw_event is None:
+        raise LookupError(f"raw_event_not_found:{raw_event_id}")
+    if raw_event.platform_account_id is not None and raw_event.platform_account_id != account.id:
+        raise PermissionError("raw_event_platform_account_mismatch")
+    if raw_event.tenant_id is not None and raw_event.tenant_id != account.tenant_id:
+        raise PermissionError("raw_event_tenant_mismatch")
+    if claim_token is None:
+        return False
+    if str(raw_event.processing_claim_token or "") != claim_token:
+        return None
+    initial_dispatch_claim = raw_event.processing_status == "INITIAL_DISPATCHING"
+    if initial_dispatch_claim:
+        database_now = await session.scalar(select(func.clock_timestamp()))
+        if (
+            raw_event.processing_claim_expires_at is None
+            or raw_event.processing_claim_expires_at <= database_now
+        ):
+            return None
+    return initial_dispatch_claim
 
 
 async def _mark_raw_event_account_inactive(
@@ -57,9 +96,7 @@ async def ingest_canonical_event(
         if raw_event_id is not None:
             raw_event = (
                 await session.execute(
-                    select(models.RawEvent)
-                    .where(models.RawEvent.id == raw_event_id)
-                    .with_for_update()
+                    select(models.RawEvent).where(models.RawEvent.id == raw_event_id)
                 )
             ).scalar_one_or_none()
             if raw_event is None:
@@ -85,21 +122,25 @@ async def ingest_canonical_event(
                         await session.rollback()
                         return None
         if not is_active_account_status(account.status):
-            if raw_event_id is not None and not initial_dispatch_claim:
-                await session.execute(
-                    update(models.RawEvent)
-                    .where(models.RawEvent.id == raw_event_id)
-                    .values(processing_status="IGNORED_ACCOUNT_INACTIVE")
+            if raw_event_id is not None:
+                validated_claim = await _lock_and_validate_raw_event(
+                    session,
+                    raw_event_id,
+                    account,
+                    claim_token=raw_event_claim_token,
                 )
+                if validated_claim is None:
+                    await session.rollback()
+                    return None
+                initial_dispatch_claim = validated_claim
+                if not initial_dispatch_claim:
+                    await session.execute(
+                        update(models.RawEvent)
+                        .where(models.RawEvent.id == raw_event_id)
+                        .values(processing_status="IGNORED_ACCOUNT_INACTIVE")
+                    )
             await session.commit()
             return None
-
-        if raw_event_id is not None and not initial_dispatch_claim:
-            await session.execute(
-                update(models.RawEvent)
-                .where(models.RawEvent.id == raw_event_id)
-                .values(processing_status="PROCESSING")
-            )
 
         managed_echo = None
         if event.platform == "x":
@@ -131,12 +172,23 @@ async def ingest_canonical_event(
                 )
             ).one_or_none()
         if managed_echo is not None:
-            if raw_event_id is not None and not initial_dispatch_claim:
-                await session.execute(
-                    update(models.RawEvent)
-                    .where(models.RawEvent.id == raw_event_id)
-                    .values(processing_status="IGNORED_MANAGED_OUTBOX_ECHO")
+            if raw_event_id is not None:
+                validated_claim = await _lock_and_validate_raw_event(
+                    session,
+                    raw_event_id,
+                    account,
+                    claim_token=raw_event_claim_token,
                 )
+                if validated_claim is None:
+                    await session.rollback()
+                    return None
+                initial_dispatch_claim = validated_claim
+                if not initial_dispatch_claim:
+                    await session.execute(
+                        update(models.RawEvent)
+                        .where(models.RawEvent.id == raw_event_id)
+                        .values(processing_status="IGNORED_MANAGED_OUTBOX_ECHO")
+                    )
             session.add(
                 models.AuditLog(
                     tenant_id=account.tenant_id,
@@ -153,44 +205,6 @@ async def ingest_canonical_event(
                     },
                 )
             )
-            await session.commit()
-            return None
-
-        normalized_id = (
-            await session.execute(
-                pg_insert(models.NormalizedEvent)
-                .values(
-                    tenant_id=account.tenant_id,
-                    platform=event.platform,
-                    platform_account_id=account.id,
-                    external_event_id=event.external_event_id,
-                    event_type=f"{event.channel_type}.message.created",
-                    raw_event_id=raw_event_id,
-                    external_conversation_id=event.external_conversation_id,
-                    event_metadata={
-                        "event_namespace": event.event_namespace or event.platform,
-                        **event.event_metadata,
-                    },
-                    occurred_at=event.occurred_at,
-                )
-                .on_conflict_do_nothing(
-                    index_elements=[
-                        "tenant_id",
-                        "platform",
-                        "platform_account_id",
-                        "external_event_id",
-                    ]
-                )
-                .returning(models.NormalizedEvent.id)
-            )
-        ).scalar_one_or_none()
-        if normalized_id is None:
-            if raw_event_id is not None and not initial_dispatch_claim:
-                await session.execute(
-                    update(models.RawEvent)
-                    .where(models.RawEvent.id == raw_event_id)
-                    .values(processing_status="SKIPPED_DUPLICATE")
-                )
             await session.commit()
             return None
 
@@ -218,20 +232,6 @@ async def ingest_canonical_event(
                 )
             ).scalar_one()
 
-        await session.execute(
-            pg_insert(models.Conversation)
-            .values(
-                id=uuid.uuid4(),
-                tenant_id=account.tenant_id,
-                brand_id=account.brand_id,
-                platform=event.platform,
-                platform_account_id=account.id,
-                contact_id=contact,
-                conversation_key=event.conversation_key,
-                channel_type=event.channel_type,
-            )
-            .on_conflict_do_nothing(index_elements=["tenant_id", "conversation_key"])
-        )
         conversation = (
             await session.execute(
                 select(models.Conversation).where(
@@ -239,8 +239,110 @@ async def ingest_canonical_event(
                     models.Conversation.conversation_key == event.conversation_key,
                 )
             )
-        ).scalar_one()
+        ).scalar_one_or_none()
+        if conversation is None:
+            await session.execute(
+                pg_insert(models.Conversation)
+                .values(
+                    id=uuid.uuid4(),
+                    tenant_id=account.tenant_id,
+                    brand_id=account.brand_id,
+                    platform=event.platform,
+                    platform_account_id=account.id,
+                    contact_id=contact,
+                    conversation_key=event.conversation_key,
+                    channel_type=event.channel_type,
+                )
+                .on_conflict_do_nothing(index_elements=["tenant_id", "conversation_key"])
+            )
+            conversation = (
+                await session.execute(
+                    select(models.Conversation).where(
+                        models.Conversation.tenant_id == account.tenant_id,
+                        models.Conversation.conversation_key == event.conversation_key,
+                    )
+                )
+            ).scalar_one()
+        await acquire_conversation_delivery_xact_lock(session, conversation.id)
+        if raw_event_id is not None:
+            validated_claim = await _lock_and_validate_raw_event(
+                session,
+                raw_event_id,
+                account,
+                claim_token=raw_event_claim_token,
+            )
+            if validated_claim is None:
+                await session.rollback()
+                return None
+            initial_dispatch_claim = validated_claim
+            if not initial_dispatch_claim:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == raw_event_id)
+                    .values(processing_status="PROCESSING")
+                )
+
+        stale_provider_order = False
+        if event.platform == "feishu" and event.occurred_at is not None:
+            latest_inbound_occurred_at = await session.scalar(
+                select(func.max(models.Message.occurred_at)).where(
+                    models.Message.conversation_id == conversation.id,
+                    models.Message.direction == "inbound",
+                )
+            )
+            stale_provider_order = (
+                latest_inbound_occurred_at is not None
+                and event.occurred_at < latest_inbound_occurred_at
+            )
+        normalized_metadata = {
+            "event_namespace": event.event_namespace or event.platform,
+            **event.event_metadata,
+        }
+        if stale_provider_order:
+            normalized_metadata["disposition"] = "stale_provider_order"
+
+        normalized_id = (
+            await session.execute(
+                pg_insert(models.NormalizedEvent)
+                .values(
+                    tenant_id=account.tenant_id,
+                    platform=event.platform,
+                    platform_account_id=account.id,
+                    external_event_id=event.external_event_id,
+                    event_type=f"{event.channel_type}.message.created",
+                    raw_event_id=raw_event_id,
+                    conversation_id=conversation.id if stale_provider_order else None,
+                    external_conversation_id=event.external_conversation_id,
+                    event_metadata=normalized_metadata,
+                    occurred_at=event.occurred_at,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        "tenant_id",
+                        "platform",
+                        "platform_account_id",
+                        "external_event_id",
+                    ]
+                )
+                .returning(models.NormalizedEvent.id)
+            )
+        ).scalar_one_or_none()
+        if normalized_id is None:
+            if raw_event_id is not None and not initial_dispatch_claim:
+                await session.execute(
+                    update(models.RawEvent)
+                    .where(models.RawEvent.id == raw_event_id)
+                    .values(processing_status="SKIPPED_DUPLICATE")
+                )
+            await session.commit()
+            return None
+
+        if stale_provider_order:
+            await session.commit()
+            return None
+
         await ensure_state(session, conversation.id, account.automation_default)
+        decision_generation = await reserve_conversation_generation(session, conversation.id)
 
         message_id = uuid.uuid4()
         await session.execute(
@@ -248,10 +350,12 @@ async def ingest_canonical_event(
                 id=message_id,
                 conversation_id=conversation.id,
                 direction="inbound",
+                decision_generation=decision_generation,
                 sender_type="contact",
                 text=event.text,
                 platform_message_id=event.external_event_id,
                 reply_target=event.reply_target,
+                attachments=event.attachments,
                 occurred_at=event.occurred_at,
             )
         )
@@ -276,28 +380,18 @@ async def ingest_canonical_event(
             conversation_key=conversation.conversation_key,
             automation_state=state.state,
             state_version=state.state_version,
+            channel_type=event.channel_type,
+            has_unsupported_attachment=bool(event.attachments),
         )
-        job_id = (
-            await session.execute(
-                pg_insert(models.DecisionJob)
-                .values(
-                    raw_event_id=raw_event_id,
-                    conversation_id=conversation.id,
-                    message_id=message_id,
-                    account_id=account.id,
-                    snapshot=snapshot_to_dict(snapshot),
-                    status="PENDING",
-                )
-                .on_conflict_do_nothing(index_elements=["message_id"])
-                .returning(models.DecisionJob.id)
-            )
-        ).scalar_one_or_none()
-        if job_id is None:
-            job_id = (
-                await session.execute(
-                    select(models.DecisionJob.id).where(models.DecisionJob.message_id == message_id)
-                )
-            ).scalar_one()
+        job_id = await reserve_decision_job(
+            session,
+            raw_event_id=raw_event_id,
+            conversation_id=conversation.id,
+            message_id=message_id,
+            account_id=account.id,
+            snapshot=snapshot,
+            decision_generation=decision_generation,
+        )
         if raw_event_id is not None and not initial_dispatch_claim:
             await session.execute(
                 update(models.RawEvent)

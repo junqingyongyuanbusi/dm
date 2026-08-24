@@ -4,9 +4,9 @@ Runtime application settings are defined by `social_reply.shared.config.Settings
 variables use the uppercase field name. Values are resolved in this order: explicit constructor
 arguments, process environment, `.env` in the process current working directory, then code defaults.
 
-Use `.env.example` for local development only. Use `deploy/vps/.env.example` for production and
-replace every secret. API, Worker, and Scheduler must use the same application settings unless a
-variable is explicitly deployment-role-only.
+Use `.env.example` for local development only. Production configuration is stored in the deployment
+platform and validated by `scripts/validate_railway_config.py` during every release. API, Worker, and
+Scheduler must use the same application settings unless a variable is explicitly deployment-role-only.
 
 ## Core and security
 
@@ -69,13 +69,15 @@ API, Worker and Scheduler must use the same values.
 | `FACEBOOK_MESSENGER_ENABLED` | `true` | Facebook Page text-DM ingress, provisioning, health reconciliation and sending |
 | `INSTAGRAM_MESSAGING_ENABLED` | `true` | Instagram professional-account text-DM ingress, provisioning, health reconciliation and sending |
 | `WHATSAPP_ENABLED` | `true` | WhatsApp Cloud API ingress, provisioning and sending |
+| `META_AUTO_REPLY_ENABLED` | `false` | Allows Meta accounts to use `BOT_ACTIVE`; account-level mode applies to both Facebook DMs and comments |
+| `META_COMMENT_REPLY_ENABLED` | `false` | Enables Facebook/Instagram comment OAuth scopes, webhook subscriptions, ingress and public child-comment replies |
 | `FACEBOOK_APP_ID` | empty | Facebook Login App ID |
 | `FACEBOOK_APP_SECRET` | empty | Must be paired with Facebook App ID |
 | `META_VERIFY_TOKEN` | empty | Shared Meta webhook verify token |
 | `INSTAGRAM_APP_ID` | empty | Standalone Instagram Login App ID |
 | `INSTAGRAM_APP_SECRET` | empty | Must be paired with Instagram App ID |
 | `INSTAGRAM_VERIFY_TOKEN` | empty | Falls back to `META_VERIFY_TOKEN` when empty |
-| `META_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler token and `messages` subscription reconciliation; range 60-86400 |
+| `META_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler token, permission and desired subscription reconciliation; range 60-86400 |
 
 `FACEBOOK_APP_*` owns Messenger Pages and Facebook Login Instagram accounts. `INSTAGRAM_APP_*`
 owns standalone Instagram Login accounts. The first path requires a Page ID and Page token; the
@@ -97,43 +99,210 @@ A disabled signed webhook stores only a tenant/app-scoped audit summary and SHA-
 does not copy message text, names or phone numbers into the gate audit row. Enabled Messenger and
 Instagram requests store one minimal verified-request record plus account-scoped occurrence
 RawEvents, so replay and tenant ownership do not depend on an account-unscoped multi-entry payload.
-Page/account Graph calls include `appsecret_proof`; the Scheduler repairs missing `messages`
+Page/account Graph calls include `appsecret_proof`; the Scheduler repairs missing desired
 subscriptions and records sanitized provider health in `PlatformAccount.config`.
+
+Meta comment auto-replies require the platform gate plus `META_COMMENT_REPLY_ENABLED=true` and
+`META_AUTO_REPLY_ENABLED=true` on API, Worker, and Scheduler. New Facebook and Instagram
+authorizations default to `comments=true` and `BOT_DRAFT_ONLY`; the latter switch only permits an
+administrator to promote a tested account explicitly. Facebook OAuth requests
+`pages_read_engagement`, `pages_read_user_content`, and `pages_manage_engagement`, validates that
+all three permissions target the selected Page, and subscribes the Page to `feed`. Existing Page
+tokens must be reauthorized from `/admin/integrations/accounts`; missing or wrong-Page permissions produce
+`META_COMMENT_PERMISSION_REQUIRED` and health status `REAUTH_REQUIRED`. Replies are always public
+child comments on the source comment.
+
+Facebook Login Instagram OAuth requests `pages_read_engagement` and `instagram_manage_comments`;
+its linked Page remains subscribed only to `messages`, while the App-level `instagram` webhook
+object adds `comments`. Standalone Instagram Login requests
+`instagram_business_manage_comments` and adds `comments` to both App-level and account-level
+subscriptions. Existing Instagram tokens must be reauthorized through the same login path that
+created them.
+
+## Feishu integration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FEISHU_ENABLED` | `false` | Feishu provisioning, normal-event dispatch, health inspection and sending |
+| `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED` | `false` | Durable handoff-card creation, updates, card actions and recovery |
+| `FEISHU_HEALTH_CHECK_INTERVAL_SECONDS` | `600` | Scheduler credential/Bot health cadence; range 60-86400 |
+| `FEISHU_HANDOFF_SWEEP_INTERVAL_SECONDS` | `3` | Scheduler handoff-notification recovery cadence; range 0.5-60 |
+| `FEISHU_HANDOFF_SENDER_LEASE_SECONDS` | `30` | Notification sender lease; range 5-600 |
+| `FEISHU_HANDOFF_MAX_ATTEMPTS` | `8` | Maximum automatic attempts for deterministic card delivery failures; range 1-100 |
+
+API, Worker and Scheduler must receive the same values, and configuration changes take effect only
+after all three roles restart on one flag-aware image. The environment templates keep
+`FEISHU_ENABLED=false`. Prepare the self-built application Bot first, deploy the flag-aware image
+with Feishu disabled, then enable all three roles together, provision the account and configure the
+returned account-specific Callback URL. Handoff cards use a second dark-launch gate: keep
+`FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` until `/admin/integrations/feishu/handoff` has a validated support
+chat and operator allowlist and the Feishu console delivers `card.action.trigger` callbacks to the
+account-specific Card Action Callback URL. The provider API origin is fixed at
+`https://open.feishu.cn` rather than configured by an environment variable.
+
+The Feishu webhook route is always registered. While the feature is disabled, plaintext or encrypted
+URL-verification challenges still receive their challenge response. A valid encrypted normal event
+is acknowledged and retained as sanitized ignored ingress evidence, but is not dispatched into the
+decision pipeline. Provisioning and health work pause, and matching Outbox sends move to recoverable
+`NEEDS_REVIEW/FEISHU_DISABLED` without consuming an attempt. Re-enabling all three roles returns
+durable work to recovery; disabling never deletes account credentials, callback identity or Outbox
+evidence.
+
+## Email integration
+
+| Variable | Default | Validation / meaning |
+| --- | --- | --- |
+| `EMAIL_ENABLED` | `false` | Master gate for Email provisioning, Scheduler IMAP polling and delivery; must match across API, Worker and Scheduler |
+| `EMAIL_AUTO_REPLY_ENABLED` | `false` | Second gate permitting an administrator to promote a provisioned Email account to `BOT_ACTIVE`; it does not bypass `EMAIL_ENABLED` or account policy |
+| `EMAIL_POLL_INTERVAL_SECONDS` | `60` | Scheduler IMAP polling cadence; range 5-3600 seconds |
+| `EMAIL_MAX_MESSAGES_PER_POLL` | `100` | Per-account message budget for one poll; range 1-1000 |
+| `EMAIL_PER_SENDER_DAILY_REPLY_LIMIT` | `5` | Maximum successful automatic Bot replies in 24 hours per account+sender, shared across threads; range 1-100 |
+| `EMAIL_NETWORK_TIMEOUT_SECONDS` | `10` | Timeout applied to IMAP/SMTP network operations; range 1-120 seconds |
+| `EMAIL_ALLOWED_HOSTS` | `imap.larksuite.com,smtp.larksuite.com` | Comma-separated exact hostname allowlist; canonicalized to lowercase IDNA hostnames, and required to be nonempty when Email is enabled |
+
+All seven values must be identical on API, Worker and Scheduler running the same image. Host matching
+happens before DNS; every resolved address must also be a public global target. IP literals,
+localhost, private/link-local/loopback/reserved/multicast/unspecified addresses, mixed public/private
+answers and hosts absent from the allowlist fail closed. Add a provider host only after operator
+review; wildcards are not supported.
+
+Email uses two deployment gates. `EMAIL_ENABLED=true` allows account provisioning, polling and the
+Email delivery route. New accounts are nevertheless forced to `BOT_DRAFT_ONLY` by both the API and
+Worker provisioning path. `EMAIL_AUTO_REPLY_ENABLED=true` only unlocks the later administrator
+promotion to `BOT_ACTIVE`; actual automatic sending still requires both gates, an active and
+provisioning-`READY` account, and the account policy. Keep both gates false for the initial image and
+migration rollout, enable the master gate on all three roles for draft-only real smoke, and enable
+the auto-reply gate only after explicit approval. There is no periodic Email health reconciler or continuous monitoring. The Admin “接入探测” result
+and timestamp record only the most recent provisioning-time credential validation over IMAP/SMTP.
+
+The IMAP client uses verified TLS, readonly `SELECT` and `BODY.PEEK[]`. SMTP accepts only SSL or
+strict STARTTLS and never downgrades to plaintext. If `smtp_port` is omitted, SSL defaults to 465 and
+STARTTLS defaults to 587; an explicitly supplied valid port is preserved. Email polling RawEvents retain UID, UIDVALIDITY,
+size and an optional SHA-256 digest, not the RFC822 body. See
+[email-integration.md](email-integration.md) for the complete protocol, Phase 0 and rollout contract.
 
 ## Decision, LLM and knowledge
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `LLM_PROVIDER` | `stub` | `stub` or `openai`; stub is forbidden outside tests |
-| `PROMPT_VERSION` | `v0-stub` | Persisted decision/audit prompt identifier |
+| `PROMPT_VERSION` | `v1-wikifx-multilingual` | Persisted decision/audit identifier for the immutable prompt plus code-compiled structured voice preferences; saved revisions append `#rN` |
 | `OPENAI_API_KEY` | empty | Required outside tests when provider is `openai` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Chat completion model |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Knowledge embedding model/version |
-| `OPENAI_TIMEOUT_SECONDS` | `30` | HTTP timeout for chat and embedding calls |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Requested knowledge embedding model/version; real OpenRouter acceptance is not proven by configuration alone |
+| `OPENAI_EMBEDDING_DIMENSIONS` | `1536` | Fixed PostgreSQL `Vector(1536)` contract; other dimensions require a separate versioned backend/index |
+| `OPENAI_TIMEOUT_SECONDS` | `30` | HTTP timeout for generation calls |
+| `OPENAI_GROUNDING_MODEL` | empty | Optional separate model for semantic fidelity verification; empty uses `OPENAI_MODEL` |
+| `GROUNDING_VERIFIER_TIMEOUT_SECONDS` | `8` | Short fail-closed timeout for the second-pass grounding verifier |
 | `KNOWLEDGE_RETRIEVAL_ENABLED` | `false` | Enables knowledge retrieval |
 | `KNOWLEDGE_MIN_SIMILARITY` | `0.5` | Minimum retrieval score |
 | `KNOWLEDGE_TOP_K` | `3` | Maximum retrieved chunks |
 | `KNOWLEDGE_VERBATIM_REPLY` | `false` | Return matched template text without LLM rewriting |
-| `REQUIRE_KNOWLEDGE` | `false` | Handoff without calling LLM when retrieval has no match |
+| `REQUIRE_KNOWLEDGE` | `false` | Legacy path: handoff without calling LLM when retrieval has no match |
+| `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Enables English-corpus multilingual runtime generation; non-English requests use the detected language, with no language or account allowlist; requires knowledge retrieval |
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
-## Module-level reconciliation variables
+### Language resolution
 
-These variables are not yet `Settings` fields. Their modules read them once at import, so changing
-them requires recreating API/Worker/Scheduler containers as applicable.
+The runtime replies in the language of the **current customer message**, with no language allowlist
+anywhere in the code. A previous conversation language never overrides language evidence in the
+current message. Resolution follows this cascade:
 
-| Variable | Default | Consumer |
-| --- | --- | --- |
-| `X_DM_POLL_INTERVAL_SECONDS` | `90` | Scheduler legacy DM poll |
-| `X_WEBHOOK_CHECK_INTERVAL_SECONDS` | `600` | Scheduler X webhook health |
-| `XCHAT_POLL_INTERVAL_SECONDS` | `900` | Scheduler XChat poll |
-| `XCHAT_MAX_CONVERSATIONS_PER_POLL` | `10` | XChat poll work budget |
-| `XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | `600` | Scheduler XChat subscription reconciliation |
-| `XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS` | `30` | Scheduler XChat RawEvent recovery sweep |
-| `XCHAT_READY_PROBE_INTERVAL_SECONDS` | `21600` | Public-key health probe for ready XChat accounts |
-| `XCHAT_PENDING_PROBE_INTERVAL_SECONDS` | `600` | Public-key health probe for pending XChat accounts |
+1. **Current-message deterministic detection** (`domain/reply/language.py`) — writing-system rules
+   plus Lingua. It is pure, synchronous, and shared with knowledge import, localization checks and
+   Outbox validation, so its behaviour must not drift. A generic Chinese result may use recent
+   Chinese history only to refine `zh` to `zh-Hans` or `zh-Hant`.
+2. **Current-message LLM fallback** (`application/reply_decision/language_resolution.py`) — consulted
+   when a message contains meaningful letters but the deterministic result is `und`, or when it
+   lands on a known-confusable sibling pair. This makes short input such as `Thanks`, `Hello` or
+   `Hola` use its own language instead of inheriting an older customer language. Lingua only ever
+   chooses between Hindi and Marathi on Devanagari text and returns confident wrong answers on short
+   input, and confidence cannot separate those errors: a misdetected `नमस्ते` scored 0.624 while
+   correctly detected Russian scored 0.383. The trigger is therefore the candidate set, not a
+   confidence threshold.
+3. **History or give up** — messages with no meaningful letters (emoji, digits, bare links) never
+   reach the model and may use recent customer history. If the current message does contain letters
+   but both detectors fail, it remains `und` and hands off with `UNKNOWN_LANGUAGE`; history is not
+   allowed to guess a potentially different current language.
+
+The resolved provenance is stored in `reply_decisions.request_language_source` as
+`current_message`, `recent_user_history` or `llm_fallback`.
+
+There is no configuration for the fallback. It reuses the existing `OPENAI_*` settings and the
+grounding timeout, and switches itself off when the client cannot detect languages — the same
+convention as `translate_to_english`.
+
+### Output guard verification strength
+
+`run_final_guard` grades its language check by that provenance:
+
+- **strict** (deterministic detection) — unchanged full language-identity assertion.
+- **lenient** (`llm_fallback`) — the deterministic detector cannot review a language it could not
+  identify in the first place, so the guard falls back to writing-system consistency between the
+  customer message and the reply, tags the decision `LANGUAGE_MODEL_ATTESTED`, and leaves semantic
+  fidelity to the grounding verifier. Outbox already refuses to send unless `grounding_verified` is
+  true, so the chain stays closed. Lenient decisions must write a real language tag into
+  `reply_language`; `und` is rejected at delivery.
+
+Allowed writing systems are the per-language table **union** the customer message's dominant script.
+The table alone cannot keep up — it lists `ru`/`uk`/`bg` but omits Macedonian, Serbian, Belarusian,
+Kazakh and Mongolian, all of which the detector identifies correctly and the guard used to reject.
+The union only widens: Japanese mixes kana and Han, so replacing the table with the customer's
+dominant script would wrongly reject Han characters in the reply.
+
+Numbers, currencies and percentages are always compared strictly against the approved English
+answer. Time units are compared only when the target language's unit words are recognised —
+`de`, `it`, `vi`, `tr`, `nl`, `pl` and `sv` are not in the pattern table, so those replies are
+tagged `FACT_UNIT_UNVERIFIED` and left to the grounding verifier rather than being mistaken for
+tampering. A recognised but *different* unit is still a mismatch and is blocked.
+
+### Conversation history
+
+History fed to the model keeps only turns that formed a question-answer pair. Customer messages
+that were never answered have already gone to a human and are not the bot's context; leaving them
+in makes the model adopt the stale intent — a real conversation where one unanswered licence
+question preceded a plain greeting produced handoff 4/4, and 4/4 auto-reply once filtered.
+
+The filter applies only to model context. Language resolution still sees the full history, because
+unanswered customer messages remain valid evidence of the customer's language.
+
+Multilingual runtime generation requires only `KNOWLEDGE_RETRIEVAL_ENABLED=true` and
+`MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true`. It retrieves verified-English knowledge in code, uses a
+protected query-translation retry when needed, and relies on the existing language, grounding,
+contact, kill-switch, and Outbox guards. It does not require a calibration report or language allowlist.
+
+Note that the lexical arm of hybrid retrieval indexes the English question with the `simple`
+text-search configuration, so it contributes nothing for non-English queries; those fall back to
+pure vector search until the query-translation retry produces English text.
+
+## Scheduler and reconciliation settings
+
+The scheduler reads one validated settings snapshot at startup. X reconciliation functions also read
+one snapshot per public invocation and retain those cadence and budget values for the full run.
+Configuration changes take effect after the relevant process restarts. A zero X interval disables
+local throttling, which is useful for direct invocations and tests.
+
+Each sweep allows at most one running instance. Missed intervals are coalesced instead of queued, and
+a slow sweep is warned about without hard cancellation because reconciliation may have external side
+effects.
+
+| Variable | Default | Validation | Consumer |
+| --- | --- | --- | --- |
+| `SCHEDULER_TICK_SECONDS` | `0.5` | 0.05-10 | Scheduler due-work scan cadence |
+| `SCHEDULER_CORE_INTERVAL_SECONDS` | `3` | 0.5-60 | Durable core recovery cadence |
+| `SCHEDULER_CORE_WARN_AFTER_SECONDS` | `30` | 1-3600 | Core slow-run warning threshold |
+| `SCHEDULER_INSPECTION_WARN_AFTER_SECONDS` | `300` | 1-7200 | Inspection slow-run warning threshold |
+| `CHATWOOT_RECONCILE_INTERVAL_SECONDS` | `3` | 1-3600 | Chatwoot reconciliation cadence |
+| `X_DM_POLL_INTERVAL_SECONDS` | `90` | 0-86400 | Legacy DM poll cadence |
+| `X_WEBHOOK_CHECK_INTERVAL_SECONDS` | `600` | 0-86400 | X webhook health cadence |
+| `XCHAT_POLL_INTERVAL_SECONDS` | `900` | 0-86400 | XChat poll cadence |
+| `XCHAT_MAX_CONVERSATIONS_PER_POLL` | `10` | 1-1000 | XChat poll work budget |
+| `XCHAT_SUBSCRIPTION_CHECK_INTERVAL_SECONDS` | `600` | 0-86400 | XChat subscription reconciliation cadence |
+| `XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS` | `30` | 0-3600 | XChat RawEvent recovery cadence |
+| `XCHAT_READY_PROBE_INTERVAL_SECONDS` | `21600` | 0-604800 | Public-key health probe for ready XChat accounts |
+| `XCHAT_PENDING_PROBE_INTERVAL_SECONDS` | `600` | 0-86400 | Public-key health probe for pending XChat accounts |
 
 ## Deployment-only variables
 
@@ -141,21 +310,25 @@ These are consumed by container orchestration or `entrypoint.sh`, not by `Settin
 
 | Variable | Owner | Meaning |
 | --- | --- | --- |
-| `SERVICE_ROLE` | entrypoint | `api`, `worker`, or `scheduler` |
+| `SERVICE_ROLE` | entrypoint | Required; must be explicitly set to `api`, `worker`, or `scheduler`. Missing/unknown values fail before startup |
 | `PORT` | entrypoint/API | API listen port, default 8000 |
-| `PG_PASSWORD` | VPS compose | PostgreSQL application password |
-| `CLOUDFLARE_TUNNEL_TOKEN` | VPS compose | Cloudflare Tunnel authentication |
+| `DRAMATIQ_PROCESSES` | entrypoint/Worker | Worker process count, default 4, range 1-32; never inferred from host CPU count |
+| `DRAMATIQ_THREADS` | entrypoint/Worker | Threads per process, default 8, range 1-32; processes × threads must not exceed 128 |
+| `DRAMATIQ_WORKER_TIMEOUT_MS` | entrypoint/Worker | Redis empty-queue polling backoff cap, default 250ms, range 50-5000ms; lower values reduce low-volume pickup latency but increase idle Redis fetches |
 
-VPS compose injects `DATABASE_URL`, `REDIS_URL`, `SERVICE_ROLE`, and `PORT` into containers. Do not
-add role-specific copies of feature flags; divergent values can accept work that another role will
-not process or recover.
+Railway injects `DATABASE_URL`, `REDIS_URL`, `SERVICE_ROLE`, and `PORT` into containers. Do not add
+role-specific copies of feature flags; divergent values can accept work that another role will not
+process or recover. Deploy API, Worker, Scheduler, PostgreSQL, and Redis in one infrastructure region.
+Cross-region Worker database and broker round trips multiply across each durable reply stage and can
+turn a two-second direct reply into tens of seconds without producing retries or errors.
 
 ## Template policy
 
 - `.env.example`: executable single-process smoke profile with `TESTING=true`, inline actor
   fallbacks, StubBroker, stub LLM, knowledge retrieval disabled, localhost callbacks and public
   development-only secrets. It does not validate the production Redis/Dramatiq boundary.
-- `deploy/vps/.env.example`: production profile with `TESTING=false`; every blank secret must be
-  generated or copied from the current production environment.
+- Production: Railway service variables are the source of truth. Every release validates required
+  secrets, feature gates, role assignment, Pydantic production settings, and cross-role consistency
+  before building or deploying an image.
 - Repository test configuration: always points at a database whose name ends in `_test`; pytest
   refuses to collect against any other database.
