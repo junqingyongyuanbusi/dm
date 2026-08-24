@@ -2,8 +2,9 @@ import pytest
 
 from social_reply.domain.reply.language import (
     assess_knowledge_language,
-    detect_customer_language,
     detect_language,
+    detect_language_from_history,
+    is_deterministically_verifiable,
     languages_match,
     reply_language_matches,
 )
@@ -69,34 +70,68 @@ def test_single_foreign_script_character_does_not_override_dominant_language():
     assert detect_language("This English support message includes 한").tag == "en"
 
 
-def test_recent_reliable_customer_message_resolves_ambiguous_current_message():
-    result = detect_customer_language(
-        "OK",
+def test_history_lookback_prefers_the_newest_reliable_customer_message():
+    result = detect_language_from_history(
         (
             ("user", "你好，我想了解退款政策。"),
             ("user", "Comment puis-je obtenir un remboursement ?"),
             ("assistant", "This English bot reply must not decide the customer language."),
-        ),
+        )
     )
+    assert result is not None
     assert result.tag == "fr"
     assert result.source == "recent_user_history"
 
 
-def test_generic_chinese_uses_recent_reliable_script_variant():
-    result = detect_customer_language(
-        "退款多久",
-        (("user", "請問退款通常需要幾天？"),),
+def test_history_lookback_ignores_messages_beyond_the_window():
+    # 只看最近 3 条客户消息：更早的语言不该无限期地影响判定。
+    result = detect_language_from_history(
+        (
+            ("user", "Comment puis-je obtenir un remboursement ?"),
+            ("user", "OK"),
+            ("user", "👍"),
+            ("user", "[REDACTED_EMAIL]"),
+        )
     )
+    assert result is None
+
+
+def test_chinese_script_only_lookback_refines_variant():
+    result = detect_language_from_history(
+        (("user", "請問退款通常需要幾天？"),), chinese_script_only=True
+    )
+    assert result is not None
     assert result.tag == "zh-Hant"
     assert result.source == "recent_user_history"
 
 
-def test_redaction_placeholders_do_not_turn_history_into_english():
-    result = detect_customer_language(
-        "OK",
-        (("user", "[REDACTED_EMAIL] [REDACTED_NUMBER]"),),
+def test_chinese_script_only_lookback_rejects_other_languages():
+    # 当前消息已确定是中文时，历史只能用来定简繁，绝不能把它判成别的语言。
+    assert (
+        detect_language_from_history(
+            (("user", "Comment puis-je obtenir un remboursement ?"),),
+            chinese_script_only=True,
+        )
+        is None
     )
-    assert result.tag == "und"
+
+
+def test_redaction_placeholders_do_not_turn_history_into_english():
+    assert detect_language_from_history((("user", "[REDACTED_EMAIL] [REDACTED_NUMBER]"),)) is None
+
+
+def test_history_lookback_without_reliable_customer_messages_returns_none():
+    assert detect_language_from_history(()) is None
+    assert detect_language_from_history((("assistant", "How can we help you today?"),)) is None
+
+
+def test_deterministic_verifiability_splits_guard_strictness():
+    # detect_language 能产出的标签才能被输出闸门严格复核。
+    for tag in ("en", "ja", "ko", "zh", "zh-Hans", "zh-Hant", "ru", "ar", "hi", "mr", "th"):
+        assert is_deterministically_verifiable(tag) is True
+    # 这些语言 detect_language 主动 fail-closed 或压根不在候选表里，严格校验必然误杀。
+    for tag in ("ne", "am", "ti", "yi", "und"):
+        assert is_deterministically_verifiable(tag) is False
 
 
 def test_languages_match_primary_language_and_chinese_script():

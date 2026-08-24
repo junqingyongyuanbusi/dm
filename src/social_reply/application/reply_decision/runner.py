@@ -17,7 +17,6 @@ from social_reply.application.knowledge.retrieval import (
     retrieve_hybrid_knowledge_result,
 )
 from social_reply.application.reply_decision.language_resolution import (
-    LLM_FALLBACK_SOURCE,
     resolve_customer_language,
 )
 from social_reply.application.reply_decision.multilingual_generation import (
@@ -42,6 +41,7 @@ from social_reply.domain.reply.guard import (
     LANGUAGE_VERIFICATION_STRICT,
     redact_pii,
 )
+from social_reply.domain.reply.language import is_deterministically_verifiable
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 from social_reply.domain.reply.rules import apply_multilingual_rules, apply_rules
@@ -540,11 +540,13 @@ async def run_and_persist_decision(
             is_english_request = (
                 language.is_reliable and language.tag.split("-", 1)[0].casefold() == "en"
             )
-            # 模型判定的语种，确定性检测复核不了它，输出闸门退到文字系统一致性校验。
+            # 闸门严格度取决于确定性检测能否复核这个标签，而不是标签的来源。按来源
+            # 判会在模型判出 en 时退到只比对文字系统——那样一句法语回复也能通过，
+            # 恰好放过了「回错语言」这类唯一需要拦住的错误。
             language_verification = (
-                LANGUAGE_VERIFICATION_LENIENT
-                if language.source == LLM_FALLBACK_SOURCE
-                else LANGUAGE_VERIFICATION_STRICT
+                LANGUAGE_VERIFICATION_STRICT
+                if is_deterministically_verifiable(language.tag)
+                else LANGUAGE_VERIFICATION_LENIENT
             )
             # 英语知识库是唯一事实源：live 模式强制只命中 verified English 文档。
             knowledge_result = (

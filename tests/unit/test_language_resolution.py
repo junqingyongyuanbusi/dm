@@ -84,9 +84,23 @@ async def test_missing_llm_or_capability_keeps_deterministic_unknown():
 
 
 @pytest.mark.asyncio
-async def test_history_fallback_still_wins_over_llm():
-    # 当前消息判不出但历史可靠时，沿用既有的历史回退，不消耗模型调用。
+async def test_llm_decides_current_message_over_history():
+    # 客户从法语切到 "OK" 之外的可判定内容时，历史绝不能抢在模型之前定语言。
     llm = _FakeLLM(tag="en")
+    result = await resolve_customer_language(
+        "hello",
+        (("user", "Comment puis-je obtenir un remboursement ?"),),
+        llm=llm,
+    )
+    assert result.tag == "en"
+    assert result.source == LLM_FALLBACK_SOURCE
+    assert llm.calls == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_history_only_serves_messages_without_any_language():
+    # "OK" 本身不含语种信息，模型也判不出，此时沿用客户此前的语言好过转人工。
+    llm = _FakeLLM(tag=None)
     result = await resolve_customer_language(
         "OK",
         (("user", "Comment puis-je obtenir un remboursement ?"),),
@@ -94,6 +108,56 @@ async def test_history_fallback_still_wins_over_llm():
     )
     assert result.tag == "fr"
     assert result.source == "recent_user_history"
+
+
+@pytest.mark.asyncio
+async def test_history_fallback_needs_no_llm_for_letterless_text():
+    llm = _FakeLLM(tag="en")
+    result = await resolve_customer_language("👍", (("user", "こんにちは"),), llm=llm)
+    assert result.tag == "ja"
+    assert result.source == "recent_user_history"
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["hello", "help", "Can I use WikiFX without registering?"])
+async def test_english_message_is_never_answered_in_the_history_language(text):
+    """生产回归：会话 4a14f1b6 的 seq 312/315/319。
+
+    "hello" 是单个拉丁词、长句 "Can I use WikiFX..." 的 margin 只有 0.027，两者
+    确定性检测都判不出；旧级联因此抄了历史里的日语，客户用英文打招呼却收到日语回复。
+    """
+    llm = _FakeLLM(tag="en")
+    japanese_history = (
+        ("user", "こんにちは"),
+        ("user", "こんにちは"),
+        ("user", "こんにちは"),
+    )
+    result = await resolve_customer_language(text, japanese_history, llm=llm)
+    assert result.tag == "en"
+    assert result.source == LLM_FALLBACK_SOURCE
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_chinese_takes_script_from_history_without_calling_llm():
+    # 简繁在短问候里字形相同，模型同样判不出，客户此前用过的字体才是最准的线索。
+    llm = _FakeLLM(tag="zh-Hans")
+    result = await resolve_customer_language(
+        "退款多久", (("user", "請問退款通常需要幾天？"),), llm=llm
+    )
+    assert result.tag == "zh-Hant"
+    assert result.source == "recent_user_history"
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_chinese_never_degrades_into_another_language():
+    llm = _FakeLLM(tag="en")
+    result = await resolve_customer_language(
+        "退款多久", (("user", "How do I withdraw money from my account?"),), llm=llm
+    )
+    assert result.tag == "zh"
+    assert result.source == "current_message"
     assert llm.calls == []
 
 
@@ -110,15 +174,18 @@ async def test_devanagari_sibling_detection_is_confirmed_by_llm():
 
 @pytest.mark.asyncio
 async def test_devanagari_confirmation_falls_back_to_deterministic_when_llm_unavailable():
-    # 二次确认失败时保留确定性结果，绝不因此退化成 und 而白白转人工。
-    result = await resolve_customer_language("नमस्ते", llm=_FakeLLM(tag=None))
+    # 二次确认失败时保留确定性结果，绝不因此退化成 und 而白白转人工，也绝不让历史
+    # 顶掉一条已经明确判出天城文的消息。
+    english_history = (("user", "How do I withdraw money from my account?"),)
+    result = await resolve_customer_language("नमस्ते", english_history, llm=_FakeLLM(tag=None))
     assert result.tag == "mr"
     assert result.is_reliable
+    assert result.source == "current_message"
 
-    result = await resolve_customer_language("नमस्ते", llm=_FakeLLM(raises=True))
+    result = await resolve_customer_language("नमस्ते", english_history, llm=_FakeLLM(raises=True))
     assert result.tag == "mr"
 
-    result = await resolve_customer_language("नमस्ते", llm=None)
+    result = await resolve_customer_language("नमस्ते", english_history, llm=None)
     assert result.tag == "mr"
 
 

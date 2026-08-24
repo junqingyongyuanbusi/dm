@@ -12,6 +12,10 @@ import hanzidentifier
 from lingua import Language, LanguageDetector, LanguageDetectorBuilder
 
 UNKNOWN_LANGUAGE = "und"
+# 只知道是中文、还没定简繁的标签。它本身可靠但不完整，需要额外线索细化。
+AMBIGUOUS_CHINESE = "zh"
+_CHINESE_SCRIPT_TAGS = frozenset({"zh-Hans", "zh-Hant"})
+_HISTORY_LOOKBACK = 3
 _MIN_LETTERS = 2
 _MIN_CONFIDENCE = 0.20
 _MIN_MARGIN = 0.10
@@ -84,6 +88,22 @@ _CYRILLIC_LANGUAGES = (
 )
 _ARABIC_SCRIPT_LANGUAGES = (Language.ARABIC, Language.PERSIAN, Language.URDU)
 _DEVANAGARI_LANGUAGES = (Language.HINDI, Language.MARATHI)
+# 文字系统与语言一对一的脚本，判出脚本即判出语言，无需分类器。
+_DIRECT_SCRIPT_LANGUAGES = {
+    "gurmukhi": "pa",
+    "gujarati": "gu",
+    "odia": "or",
+    "tamil": "ta",
+    "telugu": "te",
+    "kannada": "kn",
+    "malayalam": "ml",
+    "sinhala": "si",
+    "lao": "lo",
+    "myanmar": "my",
+    "khmer": "km",
+    "armenian": "hy",
+    "georgian": "ka",
+}
 _NEPALI_HINTS = ("कसरी", "गर्न", "सक्छ", "छन्", "छु", "तपाईं")
 _YIDDISH_HINTS = ("ווי", "קען", "געלט", "זיי", "ניט")
 
@@ -323,24 +343,9 @@ def detect_language(text: str | None, *, source: str = "current_message") -> Lan
     if dominant_script == "ethiopic":
         # Amharic and Tigrinya share this script; fail closed without a language classifier.
         return LanguageDetection(tag=UNKNOWN_LANGUAGE, source="script_ambiguous")
-    direct_script_languages = {
-        "gurmukhi": "pa",
-        "gujarati": "gu",
-        "odia": "or",
-        "tamil": "ta",
-        "telugu": "te",
-        "kannada": "kn",
-        "malayalam": "ml",
-        "sinhala": "si",
-        "lao": "lo",
-        "myanmar": "my",
-        "khmer": "km",
-        "armenian": "hy",
-        "georgian": "ka",
-    }
-    if dominant_script in direct_script_languages:
+    if dominant_script in _DIRECT_SCRIPT_LANGUAGES:
         return LanguageDetection(
-            tag=direct_script_languages[dominant_script],
+            tag=_DIRECT_SCRIPT_LANGUAGES[dominant_script],
             confidence=1.0,
             margin=1.0,
             source=source,
@@ -364,25 +369,31 @@ def detect_language(text: str | None, *, source: str = "current_message") -> Lan
     )
 
 
-def detect_customer_language(
-    text: str | None,
-    history: tuple[tuple[str, str], ...] = (),
-) -> LanguageDetection:
-    current = detect_language(text)
-    if current.is_reliable and current.tag != "zh":
-        return current
+def detect_language_from_history(
+    history: tuple[tuple[str, str], ...],
+    *,
+    chinese_script_only: bool = False,
+) -> LanguageDetection | None:
+    """从最近几条客户消息回推语种；没有可靠结果时返回 None。
 
-    recent_user_messages = [
+    这是降级手段，不是判定依据：客户当前这条消息用什么语言就该回什么语言，历史
+    只在当前消息自身给不出语种时才有资格发言，调用方负责守住这个前提。曾经把它
+    嵌在当前消息的检测里，结果客户从日语切到英语说 "hello" 时被历史判成日语。
+
+    chinese_script_only 用于当前消息已确定是中文、只差简繁的场合：此时必须丢弃
+    非中文的历史结果，否则会把一条确定是中文的消息判成别的语言。
+    """
+    recent = [
         message for role, message in history if role == "user" and message and message.strip()
-    ][-3:]
-    for message in reversed(recent_user_messages):
+    ][-_HISTORY_LOOKBACK:]
+    for message in reversed(recent):
         detected = detect_language(message, source="recent_user_history")
         if not detected.is_reliable:
             continue
-        if current.tag == "zh" and detected.tag not in {"zh-Hans", "zh-Hant"}:
+        if chinese_script_only and detected.tag not in _CHINESE_SCRIPT_TAGS:
             continue
         return detected
-    return current
+    return None
 
 
 def languages_match(expected: str, observed: str) -> bool:
@@ -397,6 +408,31 @@ def languages_match(expected: str, observed: str) -> bool:
     if len(expected_parts) == 1 or len(observed_parts) == 1:
         return True
     return expected_parts[1] == observed_parts[1]
+
+
+# detect_language 可能产出的全部标签。输出闸门据此决定能否复核回复语种：表内的
+# 标签可以严格校验；表外的（例如模型判出的 ne、am）确定性检测本就判不出来，严格
+# 校验必然误杀，只能退到文字系统一致性。由各候选表推导而来，不手工维护第二份清单。
+_DETERMINISTIC_TAGS: frozenset[str] = frozenset(
+    {"ja", "ko", AMBIGUOUS_CHINESE, "th", "el", "he", "bn"}
+    | _CHINESE_SCRIPT_TAGS
+    | set(_DIRECT_SCRIPT_LANGUAGES.values())
+    | {
+        _language_tag(language)
+        for group in (
+            _LATIN_LANGUAGES,
+            _CYRILLIC_LANGUAGES,
+            _ARABIC_SCRIPT_LANGUAGES,
+            _DEVANAGARI_LANGUAGES,
+        )
+        for language in group
+    }
+)
+
+
+def is_deterministically_verifiable(tag: str) -> bool:
+    """detect_language 是否可能产出该标签——即输出闸门能否复核回复真的用了它。"""
+    return tag in _DETERMINISTIC_TAGS
 
 
 # 各语言允许出现的文字系统。这张表天然追不上世界上的语言——例如它收了 ru/uk/bg
