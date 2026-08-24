@@ -58,6 +58,10 @@ def test_source_release_is_commit_pinned_ordered_and_fail_closed():
     assert "serviceInstanceDeployV2" in script
     assert "commitSha: $commitSha" in script
     assert "Project-Access-Token" in script
+    assert '--connect-timeout "$GRAPHQL_CONNECT_TIMEOUT_SECONDS"' in script
+    assert '--max-time "$GRAPHQL_QUERY_MAX_TIME_SECONDS"' in script
+    assert '--retry-max-time "$GRAPHQL_QUERY_RETRY_MAX_TIME_SECONDS"' in script
+    assert '--max-time "$GRAPHQL_MUTATION_MAX_TIME_SECONDS"' in script
     assert "native Railway autodeploy must be disabled" in script
     assert "automatic source release refuses Alembic graph changes" in script
     assert "git merge-base --is-ancestor" in script

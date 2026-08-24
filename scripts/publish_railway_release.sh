@@ -9,6 +9,10 @@ readonly RAILWAY_REPOSITORY="junqingyongyuanbusi/dm"
 readonly PUBLIC_BASE_URL="https://relay.nexory.top"
 readonly DEPLOY_TIMEOUT_SECONDS="${DEPLOY_TIMEOUT_SECONDS:-1200}"
 readonly API_HEALTH_TIMEOUT_SECONDS="${API_HEALTH_TIMEOUT_SECONDS:-180}"
+readonly GRAPHQL_CONNECT_TIMEOUT_SECONDS="${GRAPHQL_CONNECT_TIMEOUT_SECONDS:-10}"
+readonly GRAPHQL_QUERY_MAX_TIME_SECONDS="${GRAPHQL_QUERY_MAX_TIME_SECONDS:-30}"
+readonly GRAPHQL_QUERY_RETRY_MAX_TIME_SECONDS="${GRAPHQL_QUERY_RETRY_MAX_TIME_SECONDS:-90}"
+readonly GRAPHQL_MUTATION_MAX_TIME_SECONDS="${GRAPHQL_MUTATION_MAX_TIME_SECONDS:-60}"
 readonly RAILWAY_SERVICES=(api worker scheduler)
 readonly RAILWAY_COLOCATED_SERVICES=(api worker scheduler Postgres Redis)
 readonly API_SERVICE_ID="b84107eb-c945-4279-92aa-c4691532d9ec"
@@ -79,7 +83,13 @@ for argument in "$@"; do
 done
 
 [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || fail "--sha must be a full lowercase Git SHA"
-for timeout_name in DEPLOY_TIMEOUT_SECONDS API_HEALTH_TIMEOUT_SECONDS; do
+for timeout_name in \
+  DEPLOY_TIMEOUT_SECONDS \
+  API_HEALTH_TIMEOUT_SECONDS \
+  GRAPHQL_CONNECT_TIMEOUT_SECONDS \
+  GRAPHQL_QUERY_MAX_TIME_SECONDS \
+  GRAPHQL_QUERY_RETRY_MAX_TIME_SECONDS \
+  GRAPHQL_MUTATION_MAX_TIME_SECONDS; do
   timeout_value="${!timeout_name}"
   [[ "$timeout_value" =~ ^[1-9][0-9]*$ ]] || fail "$timeout_name must be positive"
 done
@@ -99,12 +109,22 @@ graphql_request() {
   local query="$2"
   local variables="$3"
   local response payload
-  local -a curl_options=(-fsS)
+  local -a curl_options=(
+    -fsS
+    --connect-timeout "$GRAPHQL_CONNECT_TIMEOUT_SECONDS"
+  )
   payload="$(jq -cn --arg query "$query" --argjson variables "$variables" \
     '{query: $query, variables: $variables}')"
   if [[ "$request_kind" == "query" ]]; then
-    curl_options+=(--retry 3 --retry-all-errors)
-  elif [[ "$request_kind" != "mutation" ]]; then
+    curl_options+=(
+      --max-time "$GRAPHQL_QUERY_MAX_TIME_SECONDS"
+      --retry 3
+      --retry-all-errors
+      --retry-max-time "$GRAPHQL_QUERY_RETRY_MAX_TIME_SECONDS"
+    )
+  elif [[ "$request_kind" == "mutation" ]]; then
+    curl_options+=(--max-time "$GRAPHQL_MUTATION_MAX_TIME_SECONDS")
+  else
     fail "unknown GraphQL request kind: $request_kind"
   fi
   response="$(curl "${curl_options[@]}" \
