@@ -313,10 +313,6 @@ current_commit_for_service() {
   '
 }
 
-current_deployment_id() {
-  local service="$1"
-  service_state "$service" | jq -r '.data.serviceInstance.latestDeployment.id // ""'
-}
 
 resolve_predecessor_sha() {
   local api_sha worker_sha scheduler_sha sha common_sha
@@ -341,13 +337,35 @@ resolve_predecessor_sha() {
   printf '%s\n' "$common_sha"
 }
 
-service_needs_deploy() {
+ensure_service_released() {
   local service="$1"
-  local state status commit_hash
+  local state status commit_hash deployment_id
   state="$(service_state "$service")"
   status="$(jq -r '.data.serviceInstance.latestDeployment.status // ""' <<<"$state")"
   commit_hash="$(jq -r '.data.serviceInstance.latestDeployment.meta.commitHash // ""' <<<"$state")"
-  [[ "$status" != "SUCCESS" || "$commit_hash" != "$release_sha" ]]
+  deployment_id="$(jq -r '.data.serviceInstance.latestDeployment.id // ""' <<<"$state")"
+  if [[ "$commit_hash" == "$release_sha" ]]; then
+    case "$status" in
+      SUCCESS)
+        log "$service already runs $release_sha; keeping deployment $deployment_id"
+        printf '%s\n' "$deployment_id"
+        return 0
+        ;;
+      QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL)
+        log "$service target deployment is still $status; resuming wait for $deployment_id"
+        wait_for_deployment "$service" "$deployment_id"
+        printf '%s\n' "$deployment_id"
+        return 0
+        ;;
+      FAILED|CRASHED|REMOVED|SKIPPED|SLEEPING|"")
+        log "$service target deployment ended with ${status:-unknown}; creating a replacement"
+        ;;
+      *) fail "$service target deployment returned unknown status $status" ;;
+    esac
+  fi
+  deployment_id="$(deploy_service "$service")"
+  wait_for_deployment "$service" "$deployment_id"
+  printf '%s\n' "$deployment_id"
 }
 
 validate_migration_graph_unchanged() {
@@ -469,28 +487,10 @@ jq -n \
   '{status: $status, release_sha: $release_sha, predecessor_sha: $predecessor_sha,
     environment: $environment, repository: $repository}' >"$manifest_path"
 
-if service_needs_deploy api; then
-  api_deployment_id="$(deploy_service api)"
-  wait_for_deployment api "$api_deployment_id"
-else
-  api_deployment_id="$(current_deployment_id api)"
-  log "api already runs $release_sha; keeping deployment $api_deployment_id"
-fi
+api_deployment_id="$(ensure_service_released api)"
 wait_for_api_health
-if service_needs_deploy worker; then
-  worker_deployment_id="$(deploy_service worker)"
-  wait_for_deployment worker "$worker_deployment_id"
-else
-  worker_deployment_id="$(current_deployment_id worker)"
-  log "worker already runs $release_sha; keeping deployment $worker_deployment_id"
-fi
-if service_needs_deploy scheduler; then
-  scheduler_deployment_id="$(deploy_service scheduler)"
-  wait_for_deployment scheduler "$scheduler_deployment_id"
-else
-  scheduler_deployment_id="$(current_deployment_id scheduler)"
-  log "scheduler already runs $release_sha; keeping deployment $scheduler_deployment_id"
-fi
+worker_deployment_id="$(ensure_service_released worker)"
+scheduler_deployment_id="$(ensure_service_released scheduler)"
 verify_final_state
 validate_role_configuration api api
 validate_role_configuration worker worker

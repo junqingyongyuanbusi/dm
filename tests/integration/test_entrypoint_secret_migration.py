@@ -70,16 +70,16 @@ def test_source_release_is_commit_pinned_ordered_and_fail_closed():
     assert "validate_railway_config" in script
     assert "validate_railway_colocation" in script
     assert "configuration_fingerprint" in script
-    api = script.index("if service_needs_deploy api")
+    api = script.index('api_deployment_id="$(ensure_service_released api)"')
     final_freshness = script.index("release commit became stale during preflight")
     fingerprint = script.index('scheduler_config_before="$(configuration_fingerprint scheduler)"')
     assert fingerprint < final_freshness < api
     health = script.index("wait_for_api_health", api)
-    worker = script.index("if service_needs_deploy worker")
-    scheduler = script.index("if service_needs_deploy scheduler")
+    worker = script.index('worker_deployment_id="$(ensure_service_released worker)"')
+    scheduler = script.index('scheduler_deployment_id="$(ensure_service_released scheduler)"')
     assert api < health < worker < scheduler
-    assert script.count("service_needs_deploy") >= 4
-    assert 'status" != "SUCCESS" || "$commit_hash" != "$release_sha"' in script
+    assert "target deployment is still $status; resuming wait" in script
+    assert "target deployment ended with ${status:-unknown}; creating a replacement" in script
     assert 'response="$(graphql_mutation "$query" "$variables")"' in script
     assert "production source mutation is authorized only" in script
     assert Path("scripts/publish_railway_release.sh").stat().st_mode & 0o111
