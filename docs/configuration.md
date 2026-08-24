@@ -206,20 +206,26 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 
 ### Language resolution
 
-The runtime replies in whatever language it resolves for the customer message, with no language
-allowlist anywhere in the code. Resolution is a three-stage cascade:
+The runtime replies in the language of the **current customer message**, with no language allowlist
+anywhere in the code. A previous conversation language never overrides language evidence in the
+current message. Resolution follows this cascade:
 
-1. **Deterministic detection** (`domain/reply/language.py`) — writing-system rules plus Lingua.
-   Pure, synchronous, and shared with knowledge import, localization checks and Outbox validation,
-   so its behaviour must not drift.
-2. **LLM fallback** (`application/reply_decision/language_resolution.py`) — consulted when the
-   deterministic result is `und`, or when it lands on a known-confusable sibling pair. Lingua only
-   ever chooses between Hindi and Marathi on Devanagari text and returns confident wrong answers on
-   short input, and confidence cannot separate those errors: a misdetected `नमस्ते` scored 0.624
-   while correctly detected Russian scored 0.383. The trigger is therefore the candidate set, not a
-   confidence threshold. Messages with no meaningful letters (emoji, digits, bare links) never reach
-   the model.
-3. **Give up** — still `und`, so the decision hands off with `UNKNOWN_LANGUAGE`.
+1. **Current-message deterministic detection** (`domain/reply/language.py`) — writing-system rules
+   plus Lingua. It is pure, synchronous, and shared with knowledge import, localization checks and
+   Outbox validation, so its behaviour must not drift. A generic Chinese result may use recent
+   Chinese history only to refine `zh` to `zh-Hans` or `zh-Hant`.
+2. **Current-message LLM fallback** (`application/reply_decision/language_resolution.py`) — consulted
+   when a message contains meaningful letters but the deterministic result is `und`, or when it
+   lands on a known-confusable sibling pair. This makes short input such as `Thanks`, `Hello` or
+   `Hola` use its own language instead of inheriting an older customer language. Lingua only ever
+   chooses between Hindi and Marathi on Devanagari text and returns confident wrong answers on short
+   input, and confidence cannot separate those errors: a misdetected `नमस्ते` scored 0.624 while
+   correctly detected Russian scored 0.383. The trigger is therefore the candidate set, not a
+   confidence threshold.
+3. **History or give up** — messages with no meaningful letters (emoji, digits, bare links) never
+   reach the model and may use recent customer history. If the current message does contain letters
+   but both detectors fail, it remains `und` and hands off with `UNKNOWN_LANGUAGE`; history is not
+   allowed to guess a potentially different current language.
 
 The resolved provenance is stored in `reply_decisions.request_language_source` as
 `current_message`, `recent_user_history` or `llm_fallback`.

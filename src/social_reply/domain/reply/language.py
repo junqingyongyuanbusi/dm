@@ -368,8 +368,19 @@ def detect_customer_language(
     text: str | None,
     history: tuple[tuple[str, str], ...] = (),
 ) -> LanguageDetection:
+    """Resolve deterministic language evidence without overriding the current message.
+
+    A current message containing meaningful letters owns its language even when the deterministic
+    detector cannot classify it.  The application layer may ask an LLM to resolve that ambiguity;
+    falling back to an older customer language here would make short English such as ``Thanks``
+    inherit Chinese or another historical language.  History is therefore consulted only when the
+    current message has no language signal at all, or to refine a generic Chinese result to its
+    script variant.
+    """
     current = detect_language(text)
     if current.is_reliable and current.tag != "zh":
+        return current
+    if not current.is_reliable and has_detectable_letters(text):
         return current
 
     recent_user_messages = [

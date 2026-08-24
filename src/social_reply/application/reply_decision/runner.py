@@ -375,8 +375,8 @@ def _answered_turns(history: tuple[tuple[str, str], ...]) -> tuple[tuple[str, st
 
     助手消息一律保留；客户消息只在紧随其后存在助手回复时保留。
 
-    注意这只过滤模型上下文，不过滤语言检测用的历史——未应答的客户消息仍然是
-    客户语种的有效证据，detect_customer_language 的历史回退依赖它们。
+    注意这只过滤模型上下文，不过滤语言检测用的历史——当前消息完全没有语言信号
+    时仍可参考旧客户消息；通用中文也可用历史细化简繁体，但历史绝不覆盖本轮文字。
     """
     answered: list[tuple[str, str]] = []
     for index, (role, text) in enumerate(history):
@@ -534,8 +534,8 @@ async def run_and_persist_decision(
                 # 只在真的要判语种时才给 LLM：其余情况保持纯确定性、零额外调用。
                 llm=_get_llm_or_none() if language_should_detect else None,
             )
-            # 语言检测用完整历史（未应答的客户消息仍是语种证据），喂给模型的上下文
-            # 只留已应答的轮次——悬而未决的旧问题会把当前消息的意图带偏。
+            # 语言检测可在当前消息无语言信号时参考完整历史，也可细化中文简繁体；
+            # 喂给模型的上下文只留已应答轮次，避免悬而未决的旧问题带偏当前意图。
             model_history = _answered_turns(history)
             is_english_request = (
                 language.is_reliable and language.tag.split("-", 1)[0].casefold() == "en"

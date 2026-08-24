@@ -1,12 +1,12 @@
-"""客户语言解析级联：确定性检测 → LLM 兜底判定 → und。
+"""客户语言解析：当前消息确定性检测 → 当前消息 LLM 兜底 → fail-closed。
 
 `domain/reply/language.py` 必须保持纯同步与确定性——它同时服务于输出闸门、
 知识导入的语料语言判定和投递前校验，任何行为漂移都会波及这些路径。因此需要
 网络调用的兜底判定放在应用层，由本模块编排。
 
-兜底只在确定性检测判不出语种时启动，且全程 fail-closed：LLM 不具备该能力、
-调用失败、或返回非法标签，都退回原始的 und 结果，上游按现有的
-UNKNOWN_LANGUAGE 转人工处理。
+当前消息的语言证据永远优先于历史：短英文等有实义字母但确定性检测判不出的
+消息先交给 LLM，失败后保持 und 并转人工，绝不继承一条可能不同语言的旧消息。
+只有当前消息完全没有语言信号（纯 emoji、数字或链接）时，确定性层才参考历史。
 """
 
 import logging
@@ -41,18 +41,19 @@ async def resolve_customer_language(
     *,
     llm: LLMClient | None = None,
 ) -> LanguageDetection:
-    """判定客户消息语种，确定性优先、LLM 兜底。
+    """判定客户消息语种，当前消息优先、LLM 兜底。
 
-    两种情况会走 LLM：确定性检测判不出（und），或判出的是已知易混的近亲语言。
-    返回的 LanguageDetection 的 source 字段区分来源：确定性路径沿用
-    current_message / recent_user_history，LLM 路径为 llm_fallback。
-    下游据此决定输出闸门用严格还是宽松校验。
+    两种情况会走 LLM：当前消息含实义字母但确定性检测判不出（und），或判出的是
+    已知易混的近亲语言。历史结果只可能来自无语言信号的当前消息，或用于细化通用
+    中文标签的简繁体。返回结果的 source 字段区分 current_message、
+    recent_user_history 与 llm_fallback，下游据此决定输出闸门强度。
     """
     deterministic = detect_customer_language(text, history)
     if deterministic.is_reliable and not _needs_confirmation(deterministic):
         return deterministic
     if llm is None or not has_detectable_letters(text):
-        # 纯 emoji / 纯数字 / 只有链接的消息没有语种可判，不浪费一次模型调用。
+        # 纯 emoji / 纯数字 / 只有链接的消息没有当前语种可判，允许确定性层沿用历史；
+        # 有字母但模型不可用时则保持当前消息的 und，绝不让历史覆盖本轮语言。
         return deterministic
 
     detect = getattr(llm, "detect_language_tag", None)

@@ -84,16 +84,56 @@ async def test_missing_llm_or_capability_keeps_deterministic_unknown():
 
 
 @pytest.mark.asyncio
-async def test_history_fallback_still_wins_over_llm():
-    # 当前消息判不出但历史可靠时，沿用既有的历史回退，不消耗模型调用。
+@pytest.mark.parametrize("text", ["OK", "Thanks", "Hello"])
+async def test_short_english_uses_current_message_llm_before_foreign_history(text):
     llm = _FakeLLM(tag="en")
     result = await resolve_customer_language(
-        "OK",
+        text,
+        (("user", "你好，我想了解退款政策。"),),
+        llm=llm,
+    )
+    assert result.tag == "en"
+    assert result.source == LLM_FALLBACK_SOURCE
+    assert llm.calls == [text]
+
+
+@pytest.mark.asyncio
+async def test_short_current_message_does_not_inherit_history_when_llm_fails():
+    result = await resolve_customer_language(
+        "Thanks",
+        (("user", "你好，我想了解退款政策。"),),
+        llm=_FakeLLM(tag=None),
+    )
+    assert result.tag == "und"
+    assert result.source == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_message_without_language_signal_uses_history_without_llm():
+    llm = _FakeLLM(tag="en")
+    result = await resolve_customer_language(
+        "👍",
         (("user", "Comment puis-je obtenir un remboursement ?"),),
         llm=llm,
     )
     assert result.tag == "fr"
     assert result.source == "recent_user_history"
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "history", "expected"),
+    [
+        ("Could you explain the refund timing?", "请问退款多久到账？", "en"),
+        ("请问退款多久到账？", "Could you explain the refund timing?", "zh-Hans"),
+    ],
+)
+async def test_current_clear_language_wins_over_different_history(text, history, expected):
+    llm = _FakeLLM(tag="fr")
+    result = await resolve_customer_language(text, (("user", history),), llm=llm)
+    assert result.tag == expected
+    assert result.source == "current_message"
     assert llm.calls == []
 
 

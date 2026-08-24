@@ -113,7 +113,13 @@ async def multilingual_runtime(monkeypatch):
         get_settings.cache_clear()
 
 
-async def _seed_conversation(session, *, text: str, tenant_id: str = "default"):
+async def _seed_conversation(
+    session,
+    *,
+    text: str,
+    tenant_id: str = "default",
+    history: tuple[tuple[str, str], ...] = (),
+):
     account_id, contact_id, conversation_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -148,6 +154,17 @@ async def _seed_conversation(session, *, text: str, tenant_id: str = "default"):
             conversation_key=f"telegram:test:{account_id}",
         )
     )
+    for direction, historical_text in history:
+        await session.execute(
+            insert(models.Message).values(
+                id=uuid.uuid4(),
+                conversation_id=conversation_id,
+                direction=direction,
+                sender_type="contact" if direction == "inbound" else "bot",
+                text=historical_text,
+                reply_target={},
+            )
+        )
     message_id = uuid.uuid4()
     await session.execute(
         insert(models.Message).values(
@@ -254,9 +271,15 @@ async def _publish_ja_localization(
     return artifact
 
 
-async def _run(session, *, text: str, tenant_id: str = "default"):
+async def _run(
+    session,
+    *,
+    text: str,
+    tenant_id: str = "default",
+    history: tuple[tuple[str, str], ...] = (),
+):
     account_id, conversation_id, message_id = await _seed_conversation(
-        session, text=text, tenant_id=tenant_id
+        session, text=text, tenant_id=tenant_id, history=history
     )
     outbox_id = await runner.run_and_persist_decision(
         _snapshot(account_id, text, tenant_id=tenant_id),
@@ -359,6 +382,60 @@ async def test_english_request_keeps_canonical_verbatim_path(session, multilingu
     assert decision.multilingual_contract_version == "multilingual-runtime-generation-v1"
     assert decision.grounding_verified is True
     assert "MULTILINGUAL_RUNTIME_GENERATION" in decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("text", "history_text", "language", "reply", "detected_language", "source"),
+    [
+        (
+            "Thanks",
+            "请问退款多久到账？",
+            "en",
+            _SOURCE_REPLY,
+            "en",
+            "llm_fallback",
+        ),
+        (
+            "请问退款多久到账？",
+            "Could you explain the refund timing?",
+            "zh-Hans",
+            "退款通常需要3到5个工作日。",
+            None,
+            "current_message",
+        ),
+    ],
+)
+async def test_current_message_language_overrides_different_history(
+    session,
+    multilingual_runtime,
+    text,
+    history_text,
+    language,
+    reply,
+    detected_language,
+    source,
+):
+    await _seed_english_policy(session)
+    runner._llm = _RuntimeLLM(
+        {language: reply},
+        detected_language=detected_language,
+    )
+
+    _conversation_id, outbox_id = await _run(
+        session,
+        text=text,
+        history=(("inbound", history_text),),
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.request_language == language
+    assert decision.request_language_source == source
+    assert decision.reply_language == language
+    assert decision.reply_text == reply
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.payload["text"] == reply
 
 
 async def test_unknown_language_handoffs(session, multilingual_runtime):

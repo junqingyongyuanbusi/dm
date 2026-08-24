@@ -4,7 +4,7 @@
 
 **Goal:** 客户用任意语言发消息，机器人就用同一语言回复，不局限于任何固定语言清单。无强命中时保持静默 handoff（不发同语种兜底文案）。
 
-**Architecture:** 语言解析改为三级级联（确定性检测 → LLM 兜底判语种 → und），`domain/reply/language.py` 保持纯同步确定性不变，异步兜底放在新的应用层模块；输出闸门按语言来源分级（strict / lenient），lenient 由 grounding verifier 兜底；投递层零改动，依靠"lenient 模式必须写入非 und 的 `reply_language`" + 既有的 `grounding_verified is True` 硬前提维持安全链条自洽。
+**Architecture:** 语言解析以当前消息为准，采用三级级联（当前消息确定性检测 → 当前消息 LLM 兜底判语种 → und）；只有当前消息完全没有语言信号时才参考历史，通用中文可用中文历史细化简繁体。`domain/reply/language.py` 保持纯同步确定性，异步兜底放在应用层模块；输出闸门按语言来源分级（strict / lenient），lenient 由 grounding verifier 兜底；投递层依靠“lenient 模式必须写入非 und 的 `reply_language`” + 既有的 `grounding_verified is True` 硬前提维持安全链条自洽。
 
 **Tech Stack:** 复用既有设施，不引入新依赖——`LLMClient` Protocol 的可选能力模式（照抄 `translate_to_english`）、`language.py::_letter_scripts` 做文字系统一致性判断、`reply_decisions` 已有的 `request_language_source` / `reply_language` 字段（**无需迁移**）。
 
@@ -156,9 +156,9 @@ Bash 权限分类器在排查期持续故障，以下三项只做到源码级确
 - [x] `domain/reply/llm.py`：`LLMClient` Protocol 增加语言判定能力，返回 BCP-47 主语言标签或 `None`；`StubLLMClient` 返回 `None`（能力不可用则静默关闭回退，与既有 `translate_to_english` 约定一致）
 - [x] `domain/reply/openai_client.py`：实现该能力。照抄 `translate_to_english`（`openai_client.py:369` 附近）的既有形态——独立 payload、复用 `self._grounding_timeout`、检查 `message.get("refusal")`、任何异常 `logger.exception` 后返回 `None`
 - [x] 新建 `language_resolution.py`，三级级联：
-  1. `detect_customer_language(text, history)` 可靠 → 直接返回，`source` 保持 `current_message` / `recent_user_history`
-  2. 不可靠 → LLM 判语种，成功则 `source="llm_fallback"`、`confidence=None`
-  3. LLM 也失败 → 保持 und → 沿用现有 `UNKNOWN_LANGUAGE` handoff（行为不变）
+  1. 当前消息确定性结果可靠 → 直接返回；通用中文可由中文历史细化简繁体
+  2. 当前消息含实义字母但不可靠 → LLM 判语种，成功则 `source="llm_fallback"`
+  3. LLM 也失败 → 保持 und → 沿用现有 `UNKNOWN_LANGUAGE` handoff；只有当前消息完全没有语言信号时才允许 `recent_user_history`
   - 调用方用 `getattr` 探测可选能力，复用 `application/knowledge/query_translation.py::translate_query_to_english` 已验证的模式
   - **成本控制**：仅当消息含实义字母时才调 LLM——复用 `language.py::_letter_scripts` 计数，emoji / 纯数字 / 空串直接返回 und
 - [x] `runner.py:490` 改调用点，把 `request_language_source` 写入决策
@@ -226,10 +226,11 @@ Bash 权限分类器在排查期持续故障，以下三项只做到源码级确
 - [x] 只保留已应答的问答对，未被回复的 inbound 不进 prompt
 
   > **实施时修正了落点**：过滤没有放进 `_fetch_history`，而是放在调用点。原因是
-  > `detect_customer_language` 的历史回退**需要**那些未应答的客户消息——它们仍是
-  > 客户语种的有效证据。放进 `_fetch_history` 会连语言检测一起削弱，且会破坏
-  > `tests/integration/test_fetch_history.py` 里 4 个测机制（排序/预算/脱敏）的用例。
-  > 现在 runner 保留完整 `history` 供语言解析，另用 `model_history = _answered_turns(history)` 供生成。
+  > `detect_customer_language` 在当前消息完全没有语言信号时仍可能需要那些未应答的
+  > 客户消息，通用中文也可借助中文历史细化简繁体；有实义字母的当前消息则绝不被
+  > 历史覆盖。放进 `_fetch_history` 会削弱这两种合法回退，且会破坏
+  > `tests/integration/test_fetch_history.py` 的排序/预算/脱敏测试。现在 runner 保留完整
+  > `history` 供语言解析，另用 `model_history = _answered_turns(history)` 供生成。
 - [~] 保留但标注（如 `[已转人工，本轮无需处理]`）的替代方案 —— **未采用**：直接过滤已实测有效，按 YAGNI 不引入更复杂的标注协议
 - [x] 回归测试锁死"历史含未应答实质问题时，当前问候仍能自动回复"（`tests/unit/test_model_history.py`，6 个用例）
 - [ ] 验证通过后把 `CONVERSATION_HISTORY_LIMIT` 恢复为默认 20 —— **必须在新代码部署到 Railway 之后**，否则旧代码没有过滤逻辑，会立刻退回原来的 handoff 问题

@@ -69,9 +69,22 @@ def test_single_foreign_script_character_does_not_override_dominant_language():
     assert detect_language("This English support message includes 한").tag == "en"
 
 
-def test_recent_reliable_customer_message_resolves_ambiguous_current_message():
+def test_current_message_with_letters_is_never_overridden_by_history():
     result = detect_customer_language(
         "OK",
+        (
+            ("user", "你好，我想了解退款政策。"),
+            ("user", "Comment puis-je obtenir un remboursement ?"),
+            ("assistant", "This English bot reply must not decide the customer language."),
+        ),
+    )
+    assert result.tag == "und"
+    assert result.source == "unknown"
+
+
+def test_message_without_language_signal_uses_recent_customer_history():
+    result = detect_customer_language(
+        "👍",
         (
             ("user", "你好，我想了解退款政策。"),
             ("user", "Comment puis-je obtenir un remboursement ?"),
