@@ -132,39 +132,17 @@ def _railway_variables(project: str, environment: str, service: str) -> dict[str
     return {str(key): str(item) for key, item in value.items()}
 
 
-def _variables_from_json(path: str) -> dict[str, dict[str, str]]:
-    if path == "-":
-        value = json.load(sys.stdin)
-    else:
-        with open(path, encoding="utf-8") as variables_file:
-            value = json.load(variables_file)
-    if not isinstance(value, Mapping):
-        raise ValueError("variables_json_must_be_object")
-    result: dict[str, dict[str, str]] = {}
-    for service in _SERVICES:
-        service_values = value.get(service)
-        if not isinstance(service_values, Mapping):
-            raise ValueError(f"variables_json_missing_service:{service}")
-        result[service] = {str(key): str(item) for key, item in service_values.items()}
-    return result
-
-
 def main() -> None:
-    if len(sys.argv) == 4 and sys.argv[1] == "--variables-json":
-        _, path, public_base_url = sys.argv[1:]
-        variables = _variables_from_json(path)
-    elif len(sys.argv) == 4:
-        project, environment, public_base_url = sys.argv[1:]
-        variables = {
-            service: _railway_variables(project, environment, service) for service in _SERVICES
-        }
-    else:
+    if len(sys.argv) != 4:
         raise SystemExit(
-            "usage: validate_railway_config.py <project_id> <environment> <public_base_url>\n"
-            "   or: validate_railway_config.py --variables-json <path> <public_base_url>"
+            "usage: validate_railway_config.py <project_id> <environment> <public_base_url>"
         )
+    project, environment, public_base_url = sys.argv[1:]
     try:
-        validate(variables, public_base_url=public_base_url)
+        validate(
+            {service: _railway_variables(project, environment, service) for service in _SERVICES},
+            public_base_url=public_base_url,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(str(exc)) from exc
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly IMAGE_REPO="zhiyangxiaozi/reply-core"
+readonly IMAGE_REPO="ghcr.io/junqingyongyuanbusi/reply-core"
 readonly RAILWAY_PROJECT_ID="abcf3199-e5ac-415b-a22e-062206390331"
 readonly RAILWAY_PROJECT_NAME="reply-core"
 readonly RAILWAY_ENVIRONMENT="production"
@@ -77,6 +77,7 @@ except (OSError, BlockingIOError) as exc:
 PY
 fi
 
+image_repository="$(jq -r '.image_repository // ""' "$manifest_path")"
 release_status="$(jq -r '.status // ""' "$manifest_path")"
 compat_ref="$(jq -r '.migration_compatible_rollback.tag // ""' "$manifest_path")"
 compat_digest="$(jq -r '.migration_compatible_rollback.digest // ""' "$manifest_path")"
@@ -90,6 +91,8 @@ expected_compat_ref="${IMAGE_REPO}:railway-compat-pre-${target_sha:0:12}"
 
 [[ "$release_status" == "deploying" || "$release_status" == "completed" ]] \
   || fail "release manifest status is not rollback-eligible: $release_status"
+[[ "$image_repository" == "$IMAGE_REPO" ]] \
+  || fail "release manifest image repository is not the production GHCR repository"
 [[ "$confirmation" == "$target_sha" ]] || fail "--execute SHA does not match release manifest"
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || fail "invalid target SHA"
 [[ "$compat_ref" == "$expected_compat_ref" ]] \
@@ -178,7 +181,7 @@ validate_preflight() {
     || fail "Railway environment not found: $RAILWAY_ENVIRONMENT"
   for service in "${RAILWAY_SERVICES[@]}"; do
     source="$(railway_source_image "$service")"
-    [[ "$source" == "$latest_ref" || "$source" == "docker.io/${latest_ref}" ]] \
+    [[ "$source" == "$latest_ref" ]] \
       || fail "$service source is not $latest_ref: ${source:-missing}"
   done
   for service in "${RAILWAY_COLOCATED_SERVICES[@]}"; do

@@ -9,9 +9,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   PYTHON_VERSION: "3.13"
@@ -23,6 +20,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -68,6 +67,8 @@ jobs:
       PLATFORM_SECRET_KEYS: Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -91,21 +92,24 @@ jobs:
 
   image:
     name: Production image
+    needs: [lint, test]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Verify release and rollback shell contracts
         run: |
           set -euo pipefail
           bash -n \
             scripts/publish_railway_release.sh \
-            scripts/publish_railway_docker_release.sh \
+            scripts/verify_production_image.sh \
             scripts/verify_migration_compatible_rollback.sh \
             scripts/rollback_railway_migration_compatible.sh
           test -x scripts/publish_railway_release.sh
-          test -x scripts/publish_railway_docker_release.sh
+          test -x scripts/verify_production_image.sh
           test -x scripts/verify_migration_compatible_rollback.sh
           test -x scripts/rollback_railway_migration_compatible.sh
       - name: Build linux/amd64 production image
@@ -139,35 +143,111 @@ jobs:
           test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.rollback-target-release"}}')" = "${GITHUB_SHA}"
           test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "c3e7a9f1b204"
       - name: Verify image contract
+        run: scripts/verify_production_image.sh "reply-core-ci:${GITHUB_SHA}" "$GITHUB_SHA"
+      - name: Export verified production image
         run: |
           set -euo pipefail
-          image="reply-core-ci:${GITHUB_SHA}"
-          test "$(docker image inspect "$image" --format '{{.Config.User}}')" = "appuser"
-          test "$(docker run --rm --entrypoint id "$image" -u)" = "10001"
-          test "$(docker run --rm --entrypoint id "$image" -g)" = "10001"
-          test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
-          test "$(docker image inspect "$image" --format '{{.Architecture}}')" = "amd64"
-          docker run --rm --entrypoint sh "$image" -c 'test ! -w /app/src && test ! -w /app/.venv'
-          docker run --rm --entrypoint sh "$image" -c 'test ! -e /app/tests && test ! -e /app/docs && test ! -e /app/scripts/publish_railway_release.sh'
-          docker run --rm \
-            -e TESTING=true \
-            -e PLATFORM_SECRET_KEYS=Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM= \
-            --entrypoint python \
-            "$image" \
-            -c 'import apps.api.main, apps.worker.main, apps.scheduler.main, scripts.prepare_database; print("runtime imports ok")'
-          docker run --rm \
-            -e TESTING=true \
-            -e PLATFORM_SECRET_KEYS=Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM= \
-            --entrypoint alembic \
-            "$image" \
-            heads
-          if docker run --rm "$image" >/tmp/reply-core-missing-role.log 2>&1; then
-            cat /tmp/reply-core-missing-role.log
-            exit 1
+          docker save "reply-core-ci:${GITHUB_SHA}" | gzip -1 >"/tmp/reply-core-${GITHUB_SHA}.tar.gz"
+      - name: Upload verified production image
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: verified-production-image-${{ github.sha }}
+          path: /tmp/reply-core-${{ github.sha }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-ghcr:
+    name: Publish GHCR image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    needs: [image]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Download verified production image
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: verified-production-image-${{ github.sha }}
+          path: /tmp
+      - name: Load verified production image
+        run: gzip -dc "/tmp/reply-core-${GITHUB_SHA}.tar.gz" | docker load
+      - name: Publish verified image to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_IMAGE: ghcr.io/junqingyongyuanbusi/reply-core
+          BOOTSTRAP_PREDECESSOR_REF: docker.io/zhiyangxiaozi/reply-core@sha256:d84321509c6ce945d9b04ec5239fe4781892079abbc1a2dee6058c966aa01792
+          BOOTSTRAP_PREDECESSOR_DIGEST: sha256:d84321509c6ce945d9b04ec5239fe4781892079abbc1a2dee6058c966aa01792
+          BOOTSTRAP_PREDECESSOR_TAG: ghcr.io/junqingyongyuanbusi/reply-core:dockerhub-predecessor-859a4499be2c
+          GHCR_PROMOTE_SHA: ${{ vars.GHCR_PROMOTE_SHA }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          local_image="reply-core-ci:${GITHUB_SHA}"
+          sha_ref="${GHCR_IMAGE}:${GITHUB_SHA}"
+          if docker buildx imagetools inspect "$sha_ref" >/dev/null 2>&1; then
+            docker pull "$sha_ref"
+            scripts/verify_production_image.sh "$sha_ref" "$GITHUB_SHA"
+            digest="$(docker buildx imagetools inspect "$sha_ref" | awk '/^Digest:/ {print $2; exit}')"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            echo "Immutable SHA tag already exists and passed the full image contract"
+          else
+            temporary_ref="${GHCR_IMAGE}:ci-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            docker tag "$local_image" "$temporary_ref"
+            docker push "$temporary_ref"
+            verified_digest="$(docker buildx imagetools inspect "$temporary_ref" | awk '/^Digest:/ {print $2; exit}')"
+            [[ "$verified_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$sha_ref" \
+              "${GHCR_IMAGE}@${verified_digest}"
+            digest="$(docker buildx imagetools inspect "$sha_ref" | awk '/^Digest:/ {print $2; exit}')"
+            test "$digest" = "$verified_digest"
           fi
-          grep -q "SERVICE_ROLE is required" /tmp/reply-core-missing-role.log
-          if docker run --rm -e SERVICE_ROLE=invalid "$image" >/tmp/reply-core-invalid-role.log 2>&1; then
-            cat /tmp/reply-core-invalid-role.log
-            exit 1
+
+          if ! docker buildx imagetools inspect "$BOOTSTRAP_PREDECESSOR_TAG" >/dev/null 2>&1; then
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$BOOTSTRAP_PREDECESSOR_TAG" \
+              "$BOOTSTRAP_PREDECESSOR_REF"
           fi
-          grep -q "unknown SERVICE_ROLE" /tmp/reply-core-invalid-role.log
+          mirrored_predecessor_digest="$(docker buildx imagetools inspect "$BOOTSTRAP_PREDECESSOR_TAG" | awk '/^Digest:/ {print $2; exit}')"
+          test "$mirrored_predecessor_digest" = "$BOOTSTRAP_PREDECESSOR_DIGEST"
+
+          latest_digest=""
+          if [[ "$GHCR_PROMOTE_SHA" == "$GITHUB_SHA" ]]; then
+            latest_ref="${GHCR_IMAGE}:latest"
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$latest_ref" \
+              "${GHCR_IMAGE}@${digest}"
+            latest_digest="$(docker buildx imagetools inspect "$latest_ref" | awk '/^Digest:/ {print $2; exit}')"
+            test "$latest_digest" = "$digest"
+            echo "Promoted release-controlled latest to $digest"
+          fi
+          mkdir -p dist
+          jq -n \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg image_repository "$GHCR_IMAGE" \
+            --arg sha_ref "$sha_ref" \
+            --arg digest "$digest" \
+            --arg predecessor_digest "$mirrored_predecessor_digest" \
+            --arg latest_digest "$latest_digest" \
+            '{git_sha: $git_sha, image_repository: $image_repository,
+              sha_ref: $sha_ref, digest: $digest,
+              latest_digest: $latest_digest,
+              mirrored_predecessor_digest: $predecessor_digest}' \
+            >"dist/ghcr-image-${GITHUB_SHA}.json"
+          echo "Published immutable $sha_ref at $digest; latest promotion=$([[ -n "$latest_digest" ]] && echo yes || echo no)"
+      - name: Upload GHCR image evidence
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: ghcr-image-${{ github.sha }}
+          path: dist/ghcr-image-${{ github.sha }}.json
+          if-no-files-found: error
+          retention-days: 90

@@ -2,35 +2,25 @@
 
 This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
-`scripts/publish_railway_release.sh` for the normal commit-pinned GitHub source release path.
+`scripts/publish_railway_release.sh` for the required production release path.
 
-## Current production release paths
+## Docker Hub to GHCR registry bootstrap
 
-Normal code releases originate from GitHub `dev`. `.github/workflows/deploy-production.yml` waits
-for the exact commit's CI run and then invokes `scripts/publish_railway_release.sh`. The script
-requires Railway native autodeploy to be disabled, deploys API first, verifies `/healthz`, and then
-deploys Worker and Scheduler. Every role must finish at `SUCCESS` with deployment metadata
-`commitHash` equal to the same requested SHA. A rerun may resume when roles are split only between
-the predecessor and target commits; any unrelated third commit fails closed.
+The one-time registry migration preserves the running Docker Hub predecessor before changing any
+Railway source. The GHCR publish job mirrors
+`docker.io/zhiyangxiaozi/reply-core@sha256:d84321509c6ce945d9b04ec5239fe4781892079abbc1a2dee6058c966aa01792`
+as `ghcr.io/junqingyongyuanbusi/reply-core:dockerhub-predecessor-859a4499be2c` and verifies the digest.
+The target CI job publishes an immutable full-SHA GHCR image; the package must then be made public and
+an anonymous inspect/pull must succeed.
 
-The normal source workflow compares the production predecessor with the target and refuses any
-change under `migrations/` or to `alembic.ini` before mutating production. This boundary is
-intentional: after API applies a new Alembic head, a raw old source commit may not contain that
-revision and can fail both database preparation and readiness checks.
-
-A commit that changes the migration graph therefore requires an explicitly reviewed
-migration-aware release. `scripts/publish_railway_docker_release.sh` preserves the former immutable
-Docker image, compatibility-image and manifest machinery for that path; it is not the normal release
-entrypoint. Before using it with GitHub-source production services, the operator must write and
-review a staged source-transition plan for that specific migration, preserve the active source
-commit/deployment IDs and Docker fallback digest, build and smoke-test the compatibility image, and
-perform API → health → Worker → Scheduler ordering. Do not reconnect all three services to an image
-source concurrently, and do not deploy a raw predecessor after the database moves forward.
-
-The Docker Hub and digest commands in older revision-specific sections below describe the releases
-for which they were written. They are historical migration evidence, not authorization to bypass the
-current source-release gate.
-
+For the first Railway switch, promote the verified target digest to GHCR `latest`, then change and
+deploy only API. Wait for `SUCCESS` and `/healthz` before changing Worker, then Scheduler. Do not
+enable Railway native image auto-update and do not change all three sources concurrently. Preserve
+the original Docker Hub digest and deployment IDs until all three GHCR deployments report the same
+target digest and production configuration fingerprints remain unchanged. After this bootstrap,
+`scripts/publish_railway_release.sh` owns normal GHCR `latest` promotion and coordinated rollout.
+Delete the repository variable `GHCR_PROMOTE_SHA` immediately after the bootstrap so later image-only
+CI runs cannot move the production tag.
 The current Alembic graph has one head: `c3e7a9f1b204`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
@@ -57,8 +47,8 @@ candidate execution is available.
 ### Migration-compatible rollback
 
 The raw predecessor image does not contain revision `a6f1c3d8e205` and must not be restarted after
-the database reaches this head. Before promoting Docker Hub `latest`,
-`scripts/publish_railway_docker_release.sh` builds an auxiliary migration-compatible rollback image from
+the database reaches this head. Before promoting GHCR `latest`,
+`scripts/publish_railway_release.sh` now builds an auxiliary migration-compatible rollback image from
 the exact active predecessor digest and overlays only the additive evaluation migration. Its OCI
 revision remains the predecessor application SHA; labels record the target release SHA, predecessor
 digest and database head.
@@ -77,7 +67,7 @@ scripts/rollback_railway_migration_compatible.sh \
   dist/release-<target-full-sha>.json
 ```
 
-The rollback script atomically retags Docker Hub `latest` to the compatibility digest, then redeploys
+The rollback script atomically retags GHCR `latest` to the compatibility digest, then redeploys
 API, waits for `/healthz`, and redeploys Worker and Scheduler. It verifies all three roles run the
 same compatibility digest and that production configuration remains fail-closed. PostgreSQL stays at
 `c3e7a9f1b204`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
@@ -235,7 +225,7 @@ After coordinated enablement, provision the tenant account, copy the returned Ca
 Feishu console, complete URL verification, subscribe to `im.message.receive_v1`, publish the
 application and perform draft-only smoke checks. Callback configuration is manual and is not
 performed by the provisioning API. Do not declare the release complete until API, Worker and
-Scheduler all report the identical digest required by the historical `scripts/publish_railway_docker_release.sh` path. Promote
+Scheduler all report the identical digest required by `scripts/publish_railway_release.sh`. Promote
 an account from `BOT_DRAFT_ONLY` to `BOT_ACTIVE` only after provider-side smoke verification. No
 production Feishu credential or successful live Feishu E2E is implied by this migration.
 
@@ -420,7 +410,7 @@ through a ReplyDecision. For this release's API-first Railway rollout, pause cla
 account-policy mutations, manual replies, and draft approvals before the migration starts. Keep the
 pause until every API instance runs the new image and API, Worker, and Scheduler all report
 `SUCCESS` at the same digest. Read-only inbox use remains safe. Run the standard
-`scripts/publish_railway_docker_release.sh`, keep the coordinated pause through its final digest
+`scripts/publish_railway_release.sh`, keep the coordinated pause through its final digest
 verification, then perform one manual-reply smoke test with a dedicated platform account. A row
 accepted during an accidental mixed-version window may move to `NEEDS_REVIEW`; inspect its delivery
 attempts and retry only after every Worker is on the new digest.
@@ -525,7 +515,7 @@ railway scale --environment production --service worker us-east4-eqdc4a=0
 railway scale --environment production --service scheduler us-east4-eqdc4a=0
 ```
 
-Wait until no `decision_jobs` row is `PROCESSING` and no `DECISION/BOT` Outbox row is `SENDING`. Revision `d3f6a1b8c904` aborts if such a send is active and quarantines queued `PENDING` or `FAILED` `DECISION/BOT` Outboxes as `NEEDS_REVIEW/PROMPT_GOVERNANCE_ROLLOUT`. With both roles still at zero replicas, run `scripts/publish_railway_docker_release.sh`; the script retains the prior digest, promotes the immutable SHA image, migrates and verifies API first, then creates the target Worker and Scheduler deployments. After the script succeeds, restore the recorded capacities against the target deployments:
+Wait until no `decision_jobs` row is `PROCESSING` and no `DECISION/BOT` Outbox row is `SENDING`. Revision `d3f6a1b8c904` aborts if such a send is active and quarantines queued `PENDING` or `FAILED` `DECISION/BOT` Outboxes as `NEEDS_REVIEW/PROMPT_GOVERNANCE_ROLLOUT`. With both roles still at zero replicas, run `scripts/publish_railway_release.sh`; the script retains the prior digest, promotes the immutable SHA image, migrates and verifies API first, then creates the target Worker and Scheduler deployments. After the script succeeds, restore the recorded capacities against the target deployments:
 
 ```bash
 railway scale --environment production --service worker us-east4-eqdc4a=1

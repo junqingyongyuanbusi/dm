@@ -8,28 +8,20 @@ Use `.env.example` for local development only. Production configuration is store
 platform and validated by `scripts/validate_railway_config.py` during every release. API, Worker, and
 Scheduler must use the same application settings unless a variable is explicitly deployment-role-only.
 
-## Production deployment source
+## Production image registry
 
-The existing Railway `reply-core / production` services build from GitHub repository
-`junqingyongyuanbusi/dm`. API, Worker and Scheduler use the `dev` history and the repository-root
-`Dockerfile`; `SERVICE_ROLE` remains `api`, `worker` and `scheduler` respectively. Railway native
-GitHub autodeploy and deployment triggers stay disabled so they cannot bypass the coordinated
-release order.
+GitHub Actions builds and verifies the production image once after Ruff and Pytest succeed. A
+separate `publish-ghcr` job receives that exact image as an artifact and publishes the immutable
+`ghcr.io/junqingyongyuanbusi/reply-core:<full-git-sha>` tag without rebuilding it. The job uses the
+repository-scoped `GITHUB_TOKEN`; no Docker Hub credential is required.
 
-`.github/workflows/deploy-production.yml` is the only automatic source-release trigger. It waits for
-the exact push SHA's CI run, then `scripts/publish_railway_release.sh` deploys that immutable commit
-through Railway's commit-pinned API in API → `/healthz` → Worker → Scheduler order. A production
-project token is stored only as the GitHub Actions `RAILWAY_TOKEN` secret; it must never be copied to
-Railway variables, repository files or logs.
-
-The release script reads rendered variables for real Pydantic Settings validation and separately
-fingerprints unrendered Railway references. Source changes and releases must preserve all existing
-variables, `${{Postgres.DATABASE_URL}}` / `${{Redis.REDIS_URL}}` references, domains, replica/restart
-configuration and role assignments. Only API may have public domains.
-
-Automatic source release intentionally refuses changes under `migrations/` or to `alembic.ini`.
-Those commits require the migration-aware procedure in `docs/production-migration.md`; CI success
-alone does not authorize applying a new schema graph to production.
+The mutable `latest` tag is release-controlled and is not moved by an ordinary image publish unless
+`GHCR_PROMOTE_SHA` explicitly equals that workflow SHA. This variable is a one-time registry-bootstrap
+gate only: delete it immediately after Railway has switched to GHCR. Normal `latest` promotion belongs
+to `scripts/publish_railway_release.sh` after rollback preparation. Railway native image auto-update remains
+disabled. Production rollout still follows API → `/healthz` → Worker → Scheduler and verifies all
+three roles run the same digest. The GHCR package must be public before Railway is switched so the
+services can pull it without registry credentials.
 ## Core and security
 
 | Variable | Code default | Requirement / owner |

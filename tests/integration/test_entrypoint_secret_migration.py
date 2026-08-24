@@ -28,7 +28,7 @@ def test_entrypoint_rejects_missing_role():
 
 
 def test_release_requires_app_and_state_service_colocation():
-    script = Path("scripts/publish_railway_docker_release.sh").read_text()
+    script = Path("scripts/publish_railway_release.sh").read_text()
     assert "RAILWAY_COLOCATED_SERVICES=(api worker scheduler Postgres Redis)" in script
     assert 'RAILWAY_REGION="us-east4-eqdc4a"' in script
     assert script.count("validate_railway_colocation") == 3
@@ -53,54 +53,44 @@ def test_release_requires_app_and_state_service_colocation():
     assert script.rindex("require_target_latest") < script.index('write_manifest "completed"')
 
 
-def test_source_release_is_commit_pinned_ordered_and_fail_closed():
+def test_ci_publishes_the_verified_image_as_immutable_ghcr_sha():
+    workflow = Path(".github/workflows/ci.yml").read_text()
+    assert "packages: write" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "ghcr.io/junqingyongyuanbusi/reply-core" in workflow
+    assert 'local_image="reply-core-ci:${GITHUB_SHA}"' in workflow
+    assert (
+        'temporary_ref="${GHCR_IMAGE}:ci-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"'
+        in workflow
+    )
+    assert 'sha_ref="${GHCR_IMAGE}:${GITHUB_SHA}"' in workflow
+    assert 'docker pull "$sha_ref"' in workflow
+    assert 'scripts/verify_production_image.sh "$sha_ref" "$GITHUB_SHA"' in workflow
+    assert "--prefer-index=false" in workflow
+    assert "GHCR_PROMOTE_SHA" in workflow
+    assert 'if [[ "$GHCR_PROMOTE_SHA" == "$GITHUB_SHA" ]]' in workflow
+    assert "Publish verified image to GHCR" in workflow
+    assert Path("scripts/verify_production_image.sh").stat().st_mode & 0o111
+
+
+def test_release_promotes_latest_then_deploys_api_first():
     script = Path("scripts/publish_railway_release.sh").read_text()
-    assert "serviceInstanceDeployV2" in script
-    assert "commitSha: $commitSha" in script
-    assert "Project-Access-Token" in script
-    assert '--connect-timeout "$GRAPHQL_CONNECT_TIMEOUT_SECONDS"' in script
-    assert '--max-time "$GRAPHQL_QUERY_MAX_TIME_SECONDS"' in script
-    assert '--retry-max-time "$GRAPHQL_QUERY_RETRY_MAX_TIME_SECONDS"' in script
-    assert '--max-time "$GRAPHQL_MUTATION_MAX_TIME_SECONDS"' in script
-    assert "native Railway autodeploy must be disabled" in script
-    assert "automatic source release refuses Alembic graph changes" in script
-    assert "git merge-base --is-ancestor" in script
-    assert "target must advance production dev history" in script
-    assert "origin/dev moved before production mutation" in script
-    assert "validate_railway_config" in script
-    assert "validate_railway_colocation" in script
-    assert "configuration_fingerprint" in script
-    api = script.index('api_deployment_id="$(ensure_service_released api)"')
-    final_freshness = script.index("release commit became stale during preflight")
-    fingerprint = script.index('scheduler_config_before="$(configuration_fingerprint scheduler)"')
-    assert fingerprint < final_freshness < api
+    assert 'IMAGE_REPO="ghcr.io/junqingyongyuanbusi/reply-core"' in script
+    assert "CI must publish $sha_ref before Railway release" in script
+    promotion = script.index('--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"')
+    api = script.index('api_deployment_id="$(deploy_role api)"')
     health = script.index("wait_for_api_health", api)
-    worker = script.index('worker_deployment_id="$(ensure_service_released worker)"')
-    scheduler = script.index('scheduler_deployment_id="$(ensure_service_released scheduler)"')
-    assert api < health < worker < scheduler
-    assert "target deployment is still $status; resuming wait" in script
-    assert "target deployment ended with ${status:-unknown}; creating a replacement" in script
-    assert 'response="$(graphql_mutation "$query" "$variables")"' in script
-    assert "production source mutation is authorized only" in script
+    worker = script.index('worker_deployment_id="$(deploy_role worker)"')
+    scheduler = script.index('scheduler_deployment_id="$(deploy_role scheduler)"')
+    assert promotion < api < health < worker < scheduler
     assert Path("scripts/publish_railway_release.sh").stat().st_mode & 0o111
-    assert Path("scripts/publish_railway_docker_release.sh").stat().st_mode & 0o111
-
-
-def test_production_workflow_cannot_cancel_an_active_rollout():
-    workflow = Path(".github/workflows/deploy-production.yml").read_text()
-    assert "group: production-source-release" in workflow
-    assert "cancel-in-progress: false" in workflow
-    assert "timeout-minutes: 120" in workflow
-    assert 'PRODUCTION_DEPLOY_AUTHORIZED: "true"' in workflow
-    assert "vars.RAILWAY_SOURCE_DEPLOY_ENABLED == 'true'" in workflow
-    assert "Wait for exact CI run" in workflow
-    assert "Recheck freshness before production mutation" in workflow
-    assert "steps.final-freshness.outputs.stale != 'true'" in workflow
 
 
 def test_migration_compatible_rollback_retags_latest_and_redeploys_in_order():
     script_path = Path("scripts/rollback_railway_migration_compatible.sh")
     script = script_path.read_text()
+    assert 'IMAGE_REPO="ghcr.io/junqingyongyuanbusi/reply-core"' in script
+    assert "release manifest image repository is not the production GHCR repository" in script
     promote = script.index("docker buildx imagetools create --prefer-index=false")
     verify = script.rindex("verify_compatibility_image")
     api = script.index('api_deployment_id="$(redeploy_role api)"')
