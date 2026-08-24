@@ -5,6 +5,7 @@ readonly IMAGE_REPO="ghcr.io/junqingyongyuanbusi/reply-core"
 readonly RAILWAY_PROJECT_ID="abcf3199-e5ac-415b-a22e-062206390331"
 readonly RAILWAY_PROJECT_NAME="reply-core"
 readonly RAILWAY_ENVIRONMENT="production"
+readonly RAILWAY_ENVIRONMENT_ID="db0d6750-eb77-40ee-8a79-f706cd1f828a"
 readonly PUBLIC_BASE_URL="https://relay.nexory.top"
 readonly SOURCE_URL="https://github.com/junqingyongyuanbusi/dm"
 readonly RAILWAY_REGION="us-east4-eqdc4a"
@@ -165,6 +166,37 @@ railway_source_image() {
   railway_service_node "$1" | jq -r '.source.image // ""'
 }
 
+railway_environment_config_json() {
+  railway api \
+    'query EnvironmentConfig($id: String!, $projectId: String!) { environment(id: $id, projectId: $projectId) { config } }' \
+    --variables "$(jq -cn --arg id "$RAILWAY_ENVIRONMENT_ID" --arg projectId "$RAILWAY_PROJECT_ID" '{id: $id, projectId: $projectId}')" \
+    | jq -e '.data.environment.config'
+}
+
+validate_railway_image_auto_updates() {
+  local service service_id auto_update_type
+  for service in "${RAILWAY_SERVICES[@]}"; do
+    service_id="$(railway_service_node "$service" | jq -r '.serviceId // ""')"
+    [[ -n "$service_id" ]] || fail "cannot resolve Railway service ID for $service"
+    auto_update_type="$(railway_environment_config_json | jq -er \
+      --arg service_id "$service_id" '
+        if (.services | has($service_id) | not) then
+          error("missing_service_config")
+        elif .services[$service_id].source == null then
+          error("missing_service_source")
+        elif .services[$service_id].source.autoUpdates == null then
+          "disabled"
+        elif .services[$service_id].source.autoUpdates.type == "disabled" then
+          "disabled"
+        else
+          (.services[$service_id].source.autoUpdates.type // "unknown")
+        end
+      ')" || fail "cannot determine Railway image auto-update state for $service"
+    [[ "$auto_update_type" == "disabled" ]] \
+      || fail "Railway native image auto-update must be disabled for $service, got: $auto_update_type"
+  done
+}
+
 active_region() {
   railway_status_json | python3 scripts/railway_active_region.py "$RAILWAY_ENVIRONMENT" "$1"
 }
@@ -189,6 +221,7 @@ validate_preflight() {
     [[ "$region" == "$RAILWAY_REGION" ]] \
       || fail "$service region $region does not match $RAILWAY_REGION"
   done
+  validate_railway_image_auto_updates
   uv run --frozen --no-dev python scripts/validate_railway_config.py \
     "$RAILWAY_PROJECT_ID" "$RAILWAY_ENVIRONMENT" "$PUBLIC_BASE_URL"
 }
@@ -245,35 +278,40 @@ require_compat_latest() {
 
 wait_for_deployment() {
   local service="$1"
-  local previous_id="$2"
+  local deployment_id="$2"
   local deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
-  local deployment id status digest
+  local deployment status digest
   while (( SECONDS < deadline )); do
-    deployment="$(latest_deployment_json "$service")"
-    id="$(jq -r '.id // ""' <<<"$deployment")"
+    deployment="$(railway deployment list \
+      --project "$RAILWAY_PROJECT_ID" \
+      --environment "$RAILWAY_ENVIRONMENT" \
+      --service "$service" \
+      --limit 100 \
+      --json | jq --arg id "$deployment_id" 'map(select(.id == $id))[0]')"
     status="$(jq -r '.status // ""' <<<"$deployment")"
     digest="$(jq -r '.meta.imageDigest // ""' <<<"$deployment")"
-    if [[ -n "$id" && "$id" != "$previous_id" ]]; then
-      case "$status" in
-        SUCCESS)
-          [[ "$digest" == "$compat_digest" ]] \
-            || fail "$service deployed $digest, expected $compat_digest"
-          printf '%s\n' "$id"
-          return 0
-          ;;
-        FAILED|CRASHED|REMOVED)
-          fail "$service rollback deployment $id ended with $status"
-          ;;
-      esac
-    fi
+    case "$status" in
+      SUCCESS)
+        [[ "$digest" == "$compat_digest" ]] \
+          || fail "$service deployed $digest, expected $compat_digest"
+        printf '%s\n' "$deployment_id"
+        return 0
+        ;;
+      FAILED|CRASHED|REMOVED|SKIPPED|SLEEPING)
+        fail "$service rollback deployment $deployment_id ended with $status"
+        ;;
+      QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL|"") ;;
+      *) fail "$service rollback deployment $deployment_id returned unknown status $status" ;;
+    esac
     sleep 5
   done
-  fail "timed out waiting for rollback deployment: $service"
+  fail "timed out waiting for rollback deployment: $service/$deployment_id"
 }
 
 redeploy_role() {
   local service="$1"
-  local active active_id active_digest before_id deployment_id
+  local active active_id active_digest latest latest_id latest_status latest_digest
+  local redeploy_output deployment_id
   validate_current_state
   require_compat_latest
   active="$(active_deployment_json "$service")"
@@ -285,17 +323,48 @@ redeploy_role() {
   fi
   [[ "$active_digest" == "$target_digest" || "$active_digest" == "$previous_digest" ]] \
     || fail "$service cannot rollback from $active_digest"
-  before_id="$(jq -r '.id // ""' <<<"$(latest_deployment_json "$service")")"
+
+  latest="$(latest_deployment_json "$service")"
+  latest_id="$(jq -r '.id // ""' <<<"$latest")"
+  latest_status="$(jq -r '.status // ""' <<<"$latest")"
+  latest_digest="$(jq -r '.meta.imageDigest // ""' <<<"$latest")"
+  if [[ -n "$latest_id" && "$latest_id" != "$active_id" ]]; then
+    if [[ "$latest_digest" == "$compat_digest" ]]; then
+      case "$latest_status" in
+        SUCCESS)
+          printf '%s\n' "$latest_id"
+          return 0
+          ;;
+        QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL)
+          log "resuming in-flight $service rollback deployment: $latest_id"
+          wait_for_deployment "$service" "$latest_id" >/dev/null
+          printf '%s\n' "$latest_id"
+          return 0
+          ;;
+        FAILED|CRASHED|REMOVED|SKIPPED|SLEEPING) ;;
+        *) fail "$service rollback deployment has unknown status $latest_status" ;;
+      esac
+    elif [[ "$latest_status" =~ ^(QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL)$ ]]; then
+      fail "$service has unresolved in-flight rollback deployment $latest_id with digest ${latest_digest:-unknown}"
+    fi
+  fi
+
   require_compat_latest
   log "redeploying $service from migration-compatible latest"
-  railway redeploy \
+  redeploy_output="$(railway redeploy \
     --project "$RAILWAY_PROJECT_ID" \
     --environment "$RAILWAY_ENVIRONMENT" \
     --service "$service" \
     --from-source \
     --yes \
-    --json >/dev/null
-  deployment_id="$(wait_for_deployment "$service" "$before_id")"
+    --json)" || fail "Railway rollback redeploy request failed for $service; inspect state before retrying"
+  deployment_id="$(jq -r '.id // .deploymentId // ""' <<<"$redeploy_output")"
+  if [[ -z "$deployment_id" ]]; then
+    deployment_id="$(jq -r '.id // ""' <<<"$(latest_deployment_json "$service")")"
+    [[ -n "$deployment_id" && "$deployment_id" != "$latest_id" ]] \
+      || fail "Railway rollback redeploy returned no trackable deployment ID for $service"
+  fi
+  wait_for_deployment "$service" "$deployment_id" >/dev/null
   printf '%s\n' "$deployment_id"
 }
 
@@ -340,6 +409,7 @@ done
 
 uv run --frozen --no-dev python scripts/validate_railway_config.py \
   "$RAILWAY_PROJECT_ID" "$RAILWAY_ENVIRONMENT" "$PUBLIC_BASE_URL"
+validate_railway_image_auto_updates
 require_compat_latest
 
 rollback_manifest="dist/rollback-${target_sha}.json"

@@ -77,6 +77,9 @@ def test_release_promotes_latest_then_deploys_api_first():
     script = Path("scripts/publish_railway_release.sh").read_text()
     assert 'IMAGE_REPO="ghcr.io/junqingyongyuanbusi/reply-core"' in script
     assert "CI must publish $sha_ref before Railway release" in script
+    assert "Railway native image auto-update must be disabled" in script
+    assert "resuming in-flight $service deployment" in script
+    assert "refusing duplicate redeploy" in script
     promotion = script.index('--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"')
     api = script.index('api_deployment_id="$(deploy_role api)"')
     health = script.index("wait_for_api_health", api)
@@ -91,6 +94,9 @@ def test_migration_compatible_rollback_retags_latest_and_redeploys_in_order():
     script = script_path.read_text()
     assert 'IMAGE_REPO="ghcr.io/junqingyongyuanbusi/reply-core"' in script
     assert "release manifest image repository is not the production GHCR repository" in script
+    assert script.count("validate_railway_image_auto_updates") >= 3
+    assert "resuming in-flight $service rollback deployment" in script
+    assert "unresolved in-flight rollback deployment" in script
     promote = script.index("docker buildx imagetools create --prefer-index=false")
     verify = script.rindex("verify_compatibility_image")
     api = script.index('api_deployment_id="$(redeploy_role api)"')
