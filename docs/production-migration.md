@@ -4,23 +4,20 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
 `scripts/publish_railway_release.sh` for the required production release path.
 
-## Docker Hub to GHCR registry bootstrap
+## Completed Docker Hub to GHCR registry bootstrap
 
-The one-time registry migration preserves the running Docker Hub predecessor before changing any
-Railway source. The GHCR publish job mirrors
-`docker.io/zhiyangxiaozi/reply-core@sha256:d84321509c6ce945d9b04ec5239fe4781892079abbc1a2dee6058c966aa01792`
-as `ghcr.io/junqingyongyuanbusi/reply-core:dockerhub-predecessor-859a4499be2c` and verifies the digest.
-The target CI job publishes an immutable full-SHA GHCR image; the package must then be made public and
-an anonymous inspect/pull must succeed.
+Production moved from Docker Hub digest
+`sha256:d84321509c6ce945d9b04ec5239fe4781892079abbc1a2dee6058c966aa01792`
+to public `ghcr.io/junqingyongyuanbusi/reply-core`. The predecessor remains mirrored as
+`dockerhub-predecessor-859a4499be2c` for audit and bootstrap recovery evidence. The target was
+promoted once, then Railway was changed in API → `/healthz` → Worker → Scheduler order. All three
+roles converged on digest
+`sha256:1289dd7731149279aa8eac72a15a598967898e5ff2e52e097d702d9090b0b631`, and pre/post
+configuration snapshots matched.
 
-For the first Railway switch, promote the verified target digest to GHCR `latest`, then change and
-deploy only API. Wait for `SUCCESS` and `/healthz` before changing Worker, then Scheduler. Do not
-enable Railway native image auto-update and do not change all three sources concurrently. Preserve
-the original Docker Hub digest and deployment IDs until all three GHCR deployments report the same
-target digest and production configuration fingerprints remain unchanged. After this bootstrap,
-`scripts/publish_railway_release.sh` owns normal GHCR `latest` promotion and coordinated rollout.
-Delete the repository variable `GHCR_PROMOTE_SHA` immediately after the bootstrap so later image-only
-CI runs cannot move the production tag.
+The one-time CI bootstrap/mirror/promotion controls have been removed. Current CI publishes only
+immutable full-SHA tags. `latest` promotion and every subsequent Railway rollout belong exclusively
+to `scripts/publish_railway_release.sh`; Railway native image auto-update must remain disabled.
 The current Alembic graph has one head: `c3e7a9f1b204`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.

@@ -15,10 +15,9 @@ separate `publish-ghcr` job receives that exact image as an artifact and publish
 `ghcr.io/junqingyongyuanbusi/reply-core:<full-git-sha>` tag without rebuilding it. The job uses the
 repository-scoped `GITHUB_TOKEN`; no Docker Hub credential is required.
 
-The mutable `latest` tag is release-controlled and is not moved by an ordinary image publish unless
-`GHCR_PROMOTE_SHA` explicitly equals that workflow SHA. This variable is a one-time registry-bootstrap
-gate only: delete it immediately after Railway has switched to GHCR. Normal `latest` promotion belongs
-to `scripts/publish_railway_release.sh` after rollback preparation. Railway native image auto-update remains
+The mutable `latest` tag is release-controlled and is never moved by ordinary CI. Only
+`scripts/publish_railway_release.sh` may promote `latest`, after it has verified the CI-published SHA
+image and prepared rollback evidence. Railway native image auto-update remains
 disabled. Production rollout still follows API → `/healthz` → Worker → Scheduler and verifies all
 three roles run the same digest. The GHCR package must be public before Railway is switched so the
 services can pull it without registry credentials.

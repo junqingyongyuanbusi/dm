@@ -67,8 +67,9 @@ def test_ci_publishes_the_verified_image_as_immutable_ghcr_sha():
     assert 'docker pull "$sha_ref"' in workflow
     assert 'scripts/verify_production_image.sh "$sha_ref" "$GITHUB_SHA"' in workflow
     assert "--prefer-index=false" in workflow
-    assert "GHCR_PROMOTE_SHA" in workflow
-    assert 'if [[ "$GHCR_PROMOTE_SHA" == "$GITHUB_SHA" ]]' in workflow
+    assert "latest remains release-controlled" in workflow
+    assert "GHCR_PROMOTE_SHA" not in workflow
+    assert "BOOTSTRAP_PREDECESSOR" not in workflow
     assert "Publish verified image to GHCR" in workflow
     assert Path("scripts/verify_production_image.sh").stat().st_mode & 0o111
 

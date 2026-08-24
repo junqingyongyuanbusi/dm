@@ -114,7 +114,7 @@ Railway 中的“测试”只允许是部署后的有界 smoke、`/healthz`、�
 - 只能从干净工作树、已推送且等于 `origin/dev` 的 `dev` commit 执行 production promotion/rollout。
 - `.github/workflows/ci.yml` 的 production image job 在 Ruff/Pytest 成功后构建、验证并推送唯一目标 `linux/amd64` immutable SHA 镜像；发布脚本不得重建目标镜像。涉及新增 Alembic head 时，发布脚本可额外基于当前运行 predecessor digest 构建只叠加新 migration graph 的 migration-compatible rollback image。
 - 推送 immutable full-SHA tag：`ghcr.io/junqingyongyuanbusi/reply-core:<40-character-git-sha>`。
-- 不得单独重建 `latest`。首次 Docker Hub→GHCR bootstrap 可让 CI 在 `GHCR_PROMOTE_SHA` 精确等于目标 SHA 时提升一次；Railway 切换完成后必须立即删除该变量。后续 `latest` 只能由发布脚本在回滚准备完成后提升。
+- CI 只发布 immutable SHA，不得移动 `latest`。`latest` 只能由 `scripts/publish_railway_release.sh` 在回滚准备完成后用 registry manifest tooling 提升。
 - 提升时必须使用 `docker buildx imagetools create --prefer-index=false`，确保 SHA tag 与 `latest` 解析到同一 digest。
 - 替换 `latest` 前，将 Railway 当前运行 digest 保留为 `railway-pre-<short-sha>` 审计 tag；若新 release 引入 Alembic head，还必须构建、推送并 smoke-test `railway-compat-pre-<short-sha>`，其内容为 predecessor app 加新 migration graph。数据库迁移后应用回滚只能使用 compatible digest，不能直接使用 raw predecessor digest。Immutable tag 不得删除或覆盖。
 

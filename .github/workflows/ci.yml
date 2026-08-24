@@ -181,10 +181,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GHCR_IMAGE: ghcr.io/junqingyongyuanbusi/reply-core
-          BOOTSTRAP_PREDECESSOR_REF: docker.io/zhiyangxiaozi/reply-core@sha256:d84321509c6ce945d9b04ec5239fe4781892079abbc1a2dee6058c966aa01792
-          BOOTSTRAP_PREDECESSOR_DIGEST: sha256:d84321509c6ce945d9b04ec5239fe4781892079abbc1a2dee6058c966aa01792
-          BOOTSTRAP_PREDECESSOR_TAG: ghcr.io/junqingyongyuanbusi/reply-core:dockerhub-predecessor-859a4499be2c
-          GHCR_PROMOTE_SHA: ${{ vars.GHCR_PROMOTE_SHA }}
         run: |
           set -euo pipefail
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
@@ -210,40 +206,16 @@ jobs:
             test "$digest" = "$verified_digest"
           fi
 
-          if ! docker buildx imagetools inspect "$BOOTSTRAP_PREDECESSOR_TAG" >/dev/null 2>&1; then
-            docker buildx imagetools create \
-              --prefer-index=false \
-              --tag "$BOOTSTRAP_PREDECESSOR_TAG" \
-              "$BOOTSTRAP_PREDECESSOR_REF"
-          fi
-          mirrored_predecessor_digest="$(docker buildx imagetools inspect "$BOOTSTRAP_PREDECESSOR_TAG" | awk '/^Digest:/ {print $2; exit}')"
-          test "$mirrored_predecessor_digest" = "$BOOTSTRAP_PREDECESSOR_DIGEST"
-
-          latest_digest=""
-          if [[ "$GHCR_PROMOTE_SHA" == "$GITHUB_SHA" ]]; then
-            latest_ref="${GHCR_IMAGE}:latest"
-            docker buildx imagetools create \
-              --prefer-index=false \
-              --tag "$latest_ref" \
-              "${GHCR_IMAGE}@${digest}"
-            latest_digest="$(docker buildx imagetools inspect "$latest_ref" | awk '/^Digest:/ {print $2; exit}')"
-            test "$latest_digest" = "$digest"
-            echo "Promoted release-controlled latest to $digest"
-          fi
           mkdir -p dist
           jq -n \
             --arg git_sha "$GITHUB_SHA" \
             --arg image_repository "$GHCR_IMAGE" \
             --arg sha_ref "$sha_ref" \
             --arg digest "$digest" \
-            --arg predecessor_digest "$mirrored_predecessor_digest" \
-            --arg latest_digest "$latest_digest" \
             '{git_sha: $git_sha, image_repository: $image_repository,
-              sha_ref: $sha_ref, digest: $digest,
-              latest_digest: $latest_digest,
-              mirrored_predecessor_digest: $predecessor_digest}' \
+              sha_ref: $sha_ref, digest: $digest}' \
             >"dist/ghcr-image-${GITHUB_SHA}.json"
-          echo "Published immutable $sha_ref at $digest; latest promotion=$([[ -n "$latest_digest" ]] && echo yes || echo no)"
+          echo "Published immutable $sha_ref at $digest; latest remains release-controlled"
       - name: Upload GHCR image evidence
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
         with:
