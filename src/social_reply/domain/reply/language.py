@@ -495,13 +495,30 @@ def expected_scripts_for(text: str | None) -> frozenset[str] | None:
     return frozenset({script, "latin"}) if script else None
 
 
+def _strip_neutral_terms(text: str, terms: tuple[str, ...]) -> str:
+    """删掉必须逐字保留的语言中立术语（品牌名、监管机构缩写、MT4 这类产品名）。
+
+    输出闸门强制这些 token 与英语标准答案完全一致，它们本身不携带任何语种信息。
+    留在文本里只会抬高拉丁字母占比，把一条正确的日语/中文回复判成「回错语言」：
+    实测「マーケットチャートには MT4、MT5、または TradingView…」这类答案在生产
+    语料里占 31.8%，逐条误杀。长术语先删，避免短前缀吃掉长实体。
+    """
+    stripped = text
+    for term in sorted(terms, key=len, reverse=True):
+        if term:
+            stripped = stripped.replace(term, " ")
+    return stripped
+
+
 def reply_language_matches(
     expected: str,
     text: str,
     *,
     extra_allowed_scripts: frozenset[str] | None = None,
+    neutral_terms: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
-    observed_detection = detect_language(text)
+    assessable = _strip_neutral_terms(text, neutral_terms)
+    observed_detection = detect_language(assessable)
     observed = observed_detection.tag
     if not observed_detection.is_reliable or not languages_match(expected, observed):
         return False, observed
@@ -511,8 +528,8 @@ def reply_language_matches(
     if extra_allowed_scripts:
         allowed_scripts = allowed_scripts | extra_allowed_scripts
 
-    sentence_safe = _strip_language_neutral_tokens(text)
-    sentence_safe = re.sub(r"(?<=\d)[.,](?=\d)", ":", sentence_safe)
+    neutral_stripped = _strip_language_neutral_tokens(assessable)
+    sentence_safe = re.sub(r"(?<=\d)[.,](?=\d)", ":", neutral_stripped)
     fragments = re.split(r"[.!?。！？；;\n]+", sentence_safe)
     for fragment in fragments:
         cleaned_fragment = fragment.strip()
@@ -531,7 +548,6 @@ def reply_language_matches(
         if fragment_detection.is_reliable and not languages_match(expected, fragment_detection.tag):
             return False, observed
 
-    neutral_stripped = _strip_language_neutral_tokens(text)
     scripts = _letter_scripts(neutral_stripped)
     total = sum(scripts.values())
     if total == 0:

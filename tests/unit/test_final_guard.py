@@ -5,7 +5,7 @@ from social_reply.domain.reply.decision import (
     ReplyDecision,
     Visibility,
 )
-from social_reply.domain.reply.guard import run_final_guard
+from social_reply.domain.reply.guard import protected_entities, run_final_guard
 
 
 def test_non_auto_reply_passes_through_untouched():
@@ -295,6 +295,162 @@ def test_changed_protected_entity_is_blocked():
     )
     assert result.action is ReplyAction.HANDOFF
     assert "GUARD_KNOWLEDGE_ENTITY_MISMATCH" in result.reason_codes
+
+
+# 生产实测：飞书渠道英语全部放行、非英语逐条转人工，根因是实体提取与语言校验都把
+# 「必须逐字保留的拉丁实体」处理错了。以下用例锁住两侧行为，防止再次回归。
+_MULTI_ENTITY_ANSWER = (
+    "This may be possible, but running many EAs can increase CPU "
+    "and memory usage and may affect VPS performance."
+)
+
+
+@pytest.mark.parametrize(
+    ("language", "customer_text", "reply_text"),
+    (
+        # 无空格文字系统：EA/CPU/VPS 两侧都不成立 \b 词边界，曾一个实体都提不出来。
+        (
+            "ja",
+            "1つのVPSで複数のEAを稼働させることはできますか？",
+            "可能ですが、多くのEAを稼働させるとCPUとメモリの使用量が増加し、"
+            "VPSのパフォーマンスに影響する可能性があります。",
+        ),
+        (
+            "zh-Hans",
+            "一台VPS可以同时运行多个EA吗？",
+            "这可能可以，但同时运行多个EA会增加CPU和内存的占用，并可能影响VPS的性能。",
+        ),
+        (
+            "ko",
+            "하나의 VPS에서 여러 EA를 실행할 수 있나요?",
+            "가능할 수 있지만, 많은 EA를 실행하면 CPU와 메모리 사용량이 증가하고 "
+            "VPS 성능에 영향을 줄 수 있습니다.",
+        ),
+        # 有空格的语言：英语原文的复数 EAs 提不出来、译文的 EA 提得出来，集合照样不等。
+        (
+            "es",
+            "¿Puedo usar varios EA en un solo VPS?",
+            "Es posible, pero ejecutar muchos EA puede aumentar el uso de CPU "
+            "y memoria y afectar el rendimiento del VPS.",
+        ),
+        (
+            "ru",
+            "Можно ли запускать несколько EA на одном VPS?",
+            "Это возможно, но запуск многих EA может увеличить использование CPU "
+            "и памяти и повлиять на производительность VPS.",
+        ),
+    ),
+)
+def test_faithful_translation_preserving_acronyms_passes(language, customer_text, reply_text):
+    decision = ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text=reply_text)
+    result = run_final_guard(
+        decision,
+        "feishu",
+        expected_reply_language=language,
+        approved_knowledge_reply=_MULTI_ENTITY_ANSWER,
+        customer_text=customer_text,
+    )
+    assert result.action is ReplyAction.AUTO_REPLY, result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("language", "customer_text", "reply_text"),
+    (
+        # 拉丁实体占比高的正确译文：实体本身不携带语种信息，不得据此判成回错语言。
+        (
+            "ja",
+            "どのチャートを使えばいいですか？",
+            "マーケットチャートには MT4、MT5、または TradingView のご利用をおすすめします。",
+        ),
+        (
+            "zh-Hans",
+            "推荐用什么看图软件？",
+            "我们建议使用 MT4、MT5 或 TradingView 查看市场图表。",
+        ),
+        (
+            "ko",
+            "어떤 차트를 쓰면 좋나요?",
+            "시장 차트에는 MT4, MT5 또는 TradingView 사용을 권장합니다.",
+        ),
+    ),
+)
+def test_latin_heavy_translation_is_not_treated_as_wrong_language(
+    language, customer_text, reply_text
+):
+    decision = ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text=reply_text)
+    result = run_final_guard(
+        decision,
+        "feishu",
+        expected_reply_language=language,
+        approved_knowledge_reply=(
+            "We recommend using MT4, MT5, or TradingView for your market charts."
+        ),
+        customer_text=customer_text,
+    )
+    assert result.action is ReplyAction.AUTO_REPLY, result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("reply_text", "expected_code"),
+    (
+        # 实体被替换/凭空新增，仍必须拦住——放宽边界不得削弱防篡改。
+        (
+            "可能ですが、多くのEAを稼働させるとGPUとメモリの使用量が増加し、"
+            "VPSのパフォーマンスに影響する可能性があります。",
+            "GUARD_KNOWLEDGE_ENTITY_MISMATCH",
+        ),
+        (
+            "可能ですが、多くのEAを稼働させるとCPUとメモリの使用量が増加し、"
+            "VPSのパフォーマンスに影響します。OtherFXにお問い合わせください。",
+            "GUARD_KNOWLEDGE_ENTITY_MISMATCH",
+        ),
+        # 实体齐全但整段是另一种语言：语言闸门照旧拦住。
+        (
+            "Es posible, pero ejecutar muchos EA puede aumentar el uso de CPU "
+            "y memoria y afectar el rendimiento del VPS.",
+            "GUARD_LANGUAGE_MISMATCH",
+        ),
+    ),
+)
+def test_entity_tampering_and_wrong_language_still_blocked(reply_text, expected_code):
+    decision = ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text=reply_text)
+    result = run_final_guard(
+        decision,
+        "feishu",
+        expected_reply_language="ja",
+        approved_knowledge_reply=_MULTI_ENTITY_ANSWER,
+        customer_text="1つのVPSで複数のEAを稼働させることはできますか？",
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert expected_code in result.reason_codes
+
+
+def test_versioned_product_name_substitution_is_blocked():
+    """MT4→MT5 必须拦住：版本号同时是事实 token，由事实闸门先命中。"""
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text="WikiFXは通常、MT5で3営業日以内に返信します。",
+    )
+    result = run_final_guard(
+        decision,
+        "feishu",
+        expected_reply_language="ja",
+        approved_knowledge_reply="WikiFX usually replies within 3 business days on MT4.",
+        customer_text="WikiFXの返信はどのくらいかかりますか？",
+    )
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in result.reason_codes
+
+
+def test_acronym_entities_are_extracted_without_ascii_word_boundaries():
+    """实体提取的口径：无空格语境下照样提得出，缩写复数归一，版本号并入实体本体。"""
+    assert set(protected_entities("多くのEAを稼働させるとCPUとVPSに影響します")) == {
+        "EA",
+        "CPU",
+        "VPS",
+    }
+    assert set(protected_entities("running many EAs can affect VPS")) == {"EA", "VPS"}
+    assert set(protected_entities("MT4 と MT5 に対応しています")) == {"MT4", "MT5"}
 
 
 @pytest.mark.parametrize(

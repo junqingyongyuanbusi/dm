@@ -93,7 +93,13 @@ _CURRENCY_PATTERNS = (
     ("CNY", re.compile(r"(?i)CNY|RMB|人民币|人民幣|(?<!日)元")),
     ("USDT", re.compile(r"(?i)USDT|Tether")),
 )
-_PROTECTED_ENTITY = re.compile(r"\b(?:[A-Z]{2,}|[A-Z][a-z]+[A-Z][A-Za-z]*)\b")
+# 实体边界不能用 \b：Unicode 下 \w 包含汉字、假名、韩文与泰文，"多くのEAを" 里 EA
+# 两侧都不成立词边界，日中韩泰这类不加空格的语言因此一个实体都提不出来——空集与英语
+# 原文的 {CPU, VPS} 必然不等，每条非英语回复都被误判成实体篡改。改用「两侧不是 ASCII
+# 字母」的显式边界；尾随数字并入实体本体，使 MT4/MT5 这类版本号可比对而非截成 MT。
+_PROTECTED_ENTITY = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Z]{2,}\d*s?|[A-Z][a-z]+[A-Z][A-Za-z]*)(?![A-Za-z])"
+)
 _KNOWN_PROTECTED_ENTITIES = (
     "WikiFX",
     "Meta",
@@ -208,10 +214,21 @@ def factual_tokens(text: str, *, language: str = "en") -> tuple[tuple[str, str, 
     return tuple(tokens)
 
 
+def _normalize_entity(value: str) -> str:
+    """归一化缩写复数：英语原文写 EAs、译文写 EA，两者必须算同一个实体。
+
+    不归一时英语侧提不出 EAs（尾随小写 s 破坏全大写形态），译文侧却提得出 EA，
+    集合比对必然不等——与文字系统无关，拉丁语系的译文同样被误判。
+    """
+    if len(value) > 2 and value.endswith("s") and value[:-1].isupper():
+        return value[:-1]
+    return value
+
+
 def protected_entities(text: str) -> tuple[str, ...]:
     regex_entities = [
         entity
-        for entity in _PROTECTED_ENTITY.findall(text)
+        for entity in (_normalize_entity(match) for match in _PROTECTED_ENTITY.findall(text))
         if entity not in {"USD", "EUR", "GBP", "CNY", "RMB", "JPY", "USDT"}
     ]
     known_entities = [entity for entity in _KNOWN_PROTECTED_ENTITIES if entity in text]
@@ -321,10 +338,19 @@ def run_final_guard(
             if customer_script and reply_script and reply_script != customer_script:
                 return _downgrade(decision, "GUARD_LANGUAGE_SCRIPT_MISMATCH")
         else:
+            # 必须逐字保留的实体不得充当语种证据：下面的实体闸门已强制它们与英语
+            # 标准答案完全一致，再让它们抬高拉丁字母占比，等于自相矛盾地把一条
+            # 忠实译文判成回错语言。
             language_ok, observed_language = reply_language_matches(
                 expected_reply_language,
                 text,
                 extra_allowed_scripts=expected_scripts_for(customer_text),
+                neutral_terms=(
+                    protected_entities(approved_knowledge_reply)
+                    if approved_knowledge_reply is not None
+                    else ()
+                )
+                + approved_localization_protected_values,
             )
             if observed_language == "und" and approved_contact:
                 observed_language = expected_reply_language
