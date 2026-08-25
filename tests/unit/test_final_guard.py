@@ -478,3 +478,51 @@ def test_lenient_verification_still_blocks_wrong_writing_system():
     )
     assert result.action is ReplyAction.HANDOFF
     assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Hello! Welcome to our trading community. How can we help you today?",
+        "Thank you! We update our charts daily to help you stay ahead of the market.",
+        "Of course! Are you looking for market analysis, broker reviews, or beginner guides?",
+        "Yes! All our educational content on this page is 100% free. Happy learning!",
+        "Great idea! We have an interactive carousel guide on drawing key levels coming out soon.",
+        "Spot on! Always double-check the broker's official website URL against the regulator.",
+    ],
+)
+def test_短句开头的英文答案不再被误判为语言不符(reply: str) -> None:
+    # 确定性检测对单句问候没有判别力（"Hello" 的 top1 是 st，"Sure" 是 fr），把
+    # "判不出"当违规会让 716 条已发布英文答案里的 83 条永远只能转人工。
+    result = run_final_guard(
+        _auto(reply),
+        "telegram",
+        expected_reply_language="en",
+        customer_text="hello",
+        approved_knowledge_reply=reply,
+    )
+    assert result.action is ReplyAction.AUTO_REPLY, result.reason_codes
+    assert result.reply_language == "en"
+
+
+@pytest.mark.parametrize(
+    ("reply", "reason"),
+    [
+        # 整条回复就是另一种语言——整条检测这一层拦住。
+        ("Bonjour, nous sommes ravis de vous accueillir dans notre communaute.", "whole"),
+        ("Hola, bienvenido a nuestra comunidad de inversores.", "whole"),
+        # 长外语句子混进英语回复——片段可靠地检出另一种语言。
+        ("Hello! Nous vous invitons a consulter notre guide complet pour les debutants.", "frag"),
+        ("Sure. Bitte beachten Sie, dass unsere Analysen zu Bildungszwecken dienen.", "frag"),
+        # 非拉丁短片段——片段级文字系统检查兜住，短到判不出语种也拦得下。
+        ("你好。Our team reviews every broker on the list before publishing.", "script"),
+        ("Спасибо. Our team reviews every broker on the list before publishing.", "script"),
+        ("Merci beaucoup. Our team reviews every broker on the list before publishing.", "frag"),
+    ],
+)
+def test_回错语言仍然被拦住(reply: str, reason: str) -> None:
+    result = run_final_guard(
+        _auto(reply), "telegram", expected_reply_language="en", customer_text="hello"
+    )
+    assert result.action is ReplyAction.HANDOFF, reason
+    assert "GUARD_LANGUAGE_MISMATCH" in result.reason_codes

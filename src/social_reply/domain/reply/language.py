@@ -138,13 +138,11 @@ class LanguageDetection:
     def is_known(self) -> bool:
         """A tag is known only after detect_language has applied its path-specific gate."""
         return self.tag != UNKNOWN_LANGUAGE
+
     @property
     def is_reliable(self) -> bool:
-        return (
-            self.is_known
-            and self.confidence >= _MIN_CONFIDENCE
-            and self.margin >= _MIN_MARGIN
-        )
+        return self.is_known and self.confidence >= _MIN_CONFIDENCE and self.margin >= _MIN_MARGIN
+
 
 @cache
 def _detector(languages: tuple[Language, ...]) -> LanguageDetector:
@@ -508,6 +506,11 @@ def reply_language_matches(
     if not observed_detection.is_reliable or not languages_match(expected, observed):
         return False, observed
 
+    primary = expected.split("-", 1)[0].casefold()
+    allowed_scripts = _LANGUAGE_ALLOWED_SCRIPTS.get(primary, frozenset({"latin"}))
+    if extra_allowed_scripts:
+        allowed_scripts = allowed_scripts | extra_allowed_scripts
+
     sentence_safe = _strip_language_neutral_tokens(text)
     sentence_safe = re.sub(r"(?<=\d)[.,](?=\d)", ":", sentence_safe)
     fragments = re.split(r"[.!?。！？；;\n]+", sentence_safe)
@@ -516,11 +519,16 @@ def reply_language_matches(
         letter_count = sum(unicodedata.category(char).startswith("L") for char in cleaned_fragment)
         if letter_count < _MIN_LETTERS:
             continue
-        fragment_detection = detect_language(cleaned_fragment)
-        fragment_language = fragment_detection.tag
-        if not fragment_detection.is_reliable or fragment_language == UNKNOWN_LANGUAGE:
+        # 文字系统越界对短片段同样有判别力（"你好"、"Спасибо" 都判得出），先拦这一层。
+        fragment_script = dominant_script(cleaned_fragment)
+        if fragment_script and fragment_script not in allowed_scripts:
             return False, observed
-        if not languages_match(expected, fragment_language):
+        fragment_detection = detect_language(cleaned_fragment)
+        # 判不出语种 ≠ 语种错了。问候语和短承接句在任何门槛下都判不出来（实测 "Hello"
+        # 的 top1 是 st、"Sure" 是 fr、"No problem" 是 bs），把"判不出"当违规会误杀
+        # 11.6% 的已审核英文答案——它们逐字发送也过不了闸门，永远只能转人工。
+        # 回错语言这个唯一需要拦住的错误，由「片段可靠地检出了另一种语言」负责。
+        if fragment_detection.is_reliable and not languages_match(expected, fragment_detection.tag):
             return False, observed
 
     neutral_stripped = _strip_language_neutral_tokens(text)
@@ -528,10 +536,6 @@ def reply_language_matches(
     total = sum(scripts.values())
     if total == 0:
         return True, observed
-    primary = expected.split("-", 1)[0].casefold()
-    allowed_scripts = _LANGUAGE_ALLOWED_SCRIPTS.get(primary, frozenset({"latin"}))
-    if extra_allowed_scripts:
-        allowed_scripts = allowed_scripts | extra_allowed_scripts
     disallowed = sum(count for script, count in scripts.items() if script not in allowed_scripts)
     if disallowed / total > 0.1:
         return False, observed
