@@ -305,16 +305,19 @@ skip translation entirely, because a wrong top1 can still clear the strong gate.
 ### Switching the embedding model
 
 `knowledge_chunks` holds one vector column per supported dimension (`embedding` for 1536,
-`embedding_1024` for 1024). Both retrieval and writes pick the column from the vector's actual
-length, and `embedding_version` remains the authoritative filter against comparing two models'
-vectors. Two columns coexisting is what makes the switch reversible without re-embedding.
+`embedding_1024` for 1024), and **each vector column has its own version column**
+(`embedding_version`, `embedding_1024_version`). Both retrieval and writes pick the pair from the
+vector's actual length. A shared version column would break the whole point of two columns: the
+moment a backfill rewrote it, the live model's version filter would match nothing.
 
-1. `alembic upgrade head` — create the target dimension's column.
-2. `uv run python -m apps.cli.reembed_knowledge --tenant <id>` — backfill. The old column and old
-   `embedding_version` are untouched, so live retrieval keeps serving throughout.
+1. `alembic upgrade head` — create the target dimension's vector and version columns.
+2. `uv run python -m apps.cli.reembed_knowledge --tenant <id>` — backfill. Only the target
+   dimension's two columns are written, so live retrieval keeps serving throughout. Use
+   `--dry-run` first to see the pending row count.
 3. Set `OPENAI_EMBEDDING_MODEL` and `OPENAI_EMBEDDING_DIMENSIONS`, then restart.
 
-Rollback is step 3 in reverse; the previous vectors are still present, so no backfill is needed.
+Rollback is step 3 in reverse; the previous vectors and their version are still present, so no
+backfill is needed.
 
 **Gate thresholds do not transfer between models.** Measured on 240 translated queries across six
 languages against the production corpus (716 verified-English documents), at the zero-wrong-answer

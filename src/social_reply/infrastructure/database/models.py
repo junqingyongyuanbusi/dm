@@ -1306,6 +1306,13 @@ class KnowledgeChunk(Base):
             "embedding IS NOT NULL OR embedding_1024 IS NOT NULL",
             name="ck_knowledge_chunks_embedding_present",
         ),
+        # 向量与它的版本必须同生同死：只有向量没有版本的行会被检索的版本过滤静默丢掉，
+        # 只有版本没有向量的行会让运维误判某个模型已经回填完。
+        CheckConstraint(
+            "(embedding IS NULL) = (embedding_version IS NULL) AND "
+            "(embedding_1024 IS NULL) = (embedding_1024_version IS NULL)",
+            name="ck_knowledge_chunks_embedding_version_pairing",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "document_id"],
             ["knowledge_documents.tenant_id", "knowledge_documents.id"],
@@ -1337,12 +1344,14 @@ class KnowledgeChunk(Base):
     # 不让 answer 措辞稀释向量（见 importer）。历史行可能为 NULL（旧数据 embed 的是 content）。
     embed_text: Mapped[str | None] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64))  # tenant-scoped sha256 idempotency
-    embedding_version: Mapped[str] = mapped_column(String(32))  # 如 "text-embedding-3-small"
+    embedding_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # 两个向量列并存：pgvector 的列维度固定，换 embedding 模型只能另开一列。检索与
-    # 写入都按向量的实际长度选列（见 retrieval.embedding_column），embedding_version
-    # 仍是防止跨模型混比的权威过滤条件。两列都为空的行没有检索价值，由 CHECK 拒绝。
+    # 写入都按向量的实际长度选列（见 retrieval.embedding_columns）。每列配自己的版本列
+    # ——共用一个版本列会让回填新模型的过程中现役模型立刻查不到任何 chunk。
+    # 两列都为空的行没有检索价值，由 CHECK 拒绝。
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
     embedding_1024: Mapped[list[float] | None] = mapped_column(Vector(1024), nullable=True)
+    embedding_1024_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -878,7 +878,7 @@ async def test_英语查询不触发翻译(session, knowledge_enabled):
 
 
 async def _seed_chunk_1024(session, content: str, *, vector, brand_id="b1", version="baai/bge-m3"):
-    """只写 embedding_1024 列（模拟切到 1024 维模型后新导入的行）。"""
+    """只写 embedding_1024 及其版本列（模拟切到 1024 维模型后新导入的行）。"""
     doc_id = uuid.uuid4()
     await session.execute(
         insert(models.KnowledgeDocument).values(
@@ -890,9 +890,10 @@ async def _seed_chunk_1024(session, content: str, *, vector, brand_id="b1", vers
             document_id=doc_id,
             content=content,
             content_hash=uuid.uuid4().hex,
-            embedding_version=version,
             embedding=None,
+            embedding_version=None,
             embedding_1024=list(vector),
+            embedding_1024_version=version,
         )
     )
     await session.commit()
@@ -950,3 +951,68 @@ async def test_1024维查询看不见只有1536向量的行(session):
         min_similarity=0.0,
     )
     assert hits == []
+
+
+async def test_回填1024向量期间1536现役模型仍可检索(session):
+    """两列各有自己的版本列，回填新模型不得让现役模型查不到东西。
+
+    共用一个 embedding_version 时，回填一开始就把版本改写成新模型，现役检索的
+    版本过滤立刻全部落空——这正是两列并存要避免的事故。
+    """
+    vector_1536 = (await _EMBEDDER.embed(["how do I withdraw funds"]))[0]
+    doc_id = uuid.uuid4()
+    await session.execute(
+        insert(models.KnowledgeDocument).values(
+            id=doc_id,
+            brand_id="b1",
+            question="how do I withdraw funds",
+            reply="how do I withdraw funds",
+            status="published",
+        )
+    )
+    await session.execute(
+        insert(models.KnowledgeChunk).values(
+            document_id=doc_id,
+            content="how do I withdraw funds",
+            content_hash=uuid.uuid4().hex,
+            embedding=vector_1536,
+            embedding_version=_EMBEDDER.version,
+        )
+    )
+    await session.commit()
+
+    async def live_hits():
+        return await retrieve_knowledge(
+            session,
+            vector_1536,
+            tenant_id="default",
+            brand_id="b1",
+            platform="telegram",
+            embedding_version=_EMBEDDER.version,
+            top_k=3,
+            min_similarity=0.9,
+        )
+
+    assert len(await live_hits()) == 1, "回填前现役模型可检索"
+
+    # 模拟回填：只写 1024 的两列。
+    await session.execute(
+        models.KnowledgeChunk.__table__.update()
+        .where(models.KnowledgeChunk.document_id == doc_id)
+        .values(embedding_1024=[1.0] + [0.0] * 1023, embedding_1024_version="baai/bge-m3")
+    )
+    await session.commit()
+
+    assert len(await live_hits()) == 1, "回填 1024 列后现役 1536 模型必须照常可检索"
+
+    new_hits = await retrieve_knowledge(
+        session,
+        [1.0] + [0.0] * 1023,
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        embedding_version="baai/bge-m3",
+        top_k=3,
+        min_similarity=0.9,
+    )
+    assert len(new_hits) == 1, "新模型也能查到同一行"

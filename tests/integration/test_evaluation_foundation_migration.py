@@ -10,7 +10,7 @@ from tests.integration.migration_support import assert_alembic_succeeds, tempora
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "f3b8c1d4e726"
-_HEAD_REVISION = "e1c8b3a7d520"
+_HEAD_REVISION = "f2d9c4b8e631"
 
 
 async def test_evaluation_foundation_upgrade_constraints_and_downgrade() -> None:

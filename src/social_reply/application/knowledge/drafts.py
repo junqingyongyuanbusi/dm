@@ -116,9 +116,8 @@ async def persist_knowledge_draft(
             content=draft.content,
             embed_text=draft.embed_text,
             content_hash=draft.content_hash,
-            embedding_version=embedding_version,
-            # 按向量维度选列（1536/1024 各一列），不写死 embedding=
-            **chunk_embedding_values(embedding),
+            # 按向量维度选列，向量与它的版本一起落；另一个模型的两列保持 NULL。
+            **chunk_embedding_values(embedding, embedding_version),
         )
     )
     if draft.is_official_contact:

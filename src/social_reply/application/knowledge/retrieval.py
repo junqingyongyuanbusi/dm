@@ -21,17 +21,19 @@ class UnsupportedEmbeddingDimensions(ValueError):
     """向量维度没有对应的 pgvector 列——绝不静默降级到别的列去比。"""
 
 
-# pgvector 的列维度固定，换 embedding 模型只能另开一列。维度→列的映射只在这里
-# 定义一次：检索、写入、reindex 全部走它，避免任何地方把两个模型的向量混起来比。
+# pgvector 的列维度固定，换 embedding 模型只能另开一列。每个向量列配自己的版本列：
+# 一行可以同时持有两个模型的向量，单个版本列描述不了两个向量，共用一列会让回填
+# 过程中的现役模型立刻查不到任何 chunk。维度→(向量列, 版本列) 的映射只在这里定义
+# 一次：检索、写入、reindex 全部走它，任何地方都不会把两个模型的向量混起来比。
 _VECTOR_COLUMNS = {
-    1536: KnowledgeChunk.embedding,
-    1024: KnowledgeChunk.embedding_1024,
+    1536: (KnowledgeChunk.embedding, KnowledgeChunk.embedding_version),
+    1024: (KnowledgeChunk.embedding_1024, KnowledgeChunk.embedding_1024_version),
 }
 SUPPORTED_EMBEDDING_DIMENSIONS = frozenset(_VECTOR_COLUMNS)
 
 
-def embedding_column(dimensions: int):
-    """按维度取向量列；未登记的维度直接报错，不猜。"""
+def embedding_columns(dimensions: int):
+    """按维度取 (向量列, 版本列)；未登记的维度直接报错，不猜。"""
     try:
         return _VECTOR_COLUMNS[dimensions]
     except KeyError:
@@ -41,9 +43,15 @@ def embedding_column(dimensions: int):
         ) from None
 
 
-def chunk_embedding_values(embedding: list[float]) -> dict[str, list[float]]:
-    """写 chunk 时按维度选列；其余向量列留 NULL（同一行可并存多模型向量）。"""
-    return {embedding_column(len(embedding)).key: embedding}
+def embedding_column(dimensions: int):
+    """按维度取向量列。"""
+    return embedding_columns(dimensions)[0]
+
+
+def chunk_embedding_values(embedding: list[float], version: str) -> dict[str, object]:
+    """写 chunk 时按维度选列，向量与它的版本一起落；其余模型的列保持不动。"""
+    vector_column, version_column = embedding_columns(len(embedding))
+    return {vector_column.key: embedding, version_column.key: version}
 
 
 @dataclass(frozen=True)
@@ -208,9 +216,10 @@ async def retrieve_knowledge(
     """按余弦相似度检索已发布模板：过滤品牌、平台（NULL=全平台）、当前 embedding 版本。
 
     similarity = 1 - cosine_distance >= min_similarity；按距离升序取 top_k。
-    向量列按 query_embedding 的实际维度选取——1536/1024 两列不可互比。
+    向量列与版本列都按 query_embedding 的实际维度选取——1536/1024 两列不可互比，
+    且各自的版本独立，回填另一个模型不会影响现役模型的可检索性。
     """
-    column = embedding_column(len(query_embedding))
+    column, version_column = embedding_columns(len(query_embedding))
     distance = column.cosine_distance(query_embedding)
     language_scope = (
         (
@@ -244,8 +253,9 @@ async def retrieve_knowledge(
                 KnowledgeDocument.platform.is_(None),
                 KnowledgeDocument.platform == platform,
             ),
-            # 版本过滤：以查询向量的实际来源版本为准（换模型/Fake 的旧向量不可比，绝不混用）
-            KnowledgeChunk.embedding_version == embedding_version,
+            # 版本过滤：以查询向量的实际来源版本为准（换模型/Fake 的旧向量不可比，绝不混用）。
+            # 用该维度自己的版本列——共用一列会让回填新模型的过程中现役模型查不到任何行。
+            version_column == embedding_version,
             # 该模型还没 reindex 到的行必须排除：NULL 距离会被下面的阈值静默滤掉，
             # 但显式写出来才能保证换列后的行为一眼可读。
             column.isnot(None),

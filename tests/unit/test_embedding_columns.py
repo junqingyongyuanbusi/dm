@@ -7,6 +7,7 @@ from social_reply.application.knowledge.retrieval import (
     UnsupportedEmbeddingDimensions,
     chunk_embedding_values,
     embedding_column,
+    embedding_columns,
 )
 from social_reply.infrastructure.database.models import KnowledgeChunk
 
@@ -27,16 +28,30 @@ def test_未登记维度直接报错而不静默换列(dimensions: int) -> None:
         embedding_column(dimensions)
 
 
-def test_写入按维度只填对应的一列() -> None:
-    values_1536 = chunk_embedding_values([0.1] * 1536)
-    assert set(values_1536) == {"embedding"}
-    assert len(values_1536["embedding"]) == 1536
+def test_每个向量列配自己的版本列() -> None:
+    # 共用一个版本列会让回填新模型的过程中现役模型立刻查不到任何 chunk。
+    assert embedding_columns(1536) == (
+        KnowledgeChunk.embedding,
+        KnowledgeChunk.embedding_version,
+    )
+    assert embedding_columns(1024) == (
+        KnowledgeChunk.embedding_1024,
+        KnowledgeChunk.embedding_1024_version,
+    )
 
-    values_1024 = chunk_embedding_values([0.2] * 1024)
-    assert set(values_1024) == {"embedding_1024"}
+
+def test_写入按维度只填对应的向量列与版本列() -> None:
+    values_1536 = chunk_embedding_values([0.1] * 1536, "text-embedding-3-small")
+    assert set(values_1536) == {"embedding", "embedding_version"}
+    assert len(values_1536["embedding"]) == 1536
+    assert values_1536["embedding_version"] == "text-embedding-3-small"
+
+    values_1024 = chunk_embedding_values([0.2] * 1024, "baai/bge-m3")
+    assert set(values_1024) == {"embedding_1024", "embedding_1024_version"}
     assert len(values_1024["embedding_1024"]) == 1024
+    assert values_1024["embedding_1024_version"] == "baai/bge-m3"
 
 
 def test_写入未登记维度同样报错() -> None:
     with pytest.raises(UnsupportedEmbeddingDimensions):
-        chunk_embedding_values([0.3] * 512)
+        chunk_embedding_values([0.3] * 512, "whatever")

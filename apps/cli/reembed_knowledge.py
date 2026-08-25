@@ -8,8 +8,8 @@
     uv run python -m apps.cli.reembed_knowledge --tenant default
 
 切换 embedding 模型的正确顺序：
-  1. alembic upgrade head            —— 建好目标维度的向量列
-  2. 本脚本回填                       —— 旧列与旧 embedding_version 不动，线上检索照常
+  1. alembic upgrade head            —— 建好目标维度的向量列与它的版本列
+  2. 本脚本回填                       —— 只写目标维度的两列，现役模型的列一字不动，线上检索照常
   3. 改 OPENAI_EMBEDDING_MODEL / OPENAI_EMBEDDING_DIMENSIONS 并重启   —— 检索切到新列
 回滚就是把第 3 步的两个变量改回去；数据仍在，无需再回填。
 
@@ -24,7 +24,7 @@ from sqlalchemy import func, select, update
 
 from social_reply.application.knowledge.retrieval import (
     UnsupportedEmbeddingDimensions,
-    embedding_column,
+    embedding_columns,
 )
 from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbeddingClient
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -54,15 +54,15 @@ async def _run(tenant_id: str, dry_run: bool, limit: int | None) -> int:
     dimensions = settings.openai_embedding_dimensions
     version = settings.openai_embedding_model
     try:
-        column = embedding_column(dimensions)
+        column, version_column = embedding_columns(dimensions)
     except UnsupportedEmbeddingDimensions as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
 
     factory = get_session_factory()
-    # 待回填 = 该维度的列还是空，或 embedding_version 还不是目标模型。
-    # 两个条件缺一不可：换回旧模型再换回来时，列有值但版本已被改写过。
-    pending = (column.is_(None)) | (KnowledgeChunk.embedding_version != version)
+    # 待回填 = 该维度的向量列还是空，或它自己的版本列还不是目标模型。只看这一维度的
+    # 两列：另一个模型的列与版本必须一字不动，否则现役模型在回填期间会查不到任何行。
+    pending = (column.is_(None)) | (version_column.is_distinct_from(version))
     async with factory() as session:
         total = await session.scalar(
             select(func.count())
@@ -70,7 +70,7 @@ async def _run(tenant_id: str, dry_run: bool, limit: int | None) -> int:
             .where(KnowledgeChunk.tenant_id == tenant_id, pending)
         )
     total = int(total or 0)
-    print(f"模型={version} 维度={dimensions} 目标列={column.key}")
+    print(f"模型={version} 维度={dimensions} 目标列={column.key}/{version_column.key}")
     print(f"tenant={tenant_id} 待回填 {total} 行")
     if dry_run:
         print("--dry-run：未调用 API、未写库")
@@ -108,7 +108,7 @@ async def _run(tenant_id: str, dry_run: bool, limit: int | None) -> int:
                     await session.execute(
                         update(KnowledgeChunk)
                         .where(KnowledgeChunk.id == row.id)
-                        .values({column.key: vector, "embedding_version": version})
+                        .values({column.key: vector, version_column.key: version})
                     )
                 await session.commit()
             done += len(rows)
@@ -120,7 +120,7 @@ async def _run(tenant_id: str, dry_run: bool, limit: int | None) -> int:
         close = getattr(embedder, "aclose", None)
         if close is not None:
             await close()
-    print(f"完成：回填 {done} 行到 {column.key}，embedding_version={version}")
+    print(f"完成：回填 {done} 行到 {column.key}，{version_column.key}={version}")
     return 0
 
 

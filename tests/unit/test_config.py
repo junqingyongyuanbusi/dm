@@ -413,21 +413,21 @@ def test_local_environment_template_disables_future_platforms() -> None:
 def test_email_documentation_and_migration_head_contract() -> None:
     root = Path(__file__).resolve().parents[2]
     assert _configuration_email_keys(root / "docs/configuration.md") == set(_EMAIL_ENV_DEFAULTS)
-    assert _migration_heads(root / "migrations/versions") == {"e1c8b3a7d520"}
+    assert _migration_heads(root / "migrations/versions") == {"f2d9c4b8e631"}
 
     production_migration = (root / "docs/production-migration.md").read_text()
     docs_readme = (root / "docs/README.md").read_text()
     root_readme = (root / "README.md").read_text()
     assert re.search(
-        r"current Alembic graph has one head: `e1c8b3a7d520`",
+        r"current Alembic graph has one head: `f2d9c4b8e631`",
         production_migration,
     )
     assert re.search(
-        r"Alembic graph has one current head:\s*`e1c8b3a7d520`",
+        r"Alembic graph has one current head:\s*`f2d9c4b8e631`",
         docs_readme,
     )
     assert re.search(
-        r"current revision 等于唯一 head `e1c8b3a7d520`",
+        r"current revision 等于唯一 head `f2d9c4b8e631`",
         root_readme,
     )
 

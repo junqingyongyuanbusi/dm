@@ -255,7 +255,7 @@ verify_rollback_compatible_image() {
     || fail "$reference has unexpected rollback base digest: $labeled_base"
   [[ "$labeled_target" == "$full_sha" ]] \
     || fail "$reference has unexpected target release: $labeled_target"
-  [[ "$database_head" == "e1c8b3a7d520" ]] \
+  [[ "$database_head" == "f2d9c4b8e631" ]] \
     || fail "$reference has unexpected database head: $database_head"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
@@ -511,7 +511,7 @@ write_manifest() {
     --arg previous_app_revision "${previous_app_revision:-}" \
     --arg rollback_compatible_tag "$rollback_compatible_ref" \
     --arg rollback_compatible_digest "${rollback_compatible_digest:-}" \
-    --arg rollback_schema_head "e1c8b3a7d520" \
+    --arg rollback_schema_head "f2d9c4b8e631" \
     --arg previous_api_deployment_id "${previous_api_deployment_id:-}" \
     --arg previous_worker_deployment_id "${previous_worker_deployment_id:-}" \
     --arg previous_scheduler_deployment_id "${previous_scheduler_deployment_id:-}" \

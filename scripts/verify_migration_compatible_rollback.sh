@@ -8,7 +8,7 @@ fi
 
 target_image="$1"
 compat_image="$2"
-expected_head="e1c8b3a7d520"
+expected_head="f2d9c4b8e631"
 postgres_image="pgvector/pgvector@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0"
 run_id="${RANDOM}-$$-$(date +%s)"
 network="reply-core-rollback-${run_id}"
