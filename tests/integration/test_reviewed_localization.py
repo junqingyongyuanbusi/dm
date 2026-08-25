@@ -557,3 +557,169 @@ async def test_llm_language_fallback_unavailable_keeps_unknown_language_handoff(
     assert decision.action == "handoff"
     assert "UNKNOWN_LANGUAGE" in decision.reason_codes
     await _assert_handoff(session, conversation_id, "UNKNOWN_LANGUAGE")
+
+
+class _NeverGeneratingLLM:
+    """审核译文命中时不得调用生成模型或 grounding verifier。"""
+
+    grounding_verifier_id = "must-not-run"
+
+    async def decide(self, context):
+        raise AssertionError("approved localization must not call the generation model")
+
+    async def verify_grounding(self, **kwargs):
+        raise AssertionError("approved localization must not run the grounding verifier")
+
+    async def translate_to_english(self, text):
+        return _SOURCE_QUESTION
+
+
+async def test_审核译文直答_跳过生成与grounding(session, multilingual_runtime):
+    """命中文档有该 locale 的已审核译文时原文直答：零生成、零 grounding 验证。"""
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_ENABLED", "true")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_LIVE_LOCALES", "ja")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-ja-v1")
+    get_settings.cache_clear()
+
+    document_id, _content_hash = await _seed_english_policy(session)
+    await _publish_ja_localization(session, document_id=document_id)
+    runner._llm = _NeverGeneratingLLM()
+
+    _conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.reply_text == _JA_REPLY
+    assert decision.resolved_locale == "ja", "溯源 CHECK 与投递前置都硬拒 und"
+    assert decision.knowledge_localization_id is not None
+    assert decision.knowledge_localization_release_id == "test-ja-v1"
+    assert decision.grounding_verified is not True, "直答路径不跑 grounding"
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == "SENT"
+    assert _SENT_TEXTS == [_JA_REPLY]
+
+
+async def test_locale_不在白名单时退回生成路径(session, multilingual_runtime):
+    """published 译文也必须列入 LIVE_LOCALES 才允许外发，否则照常走生成。"""
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_ENABLED", "true")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_LIVE_LOCALES", "es")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-ja-v1")
+    get_settings.cache_clear()
+
+    document_id, _content_hash = await _seed_english_policy(session)
+    await _publish_ja_localization(session, document_id=document_id)
+    generated = "返金は3〜5営業日で反映されます。"
+    runner._llm = _RuntimeLLM({"ja": generated}, translated_query=_SOURCE_QUESTION)
+
+    _conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.reply_text == generated
+    assert decision.knowledge_localization_id is None
+    assert "MULTILINGUAL_RUNTIME_GENERATION" in decision.reason_codes
+
+
+async def test_开关关闭时不使用审核译文(session, multilingual_runtime):
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_ENABLED", "false")
+    get_settings.cache_clear()
+
+    document_id, _content_hash = await _seed_english_policy(session)
+    await _publish_ja_localization(session, document_id=document_id)
+    generated = "返金は3〜5営業日で反映されます。"
+    runner._llm = _RuntimeLLM({"ja": generated}, translated_query=_SOURCE_QUESTION)
+
+    _conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.reply_text == generated
+    assert decision.knowledge_localization_id is None
+
+
+async def test_未批准自动回复的译文不放行联系方式闸门(session, multilingual_runtime):
+    """译文存在但 publish 时没批自动回复：load 阶段就被 auto_reply_allowed 过滤掉，
+    official-contact 闸门照常转人工。"""
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_ENABLED", "true")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_LIVE_LOCALES", "ja")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-ja-v1")
+    get_settings.cache_clear()
+
+    contact_reply = "Please email support@wikifx.test for refund status."
+    ja_text = "返金状況は support@wikifx.test までメールでお問い合わせください。"
+    document_id, _hash = await _seed_english_policy(
+        session, reply=contact_reply, is_official_contact=True
+    )
+    artifact = await create_localization_draft(
+        session,
+        LocalizationDraftInput(
+            tenant_id="default",
+            document_id=document_id,
+            release_id="test-ja-v1",
+            locale="ja",
+            text=ja_text,
+        ),
+    )
+    await publish_localization(
+        session,
+        tenant_id="default",
+        artifact_id=artifact.id,
+        reviewer="reviewer@example.test",
+        approve_auto_reply=False,
+        approve_official_contact=False,
+    )
+    await session.commit()
+    runner._llm = _RuntimeLLM({"ja": ja_text}, translated_query=_SOURCE_QUESTION)
+
+    conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
+
+    assert outbox_id is None
+    await _assert_handoff(
+        session, conversation_id, "MULTILINGUAL_OFFICIAL_CONTACT_REVIEW"
+    )
+
+
+async def test_完整授权的联系方式译文可以放行(session, multilingual_runtime):
+    """这是本次接线新增的能力：非英语联系方式此前一律转人工，现在人工签过字的
+    译文可以直答——原文直出，不经生成模型改写。"""
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_ENABLED", "true")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_LIVE_LOCALES", "ja")
+    multilingual_runtime.setenv("KNOWLEDGE_LOCALIZATION_RELEASE", "test-ja-v1")
+    get_settings.cache_clear()
+
+    contact_reply = "Please email support@wikifx.test for refund status."
+    ja_text = "返金状況は support@wikifx.test までメールでお問い合わせください。"
+    document_id, _hash = await _seed_english_policy(
+        session, reply=contact_reply, is_official_contact=True
+    )
+    artifact = await create_localization_draft(
+        session,
+        LocalizationDraftInput(
+            tenant_id="default",
+            document_id=document_id,
+            release_id="test-ja-v1",
+            locale="ja",
+            text=ja_text,
+        ),
+    )
+    await publish_localization(
+        session,
+        tenant_id="default",
+        artifact_id=artifact.id,
+        reviewer="reviewer@example.test",
+        approve_auto_reply=True,
+        approve_official_contact=True,
+    )
+    await session.commit()
+    runner._llm = _NeverGeneratingLLM()
+
+    _conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.reply_text == ja_text
+    assert decision.resolved_locale == "ja"
+    assert decision.knowledge_localization_id == artifact.id
+    assert _SENT_TEXTS == [ja_text]

@@ -17,6 +17,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from social_reply.infrastructure.database.models import KnowledgeChunk, KnowledgeDocument
 
 
+class UnsupportedEmbeddingDimensions(ValueError):
+    """向量维度没有对应的 pgvector 列——绝不静默降级到别的列去比。"""
+
+
+# pgvector 的列维度固定，换 embedding 模型只能另开一列。维度→列的映射只在这里
+# 定义一次：检索、写入、reindex 全部走它，避免任何地方把两个模型的向量混起来比。
+_VECTOR_COLUMNS = {
+    1536: KnowledgeChunk.embedding,
+    1024: KnowledgeChunk.embedding_1024,
+}
+SUPPORTED_EMBEDDING_DIMENSIONS = frozenset(_VECTOR_COLUMNS)
+
+
+def embedding_column(dimensions: int):
+    """按维度取向量列；未登记的维度直接报错，不猜。"""
+    try:
+        return _VECTOR_COLUMNS[dimensions]
+    except KeyError:
+        raise UnsupportedEmbeddingDimensions(
+            f"no pgvector column for {dimensions} dimensions; "
+            f"supported: {sorted(SUPPORTED_EMBEDDING_DIMENSIONS)}"
+        ) from None
+
+
+def chunk_embedding_values(embedding: list[float]) -> dict[str, list[float]]:
+    """写 chunk 时按维度选列；其余向量列留 NULL（同一行可并存多模型向量）。"""
+    return {embedding_column(len(embedding)).key: embedding}
+
+
 @dataclass(frozen=True)
 class KnowledgeHit:
     content: str  # 展示/LLM 上下文（问+答拼接）
@@ -179,8 +208,10 @@ async def retrieve_knowledge(
     """按余弦相似度检索已发布模板：过滤品牌、平台（NULL=全平台）、当前 embedding 版本。
 
     similarity = 1 - cosine_distance >= min_similarity；按距离升序取 top_k。
+    向量列按 query_embedding 的实际维度选取——1536/1024 两列不可互比。
     """
-    distance = KnowledgeChunk.embedding.cosine_distance(query_embedding)
+    column = embedding_column(len(query_embedding))
+    distance = column.cosine_distance(query_embedding)
     language_scope = (
         (
             KnowledgeDocument.source_language == "en",
@@ -215,6 +246,9 @@ async def retrieve_knowledge(
             ),
             # 版本过滤：以查询向量的实际来源版本为准（换模型/Fake 的旧向量不可比，绝不混用）
             KnowledgeChunk.embedding_version == embedding_version,
+            # 该模型还没 reindex 到的行必须排除：NULL 距离会被下面的阈值静默滤掉，
+            # 但显式写出来才能保证换列后的行为一眼可读。
+            column.isnot(None),
             distance <= 1.0 - min_similarity,
         )
         .order_by(distance.asc())

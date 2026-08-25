@@ -204,16 +204,20 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Chat completion model |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Requested knowledge embedding model/version; real OpenRouter acceptance is not proven by configuration alone |
-| `OPENAI_EMBEDDING_DIMENSIONS` | `1536` | Fixed PostgreSQL `Vector(1536)` contract; other dimensions require a separate versioned backend/index |
+| `OPENAI_EMBEDDING_DIMENSIONS` | `1536` | Must match a vector column that exists on `knowledge_chunks` (`1536` or `1024`); startup rejects any other value |
 | `OPENAI_TIMEOUT_SECONDS` | `30` | HTTP timeout for generation calls |
 | `OPENAI_GROUNDING_MODEL` | empty | Optional separate model for semantic fidelity verification; empty uses `OPENAI_MODEL` |
 | `GROUNDING_VERIFIER_TIMEOUT_SECONDS` | `8` | Short fail-closed timeout for the second-pass grounding verifier |
 | `KNOWLEDGE_RETRIEVAL_ENABLED` | `false` | Enables knowledge retrieval |
 | `KNOWLEDGE_MIN_SIMILARITY` | `0.5` | Minimum retrieval score |
 | `KNOWLEDGE_TOP_K` | `3` | Maximum retrieved chunks |
+| `KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY` | `0.8` | Answer-level strong-match gate: top1 similarity floor for auto reply |
+| `KNOWLEDGE_AUTO_REPLY_MIN_MARGIN` | `0.08` | Answer-level strong-match gate: minimum top1-top2 similarity gap. Not transferable across embedding models — see the model-switch section |
 | `KNOWLEDGE_VERBATIM_REPLY` | `false` | Return matched template text without LLM rewriting |
 | `REQUIRE_KNOWLEDGE` | `false` | Legacy path: handoff without calling LLM when retrieval has no match |
 | `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Enables English-corpus multilingual runtime generation; non-English requests use the detected language, with no language or account allowlist; requires knowledge retrieval |
+| `KNOWLEDGE_LOCALIZATION_ENABLED` | `false` | Prefer human-reviewed localized text over runtime generation; requires `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true` and a non-empty live-locale list |
+| `KNOWLEDGE_LOCALIZATION_LIVE_LOCALES` | empty | Comma-separated send allowlist for reviewed localizations; published locales outside it still fall back to runtime generation |
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
@@ -276,13 +280,55 @@ The filter applies only to model context. Language resolution still sees the ful
 unanswered customer messages remain valid evidence of the customer's language.
 
 Multilingual runtime generation requires only `KNOWLEDGE_RETRIEVAL_ENABLED=true` and
-`MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true`. It retrieves verified-English knowledge in code, uses a
-protected query-translation retry when needed, and relies on the existing language, grounding,
-contact, kill-switch, and Outbox guards. It does not require a calibration report or language allowlist.
+`MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true`. It retrieves verified-English knowledge in code and
+relies on the existing language, grounding, contact, kill-switch, and Outbox guards. It does not
+require a calibration report or language allowlist.
 
-Note that the lexical arm of hybrid retrieval indexes the English question with the `simple`
-text-search configuration, so it contributes nothing for non-English queries; those fall back to
-pure vector search until the query-translation retry produces English text.
+### Non-English retrieval: translation comes first
+
+The English corpus is the only source of truth, so a non-English query is translated to English
+*before* retrieval, not as a fallback after a weak score. Translation failure silently falls back to
+native-query retrieval, so the path is an enhancement and never a dependency.
+
+Translating first restores two arms that are dead for non-English text:
+
+- **Exact question match.** A non-English query can never equal an English question, so non-English
+  customers previously could not reach the cheapest and most trustworthy arm at all.
+- **Lexical (`tsvector`) retrieval.** The question index uses the `simple` text-search
+  configuration, which does not segment Chinese, Japanese, Korean, or Thai, so the lexical arm
+  returned nothing and RRF degraded to pure vector search.
+
+Ordering matters for correctness, not just recall. Treating translation as a
+"retrieve, and retry only if not strong" fallback lets a *confident but wrong* cross-lingual match
+skip translation entirely, because a wrong top1 can still clear the strong gate.
+
+### Switching the embedding model
+
+`knowledge_chunks` holds one vector column per supported dimension (`embedding` for 1536,
+`embedding_1024` for 1024). Both retrieval and writes pick the column from the vector's actual
+length, and `embedding_version` remains the authoritative filter against comparing two models'
+vectors. Two columns coexisting is what makes the switch reversible without re-embedding.
+
+1. `alembic upgrade head` — create the target dimension's column.
+2. `uv run python -m apps.cli.reembed_knowledge --tenant <id>` — backfill. The old column and old
+   `embedding_version` are untouched, so live retrieval keeps serving throughout.
+3. Set `OPENAI_EMBEDDING_MODEL` and `OPENAI_EMBEDDING_DIMENSIONS`, then restart.
+
+Rollback is step 3 in reverse; the previous vectors are still present, so no backfill is needed.
+
+**Gate thresholds do not transfer between models.** Measured on 240 translated queries across six
+languages against the production corpus (716 verified-English documents), at the zero-wrong-answer
+optimum:
+
+| Embedding model | `MIN_SIMILARITY` | `MIN_MARGIN` | Auto-reply coverage | Wrong answers sent |
+| --- | --- | --- | --- | --- |
+| `text-embedding-3-small` (1536) | 0.55 | 0.08 | 159/240 | 0 |
+| `baai/bge-m3` (1024) | 0.55 | 0.05 | 207/240 | 0 |
+
+BGE-M3 aligns cross-lingual text far better (mean top1 similarity 0.66 -> 0.84), but it also
+compresses the whole similarity space, so its margins are smaller in absolute terms. Reusing the
+1536-model margin would over-handoff; reusing a loose margin sends wrong answers. Re-sweep the two
+gates whenever the embedding model changes.
 
 ## Scheduler and reconciliation settings
 

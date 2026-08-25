@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import redis.asyncio as aioredis
 from sqlalchemy import select, update
 
+from social_reply.application.knowledge.localizations import load_approved_localization
 from social_reply.application.knowledge.query_translation import translate_query_to_english
 from social_reply.application.knowledge.retrieval import (
     KnowledgeHit,
@@ -43,6 +44,7 @@ from social_reply.domain.reply.guard import (
 )
 from social_reply.domain.reply.language import is_deterministically_verifiable
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
+from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 from social_reply.domain.reply.rules import apply_multilingual_rules, apply_rules
 from social_reply.domain.reply.voice import DEFAULT_PERSONA
@@ -300,6 +302,91 @@ def _merge_knowledge_results(
         retrieval_mode="vector_hybrid+query_translation",
     )
 
+async def _translate_query(snapshot: DecisionSnapshot) -> str | None:
+    """把非英语查询译成英语；LLM 不可用或翻译失败返回 None（调用方退回原文检索）。"""
+    try:
+        llm = _get_llm()
+    except Exception:
+        logger.exception("query translation LLM construction failed; using native query only")
+        return None
+    return await translate_query_to_english(llm, snapshot.text or "")
+
+
+async def _retrieve_translation_first(
+    snapshot: DecisionSnapshot,
+    *,
+    translated_query: str | None,
+) -> tuple[KnowledgeRetrievalResult, bool]:
+    """英语知识库是唯一事实源，故非英语查询先译成英语再检索——译文是主路，不是回退。
+
+    译文检索恢复了两条对非英语原文完全失效的路径：question 精确匹配（原文永远
+    不可能与英语 question 相等）与 tsvector 词法（'simple' 分词器切不开中日韩泰，
+    原文词法一路是空转，RRF 因此退化成纯向量）。同一生产语料实测：平均 top1
+    相似度 0.706 → 0.976、top1 命中 6/10 → 10/10。
+
+    把翻译放在检索之后（旧行为：仅当原文检索不 strong 才翻译）会漏掉最危险的一
+    类错误——自信的跨语言错配。实测一条阿拉伯语查询以 similarity 0.621、margin
+    0.004 命中了语义无关的文档，因为判定为 strong，翻译回退永不触发。
+
+    译文精确命中时直接返回，省掉原文的 embedding 调用；否则与原文检索取并集，
+    避免翻译走偏时丢掉原文本来能召回的候选。任一路失败退到另一路，两路都失败
+    才向上报 error_code（由调用方转人工）。
+
+    返回 (检索结果, 是否用上了译文)。
+    """
+    if translated_query is None:
+        return await _fetch_knowledge(snapshot, verified_english_only=True), False
+    english = await _fetch_knowledge(
+        snapshot, verified_english_only=True, query_text=translated_query
+    )
+    if english.exact_match:
+        return english, True
+    native = await _fetch_knowledge(snapshot, verified_english_only=True)
+    if native.error_code:
+        return (native, False) if english.error_code else (english, True)
+    if english.error_code:
+        return native, False
+    # 合并方向固定为 (原文, 译文)：_merge_knowledge_results 用第二个参数承载译文
+    # 侧的 embedding 版本与 retrieval_mode，落库的检索溯源必须指向实际用的查询。
+    return _merge_knowledge_results(native, english), True
+
+
+async def _load_localization(
+    snapshot: DecisionSnapshot,
+    *,
+    selected: KnowledgeHit,
+    detected_language: str,
+) -> ApprovedLocalizationArtifact | None:
+    """取命中文档在该语种下的已审核译文；没有或加载失败都返回 None（退回生成路径）。
+
+    译文是人工审核并与某个英语 chunk 的 content_hash 绑定的不可变文本。命中它就
+    不必调生成模型，也不必跑 grounding verifier——安全性等同英语 verbatim，延迟
+    只剩一次检索。英语知识改版后 content_hash 变化，旧译文自动失配，不会串版。
+
+    这条路是纯增强：任何异常都不得让决策丢失，故失败仅记日志并退回生成。
+    """
+    settings = get_settings()
+    try:
+        async with get_session_factory()() as session:
+            return await load_approved_localization(
+                session,
+                tenant_id=snapshot.tenant_id,
+                document_id=selected.document_id,
+                source_content_hash=selected.content_hash,
+                detected_language=detected_language,
+                pinned_release_id=settings.knowledge_localization_release,
+                live_locales=set(settings.knowledge_localization_live_locale_set),
+            )
+    except Exception:
+        logger.exception(
+            "approved localization lookup failed; falling back to runtime generation: "
+            "conversation=%s document=%s",
+            snapshot.conversation_key,
+            selected.document_id,
+        )
+        return None
+
+
 def _knowledge_evidence_block(hit: KnowledgeHit) -> str:
     return json.dumps(
         {
@@ -549,10 +636,17 @@ async def run_and_persist_decision(
                 else LANGUAGE_VERIFICATION_LENIENT
             )
             # 英语知识库是唯一事实源：live 模式强制只命中 verified English 文档。
-            knowledge_result = (
-                await _fetch_knowledge(snapshot, verified_english_only=True)
+            # 非英语查询先译成英语再检索（翻译前置，见 _retrieve_translation_first）。
+            should_translate_query = (
+                should_retrieve and language.is_reliable and not is_english_request
+            )
+            translated_query = (
+                await _translate_query(snapshot) if should_translate_query else None
+            )
+            knowledge_result, query_translation_used = (
+                await _retrieve_translation_first(snapshot, translated_query=translated_query)
                 if should_retrieve and language.is_reliable
-                else KnowledgeRetrievalResult()
+                else (KnowledgeRetrievalResult(), False)
             )
             gate_min_similarity = settings.knowledge_auto_reply_min_similarity
             gate_min_margin = settings.knowledge_auto_reply_min_margin
@@ -561,44 +655,30 @@ async def run_and_persist_decision(
                 min_similarity=gate_min_similarity,
                 min_margin=gate_min_margin,
             )
-            # 低置信度查询翻译回退：非英语、无歧义、检索正常但答案级不 strong 时，
-            # 把查询译成英语重检一次；翻译不可用/失败/还原不一致都静默保持原评估。
-            query_translation_used = False
-            if (
-                should_retrieve
-                and language.is_reliable
-                and not is_english_request
-                and not knowledge_result.error_code
-                and not knowledge_result.exact_ambiguous
-                and not assessment.strong
-            ):
-                try:
-                    translation_llm = _get_llm()
-                except Exception:
-                    logger.exception("query translation LLM construction failed; skipping fallback")
-                    translation_llm = None
-                translated_query = (
-                    await translate_query_to_english(translation_llm, snapshot.text or "")
-                    if translation_llm is not None
-                    else None
-                )
-                if translated_query is not None:
-                    retry_result = await _fetch_knowledge(
-                        snapshot, verified_english_only=True, query_text=translated_query
-                    )
-                    if not retry_result.error_code:
-                        merged_result = _merge_knowledge_results(knowledge_result, retry_result)
-                        knowledge_result = merged_result
-                        assessment = _assess_answer_match(
-                            merged_result,
-                            min_similarity=gate_min_similarity,
-                            min_margin=gate_min_margin,
-                        )
-                        query_translation_used = True
             gate_evaluated = (
                 should_retrieve and language.is_reliable and not knowledge_result.error_code
             )
             selected = assessment.selected
+
+            # 审核译文优先于运行时生成：命中文档在该语种下有已审核译文时直接用它。
+            # 必须在下面的 official-contact 闸门之前解析——一份 official_contact_authorized
+            # 的译文正是人工为联系方式类事实签过字的产物，是该闸门唯一合法的放行凭据。
+            approved_localization: ApprovedLocalizationArtifact | None = None
+            if (
+                settings.knowledge_localization_enabled
+                and should_retrieve
+                and deterministic_rule is None
+                and language.is_reliable
+                and not is_english_request
+                and not knowledge_result.error_code
+                and assessment.strong
+                and selected is not None
+            ):
+                approved_localization = await _load_localization(
+                    snapshot,
+                    selected=selected,
+                    detected_language=language.tag,
+                )
 
             forced_decision: ReplyDecision | None = deterministic_rule
             if should_retrieve and knowledge_result.error_code:
@@ -623,8 +703,13 @@ async def run_and_persist_decision(
                 should_retrieve
                 and selected is not None
                 and selected.is_official_contact
+                and not (
+                    approved_localization is not None
+                    and approved_localization.official_contact_authorized
+                )
             ):
-                # 联系方式类事实只允许确定性 verbatim 渲染（英语路径），生成路径一律人工。
+                # 联系方式类事实只允许确定性渲染：英语走 verbatim，非英语只认人工
+                # 审核并显式授权过的译文，其余（含生成路径）一律转人工。
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
                     reason_codes=("MULTILINGUAL_OFFICIAL_CONTACT_REVIEW",),
@@ -634,6 +719,8 @@ async def run_and_persist_decision(
             multilingual_generate = (
                 should_retrieve
                 and forced_decision is None
+                # 有审核译文就不生成：省两次 LLM 往返，且不引入改写风险。
+                and approved_localization is None
                 and selected is not None
                 and (is_english_request or not selected.is_official_contact)
             )
@@ -682,7 +769,7 @@ async def run_and_persist_decision(
                         or (settings.email_enabled and settings.email_auto_reply_enabled)
                     ),
                     fallback_reason_codes=(
-                        ("QUERY_TRANSLATION_FALLBACK",) if query_translation_used else ()
+                        ("QUERY_TRANSLATED",) if query_translation_used else ()
                     ),
                     language_verification=language_verification,
                 )
@@ -714,6 +801,9 @@ async def run_and_persist_decision(
                         else None
                     ),
                     forced_decision=forced_decision,
+                    approved_localization=(
+                        approved_localization if forced_decision is None else None
+                    ),
                     target_language=(
                         language.tag if should_retrieve and language.is_reliable else "und"
                     ),
@@ -731,9 +821,16 @@ async def run_and_persist_decision(
                     language.tag if language_should_detect and language.is_reliable else "und"
                 ),
                 resolved_locale=(
-                    language.tag
-                    if multilingual_generate and language.is_reliable
-                    else ("en" if is_english_request and assessment.strong else "und")
+                    # 审核译文路径的 locale 由 artifact 决定（可能是 zh 而检测出 zh-Hans），
+                    # 且必须非 und：投递前置与 reply_decisions 的溯源 CHECK 都硬拒 und。
+                    approved_localization.locale
+                    if approved_localization is not None
+                    and decision.source == "knowledge_localization"
+                    else (
+                        language.tag
+                        if multilingual_generate and language.is_reliable
+                        else ("en" if is_english_request and assessment.strong else "und")
+                    )
                 ),
                 multilingual_contract_version=(
                     prompt_contract_suffix.lstrip("+").replace("+", "/")

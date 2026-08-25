@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.knowledge.retrieval import chunk_embedding_values
 from social_reply.infrastructure.database.models import AuditLog, KnowledgeChunk, KnowledgeDocument
 
 
@@ -116,7 +117,8 @@ async def persist_knowledge_draft(
             embed_text=draft.embed_text,
             content_hash=draft.content_hash,
             embedding_version=embedding_version,
-            embedding=embedding,
+            # 按向量维度选列（1536/1024 各一列），不写死 embedding=
+            **chunk_embedding_values(embedding),
         )
     )
     if draft.is_official_contact:

@@ -1302,6 +1302,10 @@ class KnowledgeChunk(Base):
     __tablename__ = "knowledge_chunks"
     __table_args__ = (
         UniqueConstraint("tenant_id", "content_hash"),
+        CheckConstraint(
+            "embedding IS NOT NULL OR embedding_1024 IS NOT NULL",
+            name="ck_knowledge_chunks_embedding_present",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "document_id"],
             ["knowledge_documents.tenant_id", "knowledge_documents.id"],
@@ -1315,6 +1319,15 @@ class KnowledgeChunk(Base):
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+        # 1024 维模型（BGE-M3 等）的独立索引。pgvector 的向量列维度固定，换模型
+        # 只能另开一列；两列并存才能在不停机、可回滚的前提下切换与比对。
+        Index(
+            "ix_knowledge_chunks_embedding_1024",
+            "embedding_1024",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding_1024": "vector_cosine_ops"},
+            postgresql_where=text("embedding_1024 IS NOT NULL"),
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(String(64), default="default")
@@ -1325,7 +1338,11 @@ class KnowledgeChunk(Base):
     embed_text: Mapped[str | None] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64))  # tenant-scoped sha256 idempotency
     embedding_version: Mapped[str] = mapped_column(String(32))  # 如 "text-embedding-3-small"
-    embedding: Mapped[list[float]] = mapped_column(Vector(1536))
+    # 两个向量列并存：pgvector 的列维度固定，换 embedding 模型只能另开一列。检索与
+    # 写入都按向量的实际长度选列（见 retrieval.embedding_column），embedding_version
+    # 仍是防止跨模型混比的权威过滤条件。两列都为空的行没有检索价值，由 CHECK 拒绝。
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
+    embedding_1024: Mapped[list[float] | None] = mapped_column(Vector(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

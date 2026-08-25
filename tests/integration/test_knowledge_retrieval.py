@@ -696,3 +696,257 @@ async def test_multilingual_wrong_language_is_blocked_before_outbox(session, kno
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "handoff"
     assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+
+
+class _TranslatingLLM:
+    """会翻译的 LLM stub：记录翻译调用，生成固定的中文回复。"""
+
+    def __init__(self, translation="How long does a refund take?"):
+        self.translation = translation
+        self.translated: list[str] = []
+
+    async def translate_to_english(self, text):
+        self.translated.append(text)
+        return self.translation
+
+    async def decide(self, context):
+        return ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text="退款通常需要 3 到 5 个工作日。",
+            confidence=0.99,
+        )
+
+    async def verify_grounding(self, **kwargs):
+        return True
+
+
+async def test_非英语查询先翻译再检索_原文强命中也照样翻译(session, knowledge_enabled):
+    """翻译前置：非英语一律先译成英语，不再等原文检索判为弱才回退。
+
+    旧行为把翻译当成 not strong 时的补救，因此放过了自信的跨语言错配（实测一条
+    阿拉伯语查询 similarity 0.621 / margin 0.004 命中语义无关文档仍判 strong）。
+    """
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+    llm = _TranslatingLLM()
+    runner._llm = llm
+
+    queries: list[str | None] = []
+
+    async def fake_fetch(snapshot, **kwargs):
+        queries.append(kwargs.get("query_text"))
+        # 原文本来就强命中——旧实现在这里就收工，不会翻译。
+        return _multilingual_result(similarity=0.95)
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "退款多久到账？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert llm.translated == [text], "非英语查询必须被翻译"
+    # 译文检索先跑；未 exact 命中时再补一次原文检索取并集。
+    assert queries == ["How long does a refund take?", None]
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert "QUERY_TRANSLATED" in decision.reason_codes
+
+
+async def test_译文精确命中时跳过原文检索(session, knowledge_enabled):
+    """译文 exact 命中是最可信的一路，直接收工，省掉原文的 embedding 调用。"""
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+    runner._llm = _TranslatingLLM()
+
+    queries: list[str | None] = []
+
+    async def fake_fetch(snapshot, **kwargs):
+        queries.append(kwargs.get("query_text"))
+        return _multilingual_result(exact=True)
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "退款多久到账？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert queries == ["How long does a refund take?"], "exact 命中后不应再检索原文"
+
+
+async def test_翻译不可用时退回原文检索(session, knowledge_enabled):
+    """翻译是增强而非依赖：LLM 不支持翻译时必须静默退回原文检索，不得丢决策。"""
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+
+    class NoTranslateLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="退款通常需要 3 到 5 个工作日。",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            return True
+
+    runner._llm = NoTranslateLLM()
+    queries: list[str | None] = []
+
+    async def fake_fetch(snapshot, **kwargs):
+        queries.append(kwargs.get("query_text"))
+        return _multilingual_result()
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "退款多久到账？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert queries == [None], "翻译不可用时只用原文检索一次"
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert "QUERY_TRANSLATED" not in decision.reason_codes
+
+
+async def test_译文检索失败时退回原文结果(session, knowledge_enabled):
+    """译文一路挂了不能连坐：原文检索仍有结果就继续用它。"""
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+    runner._llm = _TranslatingLLM()
+
+    async def fake_fetch(snapshot, **kwargs):
+        if kwargs.get("query_text") is not None:
+            return KnowledgeRetrievalResult(error_code="KNOWLEDGE_RETRIEVAL_FAILED")
+        return _multilingual_result()
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "退款多久到账？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert "QUERY_TRANSLATED" not in decision.reason_codes
+
+
+async def test_两路检索都失败才转人工(session, knowledge_enabled):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+    runner._llm = _TranslatingLLM()
+
+    async def fake_fetch(snapshot, **kwargs):
+        return KnowledgeRetrievalResult(error_code="KNOWLEDGE_RETRIEVAL_FAILED")
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "退款多久到账？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert "KNOWLEDGE_RETRIEVAL_FAILED" in decision.reason_codes
+
+
+async def test_英语查询不触发翻译(session, knowledge_enabled):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    get_settings.cache_clear()
+    llm = _TranslatingLLM()
+    runner._llm = llm
+
+    async def fake_fetch(snapshot, **kwargs):
+        return _multilingual_result()
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "How long does a refund take?"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+    await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert llm.translated == [], "英语查询已经在事实源语言上，翻译纯属浪费"
+
+
+async def _seed_chunk_1024(session, content: str, *, vector, brand_id="b1", version="baai/bge-m3"):
+    """只写 embedding_1024 列（模拟切到 1024 维模型后新导入的行）。"""
+    doc_id = uuid.uuid4()
+    await session.execute(
+        insert(models.KnowledgeDocument).values(
+            id=doc_id, brand_id=brand_id, question=content, reply=content, status="published"
+        )
+    )
+    await session.execute(
+        insert(models.KnowledgeChunk).values(
+            document_id=doc_id,
+            content=content,
+            content_hash=uuid.uuid4().hex,
+            embedding_version=version,
+            embedding=None,
+            embedding_1024=list(vector),
+        )
+    )
+    await session.commit()
+
+
+async def test_1024维向量走独立列检索(session):
+    """pgvector 列维度固定，1024 维模型必须能用 embedding_1024 列检索到。"""
+    target = [1.0] + [0.0] * 1023
+    other = [0.0, 1.0] + [0.0] * 1022
+    await _seed_chunk_1024(session, "how do I withdraw funds", vector=target)
+    await _seed_chunk_1024(session, "unrelated topic", vector=other)
+
+    hits = await retrieve_knowledge(
+        session,
+        target,
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        embedding_version="baai/bge-m3",
+        top_k=3,
+        min_similarity=0.9,
+    )
+    assert [h.content for h in hits] == ["how do I withdraw funds"]
+    assert hits[0].similarity == pytest.approx(1.0, abs=1e-6)
+
+
+async def test_1536维查询看不见只有1024向量的行(session):
+    """两个模型的向量绝不互比：维度选列 + embedding_version 双重隔离。"""
+    await _seed_chunk_1024(session, "only has a 1024 vector", vector=[1.0] + [0.0] * 1023)
+
+    hits = await retrieve_knowledge(
+        session,
+        [1.0] + [0.0] * 1535,
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        embedding_version="baai/bge-m3",
+        top_k=3,
+        min_similarity=0.0,
+    )
+    assert hits == []
+
+
+async def test_1024维查询看不见只有1536向量的行(session):
+    await _seed_chunk(session, "only has a 1536 vector", embedding_version="baai/bge-m3")
+
+    hits = await retrieve_knowledge(
+        session,
+        [1.0] + [0.0] * 1023,
+        tenant_id="default",
+        brand_id="b1",
+        platform="telegram",
+        embedding_version="baai/bge-m3",
+        top_k=3,
+        min_similarity=0.0,
+    )
+    assert hits == []

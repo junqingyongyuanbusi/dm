@@ -10,6 +10,7 @@ from social_reply.connectors.email.network import (
     EmailNetworkError,
     normalize_allowed_hosts,
 )
+from social_reply.domain.reply.localization import canonicalize_locale
 
 _META_PLATFORMS = {"facebook", "instagram"}
 
@@ -93,8 +94,9 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
-    # 当前 PostgreSQL pgvector 列固定为 Vector(1536)；其它维度必须使用独立版本化索引。
-    openai_embedding_dimensions: int = Field(default=1536, ge=1536, le=1536)
+    # 必须与 knowledge_chunks 上实际存在的向量列维度一致（当前 1536 / 1024 两列）。
+    # 换模型时同时改 OPENAI_EMBEDDING_MODEL 与本项，并先跑 reembed_knowledge 回填。
+    openai_embedding_dimensions: int = 1536
     openai_timeout_seconds: float = 30.0
     openai_grounding_model: str = ""
     grounding_verifier_timeout_seconds: float = Field(default=8.0, gt=0.0, le=30.0)
@@ -117,6 +119,11 @@ class Settings(BaseSettings):
     )
     multilingual_calibration_report_sha256: str = ""
     knowledge_localization_release: str = "unversioned"
+    # 审核译文直答：命中英语文档时优先使用该 locale 已人工审核的译文，跳过运行时
+    # 生成与 grounding 验证。只有列在 KNOWLEDGE_LOCALIZATION_LIVE_LOCALES 的
+    # locale 才允许外发，未列入的 locale 即使库里有 published 译文也照常走生成。
+    knowledge_localization_enabled: bool = False
+    knowledge_localization_live_locales: str = ""
     multilingual_e2e_report_path: Path = Path(
         "src/social_reply/shared/multilingual-e2e-calibration.json"
     )
@@ -198,6 +205,28 @@ class Settings(BaseSettings):
                 "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
             )
         self.knowledge_localization_release = self.knowledge_localization_release.strip()
+        # embedding 维度必须有对应的 pgvector 列，否则检索会在运行时才炸。
+        from social_reply.application.knowledge.retrieval import (
+            SUPPORTED_EMBEDDING_DIMENSIONS,
+        )
+
+        if self.openai_embedding_dimensions not in SUPPORTED_EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"OPENAI_EMBEDDING_DIMENSIONS={self.openai_embedding_dimensions} "
+                f"没有对应的向量列；支持 {sorted(SUPPORTED_EMBEDDING_DIMENSIONS)}"
+            )
+        if self.knowledge_localization_enabled:
+            if not self.multilingual_knowledge_reply_enabled:
+                raise ValueError(
+                    "KNOWLEDGE_LOCALIZATION_ENABLED requires "
+                    "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true"
+                )
+            # 空白名单等于全部关闭——与其静默退化成生成路径，不如在启动时说清楚。
+            if not self.knowledge_localization_live_locale_set:
+                raise ValueError(
+                    "KNOWLEDGE_LOCALIZATION_LIVE_LOCALES 在 "
+                    "KNOWLEDGE_LOCALIZATION_ENABLED=true 时不能为空"
+                )
         # 生产环境启用 openai provider 时必须提供 API key
         if (
             not self.testing
@@ -208,6 +237,15 @@ class Settings(BaseSettings):
                 "OPENAI_API_KEY 未配置（LLM_PROVIDER=openai 时不能为空）；测试环境请设 TESTING=true"
             )
         return self
+
+    @property
+    def knowledge_localization_live_locale_set(self) -> frozenset[str]:
+        """允许外发审核译文的 locale 白名单（逗号分隔，大小写与分隔符归一）。"""
+        return frozenset(
+            canonicalize_locale(item)
+            for item in self.knowledge_localization_live_locales.split(",")
+            if item.strip()
+        )
 
     @property
     def platform_secret_key_list(self) -> tuple[str, ...]:

@@ -139,9 +139,9 @@ jobs:
             --build-arg "BASE_DIGEST=${base_digest}" \
             --tag reply-core-compat-ci:${GITHUB_SHA} \
             .
-          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.database-head"}}')" = "c3e7a9f1b204"
+          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.database-head"}}')" = "e1c8b3a7d520"
           test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.rollback-target-release"}}')" = "${GITHUB_SHA}"
-          test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "c3e7a9f1b204"
+          test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "e1c8b3a7d520"
       - name: Verify image contract
         run: scripts/verify_production_image.sh "reply-core-ci:${GITHUB_SHA}" "$GITHUB_SHA"
       - name: Export verified production image
