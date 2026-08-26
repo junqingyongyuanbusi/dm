@@ -33,7 +33,6 @@ Fixed production targets:
   - Public API: https://relay.nexory.top
 
 Optional environment variables:
-  BUILDX_BUILDER             Explicit Docker Buildx builder
   DEPLOY_TIMEOUT_SECONDS     Per-service deployment timeout (default: 900)
   CI_TIMEOUT_SECONDS         CI wait timeout (default: 1200)
 EOF
@@ -258,6 +257,7 @@ verify_rollback_compatible_image() {
   local base_digest="$2"
   local app_revision="$3"
   local expected_capability="$4"
+  local expected_database_head="$5"
   local metadata revision source image_os architecture purpose labeled_base labeled_target database_head capability
   metadata="$(image_metadata "$reference")"
   revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
@@ -280,7 +280,7 @@ verify_rollback_compatible_image() {
     || fail "$reference has unexpected rollback base digest: $labeled_base"
   [[ "$labeled_target" == "$full_sha" ]] \
     || fail "$reference has unexpected target release: $labeled_target"
-  [[ "$database_head" == "a7c3e9d1b624" ]] \
+  [[ "$database_head" == "$expected_database_head" ]] \
     || fail "$reference has unexpected database head: $database_head"
   [[ "$capability" == "$expected_capability" ]] \
     || fail "$reference has unexpected review Outbox capability: ${capability:-missing}"
@@ -288,62 +288,41 @@ verify_rollback_compatible_image() {
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
 
-select_builder() {
-  if [[ -n "${BUILDX_BUILDER:-}" ]]; then
-    printf '%s\n' "$BUILDX_BUILDER"
-    return
-  fi
-  local candidate
-  for candidate in orbstack default; do
-    if docker buildx inspect "$candidate" >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-}
-
-prepare_rollback_compatible_image() {
+require_ci_rollback_compatible_image() {
   local reference="$1"
   local base_digest="$2"
   local app_revision="$3"
   local base_capability="$4"
-  local state builder_name build_date digest
-  local -a builder_args
+  local expected_database_head="$5"
+  local state digest
   state="$(image_state "$reference")"
-  if [[ "$state" == "exists" ]]; then
-    verify_rollback_compatible_image \
-      "$reference" "$base_digest" "$app_revision" "$base_capability"
-  else
-    revalidate_dev_head
-    builder_name="$(select_builder)"
-    builder_args=()
-    if [[ -n "$builder_name" ]]; then
-      builder_args=(--builder "$builder_name")
-    fi
-    build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    log "building and pushing migration-compatible rollback image: $reference"
-    docker buildx build \
-      "${builder_args[@]}" \
-      --file deploy/Dockerfile.migration-compatible-rollback \
-      --platform linux/amd64 \
-      --provenance=false \
-      --build-arg "BASE_IMAGE=${IMAGE_REPO}@${base_digest}" \
-      --build-arg "APP_REVISION=${app_revision}" \
-      --build-arg "TARGET_RELEASE_SHA=${full_sha}" \
-      --build-arg "BUILD_DATE=${build_date}" \
-      --build-arg "SOURCE_URL=${SOURCE_URL}" \
-      --build-arg "BASE_DIGEST=${base_digest}" \
-      --build-arg "BASE_REVIEW_OUTBOX_CAPABILITY=${base_capability}" \
-      --tag "$reference" \
-      --push \
-      . >&2
-    verify_rollback_compatible_image \
-      "$reference" "$base_digest" "$app_revision" "$base_capability"
-  fi
+  [[ "$state" == "exists" ]] \
+    || fail "CI did not publish required migration-compatible image: $reference"
+  verify_rollback_compatible_image \
+    "$reference" "$base_digest" "$app_revision" "$base_capability" \
+    "$expected_database_head"
   digest="$(image_digest "$reference")"
   [[ "$digest" != "$expected_digest" ]] \
     || fail "rollback-compatible image unexpectedly matches target digest"
   printf '%s\n' "$digest"
+}
+
+migration_graph_changed() {
+  local predecessor_revision="$1"
+  git cat-file -e "${predecessor_revision}^{commit}" 2>/dev/null \
+    || fail "predecessor commit is not available locally: $predecessor_revision"
+  ! git diff --quiet "$predecessor_revision" "$full_sha" -- migrations/versions
+}
+
+target_database_head() {
+  local output head_count head
+  output="$(uv run --frozen --no-dev alembic heads)" \
+    || fail "could not resolve target Alembic head"
+  head_count="$(awk 'NF {count += 1} END {print count + 0}' <<<"$output")"
+  [[ "$head_count" == "1" ]] || fail "target migration graph must have exactly one head"
+  head="$(awk 'NF {print $1; exit}' <<<"$output")"
+  [[ "$head" =~ ^[0-9a-f]{12,64}$ ]] || fail "invalid target Alembic head: $head"
+  printf '%s\n' "$head"
 }
 
 railway_status_json() {
@@ -542,9 +521,10 @@ write_manifest() {
     --arg previous_digest "${previous_digest:-}" \
     --arg rollback_tag "$rollback_ref" \
     --arg previous_app_revision "${previous_app_revision:-}" \
+    --argjson migration_compatibility_required "${migration_compatibility_required:-false}" \
     --arg rollback_compatible_tag "$rollback_compatible_ref" \
     --arg rollback_compatible_digest "${rollback_compatible_digest:-}" \
-    --arg rollback_schema_head "a7c3e9d1b624" \
+    --arg rollback_schema_head "${rollback_database_head:-}" \
     --arg previous_review_outbox_capability "${previous_review_outbox_capability:-}" \
     --arg target_review_outbox_capability "${target_review_outbox_capability:-}" \
     --arg previous_api_deployment_id "${previous_api_deployment_id:-}" \
@@ -568,7 +548,8 @@ write_manifest() {
       previous_digest: $previous_digest,
       rollback_tag: $rollback_tag,
       migration_compatible_rollback: {
-        tag: $rollback_compatible_tag,
+        required: $migration_compatibility_required,
+        tag: (if $migration_compatibility_required then $rollback_compatible_tag else "" end),
         digest: $rollback_compatible_digest,
         predecessor_app_revision: $previous_app_revision,
         database_head: $rollback_schema_head
@@ -723,24 +704,27 @@ case "${previous_review_outbox_capability}:${target_review_outbox_capability}" i
     fail "unsupported review Outbox capability transition: ${previous_review_outbox_capability} -> ${target_review_outbox_capability}"
     ;;
 esac
-rollback_compatible_digest="$(prepare_rollback_compatible_image \
-  "$rollback_compatible_ref" \
-  "$previous_digest" \
-  "$previous_app_revision" \
-  "$previous_review_outbox_capability")"
-[[ "$rollback_compatible_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
-  || fail "invalid migration-compatible rollback digest: $rollback_compatible_digest"
-log "verifying target and migration-compatible predecessor against an isolated database"
-scripts/verify_migration_compatible_rollback.sh \
-  "${IMAGE_REPO}@${expected_digest}" \
-  "${IMAGE_REPO}@${rollback_compatible_digest}"
-[[ "$(image_digest "$rollback_compatible_ref")" == "$rollback_compatible_digest" ]] \
-  || fail "migration-compatible rollback tag changed during smoke test"
-verify_rollback_compatible_image \
-  "${IMAGE_REPO}@${rollback_compatible_digest}" \
-  "$previous_digest" \
-  "$previous_app_revision" \
-  "$previous_review_outbox_capability"
+migration_compatibility_required="false"
+rollback_compatible_digest=""
+rollback_database_head=""
+if migration_graph_changed "$previous_app_revision"; then
+  migration_compatibility_required="true"
+  rollback_database_head="$(target_database_head)"
+  rollback_compatible_digest="$(require_ci_rollback_compatible_image \
+    "$rollback_compatible_ref" \
+    "$previous_digest" \
+    "$previous_app_revision" \
+    "$previous_review_outbox_capability" \
+    "$rollback_database_head")"
+  [[ "$rollback_compatible_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "invalid migration-compatible rollback digest: $rollback_compatible_digest"
+  log "verified CI-published migration-compatible rollback image: $rollback_compatible_ref"
+else
+  log "migration graph unchanged; raw predecessor digest remains rollback-compatible"
+fi
+if [[ "$bridge_required" == "true" && "$migration_compatibility_required" != "true" ]]; then
+  fail "review Outbox capability bridge requires a CI-published migration-compatible image"
+fi
 
 for service in "${RAILWAY_SERVICES[@]}"; do
   case "$service" in
@@ -749,11 +733,14 @@ for service in "${RAILWAY_SERVICES[@]}"; do
     scheduler) current_digest="$active_scheduler_digest" ;;
   esac
   if [[ "$current_digest" != "$previous_digest" \
-    && "$current_digest" != "$expected_digest" \
-    && "$current_digest" != "$rollback_compatible_digest" ]]; then
-    fail "$service is on unrelated digest $current_digest"
+    && "$current_digest" != "$expected_digest" ]]; then
+    if [[ "$migration_compatibility_required" != "true" \
+      || "$current_digest" != "$rollback_compatible_digest" ]]; then
+      fail "$service is on unrelated digest $current_digest"
+    fi
   fi
-  if [[ "$bridge_required" != "true" \
+  if [[ "$migration_compatibility_required" == "true" \
+    && "$bridge_required" != "true" \
     && "$current_digest" == "$rollback_compatible_digest" ]]; then
     fail "$service unexpectedly runs the compatibility digest without a capability bridge"
   fi
@@ -766,12 +753,16 @@ if [[ -f "$manifest_path" ]]; then
   manifest_sha="$(jq -r '.git_sha // ""' "$manifest_path")"
   manifest_digest="$(jq -r '.digest // ""' "$manifest_path")"
   manifest_previous="$(jq -r '.previous_digest // ""' "$manifest_path")"
+  manifest_compatibility_required="$(
+    jq -r '.migration_compatible_rollback.required // false' "$manifest_path"
+  )"
   manifest_compatibility="$(
     jq -r '.migration_compatible_rollback.digest // ""' "$manifest_path"
   )"
   [[ "$manifest_sha" == "$full_sha" \
     && "$manifest_digest" == "$expected_digest" \
     && "$manifest_previous" == "$previous_digest" \
+    && "$manifest_compatibility_required" == "$migration_compatibility_required" \
     && "$manifest_compatibility" == "$rollback_compatible_digest" ]] \
     || fail "existing release manifest does not match this rollout"
   manifest_status="$(jq -r '.status // ""' "$manifest_path")"
@@ -782,12 +773,17 @@ if [[ -f "$manifest_path" ]]; then
   esac
 fi
 
-compatibility_api_deployment_id="$(jq -r '.id // ""' \
-  <<<"$(deployment_for_digest_json api "$rollback_compatible_digest")")"
-compatibility_worker_deployment_id="$(jq -r '.id // ""' \
-  <<<"$(deployment_for_digest_json worker "$rollback_compatible_digest")")"
-compatibility_scheduler_deployment_id="$(jq -r '.id // ""' \
-  <<<"$(deployment_for_digest_json scheduler "$rollback_compatible_digest")")"
+compatibility_api_deployment_id=""
+compatibility_worker_deployment_id=""
+compatibility_scheduler_deployment_id=""
+if [[ "$migration_compatibility_required" == "true" ]]; then
+  compatibility_api_deployment_id="$(jq -r '.id // ""' \
+    <<<"$(deployment_for_digest_json api "$rollback_compatible_digest")")"
+  compatibility_worker_deployment_id="$(jq -r '.id // ""' \
+    <<<"$(deployment_for_digest_json worker "$rollback_compatible_digest")")"
+  compatibility_scheduler_deployment_id="$(jq -r '.id // ""' \
+    <<<"$(deployment_for_digest_json scheduler "$rollback_compatible_digest")")"
+fi
 api_deployment_id="$(jq -r '.id // ""' \
   <<<"$(deployment_for_digest_json api "$expected_digest")")"
 worker_deployment_id="$(jq -r '.id // ""' \
@@ -1047,5 +1043,9 @@ recorded_rollout_phase="complete"
 write_manifest "completed" "$recorded_rollout_phase"
 
 log "release complete: $full_sha -> $expected_digest"
-log "migration-compatible rollback: $rollback_compatible_ref -> $rollback_compatible_digest"
+if [[ "$migration_compatibility_required" == "true" ]]; then
+  log "migration-compatible rollback: $rollback_compatible_ref -> $rollback_compatible_digest"
+else
+  log "rollback uses retained raw predecessor: $rollback_ref -> $previous_digest"
+fi
 log "release manifest: $manifest_path"

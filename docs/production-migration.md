@@ -15,12 +15,55 @@ roles converged on digest
 `sha256:1289dd7731149279aa8eac72a15a598967898e5ff2e52e097d702d9090b0b631`, and pre/post
 configuration snapshots matched.
 
-The one-time CI bootstrap/mirror/promotion controls have been removed. Current CI publishes only
-immutable full-SHA tags. `latest` promotion and every subsequent Railway rollout belong exclusively
-to `scripts/publish_railway_release.sh`; Railway native image auto-update must remain disabled.
-The current Alembic graph has one head: `a7c3e9d1b624`. Database migration verifies schema state
+The one-time CI bootstrap/mirror/promotion controls have been removed. Current CI always publishes
+the immutable full-SHA target tag. If `migrations/versions` changed relative to the application
+revision advertised by the current GHCR `latest`, CI also builds and smoke-tests the immutable
+`railway-compat-pre-<short-sha>` image from that predecessor digest plus the target migration graph.
+Code-only releases do not create this compatibility image. `latest` promotion and every subsequent
+Railway rollout belong exclusively to `scripts/publish_railway_release.sh`; the local release path
+only inspects or retags registry manifests and never builds, pulls or runs image layers. Railway
+native image auto-update must remain disabled.
+The current Alembic graph has one head: `b9d5e2f7c314`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
+
+## Editable reply business Prompt revision
+
+Revision `b9d5e2f7c314` is additive after `a7c3e9d1b624`. It creates the active Tenant + Brand
+`reply_business_prompts` pointer, immutable `reply_business_prompt_versions` history, and nullable
+Prompt version/hash provenance on `reply_decisions`. Existing `reply_prompts.persona` rows are safe
+code-compiled compatibility projections after the earlier governance migration; this revision
+copies each current projection into one immutable business-Prompt version without re-enabling the
+legacy arbitrary persona sink. Scopes without an existing row continue to use the code-owned
+default until their first Admin save.
+
+Deploy the target image and schema first with the following value explicit and identical on API,
+Worker and Scheduler:
+
+```env
+REPLY_BUSINESS_PROMPT_ENABLED=false
+```
+
+The API-owned database preparation may then advance PostgreSQL to `b9d5e2f7c314`; Worker and
+Scheduler readiness must confirm the same head. Verify `/admin/content/reply-prompt` displays the
+backfilled current text and that trial mode creates no `ReplyDecision` or `OutboxMessage`. To
+activate, set `REPLY_BUSINESS_PROMPT_ENABLED=true` on all three services before a coordinated
+API -> Worker -> Scheduler redeploy. Configuration validation rejects a missing, partial or
+cross-role-divergent value.
+
+Once enabled, Admin saves are immediately visible to new generation. A scope advisory lock and
+optimistic revision prevent concurrent lost updates. Decision persistence rejects an old loaded
+version before creating a public Outbox, and delivery cancels a queued old-version Outbox with
+`STALE_REPLY_BUSINESS_PROMPT` before provider I/O. A send that already passed preflight is external
+I/O and cannot be recalled.
+
+Application rollback keeps PostgreSQL at `b9d5e2f7c314`: first set the shared gate to `false`, then
+use the migration-compatible predecessor image. The predecessor ignores the additive tables and
+continues from its last code-compiled `reply_prompts` projection; new business-Prompt edits are not
+silently copied back into that compatibility column. Alembic downgrade is allowed only while every
+version was created by the migration backfill. After any Admin save or rollback creates audit
+history, schema downgrade fails before dropping the tables; retain the additive schema or restore a
+reviewed pre-migration backup.
 
 ## Reply review and RAG provenance revision
 
@@ -121,18 +164,19 @@ candidate execution is available.
 ### Migration-compatible rollback
 
 The raw predecessor image may not contain the migration graph through `a7c3e9d1b624` and must not be
-restarted after the database reaches that head. Before promoting GHCR `latest`,
-`scripts/publish_railway_release.sh` now builds an auxiliary migration-compatible rollback image from
-the exact active predecessor digest and overlays the additive migration graph from the evaluation
-foundation through current head `a7c3e9d1b624`. Its OCI revision remains the predecessor application
-SHA; labels record the target release SHA, predecessor digest and database head.
+restarted after the database reaches that head. Before a migration-bearing release can become CI
+green, the `publish-ghcr` job builds an auxiliary migration-compatible rollback image from the GHCR
+`latest` predecessor digest and overlays the target migration graph. Its OCI revision remains the
+predecessor application SHA; labels record the target release SHA, predecessor digest and database
+head.
 
-The release script verifies this image before changing `latest` or Railway. Against an isolated
+CI verifies this image before the release script may change `latest` or Railway. Against an isolated
 database, the compatibility image runs `scripts.prepare_database` first, exactly as the bridge API
 does in production. The compatibility image then proves exact-head readiness, followed by the target
-image's Worker readiness check and idempotent API preparation. A release aborts before production
-mutation if the compatibility API cannot migrate to `a7c3e9d1b624`, either image cannot accept that
-exact head, or the target API cannot prepare it idempotently.
+image's Worker readiness check and idempotent API preparation. CI fails if the compatibility API
+cannot migrate to the target head, either image cannot accept that exact head, or the target API
+cannot prepare it idempotently. The local release script only verifies the immutable tag, digest and
+OCI labels; it never builds or runs the image.
 
 The release manifest records the compatibility tag and digest. Preserve the `deploying`/`completed` manifest in the operator's durable release evidence store; the ignored local `dist/` copy is not the sole retention mechanism. To roll back application behavior
 without downgrading PostgreSQL, run from a trusted checkout containing that manifest:

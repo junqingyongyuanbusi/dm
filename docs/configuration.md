@@ -13,14 +13,19 @@ Scheduler must use the same application settings unless a variable is explicitly
 GitHub Actions builds and verifies the production image once after Ruff and Pytest succeed. A
 separate `publish-ghcr` job receives that exact image as an artifact and publishes the immutable
 `ghcr.io/junqingyongyuanbusi/reply-core:<full-git-sha>` tag without rebuilding it. The job uses the
-repository-scoped `GITHUB_TOKEN`; no Docker Hub credential is required.
+repository-scoped `GITHUB_TOKEN`; no Docker Hub credential is required. It compares the migration
+graph with the application revision advertised by the current GHCR `latest`. When that graph
+changed, the same job builds, pushes and smoke-tests
+`railway-compat-pre-<short-sha>` from the predecessor digest plus the target migration graph. A
+code-only release does not create a compatibility image.
 
 The mutable `latest` tag is release-controlled and is never moved by ordinary CI. Only
 `scripts/publish_railway_release.sh` may promote `latest`, after it has verified the CI-published SHA
-image and prepared rollback evidence. Railway native image auto-update remains
-disabled. Production rollout still follows API → `/healthz` → Worker → Scheduler and verifies all
-three roles run the same digest. The GHCR package must be public before Railway is switched so the
-services can pull it without registry credentials.
+image and any required CI-published compatibility image. The local release path performs registry
+manifest inspection/retagging only: it does not build, pull, load, save, or run image layers.
+Railway native image auto-update remains disabled. Production rollout still follows API →
+`/healthz` → Worker → Scheduler and verifies all three roles run the same digest. The GHCR package
+must be public before Railway is switched so the services can pull it without registry credentials.
 ## Core and security
 
 | Variable | Code default | Requirement / owner |
@@ -199,7 +204,8 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `LLM_PROVIDER` | `stub` | `stub` or `openai`; stub is forbidden outside tests |
-| `PROMPT_VERSION` | `v1-wikifx-multilingual` | Persisted decision/audit identifier for the immutable prompt plus code-compiled structured voice preferences; saved revisions append `#rN` |
+| `PROMPT_VERSION` | `v2-editable-business-prompt` | Persisted identifier for the code-owned immutable reply contract; an active editable business Prompt appends `#bpN` and also records its version ID/hash separately |
+| `REPLY_BUSINESS_PROMPT_ENABLED` | `false` | Enables the versioned Tenant + Brand business Prompt for primary reply generation. Must be explicit and identical on API, Worker and Scheduler; auxiliary Prompt calls never receive it |
 | `OPENAI_API_KEY` | empty | Required outside tests when provider is `openai` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Chat completion model |

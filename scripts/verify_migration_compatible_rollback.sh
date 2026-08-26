@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 2 ]]; then
-  printf 'usage: %s <target-image> <migration-compatible-rollback-image>\n' "$0" >&2
+if [[ $# -ne 3 ]]; then
+  printf 'usage: %s <target-image> <migration-compatible-rollback-image> <expected-head>\n' "$0" >&2
   exit 2
 fi
 
 target_image="$1"
 compat_image="$2"
-expected_head="a7c3e9d1b624"
+expected_head="$3"
+[[ "$expected_head" =~ ^[0-9a-f]{12,64}$ ]] || {
+  echo "invalid expected Alembic head: $expected_head" >&2
+  exit 2
+}
 postgres_image="pgvector/pgvector@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0"
 run_id="${RANDOM}-$$-$(date +%s)"
 network="reply-core-rollback-${run_id}"

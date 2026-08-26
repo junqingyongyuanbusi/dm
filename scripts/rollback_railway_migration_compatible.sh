@@ -82,6 +82,7 @@ image_repository="$(jq -r '.image_repository // ""' "$manifest_path")"
 release_status="$(jq -r '.status // ""' "$manifest_path")"
 compat_ref="$(jq -r '.migration_compatible_rollback.tag // ""' "$manifest_path")"
 compat_digest="$(jq -r '.migration_compatible_rollback.digest // ""' "$manifest_path")"
+compat_required="$(jq -r '.migration_compatible_rollback.required // false' "$manifest_path")"
 target_digest="$(jq -r '.digest // ""' "$manifest_path")"
 previous_digest="$(jq -r '.previous_digest // ""' "$manifest_path")"
 target_sha="$(jq -r '.git_sha // ""' "$manifest_path")"
@@ -92,6 +93,8 @@ expected_compat_ref="${IMAGE_REPO}:railway-compat-pre-${target_sha:0:12}"
 
 [[ "$release_status" == "deploying" || "$release_status" == "completed" ]] \
   || fail "release manifest status is not rollback-eligible: $release_status"
+[[ "$compat_required" == "true" ]] \
+  || fail "release manifest does not require a migration-compatible rollback"
 [[ "$image_repository" == "$IMAGE_REPO" ]] \
   || fail "release manifest image repository is not the production GHCR repository"
 [[ "$confirmation" == "$target_sha" ]] || fail "--execute SHA does not match release manifest"
@@ -102,7 +105,7 @@ expected_compat_ref="${IMAGE_REPO}:railway-compat-pre-${target_sha:0:12}"
 [[ "$target_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid target digest"
 [[ "$previous_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid predecessor digest"
 [[ "$previous_app_revision" =~ ^[0-9a-f]{40}$ ]] || fail "invalid predecessor app revision"
-[[ "$database_head" == "a7c3e9d1b624" ]] || fail "unexpected compatibility DB head"
+[[ "$database_head" =~ ^[0-9a-f]{12,64}$ ]] || fail "unexpected compatibility DB head"
 
 image_digest() {
   local output digest

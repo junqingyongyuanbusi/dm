@@ -37,16 +37,19 @@ def test_release_requires_app_and_state_service_colocation():
     assert script.count("validate_railway_config") == 4
     assert "capture_experimental_multilingual_gate" not in script
     assert "railway-compat-pre-${short_sha}" in script
-    assert "deploy/Dockerfile.migration-compatible-rollback" in script
-    assert "scripts/verify_migration_compatible_rollback.sh" in script
+    assert "require_ci_rollback_compatible_image" in script
+    assert "prepare_rollback_compatible_image" not in script
+    assert "docker buildx build" not in script
+    assert "docker run" not in script
+    assert "docker pull" not in script
+    assert "docker save" not in script
+    assert "docker load" not in script
     assert "scripts/release_rollout_state.py" in script
     assert "migration_compatible_rollback" in script
     assert Path("scripts/verify_migration_compatible_rollback.sh").stat().st_mode & 0o111
     assert script.index(
         'verify_predecessor_image "${IMAGE_REPO}@${previous_digest}"'
-    ) < script.index('rollback_compatible_digest="$(prepare_rollback_compatible_image')
-    assert '"${IMAGE_REPO}@${expected_digest}"' in script
-    assert '"${IMAGE_REPO}@${rollback_compatible_digest}"' in script
+    ) < script.index('rollback_compatible_digest="$(require_ci_rollback_compatible_image')
     bridge_case = script.index("promote_compatibility_latest)")
     manifest = script.index(
         'write_manifest "$manifest_status" "$observed_phase"', bridge_case
@@ -62,6 +65,9 @@ def test_release_requires_app_and_state_service_colocation():
 
 def test_ci_publishes_the_verified_image_as_immutable_ghcr_sha():
     workflow = Path(".github/workflows/ci.yml").read_text()
+    compatibility_script = Path(
+        "scripts/publish_ci_migration_rollback_image.sh"
+    ).read_text()
     assert "packages: write" in workflow
     assert "persist-credentials: false" in workflow
     assert "ghcr.io/junqingyongyuanbusi/reply-core" in workflow
@@ -78,7 +84,17 @@ def test_ci_publishes_the_verified_image_as_immutable_ghcr_sha():
     assert "GHCR_PROMOTE_SHA" not in workflow
     assert "BOOTSTRAP_PREDECESSOR" not in workflow
     assert "Publish verified image to GHCR" in workflow
+    assert "scripts/publish_ci_migration_rollback_image.sh" in workflow
+    assert 'fetch-depth: 0' in workflow
     assert Path("scripts/verify_production_image.sh").stat().st_mode & 0o111
+    assert Path("scripts/publish_ci_migration_rollback_image.sh").stat().st_mode & 0o111
+    assert (
+        'git diff --quiet "$predecessor_revision" "$target_sha" -- migrations/versions'
+        in compatibility_script
+    )
+    assert "docker buildx build" in compatibility_script
+    assert "scripts/verify_migration_compatible_rollback.sh" in compatibility_script
+    assert 'write_evidence false' in compatibility_script
 
 
 def test_release_bridges_legacy_review_outbox_contract_in_validated_order():
@@ -95,6 +111,8 @@ def test_release_bridges_legacy_review_outbox_contract_in_validated_order():
     assert 'TARGET_REVIEW_OUTBOX_CAPABILITY="review-outbox-dual-read-v1"' in script
     assert "review-outbox-dual-read-v1" in dockerfile
     assert "BASE_REVIEW_OUTBOX_CAPABILITY" in compatibility_dockerfile
+    assert "DATABASE_HEAD" in compatibility_dockerfile
+    assert "migrations/versions/" in compatibility_dockerfile
     assert "scripts/release_rollout_state.py" in script
     assert "nine safe bridge checkpoints" in script
 
