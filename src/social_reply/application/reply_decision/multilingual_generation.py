@@ -40,7 +40,7 @@ async def generate_multilingual_reply(
     email_auto_reply_allowed: bool,
     fallback_reason_codes: tuple[str, ...] = (),
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
-    language_policy: str = "legacy_hard",
+    language_policy: str = "review",
     approved_knowledge_protected_values: tuple[str, ...] = (),
 ) -> ReplyDecision:
     """Generate a guarded same-language reply from the canonical English knowledge hit."""

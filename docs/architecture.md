@@ -165,8 +165,10 @@ tenant/account/conversation snapshot + rules + kill switch
 or wrong-language output. In `review`, language identity is advisory: that signal may preserve an
 otherwise safe candidate only as a private DRAFT. It cannot soften deterministic facts, knowledge
 provenance, protected entities, official-contact authorization, numbers, currencies, grounding,
-writing-system conflicts, tenant scope, kill switch, or send-time checks. An unresolved request
-language in `review` likewise cannot produce an automatic public reply.
+tenant scope, kill switch, or send-time checks. Reply-language resolution uses deterministic
+detection first and one structured LLM classification only when needed; a mismatch, unresolved
+language, or obvious writing-system disagreement follows the selected language policy. An unresolved
+request language in `review` likewise cannot produce an automatic public reply.
 
 The selector rollout is independently gated by `RAG_SELECTOR_MODE=off|shadow|live` and a stable
 `RAG_SELECTOR_CANARY_BPS` bucket. The bucket is SHA-256 of `tenant_id:conversation_key` modulo

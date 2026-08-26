@@ -561,6 +561,10 @@ def test_multilingual_language_policy_is_typed(policy: str) -> None:
     assert settings.multilingual_language_policy == policy
 
 
+def test_multilingual_language_policy_defaults_to_review() -> None:
+    assert _make(testing=True).multilingual_language_policy == "review"
+
+
 @pytest.mark.parametrize("mode", ["off", "shadow", "live"])
 def test_rag_selector_rollout_settings(mode: str) -> None:
     settings = _make(testing=True, rag_selector_mode=mode, rag_selector_canary_bps=4321)

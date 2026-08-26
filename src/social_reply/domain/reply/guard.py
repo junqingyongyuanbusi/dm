@@ -8,6 +8,7 @@ from social_reply.domain.platform_accounts import PLATFORM_CAPABILITY_SPECS
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.language import (
     expected_scripts_for,
+    languages_match,
     reply_language_matches,
     reply_script_matches,
 )
@@ -384,6 +385,7 @@ def run_language_observation_guard(
     approved_knowledge_protected_values: tuple[str, ...] = (),
     approved_localization_protected_values: tuple[str, ...] = (),
     customer_text: str | None = None,
+    observed_reply_language: str | None = None,
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
     language_policy: str = LANGUAGE_POLICY_LEGACY_HARD,
 ) -> ReplyDecision:
@@ -413,6 +415,19 @@ def run_language_observation_guard(
         customer_text,
         include_all=expected_reply_language == "mirror-user",
     )
+    if observed_reply_language is not None:
+        observed_language = observed_reply_language
+        if observed_language == "und" and approved_contact:
+            observed_language = expected_reply_language
+        decision = replace(decision, reply_language=observed_language)
+        if languages_match(expected_reply_language, observed_language):
+            return decision
+        return _apply_language_mismatch(
+            decision,
+            "GUARD_LANGUAGE_MISMATCH",
+            language_policy=language_policy,
+        )
+
     if language_verification == LANGUAGE_VERIFICATION_LENIENT:
         # The model-attested language remains routing metadata. A writing-system conflict is still
         # deterministic enough to reject in every policy; only language identity is reviewable.

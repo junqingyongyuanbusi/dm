@@ -49,6 +49,95 @@ async def test_bot_active_normal_question_auto_replies_via_llm():
     assert "STUB_LLM" in d.reason_codes
 
 
+async def test_short_same_language_reply_uses_model_fallback_and_auto_replies():
+    class _ShortReplyLLM:
+        def __init__(self) -> None:
+            self.language_calls: list[str] = []
+
+        async def decide(self, context):
+            assert context.target_language == "en"
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Hello",
+                confidence=0.99,
+            )
+
+        async def detect_language_tag(self, text):
+            self.language_calls.append(text)
+            return "en"
+
+    llm = _ShortReplyLLM()
+    decision = await run_decision_pipeline(
+        _snap(text="Hello"),
+        llm=llm,
+        killswitch=_OpenSwitch(),
+        target_language="en",
+        apply_legacy_rules=False,
+    )
+
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_language == "en"
+    assert llm.language_calls == ["Hello"]
+
+
+async def test_unresolved_reply_language_becomes_private_draft():
+    class _UnresolvedReplyLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="OK",
+                confidence=0.99,
+            )
+
+        async def detect_language_tag(self, text):
+            return None
+
+    decision = await run_decision_pipeline(
+        _snap(text="Can you help me?"),
+        llm=_UnresolvedReplyLLM(),
+        killswitch=_OpenSwitch(),
+        target_language="en",
+        apply_legacy_rules=False,
+    )
+
+    assert decision.action is ReplyAction.DRAFT
+    assert decision.reply_text == "OK"
+    assert decision.reply_visibility is Visibility.PRIVATE
+    assert decision.reply_language == "und"
+    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+
+
+async def test_hard_output_guard_runs_before_reply_language_fallback():
+    class _UnsafeReplyLLM:
+        def __init__(self) -> None:
+            self.language_calls: list[str] = []
+
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Contact support@example.com",
+                confidence=0.99,
+            )
+
+        async def detect_language_tag(self, text):
+            self.language_calls.append(text)
+            return "en"
+
+    llm = _UnsafeReplyLLM()
+    decision = await run_decision_pipeline(
+        _snap(text="How can I contact support?"),
+        llm=llm,
+        killswitch=_OpenSwitch(),
+        target_language="en",
+        apply_legacy_rules=False,
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert "GUARD_PII_LEAK" in decision.reason_codes
+    assert llm.language_calls == []
+
+
 async def test_llm_context_redacts_current_and_history_pii():
     captured = {}
 

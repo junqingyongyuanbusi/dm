@@ -105,3 +105,46 @@ async def resolve_customer_language(
         if from_history is not None:
             return from_history
     return current
+
+
+def _remove_language_neutral_terms(
+    text: str | None,
+    neutral_terms: tuple[str, ...],
+) -> str:
+    """Remove approved product/entity tokens that do not identify the reply language."""
+    assessable_text = text or ""
+    for neutral_term in sorted(neutral_terms, key=len, reverse=True):
+        if neutral_term:
+            assessable_text = assessable_text.replace(neutral_term, " ")
+    return assessable_text
+
+
+async def resolve_reply_language(
+    text: str | None,
+    *,
+    llm: LLMClient | None = None,
+    neutral_terms: tuple[str, ...] = (),
+) -> LanguageDetection:
+    """Resolve generated reply language without using conversation history.
+
+    Reply verification intentionally follows a smaller cascade than customer-language
+    resolution: deterministic detection first, then one model classification only when the
+    local detector cannot make a reliable decision. A generated reply must stand on its own;
+    customer history must never be used to claim that an ambiguous output is in the right
+    language.
+    """
+    assessable_text = _remove_language_neutral_terms(text, neutral_terms)
+    current = detect_language(assessable_text, source="generated_reply")
+    if current.is_reliable and not _needs_llm_review(current):
+        return current
+
+    if has_detectable_letters(assessable_text):
+        attested = await _attest_with_llm(llm, assessable_text)
+        if attested is not None:
+            logger.info(
+                "reply language attested by LLM: tag=%s deterministic=%s",
+                attested.tag,
+                current.tag,
+            )
+            return attested
+    return current

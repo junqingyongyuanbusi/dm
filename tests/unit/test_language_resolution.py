@@ -3,6 +3,7 @@ import pytest
 from social_reply.application.reply_decision.language_resolution import (
     LLM_FALLBACK_SOURCE,
     resolve_customer_language,
+    resolve_reply_language,
 )
 
 
@@ -221,4 +222,37 @@ async def test_non_sibling_reliable_detection_never_pays_for_confirmation(text):
     llm = _FakeLLM(tag="en")
     result = await resolve_customer_language(text, llm=llm)
     assert result.source == "current_message"
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reply_language_uses_deterministic_detection_before_llm():
+    llm = _FakeLLM(tag="en")
+    result = await resolve_reply_language("返金には通常3〜5営業日かかります。", llm=llm)
+
+    assert result.tag == "ja"
+    assert result.source == "generated_reply"
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reply_language_uses_llm_only_when_local_detection_is_uncertain():
+    llm = _FakeLLM(tag="en")
+    result = await resolve_reply_language("Hello", llm=llm)
+
+    assert result.tag == "en"
+    assert result.source == LLM_FALLBACK_SOURCE
+    assert llm.calls == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_reply_language_ignores_approved_product_terms():
+    llm = _FakeLLM(tag="ja")
+    result = await resolve_reply_language(
+        "MT4 VPS",
+        llm=llm,
+        neutral_terms=("MT4", "VPS"),
+    )
+
+    assert result.tag == "und"
     assert llm.calls == []

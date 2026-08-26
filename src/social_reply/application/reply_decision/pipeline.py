@@ -2,11 +2,13 @@ import logging
 import time
 from dataclasses import dataclass, replace
 
+from social_reply.application.reply_decision.language_resolution import resolve_reply_language
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import (
-    LANGUAGE_POLICY_LEGACY_HARD,
+    LANGUAGE_POLICY_REVIEW,
     LANGUAGE_VERIFICATION_STRICT,
+    protected_entities,
     redact_pii,
     run_hard_output_guard,
     run_language_observation_guard,
@@ -116,7 +118,7 @@ async def run_decision_pipeline(
     voice_preferences: VoicePreferences | None = None,
     email_auto_reply_allowed: bool = True,
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
-    language_policy: str = LANGUAGE_POLICY_LEGACY_HARD,
+    language_policy: str = LANGUAGE_POLICY_REVIEW,
 ) -> ReplyDecision:
     """纯管线：状态门 → 安全规则 → 生成 → 硬闸门 → 语义验证 → 语言观察 → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
@@ -301,6 +303,27 @@ async def run_decision_pipeline(
             customer_query=snapshot.text or "",
         )
 
+    observed_reply_language: str | None = None
+    if decision.action is ReplyAction.AUTO_REPLY and target_language != "und":
+        if decision.source == "knowledge_localization" and decision.reply_language != "und":
+            observed_reply_language = decision.reply_language
+        else:
+            neutral_terms = (
+                protected_entities(
+                    approved_knowledge_reply,
+                    protected_values=approved_knowledge_protected_values,
+                )
+                if approved_knowledge_reply is not None
+                else ()
+            ) + (approved_localization.protected_values if approved_localization else ())
+            observed_reply_language = (
+                await resolve_reply_language(
+                    decision.reply_text,
+                    llm=llm,
+                    neutral_terms=neutral_terms,
+                )
+            ).tag
+
     # Phase 3: language identity is routing/review evidence, never a shortcut around safety.
     decision = run_language_observation_guard(
         decision,
@@ -312,6 +335,7 @@ async def run_decision_pipeline(
             approved_localization.protected_values if approved_localization else ()
         ),
         customer_text=snapshot.text,
+        observed_reply_language=observed_reply_language,
         language_verification=language_verification,
         language_policy=language_policy,
     )

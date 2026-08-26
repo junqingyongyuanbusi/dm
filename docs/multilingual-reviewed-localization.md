@@ -6,13 +6,13 @@
 
 ## Configuration
 
-The runtime path uses the retrieval and multilingual switches. Language and selector rollout remain
-fail-closed by default:
+The runtime path uses the retrieval and multilingual switches. Language uncertainty defaults to
+private review, while selector changes remain disabled:
 
 ```dotenv
 KNOWLEDGE_RETRIEVAL_ENABLED=true
 MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true
-MULTILINGUAL_LANGUAGE_POLICY=legacy_hard
+MULTILINGUAL_LANGUAGE_POLICY=review
 RAG_SELECTOR_MODE=off
 RAG_SELECTOR_CANARY_BPS=0
 ```
@@ -55,10 +55,10 @@ ID; reply generation and grounding stay on the shared canonical path in every mo
 
 The decision becomes `HANDOFF` when retrieval fails, no strong answer exists, sampled live selection
 abstains, official-contact authorization is missing, a deterministic fact or protected entity drifts,
-a writing-system conflict is observed, grounding fails, or a required provider is unavailable.
-`legacy_hard` also hands off on unresolved or wrong language. `review` changes only that language-
-identity signal: after every hard check passes, it stores the candidate as a private DRAFT and never
-sends it automatically.
+grounding fails, or a required provider is unavailable. `legacy_hard` also hands off on unresolved or
+wrong language, including an obvious writing-system disagreement. `review` changes only that
+language-identity signal: after every hard check passes, it stores the candidate as a private DRAFT
+and never sends it automatically.
 
 ## Reviewed localization artifacts
 

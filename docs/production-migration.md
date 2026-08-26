@@ -181,7 +181,9 @@ preflight. Unknown language under `legacy_hard`, no strong match, unauthorized o
 failed grounding, or provider failure becomes `HANDOFF`. Under
 `MULTILINGUAL_LANGUAGE_POLICY=review`, language uncertainty or a wrong-language observation alone
 preserves a candidate only as a private `DRAFT`; deterministic facts, provenance, protected
-entities, contacts, numbers, currencies, and writing-system conflicts still fail closed.
+entities, contacts, numbers, currencies, grounding, and delivery authorization still fail closed.
+An obvious writing-system disagreement is treated as a wrong-language observation rather than a
+separate content-safety failure.
 
 The old `MULTILINGUAL_SUPPORTED_LANGUAGES`, `MULTILINGUAL_LIVE_LOCALES`, and experimental account
 configuration are retired and must not be added to Railway variables. Existing reviewed localization

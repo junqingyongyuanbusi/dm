@@ -258,9 +258,9 @@ closed。
 
 `MULTILINGUAL_LANGUAGE_POLICY=legacy_hard` 保留未知/回错语言即 HANDOFF 的历史行为；`review`
 只把语种身份当作审阅信号，让已通过事实、出处、实体、联系方式、数值货币和 grounding 硬校验的
-候选进入私有 DRAFT，绝不自动公开发送。默认发布组合是 `legacy_hard`、`RAG_SELECTOR_MODE=off`、
-`RAG_SELECTOR_CANARY_BPS=0`，先做 bounded shadow，再审阅证据和草稿队列，最后才允许小流量
-review/live canary。
+候选进入私有 DRAFT，绝不自动公开发送。默认组合是 `review`、`RAG_SELECTOR_MODE=off`、
+`RAG_SELECTOR_CANARY_BPS=0`；上线后先审阅语言草稿率和知识命中证据，再决定是否启用小流量
+selector live canary。
 
 PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Scheduler 会恢复带版本化 dispatch contract 的新 RawEvent、DecisionJob 和 Outbox；历史缺少安全重建参数的 `PENDING` RawEvent 不会被猜测执行。Worker 提交 Outbox 后仍走低延迟 Fast Path。
 

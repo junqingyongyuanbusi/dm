@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     multilingual_knowledge_reply_enabled: bool = False
     # Language identity is advisory in review mode: deterministic fact/provenance
     # checks still fail closed, while uncertain language observations create a draft.
-    multilingual_language_policy: Literal["legacy_hard", "review"] = "legacy_hard"
+    multilingual_language_policy: Literal["legacy_hard", "review"] = "review"
     # Selector rollout is independent from multilingual generation so shadow evidence
     # can be collected before any candidate choice changes.
     rag_selector_mode: Literal["off", "shadow", "live"] = "off"

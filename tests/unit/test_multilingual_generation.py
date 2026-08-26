@@ -8,7 +8,7 @@ from social_reply.application.reply_decision.multilingual_generation import (
     generate_multilingual_reply,
 )
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.voice import DEFAULT_VOICE_PREFERENCES
 
 
@@ -92,7 +92,7 @@ async def test_runtime_generation_returns_same_language_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wrong_language_generation_handoffs() -> None:
+async def test_wrong_language_generation_becomes_private_draft() -> None:
     decision = await generate_multilingual_reply(
         _snapshot(),
         selected=_hit(),
@@ -104,8 +104,10 @@ async def test_wrong_language_generation_handoffs() -> None:
         email_auto_reply_allowed=True,
     )
 
-    assert decision.action is ReplyAction.HANDOFF
-    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in decision.reason_codes
+    assert decision.action is ReplyAction.DRAFT
+    assert decision.reply_text == "Refunds take 3 to 5 business days."
+    assert decision.reply_visibility is Visibility.PRIVATE
+    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
 
 
 @pytest.mark.asyncio

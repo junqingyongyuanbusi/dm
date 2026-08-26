@@ -218,7 +218,7 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Enables English-corpus multilingual runtime generation; non-English requests use the detected language, with no language or account allowlist; requires knowledge retrieval |
 | `KNOWLEDGE_LOCALIZATION_ENABLED` | `false` | Prefer human-reviewed localized text over runtime generation; requires `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true` and a non-empty live-locale list |
 | `KNOWLEDGE_LOCALIZATION_LIVE_LOCALES` | empty | Comma-separated send allowlist for reviewed localizations; published locales outside it still fall back to runtime generation |
-| `MULTILINGUAL_LANGUAGE_POLICY` | `legacy_hard` | `legacy_hard` keeps uncertain/wrong-language output fail-closed as HANDOFF; `review` may preserve language-only uncertainty as a private DRAFT after every hard guard passes |
+| `MULTILINGUAL_LANGUAGE_POLICY` | `review` | `review` preserves uncertain/wrong-language output as a private DRAFT after every hard guard passes; `legacy_hard` remains available as a rollback mode that converts it to HANDOFF |
 | `RAG_SELECTOR_MODE` | `off` | `off`, `shadow`, or `live`; controls sampled non-exact candidate selection independently from language policy |
 | `RAG_SELECTOR_CANARY_BPS` | `0` | Stable selector sample in basis points, `0..10000`; the bucket is derived from tenant and conversation identity |
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
@@ -264,25 +264,23 @@ contact authorization, numbers, currencies, semantic grounding, tenant/account s
 switch, idempotency, or Outbox preflight. A failure in any of those layers still discards the
 candidate and fails closed.
 
-### Language observation strength
+### Reply-language observation
 
-After deterministic hard checks and grounding, `run_language_observation_guard` records how strongly
-the pipeline can observe language identity:
+After deterministic hard checks and grounding, the runtime resolves the generated reply language
+with a small cascade: deterministic detection first, then one structured LLM language-classification
+call only when local detection is uncertain. Generated replies never inherit a language from
+conversation history. Approved product names and protected entities are removed from the text being
+classified because they carry no useful language evidence.
 
-- **strict** (deterministic detection) — compares the observed output language with the prompt target.
-- **lenient** (a tag the deterministic detector cannot verify): the guard falls back to
-  writing-system consistency between the customer message and reply, tags the decision
-  `LANGUAGE_MODEL_ATTESTED`, and leaves semantic fidelity to the grounding verifier. A writing-system
-  conflict remains HANDOFF under both policies; only language identity uncertainty becomes a private
-  DRAFT under `review`.
+The resolved primary language must match the prompt target; Chinese script variants remain distinct
+when both sides provide one. Under the default `review` policy, a mismatch or unresolved reply is
+preserved only as a private DRAFT. `legacy_hard` remains a rollback mode that converts the same signal
+to HANDOFF. Language observation runs only after hard fact, number/currency, protected-entity,
+contact/PII and semantic-grounding checks, so it cannot soften those failures.
 
-Language identity is prompt/routing metadata plus this policy-controlled observation. Outbox does
-not re-detect it, compare request and reply language tags, or reject a decision merely because
-`reply_language=und`. Under `review`, language-only uncertainty cannot become an automatic public
-reply because the pipeline has already made it a private DRAFT. Public bot-derived delivery remains
-fail-closed on grounding and deterministic fact, number/currency, protected-entity, contact/PII, and
-knowledge/localization provenance checks, in addition to its normal scope, payload-binding, account,
-conversation, kill-switch, and idempotency preflight.
+Outbox does not call a language model again. Public bot-derived delivery remains fail-closed on
+grounding and deterministic knowledge provenance in addition to its normal scope, payload binding,
+account, conversation, kill-switch and idempotency preflight.
 
 Allowed writing systems are the per-language table **union** the customer message's dominant script.
 The table alone cannot keep up — it lists `ru`/`uk`/`bg` but omits Macedonian, Serbian, Belarusian,
