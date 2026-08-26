@@ -1,5 +1,9 @@
 from typing import Protocol
 
+import redis.asyncio as aioredis
+
+from social_reply.shared.config import get_settings
+
 
 class _RedisLike(Protocol):
     async def mget(self, keys: list[str]) -> list[bytes | None]: ...
@@ -20,3 +24,14 @@ class KillSwitchChecker:
         ]
         values = await self._redis.mget(keys)
         return any(v is not None for v in values)
+
+
+_redis = None
+
+
+def make_killswitch_checker() -> KillSwitchChecker:
+    """Return a process-wide checker so decision and delivery share one Redis pool."""
+    global _redis
+    if _redis is None:
+        _redis = aioredis.from_url(get_settings().redis_url)
+    return KillSwitchChecker(_redis)

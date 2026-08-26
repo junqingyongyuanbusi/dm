@@ -5,9 +5,11 @@ from dataclasses import dataclass, replace
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import (
+    LANGUAGE_POLICY_LEGACY_HARD,
     LANGUAGE_VERIFICATION_STRICT,
     redact_pii,
-    run_final_guard,
+    run_hard_output_guard,
+    run_language_observation_guard,
 )
 from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, LLMClient, LLMContext
 from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
@@ -35,6 +37,65 @@ class DecisionSnapshot:
     has_unsupported_attachment: bool = False
 
 
+async def _run_grounding_verifier(
+    decision: ReplyDecision,
+    *,
+    llm: LLMClient | None,
+    approved_knowledge_reply: str,
+    target_language: str,
+    customer_query: str,
+) -> ReplyDecision:
+    relevant = False
+    faithful = False
+    failure_reason = "GUARD_KNOWLEDGE_SEMANTIC_MISMATCH"
+    verifier_v2 = getattr(llm, "verify_rag_answer", None) if llm is not None else None
+    legacy_verifier = getattr(llm, "verify_grounding", None) if llm is not None else None
+    verification_started = time.perf_counter()
+    if verifier_v2 is not None:
+        try:
+            result = await verifier_v2(
+                query=customer_query,
+                approved_reply=approved_knowledge_reply,
+                candidate_reply=decision.reply_text or "",
+                target_language=target_language,
+            )
+            relevant = result.relevant
+            faithful = result.faithful
+            if not relevant:
+                failure_reason = "GUARD_KNOWLEDGE_RELEVANCE_MISMATCH"
+        except Exception:
+            logger.exception("RAG verifier failed; decision downgraded to handoff")
+    elif legacy_verifier is not None:
+        try:
+            faithful = await legacy_verifier(
+                approved_reply=approved_knowledge_reply,
+                candidate_reply=decision.reply_text or "",
+                target_language=target_language,
+            )
+            relevant = faithful
+        except Exception:
+            logger.exception("grounding verifier failed; decision downgraded to handoff")
+    decision = replace(
+        decision,
+        grounding_verified=relevant and faithful,
+        grounding_verifier_version=getattr(
+            llm,
+            "rag_verifier_id",
+            getattr(llm, "grounding_verifier_id", _GROUNDING_VERIFIER_VERSION),
+        ),
+        grounding_latency_ms=(time.perf_counter() - verification_started) * 1000,
+    )
+    if relevant and faithful:
+        return decision
+    return replace(
+        decision,
+        action=ReplyAction.HANDOFF,
+        reply_text=None,
+        source="guard",
+        reason_codes=decision.reason_codes + (failure_reason,),
+    )
+
+
 async def run_decision_pipeline(
     snapshot: DecisionSnapshot,
     *,
@@ -45,6 +106,7 @@ async def run_decision_pipeline(
     verbatim_reply: str | None = None,
     approved_official_contact_reply: str | None = None,
     approved_knowledge_reply: str | None = None,
+    approved_knowledge_protected_values: tuple[str, ...] = (),
     approved_localization: ApprovedLocalizationArtifact | None = None,
     verbatim_after_decision: str | None = None,
     forced_decision: ReplyDecision | None = None,
@@ -54,8 +116,9 @@ async def run_decision_pipeline(
     voice_preferences: VoicePreferences | None = None,
     email_auto_reply_allowed: bool = True,
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
+    language_policy: str = LANGUAGE_POLICY_LEGACY_HARD,
 ) -> ReplyDecision:
-    """纯管线：状态门 → kill switch → 安全规则 → 模板直答/LLM → Final Guard → 草稿降级。
+    """纯管线：状态门 → 安全规则 → 生成 → 硬闸门 → 语义验证 → 语言观察 → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
     verbatim_reply 非空时（知识库命中且开模板直答）原文返回模板回复，不调 LLM。"""
     # Only active automation modes are allowed to spend model capacity or create decisions.
@@ -204,13 +267,14 @@ async def run_decision_pipeline(
             reason_codes=decision.reason_codes + (reason,),
         )
 
-    # 输出侧闸门
-    decision = run_final_guard(
+    # Phase 1: deterministic safety facts. Failures hand off and discard the candidate.
+    decision = run_hard_output_guard(
         decision,
         snapshot.platform,
         approved_official_contact_reply=approved_official_contact_reply,
         expected_reply_language=target_language,
         approved_knowledge_reply=approved_knowledge_reply,
+        approved_knowledge_protected_values=approved_knowledge_protected_values,
         approved_localization_text=(approved_localization.text if approved_localization else None),
         approved_localization_text_hash=(
             approved_localization.text_hash if approved_localization else None
@@ -218,10 +282,10 @@ async def run_decision_pipeline(
         approved_localization_protected_values=(
             approved_localization.protected_values if approved_localization else ()
         ),
-        customer_text=snapshot.text,
-        language_verification=language_verification,
     )
 
+    # Phase 2: semantic fidelity/relevance. It runs only after every deterministic check passes,
+    # but before language identity can turn the candidate into a review draft.
     if (
         target_language != "und"
         and approved_knowledge_reply is not None
@@ -229,36 +293,29 @@ async def run_decision_pipeline(
         and approved_localization is None
         and decision.action is ReplyAction.AUTO_REPLY
     ):
-        faithful = False
-        verifier = getattr(llm, "verify_grounding", None) if llm is not None else None
-        verification_started = time.perf_counter()
-        if verifier is not None:
-            try:
-                faithful = await verifier(
-                    approved_reply=approved_knowledge_reply,
-                    candidate_reply=decision.reply_text or "",
-                    target_language=target_language,
-                )
-            except Exception:
-                logger.exception("grounding verifier failed; decision downgraded to handoff")
-        decision = replace(
+        decision = await _run_grounding_verifier(
             decision,
-            grounding_verified=faithful,
-            grounding_verifier_version=getattr(
-                llm,
-                "grounding_verifier_id",
-                _GROUNDING_VERIFIER_VERSION,
-            ),
-            grounding_latency_ms=(time.perf_counter() - verification_started) * 1000,
+            llm=llm,
+            approved_knowledge_reply=approved_knowledge_reply,
+            target_language=target_language,
+            customer_query=snapshot.text or "",
         )
-        if not faithful:
-            decision = replace(
-                decision,
-                action=ReplyAction.HANDOFF,
-                reply_text=None,
-                source="guard",
-                reason_codes=decision.reason_codes + ("GUARD_KNOWLEDGE_SEMANTIC_MISMATCH",),
-            )
+
+    # Phase 3: language identity is routing/review evidence, never a shortcut around safety.
+    decision = run_language_observation_guard(
+        decision,
+        approved_official_contact_reply=approved_official_contact_reply,
+        expected_reply_language=target_language,
+        approved_knowledge_reply=approved_knowledge_reply,
+        approved_knowledge_protected_values=approved_knowledge_protected_values,
+        approved_localization_protected_values=(
+            approved_localization.protected_values if approved_localization else ()
+        ),
+        customer_text=snapshot.text,
+        language_verification=language_verification,
+        language_policy=language_policy,
+    )
+
     # 草稿降级必须是管线的最后一步：任何把 action 改回 AUTO_REPLY 的兜底都要排在它前面，
     # 否则决策会以 auto_reply 落库——BOT_DRAFT_ONLY 下既不外发，也进不了 admin 待审队列。
     # Persistence creates a public Outbox only when state and version still match BOT_ACTIVE.

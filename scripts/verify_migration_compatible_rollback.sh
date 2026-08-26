@@ -8,7 +8,7 @@ fi
 
 target_image="$1"
 compat_image="$2"
-expected_head="f2d9c4b8e631"
+expected_head="a7c3e9d1b624"
 postgres_image="pgvector/pgvector@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0"
 run_id="${RANDOM}-$$-$(date +%s)"
 network="reply-core-rollback-${run_id}"
@@ -80,30 +80,28 @@ run_alembic() {
     "$@"
 }
 
-run_python_module "$target_image" scripts.prepare_database
-
-target_current="$(run_alembic "$target_image" current | awk '{print $1; exit}')"
 compat_head="$(run_alembic "$compat_image" heads | awk '{print $1; exit}')"
-compat_current="$(run_alembic "$compat_image" current | awk '{print $1; exit}')"
-[[ "$target_current" == "$expected_head" ]] || {
-  echo "target image prepared unexpected DB revision: $target_current" >&2
-  exit 1
-}
 [[ "$compat_head" == "$expected_head" ]] || {
   echo "compat image has unexpected Alembic head: $compat_head" >&2
   exit 1
 }
-[[ "$compat_current" == "$expected_head" ]] || {
-  echo "compat image sees unexpected DB revision: $compat_current" >&2
-  exit 1
-}
 
+# Exercise the production bridge order: the compatibility API owns the schema
+# expansion before a target Worker is allowed to assert exact-head readiness.
 run_python_module "$compat_image" scripts.prepare_database
 run_python_module "$compat_image" scripts.assert_database_ready
 
-compat_current_after="$(run_alembic "$compat_image" current | awk '{print $1; exit}')"
-[[ "$compat_current_after" == "$expected_head" ]] || {
-  echo "compat image changed DB revision unexpectedly: $compat_current_after" >&2
+compat_current="$(run_alembic "$compat_image" current | awk '{print $1; exit}')"
+[[ "$compat_current" == "$expected_head" ]] || {
+  echo "compat API prepared unexpected DB revision: $compat_current" >&2
+  exit 1
+}
+
+run_python_module "$target_image" scripts.assert_database_ready
+run_python_module "$target_image" scripts.prepare_database
+target_current="$(run_alembic "$target_image" current | awk '{print $1; exit}')"
+[[ "$target_current" == "$expected_head" ]] || {
+  echo "target image sees unexpected DB revision: $target_current" >&2
   exit 1
 }
 

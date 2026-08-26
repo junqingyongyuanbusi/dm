@@ -1,12 +1,17 @@
 import asyncio
+import hashlib
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select, text, update
 
+from social_reply.application.knowledge.localizations import (
+    LocalizationValidationError,
+    revoke_localization,
+)
 from social_reply.application.message_delivery import outbox as outbox_module
 from social_reply.application.message_delivery import sweep as sweep_module
 from social_reply.application.message_delivery.outbox import deliver_outbox
@@ -24,19 +29,46 @@ from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
 
+_VECTOR = [1.0] + [0.0] * 1535
+
+
+class _OpenKillSwitch:
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
+        return False
+
+
+class _ClosedKillSwitch:
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
+        return True
+
+
+class _UnavailableKillSwitch:
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
+        raise RuntimeError("redis unavailable")
+
 
 @pytest.fixture(autouse=True)
-def _flush_fake_sent():
+def _flush_fake_sent(monkeypatch):
     # Fake 为模块级单例，测试间累积 .sent；本套件各 seed 用相同 content/会话，
     # 故按 [-1] 断言前需隔离——每测试前清空。
     get_chatwoot_client().sent.clear()
+    monkeypatch.setattr(
+        outbox_module,
+        "make_killswitch_checker",
+        lambda: _OpenKillSwitch(),
+    )
     yield
 
 
 async def _seed(
     session, *, state="BOT_ACTIVE", message_type="text", status="PENDING", with_mapping=True
 ):
-    account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    account_id, contact_id, conv_id, message_id = (
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
     await session.execute(
         insert(models.PlatformAccount).values(
             id=account_id, brand_id="b1", platform="telegram", name="a", chatwoot_inbox_id=101
@@ -55,6 +87,7 @@ async def _seed(
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key="telegram:x:9",
+            decision_generation=1,
         )
     )
     await ensure_state(session, conv_id, state)
@@ -66,6 +99,16 @@ async def _seed(
         )
     ob_id = uuid.uuid4()
     await session.execute(
+        insert(models.Message).values(
+            id=message_id,
+            conversation_id=conv_id,
+            direction="inbound",
+            sender_type="contact",
+            text="inbound",
+            decision_generation=1,
+        )
+    )
+    await session.execute(
         insert(models.OutboxMessage).values(
             id=ob_id,
             conversation_id=conv_id,
@@ -74,12 +117,218 @@ async def _seed(
             destination_id="telegram:x:9",
             message_type=message_type,
             payload={"text": "您好，请提供订单号。", "visibility": "public"},
+            reply_to_message_id=message_id,
             idempotency_key=str(ob_id),
             status=status,
         )
     )
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            tenant_id="default",
+            conversation_id=conv_id,
+            message_id=message_id,
+            action=("draft" if message_type == "private_note" else "auto_reply"),
+            reply_text="您好，请提供订单号。",
+            source="rule",
+            decision_generation=1,
+            outbox_id=ob_id,
+        )
+    )
     await session.commit()
     return conv_id, ob_id
+
+
+async def _preflight_reason(session, outbox_id: uuid.UUID) -> str | None:
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    return await outbox_module._public_bot_send_preflight(
+        session,
+        outbox=outbox,
+        payload_text=outbox.payload["text"],
+    )
+
+
+async def _attach_knowledge(
+    session,
+    outbox_id: uuid.UUID,
+    *,
+    approved_reply: str,
+    protected_values: tuple[str, ...] = (),
+    is_official_contact: bool = False,
+) -> tuple[uuid.UUID, uuid.UUID, str]:
+    document_id, chunk_id = uuid.uuid4(), uuid.uuid4()
+    content = f"Question: test\nApproved answer: {approved_reply}"
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    await session.execute(
+        insert(models.KnowledgeDocument).values(
+            id=document_id,
+            tenant_id="default",
+            brand_id="b1",
+            question="test",
+            reply=approved_reply,
+            protected_values=list(protected_values),
+            status="published",
+            is_official_contact=is_official_contact,
+            source_language="en",
+            detected_language="en",
+            language_detection_status="english",
+            language_verified=True,
+        )
+    )
+    await session.execute(
+        insert(models.KnowledgeChunk).values(
+            id=chunk_id,
+            tenant_id="default",
+            document_id=document_id,
+            content=content,
+            embed_text="test",
+            content_hash=content_hash,
+            embedding=_VECTOR,
+            embedding_version="test-v1",
+        )
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            knowledge_document_id=document_id,
+            knowledge_chunk_id=chunk_id,
+            knowledge_content_hash=content_hash,
+        )
+    )
+    await session.commit()
+    return document_id, chunk_id, content_hash
+
+
+async def _mark_current_multilingual(
+    session,
+    outbox_id: uuid.UUID,
+    *,
+    gate_version: str,
+    margin: float | None,
+) -> None:
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            multilingual_contract_version="multilingual-runtime-generation-v1",
+            grounding_verified=True,
+            knowledge_match_status="strong",
+            knowledge_gate_version=gate_version,
+            knowledge_similarity=0.9,
+            knowledge_similarity_margin=margin,
+            knowledge_min_similarity_threshold=0.8,
+            knowledge_min_margin_threshold=0.08,
+            request_language="und",
+            reply_language="fr",
+            resolved_locale="ja",
+        )
+    )
+    await session.commit()
+
+
+async def _convert_to_approval(session, outbox_id: uuid.UUID, *, final_text: str) -> None:
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(origin_kind="DRAFT_APPROVAL", actor_kind="ADMIN_HUMAN")
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            action="draft",
+            original_reply_text="您好，请提供订单号。",
+            final_reply_text=final_text,
+            review_action=(
+                "ACCEPTED"
+                if final_text == "您好，请提供订单号。"
+                else "EDITED"
+            ),
+            reviewed_by="user:admin",
+            reviewed_at=datetime.now(UTC),
+            review_outbox_id=outbox_id,
+            outbox_id=None,
+        )
+    )
+    await session.commit()
+
+
+async def _convert_to_predecessor_approval(
+    session,
+    outbox_id: uuid.UUID,
+    *,
+    final_text: str,
+) -> None:
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(
+            origin_kind="DRAFT_APPROVAL",
+            actor_kind="ADMIN_HUMAN",
+            payload=dict(outbox.payload)
+            | {"approval": "admin", "approved_by": "user:predecessor-admin"},
+        )
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            action="draft",
+            original_reply_text="您好，请提供订单号。",
+            final_reply_text=final_text,
+            review_action=(
+                "ACCEPTED" if final_text == "您好，请提供订单号。" else "EDITED"
+            ),
+            reviewed_by="user:predecessor-admin",
+            reviewed_at=datetime.now(UTC),
+            review_outbox_id=None,
+        )
+    )
+    await session.commit()
+
+
+async def _attach_published_localization(session, outbox_id: uuid.UUID) -> uuid.UUID:
+    document_id, _chunk_id, source_hash = await _attach_knowledge(
+        session,
+        outbox_id,
+        approved_reply="Please provide your order number.",
+    )
+    artifact_id = uuid.uuid4()
+    localized_text = "您好，请提供订单号。"
+    localized_hash = hashlib.sha256(localized_text.encode()).hexdigest()
+    await session.execute(
+        insert(models.KnowledgeLocalization).values(
+            id=artifact_id,
+            tenant_id="default",
+            document_id=document_id,
+            release_id="review-lock-v1",
+            locale="zh",
+            localized_text=localized_text,
+            text_hash=localized_hash,
+            source_content_hash=source_hash,
+            protected_values=[],
+            auto_reply_allowed=True,
+            official_contact_authorized=False,
+            status="published",
+            reviewed_by="user:localization-reviewer",
+            reviewed_at=datetime.now(UTC),
+        )
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            resolved_locale="zh",
+            knowledge_localization_id=artifact_id,
+            knowledge_localization_release_id="review-lock-v1",
+            knowledge_localization_text_hash=localized_hash,
+            knowledge_localization_source_hash=source_hash,
+        )
+    )
+    await session.commit()
+    return artifact_id
 
 
 async def test_disabled_chatwoot_outbox_fails_closed(session, monkeypatch):
@@ -187,6 +436,7 @@ async def test_bot_active_text_delivers_and_marks_sent(session):
     ).scalar_one()
     await session.commit()
     assert await runner._fetch_history(conv_id, current_seq) == (
+        ("user", "inbound"),
         ("assistant", "您好，请提供订单号。"),
     )
 
@@ -201,6 +451,510 @@ async def test_private_note_delivers_as_private(session):
             select(models.Message).where(models.Message.source_outbox_id == ob_id)
         )
     ).first() is None
+
+
+async def test_private_note_never_invokes_delivery_killswitch(session, monkeypatch):
+    _conv_id, outbox_id = await _seed(
+        session,
+        state="BOT_DRAFT_ONLY",
+        message_type="private_note",
+    )
+
+    def unexpected_checker():
+        raise AssertionError("private notes must bypass public-send authorization")
+
+    monkeypatch.setattr(outbox_module, "make_killswitch_checker", unexpected_checker)
+    assert await deliver_outbox(str(outbox_id)) == "SENT"
+
+
+@pytest.mark.parametrize(
+    ("checker", "expected_code"),
+    [
+        (_ClosedKillSwitch, "KILLSWITCH"),
+        (_UnavailableKillSwitch, "KILLSWITCH_UNAVAILABLE"),
+    ],
+)
+async def test_public_send_rechecks_killswitch(
+    session,
+    monkeypatch,
+    checker,
+    expected_code,
+):
+    _conv_id, outbox_id = await _seed(session)
+    monkeypatch.setattr(outbox_module, "make_killswitch_checker", checker)
+
+    assert await deliver_outbox(str(outbox_id)) == "CANCELLED"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.last_error_code == expected_code
+    assert get_chatwoot_client().sent == []
+
+
+async def test_public_send_rejects_stale_direct_and_approval_generations(session):
+    conversation_id, direct_id = await _seed(session)
+    await session.execute(
+        update(models.Conversation)
+        .where(models.Conversation.id == conversation_id)
+        .values(decision_generation=2)
+    )
+    await session.commit()
+    assert await _preflight_reason(session, direct_id) == "STALE_CONVERSATION_INPUT"
+
+    # Each parametrized test has one clean schema, so reuse the same decision as an approval.
+    await _convert_to_approval(
+        session,
+        direct_id,
+        final_text="您好，请提供订单号。",
+    )
+    assert await _preflight_reason(session, direct_id) == "STALE_CONVERSATION_INPUT"
+
+
+async def test_stale_draft_approval_cancels_without_handoff_current_conversation(session):
+    conversation_id, outbox_id = await _seed(session, state="BOT_DRAFT_ONLY")
+    await _convert_to_approval(
+        session,
+        outbox_id,
+        final_text="您好，请提供订单号。",
+    )
+    await session.execute(
+        update(models.Conversation)
+        .where(models.Conversation.id == conversation_id)
+        .values(decision_generation=2)
+    )
+    await session.commit()
+
+    assert await deliver_outbox(str(outbox_id)) == "CANCELLED"
+
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    state = await session.get(models.AutomationState, conversation_id)
+    work_items = list(
+        (
+            await session.scalars(
+                select(models.HumanWorkItem).where(
+                    models.HumanWorkItem.conversation_id == conversation_id
+                )
+            )
+        ).all()
+    )
+    assert outbox.status == "CANCELLED"
+    assert outbox.last_error_code == "STALE_CONVERSATION_INPUT"
+    assert outbox.attempt_count == 0
+    assert state.state == "BOT_DRAFT_ONLY"
+    assert state.state_changed_reason is None
+    assert work_items == []
+    assert get_chatwoot_client().sent == []
+
+
+async def test_public_send_accepts_predecessor_draft_approval_link(session):
+    _conversation_id, outbox_id = await _seed(session, state="BOT_DRAFT_ONLY")
+    await _convert_to_predecessor_approval(
+        session,
+        outbox_id,
+        final_text="您好，请提供订单号。",
+    )
+
+    assert await _preflight_reason(session, outbox_id) is None
+
+
+@pytest.mark.parametrize("link_kind", ["canonical", "predecessor"])
+async def test_localization_revoke_serializes_with_review_delivery(session, link_kind):
+    _conversation_id, outbox_id = await _seed(session, state="BOT_DRAFT_ONLY")
+    artifact_id = await _attach_published_localization(session, outbox_id)
+    converter = (
+        _convert_to_approval if link_kind == "canonical" else _convert_to_predecessor_approval
+    )
+    await converter(session, outbox_id, final_text="您好，请提供订单号。")
+
+    started = asyncio.Event()
+    revoker_pid: list[int] = []
+
+    async def revoke_while_sending() -> str | None:
+        async with get_session_factory()() as revoke_session:
+            revoker_pid.append(int(await revoke_session.scalar(text("SELECT pg_backend_pid()"))))
+            started.set()
+            try:
+                await revoke_localization(
+                    revoke_session,
+                    tenant_id="default",
+                    artifact_id=artifact_id,
+                    actor="user:revoker",
+                    reason="concurrent revoke",
+                )
+                await revoke_session.commit()
+            except LocalizationValidationError as exc:
+                await revoke_session.rollback()
+                return str(exc)
+        return None
+
+    async with get_session_factory()() as delivery_session:
+        delivery_pid = int(await delivery_session.scalar(text("SELECT pg_backend_pid()")))
+        await delivery_session.execute(
+            update(models.OutboxMessage)
+            .where(models.OutboxMessage.id == outbox_id)
+            .values(status="SENDING")
+        )
+        delivery_outbox = await delivery_session.get(models.OutboxMessage, outbox_id)
+        assert (
+            await outbox_module._public_bot_send_preflight(
+                delivery_session,
+                outbox=delivery_outbox,
+                payload_text=delivery_outbox.payload["text"],
+            )
+            is None
+        )
+
+        revoke_task = asyncio.create_task(revoke_while_sending())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        blocked_on_artifact = False
+        blocking_detail = None
+        blocker_locks = []
+        for _attempt in range(200):
+            if revoke_task.done():
+                break
+            blocking_detail = (
+                await session.execute(
+                    text(
+                        "SELECT wait_event_type, wait_event, pg_blocking_pids(pid) "
+                        "FROM pg_stat_activity WHERE pid = :pid"
+                    ),
+                    {"pid": revoker_pid[0]},
+                )
+            ).one_or_none()
+            wait_event_type = blocking_detail[0] if blocking_detail is not None else None
+            if wait_event_type == "Lock":
+                blocker_locks = (
+                    await session.execute(
+                        text(
+                            "SELECT pid, locktype, relation::regclass::text, mode, granted, "
+                            "transactionid FROM pg_locks WHERE pid = ANY(:pids) "
+                            "ORDER BY pid, granted, locktype, mode"
+                        ),
+                        {"pids": [delivery_pid, revoker_pid[0]]},
+                    )
+                ).all()
+                blockers = set(blocking_detail[2])
+                holds_localization_row_lock = any(
+                    lock.pid == delivery_pid
+                    and lock.relation == "knowledge_localizations"
+                    and lock.mode == "RowShareLock"
+                    and lock.granted
+                    for lock in blocker_locks
+                )
+                if delivery_pid in blockers and holds_localization_row_lock:
+                    blocked_on_artifact = True
+                    break
+            await asyncio.sleep(0.01)
+
+        if blocked_on_artifact:
+            await delivery_session.commit()
+        else:
+            await delivery_session.rollback()
+        revoke_result = await asyncio.wait_for(revoke_task, timeout=2)
+
+    assert blocked_on_artifact, "send preflight must lock the localization before SENDING commits"
+    assert revoke_result == "localization has a sending outbox"
+
+
+@pytest.mark.parametrize("link_kind", ["canonical", "legacy_approval"])
+async def test_public_send_rejects_duplicate_decision_links(session, link_kind):
+    conversation_id, outbox_id = await _seed(session)
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+
+    decision_values = {
+        "tenant_id": "default",
+        "conversation_id": conversation_id,
+        "message_id": outbox.reply_to_message_id,
+        "action": "auto_reply",
+        "reply_text": "您好，请提供订单号。",
+        "source": "rule",
+        "decision_generation": 1,
+        "outbox_id": outbox_id,
+    }
+    if link_kind == "legacy_approval":
+        await session.execute(
+            update(models.OutboxMessage)
+            .where(models.OutboxMessage.id == outbox_id)
+            .values(
+                actor_kind="ADMIN_HUMAN",
+                payload={
+                    "text": "您好，请提供订单号。",
+                    "visibility": "public",
+                    "approval": "admin",
+                },
+            )
+        )
+        decision_values.update(
+            action="draft",
+            original_reply_text="您好，请提供订单号。",
+            final_reply_text="您好，请提供订单号。",
+            review_action="ACCEPTED",
+            reviewed_by="user:admin",
+            reviewed_at=datetime.now(UTC),
+        )
+        await session.execute(
+            update(models.ReplyDecision)
+            .where(models.ReplyDecision.outbox_id == outbox_id)
+            .values(**decision_values)
+        )
+
+    duplicate_message_id = uuid.uuid4()
+    await session.execute(
+        insert(models.Message).values(
+            id=duplicate_message_id,
+            conversation_id=conversation_id,
+            direction="inbound",
+            sender_type="contact",
+            text="duplicate decision source",
+            decision_generation=1,
+        )
+    )
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            **(decision_values | {"message_id": duplicate_message_id})
+        )
+    )
+    await session.commit()
+
+    assert await _preflight_reason(session, outbox_id) == "PUBLIC_SEND_PROVENANCE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "invalid_link",
+    ["cross_tenant_conversation", "outbound", "wrong_generation"],
+)
+async def test_public_send_validates_source_message_scope(session, invalid_link):
+    conversation_id, outbox_id = await _seed(session)
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    source_message_id = outbox.reply_to_message_id
+
+    if invalid_link == "cross_tenant_conversation":
+        conversation = await session.get(models.Conversation, conversation_id)
+        other_conversation_id = uuid.uuid4()
+        await session.execute(
+            insert(models.Conversation).values(
+                id=other_conversation_id,
+                tenant_id="other-tenant",
+                brand_id=conversation.brand_id,
+                platform=conversation.platform,
+                platform_account_id=conversation.platform_account_id,
+                contact_id=conversation.contact_id,
+                conversation_key=f"cross-scope:{other_conversation_id}",
+                decision_generation=1,
+            )
+        )
+        await session.execute(
+            update(models.Message)
+            .where(models.Message.id == source_message_id)
+            .values(conversation_id=other_conversation_id)
+        )
+    elif invalid_link == "outbound":
+        await session.execute(
+            update(models.Message)
+            .where(models.Message.id == source_message_id)
+            .values(direction="outbound")
+        )
+    else:
+        await session.execute(
+            update(models.Message)
+            .where(models.Message.id == source_message_id)
+            .values(decision_generation=2)
+        )
+    await session.commit()
+
+    assert await _preflight_reason(session, outbox_id) == "PUBLIC_SEND_SCOPE_INVALID"
+
+
+async def test_public_send_binds_direct_and_approval_payloads(session):
+    _conversation_id, outbox_id = await _seed(session)
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": "tampered"})
+    )
+    await session.commit()
+    assert await _preflight_reason(session, outbox_id) == "PUBLIC_SEND_PAYLOAD_MISMATCH"
+
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": "您好，请提供订单号。"})
+    )
+    await session.commit()
+    await _convert_to_approval(
+        session,
+        outbox_id,
+        final_text="您好，请提供订单号。",
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": "tampered"})
+    )
+    await session.commit()
+    assert await _preflight_reason(session, outbox_id) == "DRAFT_APPROVAL_PROVENANCE_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("gate_version", "margin", "expected"),
+    [
+        ("selector-gate-v2", -1.0, None),
+        ("strong-gate-v1", None, None),
+        ("strong-gate-v1", 0.01, "MULTILINGUAL_PROVENANCE_INVALID"),
+        ("unknown-gate", 1.0, "MULTILINGUAL_PROVENANCE_INVALID"),
+    ],
+)
+async def test_multilingual_send_uses_gate_version_not_language_identity(
+    session,
+    monkeypatch,
+    gate_version,
+    margin,
+    expected,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(
+        session,
+        outbox_id,
+        approved_reply="您好，请提供订单号。",
+    )
+    await _mark_current_multilingual(
+        session,
+        outbox_id,
+        gate_version=gate_version,
+        margin=margin,
+    )
+    settings = outbox_module.get_settings().model_copy(
+        update={"multilingual_knowledge_reply_enabled": True}
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert await _preflight_reason(session, outbox_id) == expected
+
+
+@pytest.mark.parametrize(
+    ("approved_reply", "candidate", "protected_values", "expected"),
+    [
+        (
+            "Refunds take 3 business days.",
+            "Refunds take 5 business days.",
+            (),
+            "GUARD_KNOWLEDGE_FACT_MISMATCH",
+        ),
+        (
+            "Use MetaTrader for this workflow.",
+            "Use TradingView for this workflow.",
+            ("MetaTrader",),
+            "GUARD_KNOWLEDGE_ENTITY_MISMATCH",
+        ),
+    ],
+)
+async def test_send_time_hard_guard_rechecks_knowledge_facts(
+    session,
+    approved_reply,
+    candidate,
+    protected_values,
+    expected,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(
+        session,
+        outbox_id,
+        approved_reply=approved_reply,
+        protected_values=protected_values,
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": candidate})
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(reply_text=candidate)
+    )
+    await session.commit()
+
+    assert await _preflight_reason(session, outbox_id) == expected
+
+
+async def test_send_time_hard_guard_blocks_unapproved_pii(session):
+    _conversation_id, outbox_id = await _seed(session)
+    candidate = "Email private@example.com for help."
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": candidate})
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(reply_text=candidate)
+    )
+    await session.commit()
+
+    assert await _preflight_reason(session, outbox_id) == "GUARD_PII_LEAK"
+
+
+async def test_send_time_hard_guard_allows_published_official_contact(session):
+    _conversation_id, outbox_id = await _seed(session)
+    reply = "Email support@example.com for help."
+    await _attach_knowledge(
+        session,
+        outbox_id,
+        approved_reply=reply,
+        protected_values=("support@example.com",),
+        is_official_contact=True,
+    )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": reply})
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(reply_text=reply, source="knowledge")
+    )
+    await session.commit()
+
+    assert await _preflight_reason(session, outbox_id) is None
+
+
+@pytest.mark.parametrize("revocation", ["status", "brand", "platform", "hash"])
+async def test_send_time_revalidates_current_knowledge_source(session, revocation):
+    _conversation_id, outbox_id = await _seed(session)
+    document_id, chunk_id, _content_hash = await _attach_knowledge(
+        session,
+        outbox_id,
+        approved_reply="您好，请提供订单号。",
+    )
+    if revocation == "status":
+        await session.execute(
+            update(models.KnowledgeDocument)
+            .where(models.KnowledgeDocument.id == document_id)
+            .values(status="draft")
+        )
+    elif revocation == "brand":
+        await session.execute(
+            update(models.KnowledgeDocument)
+            .where(models.KnowledgeDocument.id == document_id)
+            .values(brand_id="other-brand")
+        )
+    elif revocation == "platform":
+        await session.execute(
+            update(models.KnowledgeDocument)
+            .where(models.KnowledgeDocument.id == document_id)
+            .values(platform="x")
+        )
+    else:
+        await session.execute(
+            update(models.KnowledgeChunk)
+            .where(models.KnowledgeChunk.id == chunk_id)
+            .values(content_hash="f" * 64)
+        )
+    await session.commit()
+
+    assert await _preflight_reason(session, outbox_id) == "MULTILINGUAL_SOURCE_REVOKED"
 
 
 async def test_defense2_cancels_text_when_not_bot_active(session):
@@ -677,6 +1431,7 @@ async def _seed_direct_platform(
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key=f"{platform}:{account_id}:user-1",
+            decision_generation=1,
         )
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
@@ -688,6 +1443,7 @@ async def _seed_direct_platform(
             sender_type="contact",
             text="inbound",
             reply_target=target,
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -700,6 +1456,7 @@ async def _seed_direct_platform(
             destination_id=f"{platform}:user-1",
             message_type="text",
             payload={"text": "hi", "target": target},
+            reply_to_message_id=message_id,
             idempotency_key=str(ob_id),
             status="PENDING",
         )
@@ -712,6 +1469,7 @@ async def _seed_direct_platform(
             action="auto_reply",
             reply_text="hi",
             source="rule",
+            decision_generation=1,
             outbox_id=ob_id,
         )
     )
@@ -845,6 +1603,11 @@ async def test_feishu_automatic_replies_use_one_sender_call_with_stable_uuid(
         update(models.OutboxMessage)
         .where(models.OutboxMessage.id == outbox_id)
         .values(payload={"text": "您好", "target": target, "uuid": "caller-value"})
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(reply_text="您好")
     )
     await session.commit()
     calls = []
@@ -1032,6 +1795,7 @@ async def _seed_direct_x(
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key="x_dm:acc:u1",
+            decision_generation=1,
         )
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
@@ -1043,6 +1807,7 @@ async def _seed_direct_x(
             sender_type="contact",
             text="inbound",
             reply_target=reply_target,
+            decision_generation=1,
         )
     )
     ob_id = uuid.uuid4()
@@ -1058,6 +1823,7 @@ async def _seed_direct_x(
                 "text": "hi",
                 "target": reply_target,
             },
+            reply_to_message_id=message_id,
             idempotency_key=str(ob_id),
             status="PENDING",
         )
@@ -1069,6 +1835,7 @@ async def _seed_direct_x(
             action="auto_reply",
             reply_text="hi",
             source="rule",
+            decision_generation=1,
             outbox_id=ob_id,
         )
     )
@@ -1600,6 +2367,7 @@ async def _seed_email_outbox(
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key=f"email:{account_id}:{sender_identity}:{thread}",
+            decision_generation=1,
         )
     )
     await ensure_state(session, conversation_id, state)
@@ -1611,6 +2379,7 @@ async def _seed_email_outbox(
             sender_type="contact",
             text="inbound",
             reply_target=target,
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -1631,19 +2400,66 @@ async def _seed_email_outbox(
             sent_at=sent_at,
         )
     )
-    await session.execute(
-        insert(models.ReplyDecision).values(
-            tenant_id="default",
-            conversation_id=conversation_id,
-            message_id=message_id,
-            action="auto_reply",
-            reply_text="reply",
-            source="rule",
-            outbox_id=outbox_id,
+    if (origin_kind, actor_kind) == ("DECISION", "BOT"):
+        await session.execute(
+            insert(models.ReplyDecision).values(
+                tenant_id="default",
+                conversation_id=conversation_id,
+                message_id=message_id,
+                action="auto_reply",
+                reply_text="reply",
+                source="rule",
+                decision_generation=1,
+                outbox_id=outbox_id,
+            )
         )
-    )
+    elif (origin_kind, actor_kind) == ("DRAFT_APPROVAL", "ADMIN_HUMAN"):
+        await session.execute(
+            insert(models.ReplyDecision).values(
+                tenant_id="default",
+                conversation_id=conversation_id,
+                message_id=message_id,
+                action="draft",
+                reply_text="reply",
+                original_reply_text="reply",
+                final_reply_text="reply",
+                review_action="ACCEPTED",
+                reviewed_by="user:admin",
+                reviewed_at=datetime.now(UTC),
+                source="rule",
+                decision_generation=1,
+                review_outbox_id=outbox_id,
+            )
+        )
     await session.commit()
     return account_id, outbox_id
+
+
+async def test_email_sender_lock_reruns_full_public_preflight(session, monkeypatch):
+    _account_id, outbox_id = await _seed_email_outbox(session)
+    settings = outbox_module.get_settings().model_copy(
+        update={"email_enabled": True, "email_auto_reply_enabled": True}
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    original_preflight = outbox_module._public_bot_send_preflight
+    checked = []
+
+    async def observed_preflight(*args, **kwargs):
+        checked.append(kwargs["outbox"].id)
+        return await original_preflight(*args, **kwargs)
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            return "email-preflight-1"
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "_public_bot_send_preflight", observed_preflight)
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+
+    assert await deliver_outbox(str(outbox_id)) == "SENT"
+    assert checked == [outbox_id, outbox_id]
 
 
 @pytest.mark.parametrize(

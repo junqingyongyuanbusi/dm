@@ -8,6 +8,7 @@ ARG TARGET_RELEASE_SHA=unknown
 ARG BUILD_DATE=unknown
 ARG SOURCE_URL=https://github.com/junqingyongyuanbusi/dm
 ARG BASE_DIGEST=unknown
+ARG BASE_REVIEW_OUTBOX_CAPABILITY=legacy
 
 USER root
 COPY --chown=10001:10001 migrations/versions/a6f1c3d8e205_evaluation_foundation.py \
@@ -20,19 +21,23 @@ COPY --chown=10001:10001 migrations/versions/e1c8b3a7d520_knowledge_embedding_10
   /app/migrations/versions/e1c8b3a7d520_knowledge_embedding_1024.py
 COPY --chown=10001:10001 migrations/versions/f2d9c4b8e631_embedding_version_per_column.py \
   /app/migrations/versions/f2d9c4b8e631_embedding_version_per_column.py
+COPY --chown=10001:10001 migrations/versions/a7c3e9d1b624_reply_review_rag_provenance.py \
+  /app/migrations/versions/a7c3e9d1b624_reply_review_rag_provenance.py
 RUN chmod 0444 \
   /app/migrations/versions/a6f1c3d8e205_evaluation_foundation.py \
   /app/migrations/versions/b7d2e4f6a901_reviewed_knowledge_localizations.py \
   /app/migrations/versions/c3e7a9f1b204_knowledge_provenance_identity.py \
   /app/migrations/versions/e1c8b3a7d520_knowledge_embedding_1024.py \
-  /app/migrations/versions/f2d9c4b8e631_embedding_version_per_column.py
+  /app/migrations/versions/f2d9c4b8e631_embedding_version_per_column.py \
+  /app/migrations/versions/a7c3e9d1b624_reply_review_rag_provenance.py
 LABEL org.opencontainers.image.revision="${APP_REVISION}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.source="${SOURCE_URL}" \
       com.nexory.reply-core.rollback-purpose="migration-compatible-predecessor" \
       com.nexory.reply-core.rollback-base-digest="${BASE_DIGEST}" \
       com.nexory.reply-core.rollback-target-release="${TARGET_RELEASE_SHA}" \
-      com.nexory.reply-core.database-head="f2d9c4b8e631"
+      com.nexory.reply-core.database-head="a7c3e9d1b624" \
+      com.nexory.reply-core.review-outbox-contract="${BASE_REVIEW_OUTBOX_CAPABILITY}"
 
 ENV RELEASE_SHA="${APP_REVISION}"
 USER appuser

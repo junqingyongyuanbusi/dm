@@ -249,8 +249,10 @@ def _reviewable_draft_condition():
     return and_(
         models.ReplyDecision.action == "draft",
         func.coalesce(models.ReplyDecision.review_action, "PENDING") == "PENDING",
-        models.ReplyDecision.outbox_id.is_(None),
+        models.ReplyDecision.review_outbox_id.is_(None),
         models.ReplyDecision.message_id.is_not(None),
+        models.ReplyDecision.decision_generation
+        == models.Conversation.decision_generation,
         func.length(draft_text) > 0,
     )
 
@@ -2006,7 +2008,11 @@ async def decisions_page(request: Request) -> Response:
 
 
 async def _load_draft(
-    session, decision_id: uuid.UUID, principal: Principal
+    session,
+    decision_id: uuid.UUID,
+    principal: Principal,
+    *,
+    allow_reviewed: bool = False,
 ) -> models.ReplyDecision:
     decision = (
         await session.execute(
@@ -2017,9 +2023,10 @@ async def _load_draft(
     ).scalar_one_or_none()
     if decision is None or decision.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="decision_not_found")
-    if (
-        decision.action != "draft"
-        or decision.outbox_id is not None
+    if decision.action != "draft":
+        raise HTTPException(status_code=409, detail="decision_not_pending_draft")
+    if not allow_reviewed and (
+        decision.review_outbox_id is not None
         or (decision.review_action or "PENDING") != "PENDING"
     ):
         raise HTTPException(status_code=409, detail="decision_not_pending_draft")
@@ -2034,65 +2041,79 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
-        decision = await _load_draft(session, decision_id, principal)
+        decision = await _load_draft(session, decision_id, principal, allow_reviewed=True)
         original_text = (decision.original_reply_text or decision.reply_text or "").strip()
         final_text = form.get("final_reply_text", original_text).strip()
         if not final_text:
             raise HTTPException(status_code=422, detail="draft_reply_text_required")
         if len(final_text) > 10000:
             raise HTTPException(status_code=422, detail="draft_reply_text_too_long")
-        conv = await session.get(models.Conversation, decision.conversation_id)
-        if conv is None or conv.tenant_id != decision.tenant_id:
+        conv = (
+            await session.execute(
+                select(models.Conversation)
+                .where(
+                    models.Conversation.id == decision.conversation_id,
+                    models.Conversation.tenant_id == decision.tenant_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if conv is None:
             raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
+        if decision.decision_generation != conv.decision_generation:
+            raise HTTPException(status_code=409, detail="draft_stale_conversation_input")
         account = await session.get(models.PlatformAccount, conv.platform_account_id)
         if account is None or account.tenant_id != decision.tenant_id:
             raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
-        try:
-            outbox_id = await create_or_get_outbox_intent(
-                session,
-                conversation_id=conv.id,
-                platform_account_id=account.id,
-                reply_to_message_id=decision.message_id,
-                text=final_text,
-                origin_kind=OutboxOrigin.DRAFT_APPROVAL,
-                actor_kind=OutboxActor.ADMIN_HUMAN,
-                actor_id=principal.actor,
-                idempotency_key=f"draft-approval:{decision.id}",
-                visibility=decision.reply_visibility or "public",
-                payload_metadata={"approval": "admin", "approved_by": principal.actor},
-            )
-        except OutboxIdempotencyConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except OutboxIntentError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
         review_action = "ACCEPTED" if final_text == original_text else "EDITED"
-        await session.execute(
-            update(models.ReplyDecision)
-            .where(
-                models.ReplyDecision.id == decision_id,
-                models.ReplyDecision.outbox_id.is_(None),
+        current_review_action = decision.review_action or "PENDING"
+        if current_review_action in {"ACCEPTED", "EDITED"}:
+            if (
+                decision.review_outbox_id is None
+                or decision.final_reply_text != final_text
+                or current_review_action != review_action
+            ):
+                raise HTTPException(status_code=409, detail="draft_approval_conflict")
+            outbox_id = decision.review_outbox_id
+        elif current_review_action == "PENDING" and decision.review_outbox_id is None:
+            try:
+                outbox_id = await create_or_get_outbox_intent(
+                    session,
+                    conversation_id=conv.id,
+                    platform_account_id=account.id,
+                    reply_to_message_id=decision.message_id,
+                    text=final_text,
+                    origin_kind=OutboxOrigin.DRAFT_APPROVAL,
+                    actor_kind=OutboxActor.ADMIN_HUMAN,
+                    actor_id=principal.actor,
+                    idempotency_key=f"draft-approval:{decision.id}",
+                    visibility="public",
+                    payload_metadata={"approval": "admin", "approved_by": principal.actor},
+                )
+            except OutboxIdempotencyConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except OutboxIntentError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            decision.original_reply_text = original_text
+            decision.final_reply_text = final_text
+            decision.review_action = review_action
+            decision.reviewed_by = principal.actor
+            decision.reviewed_at = datetime.now(UTC)
+            decision.review_reason = None
+            decision.review_outbox_id = outbox_id
+            await session.execute(
+                models.AuditLog.__table__.insert().values(
+                    tenant_id=account.tenant_id,
+                    category="admin_action",
+                    actor=principal.actor,
+                    action="APPROVE_DRAFT",
+                    subject_type="reply_decision",
+                    subject_id=str(decision_id),
+                    detail={"outbox_id": str(outbox_id), "review_action": review_action},
+                )
             )
-            .values(
-                original_reply_text=original_text,
-                final_reply_text=final_text,
-                review_action=review_action,
-                reviewed_by=principal.actor,
-                reviewed_at=datetime.now(UTC),
-                review_reason=None,
-                outbox_id=outbox_id,
-            )
-        )
-        await session.execute(
-            models.AuditLog.__table__.insert().values(
-                tenant_id=account.tenant_id,
-                category="admin_action",
-                actor=principal.actor,
-                action="APPROVE_DRAFT",
-                subject_type="reply_decision",
-                subject_id=str(decision_id),
-                detail={"outbox_id": str(outbox_id), "review_action": review_action},
-            )
-        )
+        else:
+            raise HTTPException(status_code=409, detail="decision_not_pending_draft")
         await session.commit()
     from social_reply.application.message_delivery.actors import deliver_outbox_message
     from social_reply.application.message_delivery.outbox import deliver_outbox
@@ -2173,7 +2194,8 @@ _KB_BANNERS = {
     "deleted": ("ok", "条目已删除。"),
     "import_bad_csv": (
         "err",
-        "CSV 无效：需 UTF-8 编码，必需列 question,reply；is_official_contact 仅接受 true/false/1/0/yes/no。",
+        "CSV 无效：需 UTF-8 编码，必需列 question,reply；is_official_contact 仅接受 "
+        "true/false/1/0/yes/no；protected_values_json 必须是 JSON 字符串数组，且每个值必须出现在 reply 中。",
     ),
     "import_too_large": ("err", "文件过大：请上传不超过 2MB 的 CSV。"),
 }
@@ -2392,7 +2414,7 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
 <form method="post" action="/admin/knowledge/import" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{csrf}">
 {_tenant_input(principal)}{_input("brand_id", "Brand（默认 default）", required=False)}
 <label for="f-kb-csv">CSV 文件</label><input id="f-kb-csv" type="file" name="file" accept=".csv" required>
-<p class="hint">必需列 question,reply；可选 brand_id,platform,category,is_official_contact。布尔值仅接受 true/false/1/0/yes/no（不区分大小写）；空白为 false。所有导入行均为草稿，明确发布前不会参与检索。UTF-8 编码，最多 2000 行 / 2MB。</p>
+<p class="hint">必需列 question,reply；可选 brand_id,platform,category,is_official_contact,protected_values_json。protected_values_json 必须是 JSON 字符串数组，且每个值必须逐字出现在 reply 中；布尔值仅接受 true/false/1/0/yes/no（不区分大小写），空白为 false。所有导入行均为草稿，明确发布前不会参与检索。UTF-8 编码，最多 2000 行 / 2MB。</p>
 <button class="btn-block">上传并导入草稿</button></form></div></details>"""
     bulk_publish_form = f"""<section class="card"><h2>批量发布草稿</h2>
 <form method="post" action="/admin/knowledge/bulk-publish"><input type="hidden" name="csrf_token" value="{csrf}">

@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 from social_reply.domain.reply.decision import (
@@ -5,12 +7,29 @@ from social_reply.domain.reply.decision import (
     ReplyDecision,
     Visibility,
 )
-from social_reply.domain.reply.guard import protected_entities, run_final_guard
+from social_reply.domain.reply.guard import (
+    LANGUAGE_POLICY_REVIEW,
+    protected_entities,
+    run_final_guard,
+)
 
 
 def test_non_auto_reply_passes_through_untouched():
     d = ReplyDecision(action=ReplyAction.HANDOFF, reason_codes=("RISK_WORD",))
     assert run_final_guard(d, "telegram") is d
+
+
+def test_review_policy_does_not_reclassify_existing_handoff():
+    decision = ReplyDecision(action=ReplyAction.HANDOFF, reason_codes=("RISK_WORD",))
+    assert (
+        run_final_guard(
+            decision,
+            "telegram",
+            expected_reply_language="ja",
+            language_policy=LANGUAGE_POLICY_REVIEW,
+        )
+        is decision
+    )
 
 
 def test_public_reply_with_pii_downgraded_to_handoff():
@@ -264,7 +283,8 @@ def test_wrong_reply_language_is_blocked():
         approved_knowledge_reply="Refunds usually take three business days.",
     )
     assert result.action is ReplyAction.HANDOFF
-    assert "GUARD_LANGUAGE_MISMATCH" in result.reason_codes
+    assert result.reply_text is None
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in result.reason_codes
 
 
 def test_changed_time_unit_is_blocked():
@@ -408,7 +428,7 @@ def test_latin_heavy_translation_is_not_treated_as_wrong_language(
         (
             "Es posible, pero ejecutar muchos EA puede aumentar el uso de CPU "
             "y memoria y afectar el rendimiento del VPS.",
-            "GUARD_LANGUAGE_MISMATCH",
+            "GUARD_LANGUAGE_SCRIPT_MISMATCH",
         ),
     ),
 )
@@ -535,7 +555,7 @@ def test_script_generalization_unblocks_languages_missing_from_the_table():
     reply = "Враќањето на средствата трае од 3 до 5 работни дена."
     blocked = run_final_guard(_auto(reply), "telegram", expected_reply_language="mk")
     assert blocked.action is ReplyAction.HANDOFF
-    assert "GUARD_LANGUAGE_MISMATCH" in blocked.reason_codes
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in blocked.reason_codes
 
     allowed = run_final_guard(
         _auto(reply), "telegram", expected_reply_language="mk", customer_text=customer
@@ -681,4 +701,218 @@ def test_回错语言仍然被拦住(reply: str, reason: str) -> None:
         _auto(reply), "telegram", expected_reply_language="en", customer_text="hello"
     )
     assert result.action is ReplyAction.HANDOFF, reason
+    expected_reason = (
+        "GUARD_LANGUAGE_SCRIPT_MISMATCH" if reason == "script" else "GUARD_LANGUAGE_MISMATCH"
+    )
+    assert expected_reason in result.reason_codes
+
+
+# --- Language observations are review signals, not deterministic safety facts ---
+
+
+@pytest.mark.parametrize(
+    ("expected_language", "reply"),
+    (("en", "Hello"), ("es", "Hola"), ("fr", "Bonjour")),
+)
+def test_uncertain_short_greeting_is_preserved_as_private_review_draft(
+    expected_language: str,
+    reply: str,
+) -> None:
+    result = run_final_guard(
+        _auto(reply),
+        "telegram",
+        expected_reply_language=expected_language,
+        customer_text=reply,
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.DRAFT
+    assert result.reply_text == reply
+    assert result.reply_visibility is Visibility.PRIVATE
+    assert result.reply_language == "und"
     assert "GUARD_LANGUAGE_MISMATCH" in result.reason_codes
+
+
+def test_japanese_reply_with_full_width_punctuation_and_latin_products_passes() -> None:
+    approved = "Keep the MT4 and VPS settings unchanged and continue using them."
+    reply = "MT4；VPSの設定は変更せず、そのままご利用ください。"
+
+    result = run_final_guard(
+        _auto(reply),
+        "feishu",
+        expected_reply_language="ja",
+        approved_knowledge_reply=approved,
+        approved_knowledge_protected_values=("MT4", "VPS"),
+        customer_text="MT4とVPSの設定は変更する必要がありますか？",
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.AUTO_REPLY, result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("customer_text", "reply"),
+    (
+        ("Hello 你好", "Hello，你好。"),
+        ("はい、OKです", "はい、OKです。"),
+    ),
+)
+def test_mirror_user_keeps_scripts_present_in_unresolved_customer(
+    customer_text: str,
+    reply: str,
+) -> None:
+    result = run_final_guard(
+        _auto(reply),
+        "telegram",
+        expected_reply_language="mirror-user",
+        customer_text=customer_text,
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.DRAFT, result.reason_codes
+    assert result.reply_text == reply
+    assert result.reply_visibility is Visibility.PRIVATE
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" not in result.reason_codes
+
+
+def test_mirror_user_still_rejects_script_absent_from_unresolved_customer() -> None:
+    result = run_final_guard(
+        _auto("Спасибо за обращение."),
+        "telegram",
+        expected_reply_language="mirror-user",
+        customer_text="Hello 你好",
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.HANDOFF
+    assert result.reply_text is None
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in result.reason_codes
+
+
+def test_mixed_script_conflict_remains_a_hard_failure_in_review_mode() -> None:
+    reply = "Hello. Спасибо за обращение в службу поддержки."
+
+    result = run_final_guard(
+        _auto(reply),
+        "telegram",
+        expected_reply_language="en",
+        customer_text="Hello",
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.HANDOFF
+    assert result.reply_text is None
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in result.reason_codes
+
+
+def test_lenient_script_mismatch_remains_a_hard_failure_in_review_mode() -> None:
+    reply = "Refunds take 3 to 5 business days."
+
+    result = run_final_guard(
+        _auto(reply),
+        "telegram",
+        expected_reply_language="ja",
+        customer_text="返金には何日かかりますか？",
+        language_verification="lenient",
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.HANDOFF
+    assert result.reply_text is None
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("reply", "approved", "protected_values", "expected_reason"),
+    (
+        (
+            "返金には5営業日かかります。",
+            "Refunds take 3 business days.",
+            (),
+            "GUARD_KNOWLEDGE_FACT_MISMATCH",
+        ),
+        (
+            "GoogleはVPSをサポートしています。",
+            "Meta supports VPS.",
+            ("Meta",),
+            "GUARD_KNOWLEDGE_ENTITY_MISMATCH",
+        ),
+        (
+            "Bonjour, contact alice@example.com.",
+            None,
+            (),
+            "GUARD_PII_LEAK",
+        ),
+    ),
+)
+def test_hard_tampering_still_hands_off_and_clears_reply_in_review_mode(
+    reply: str,
+    approved: str | None,
+    protected_values: tuple[str, ...],
+    expected_reason: str,
+) -> None:
+    result = run_final_guard(
+        _auto(reply),
+        "telegram",
+        expected_reply_language="ja",
+        approved_knowledge_reply=approved,
+        approved_knowledge_protected_values=protected_values,
+        customer_text="返金について教えてください。",
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.HANDOFF
+    assert result.reply_text is None
+    assert expected_reason in result.reason_codes
+    assert "GUARD_LANGUAGE_MISMATCH" not in result.reason_codes
+
+
+def test_protected_entities_use_knowledge_bound_values_without_global_brand_table() -> None:
+    assert protected_entities("Meta and VPS", protected_values=("Meta",)) == ("VPS", "Meta")
+    assert protected_entities("Meta and VPS") == ("VPS",)
+    assert protected_entities("Metadata and VPS", protected_values=("Meta",)) == ("VPS",)
+
+
+def test_arbitrary_knowledge_bound_protected_value_is_required_verbatim() -> None:
+    approved = "Use the Acme portal for this request."
+    valid = run_final_guard(
+        _auto("Use the Acme portal for this request."),
+        "telegram",
+        approved_knowledge_reply=approved,
+        approved_knowledge_protected_values=("Acme",),
+    )
+    replaced = run_final_guard(
+        _auto("Use the Example portal for this request."),
+        "telegram",
+        approved_knowledge_reply=approved,
+        approved_knowledge_protected_values=("Acme",),
+    )
+
+    assert valid.action is ReplyAction.AUTO_REPLY
+    assert replaced.action is ReplyAction.HANDOFF
+    assert replaced.reply_text is None
+    assert "GUARD_KNOWLEDGE_ENTITY_MISMATCH" in replaced.reason_codes
+
+
+def test_localization_protected_value_failure_remains_hard_in_review_mode() -> None:
+    reply = "公式ポータルをご利用ください。"
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text=reply,
+        source="knowledge_localization",
+    )
+    result = run_final_guard(
+        decision,
+        "telegram",
+        expected_reply_language="ja",
+        approved_localization_text=reply,
+        approved_localization_text_hash=hashlib.sha256(reply.encode()).hexdigest(),
+        approved_localization_protected_values=("Acme",),
+        customer_text="公式ポータルはどこですか？",
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert result.action is ReplyAction.HANDOFF
+    assert result.reply_text is None
+    assert "GUARD_LOCALIZATION_PROTECTED_VALUE_MISMATCH" in result.reason_codes
+    assert "GUARD_LANGUAGE_MISMATCH" not in result.reason_codes

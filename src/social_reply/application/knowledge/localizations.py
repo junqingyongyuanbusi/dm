@@ -6,7 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.domain.reply.guard import (
@@ -262,12 +262,33 @@ async def _has_sending_localization_outbox(
         .select_from(models.OutboxMessage)
         .join(
             models.ReplyDecision,
-            models.ReplyDecision.outbox_id == models.OutboxMessage.id,
+            or_(
+                and_(
+                    models.ReplyDecision.outbox_id == models.OutboxMessage.id,
+                    models.OutboxMessage.origin_kind == "DECISION",
+                    models.OutboxMessage.actor_kind == "BOT",
+                ),
+                and_(
+                    models.ReplyDecision.review_outbox_id == models.OutboxMessage.id,
+                    models.OutboxMessage.origin_kind == "DRAFT_APPROVAL",
+                    models.OutboxMessage.actor_kind == "ADMIN_HUMAN",
+                ),
+                and_(
+                    models.ReplyDecision.review_outbox_id.is_(None),
+                    models.ReplyDecision.outbox_id == models.OutboxMessage.id,
+                    models.OutboxMessage.origin_kind == "DRAFT_APPROVAL",
+                    models.OutboxMessage.actor_kind == "ADMIN_HUMAN",
+                ),
+                and_(
+                    models.ReplyDecision.outbox_id == models.OutboxMessage.id,
+                    models.OutboxMessage.origin_kind == "DECISION",
+                    models.OutboxMessage.actor_kind == "ADMIN_HUMAN",
+                    models.OutboxMessage.payload["approval"].astext == "admin",
+                ),
+            ),
         )
         .where(
             models.ReplyDecision.knowledge_localization_id.in_(artifact_ids),
-            models.OutboxMessage.origin_kind == "DECISION",
-            models.OutboxMessage.actor_kind == "BOT",
             models.OutboxMessage.status == "SENDING",
         )
     )

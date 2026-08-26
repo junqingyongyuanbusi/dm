@@ -9,6 +9,8 @@ readonly RAILWAY_ENVIRONMENT_ID="db0d6750-eb77-40ee-8a79-f706cd1f828a"
 readonly RAILWAY_REGION="us-east4-eqdc4a"
 readonly PUBLIC_BASE_URL="https://relay.nexory.top"
 readonly SOURCE_URL="https://github.com/junqingyongyuanbusi/dm"
+readonly LEGACY_REVIEW_OUTBOX_CAPABILITY="legacy"
+readonly TARGET_REVIEW_OUTBOX_CAPABILITY="review-outbox-dual-read-v1"
 readonly DEPLOY_TIMEOUT_SECONDS="${DEPLOY_TIMEOUT_SECONDS:-900}"
 readonly CI_TIMEOUT_SECONDS="${CI_TIMEOUT_SECONDS:-1200}"
 readonly RAILWAY_SERVICES=(api worker scheduler)
@@ -201,16 +203,35 @@ image_revision() {
     <<<"$(image_metadata "$1")"
 }
 
+image_review_outbox_capability() {
+  local reference="$1"
+  local capability
+  capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // "legacy"' \
+    <<<"$(image_metadata "$reference")")"
+  case "$capability" in
+    "$LEGACY_REVIEW_OUTBOX_CAPABILITY"|"$TARGET_REVIEW_OUTBOX_CAPABILITY")
+      printf '%s\n' "$capability"
+      ;;
+    *) fail "$reference has unknown review Outbox capability: ${capability:-missing}" ;;
+  esac
+}
+
 verify_sha_image() {
   local reference="$1"
-  local metadata revision source image_os architecture
+  local metadata revision source image_os architecture capability
   metadata="$(image_metadata "$reference")"
   revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
   source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
   image_os="$(jq -r '.os // ""' <<<"$metadata")"
   architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
+  capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // ""' \
+    <<<"$metadata")"
   [[ "$revision" == "$full_sha" ]] || fail "$reference has unexpected OCI revision: $revision"
   [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
+  [[ "$capability" == "$TARGET_REVIEW_OUTBOX_CAPABILITY" ]] \
+    || fail "$reference has unexpected review Outbox capability: ${capability:-missing}"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
@@ -236,7 +257,8 @@ verify_rollback_compatible_image() {
   local reference="$1"
   local base_digest="$2"
   local app_revision="$3"
-  local metadata revision source image_os architecture purpose labeled_base labeled_target database_head
+  local expected_capability="$4"
+  local metadata revision source image_os architecture purpose labeled_base labeled_target database_head capability
   metadata="$(image_metadata "$reference")"
   revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
   source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
@@ -244,6 +266,9 @@ verify_rollback_compatible_image() {
   labeled_base="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-base-digest"] // ""' <<<"$metadata")"
   labeled_target="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-target-release"] // ""' <<<"$metadata")"
   database_head="$(jq -r '.config.Labels["com.nexory.reply-core.database-head"] // ""' <<<"$metadata")"
+  capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // ""' \
+    <<<"$metadata")"
   image_os="$(jq -r '.os // ""' <<<"$metadata")"
   architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
   [[ "$revision" == "$app_revision" ]] \
@@ -255,8 +280,10 @@ verify_rollback_compatible_image() {
     || fail "$reference has unexpected rollback base digest: $labeled_base"
   [[ "$labeled_target" == "$full_sha" ]] \
     || fail "$reference has unexpected target release: $labeled_target"
-  [[ "$database_head" == "f2d9c4b8e631" ]] \
+  [[ "$database_head" == "a7c3e9d1b624" ]] \
     || fail "$reference has unexpected database head: $database_head"
+  [[ "$capability" == "$expected_capability" ]] \
+    || fail "$reference has unexpected review Outbox capability: ${capability:-missing}"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
@@ -279,11 +306,13 @@ prepare_rollback_compatible_image() {
   local reference="$1"
   local base_digest="$2"
   local app_revision="$3"
+  local base_capability="$4"
   local state builder_name build_date digest
   local -a builder_args
   state="$(image_state "$reference")"
   if [[ "$state" == "exists" ]]; then
-    verify_rollback_compatible_image "$reference" "$base_digest" "$app_revision"
+    verify_rollback_compatible_image \
+      "$reference" "$base_digest" "$app_revision" "$base_capability"
   else
     revalidate_dev_head
     builder_name="$(select_builder)"
@@ -304,10 +333,12 @@ prepare_rollback_compatible_image() {
       --build-arg "BUILD_DATE=${build_date}" \
       --build-arg "SOURCE_URL=${SOURCE_URL}" \
       --build-arg "BASE_DIGEST=${base_digest}" \
+      --build-arg "BASE_REVIEW_OUTBOX_CAPABILITY=${base_capability}" \
       --tag "$reference" \
       --push \
       . >&2
-    verify_rollback_compatible_image "$reference" "$base_digest" "$app_revision"
+    verify_rollback_compatible_image \
+      "$reference" "$base_digest" "$app_revision" "$base_capability"
   fi
   digest="$(image_digest "$reference")"
   [[ "$digest" != "$expected_digest" ]] \
@@ -497,10 +528,12 @@ wait_for_api_health() {
 
 write_manifest() {
   local release_status="$1"
+  local rollout_phase="${2:-${recorded_rollout_phase:-previous}}"
   local manifest_tmp
   manifest_tmp="$(mktemp "${manifest_path}.tmp.XXXXXX")"
   jq -n \
     --arg status "$release_status" \
+    --arg rollout_phase "$rollout_phase" \
     --arg git_sha "$full_sha" \
     --arg image_repository "$IMAGE_REPO" \
     --arg sha_tag "$sha_ref" \
@@ -511,16 +544,22 @@ write_manifest() {
     --arg previous_app_revision "${previous_app_revision:-}" \
     --arg rollback_compatible_tag "$rollback_compatible_ref" \
     --arg rollback_compatible_digest "${rollback_compatible_digest:-}" \
-    --arg rollback_schema_head "f2d9c4b8e631" \
+    --arg rollback_schema_head "a7c3e9d1b624" \
+    --arg previous_review_outbox_capability "${previous_review_outbox_capability:-}" \
+    --arg target_review_outbox_capability "${target_review_outbox_capability:-}" \
     --arg previous_api_deployment_id "${previous_api_deployment_id:-}" \
     --arg previous_worker_deployment_id "${previous_worker_deployment_id:-}" \
     --arg previous_scheduler_deployment_id "${previous_scheduler_deployment_id:-}" \
+    --arg compatibility_api_deployment_id "${compatibility_api_deployment_id:-}" \
+    --arg compatibility_worker_deployment_id "${compatibility_worker_deployment_id:-}" \
+    --arg compatibility_scheduler_deployment_id "${compatibility_scheduler_deployment_id:-}" \
     --arg api_deployment_id "${api_deployment_id:-}" \
     --arg worker_deployment_id "${worker_deployment_id:-}" \
     --arg scheduler_deployment_id "${scheduler_deployment_id:-}" \
     --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{
       status: $status,
+      rollout_phase: $rollout_phase,
       git_sha: $git_sha,
       image_repository: $image_repository,
       sha_tag: $sha_tag,
@@ -534,10 +573,19 @@ write_manifest() {
         predecessor_app_revision: $previous_app_revision,
         database_head: $rollback_schema_head
       },
+      review_outbox_contract: {
+        previous: $previous_review_outbox_capability,
+        target: $target_review_outbox_capability
+      },
       previous_railway: {
         api_deployment_id: $previous_api_deployment_id,
         worker_deployment_id: $previous_worker_deployment_id,
         scheduler_deployment_id: $previous_scheduler_deployment_id
+      },
+      compatibility_railway: {
+        api_deployment_id: $compatibility_api_deployment_id,
+        worker_deployment_id: $compatibility_worker_deployment_id,
+        scheduler_deployment_id: $compatibility_scheduler_deployment_id
       },
       railway: {
         api_deployment_id: $api_deployment_id,
@@ -642,17 +690,6 @@ else
   fi
 fi
 
-for service in "${RAILWAY_SERVICES[@]}"; do
-  case "$service" in
-    api) current_digest="$active_api_digest" ;;
-    worker) current_digest="$active_worker_digest" ;;
-    scheduler) current_digest="$active_scheduler_digest" ;;
-  esac
-  if [[ "$current_digest" != "$previous_digest" && "$current_digest" != "$expected_digest" ]]; then
-    fail "$service is on unrelated digest $current_digest"
-  fi
-done
-
 previous_api_deployment_id="$(jq -r '.id // ""' \
   <<<"$(deployment_for_digest_json api "$previous_digest")")"
 previous_worker_deployment_id="$(jq -r '.id // ""' \
@@ -670,76 +707,160 @@ verify_predecessor_image "${IMAGE_REPO}@${previous_digest}" "$previous_digest"
 previous_app_revision="$(image_revision "${IMAGE_REPO}@${previous_digest}")"
 [[ "$previous_app_revision" =~ ^[0-9a-f]{40}$ ]] \
   || fail "predecessor image has invalid OCI revision: ${previous_app_revision:-missing}"
+previous_review_outbox_capability="$(
+  image_review_outbox_capability "${IMAGE_REPO}@${previous_digest}"
+)"
+target_review_outbox_capability="$(
+  image_review_outbox_capability "${IMAGE_REPO}@${expected_digest}"
+)"
+bridge_required="false"
+case "${previous_review_outbox_capability}:${target_review_outbox_capability}" in
+  "${LEGACY_REVIEW_OUTBOX_CAPABILITY}:${TARGET_REVIEW_OUTBOX_CAPABILITY}")
+    bridge_required="true"
+    ;;
+  "${TARGET_REVIEW_OUTBOX_CAPABILITY}:${TARGET_REVIEW_OUTBOX_CAPABILITY}") ;;
+  *)
+    fail "unsupported review Outbox capability transition: ${previous_review_outbox_capability} -> ${target_review_outbox_capability}"
+    ;;
+esac
 rollback_compatible_digest="$(prepare_rollback_compatible_image \
-  "$rollback_compatible_ref" "$previous_digest" "$previous_app_revision")"
+  "$rollback_compatible_ref" \
+  "$previous_digest" \
+  "$previous_app_revision" \
+  "$previous_review_outbox_capability")"
 [[ "$rollback_compatible_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || fail "invalid migration-compatible rollback digest: $rollback_compatible_digest"
-log "verifying target and migration-compatible predecessor against an isolated a6 database"
+log "verifying target and migration-compatible predecessor against an isolated database"
 scripts/verify_migration_compatible_rollback.sh \
   "${IMAGE_REPO}@${expected_digest}" \
   "${IMAGE_REPO}@${rollback_compatible_digest}"
 [[ "$(image_digest "$rollback_compatible_ref")" == "$rollback_compatible_digest" ]] \
   || fail "migration-compatible rollback tag changed during smoke test"
 verify_rollback_compatible_image \
-  "${IMAGE_REPO}@${rollback_compatible_digest}" "$previous_digest" "$previous_app_revision"
-write_manifest "prepared"
+  "${IMAGE_REPO}@${rollback_compatible_digest}" \
+  "$previous_digest" \
+  "$previous_app_revision" \
+  "$previous_review_outbox_capability"
 
-initial_latest_digest="$(image_digest "$latest_ref")"
-if [[ "$initial_latest_digest" != "$previous_digest" && "$initial_latest_digest" != "$expected_digest" ]]; then
-  fail "GHCR latest changed to unrelated digest $initial_latest_digest"
+for service in "${RAILWAY_SERVICES[@]}"; do
+  case "$service" in
+    api) current_digest="$active_api_digest" ;;
+    worker) current_digest="$active_worker_digest" ;;
+    scheduler) current_digest="$active_scheduler_digest" ;;
+  esac
+  if [[ "$current_digest" != "$previous_digest" \
+    && "$current_digest" != "$expected_digest" \
+    && "$current_digest" != "$rollback_compatible_digest" ]]; then
+    fail "$service is on unrelated digest $current_digest"
+  fi
+  if [[ "$bridge_required" != "true" \
+    && "$current_digest" == "$rollback_compatible_digest" ]]; then
+    fail "$service unexpectedly runs the compatibility digest without a capability bridge"
+  fi
+done
+
+recorded_rollout_phase=""
+manifest_status=""
+if [[ -f "$manifest_path" ]]; then
+  jq -e . "$manifest_path" >/dev/null || fail "existing release manifest is invalid JSON"
+  manifest_sha="$(jq -r '.git_sha // ""' "$manifest_path")"
+  manifest_digest="$(jq -r '.digest // ""' "$manifest_path")"
+  manifest_previous="$(jq -r '.previous_digest // ""' "$manifest_path")"
+  manifest_compatibility="$(
+    jq -r '.migration_compatible_rollback.digest // ""' "$manifest_path"
+  )"
+  [[ "$manifest_sha" == "$full_sha" \
+    && "$manifest_digest" == "$expected_digest" \
+    && "$manifest_previous" == "$previous_digest" \
+    && "$manifest_compatibility" == "$rollback_compatible_digest" ]] \
+    || fail "existing release manifest does not match this rollout"
+  manifest_status="$(jq -r '.status // ""' "$manifest_path")"
+  recorded_rollout_phase="$(jq -r '.rollout_phase // ""' "$manifest_path")"
+  case "$manifest_status" in
+    prepared|deploying|completed) ;;
+    *) fail "existing release manifest has unknown status: ${manifest_status:-missing}" ;;
+  esac
 fi
-write_manifest "deploying"
-if [[ "$initial_latest_digest" != "$expected_digest" ]]; then
+
+compatibility_api_deployment_id="$(jq -r '.id // ""' \
+  <<<"$(deployment_for_digest_json api "$rollback_compatible_digest")")"
+compatibility_worker_deployment_id="$(jq -r '.id // ""' \
+  <<<"$(deployment_for_digest_json worker "$rollback_compatible_digest")")"
+compatibility_scheduler_deployment_id="$(jq -r '.id // ""' \
+  <<<"$(deployment_for_digest_json scheduler "$rollback_compatible_digest")")"
+api_deployment_id="$(jq -r '.id // ""' \
+  <<<"$(deployment_for_digest_json api "$expected_digest")")"
+worker_deployment_id="$(jq -r '.id // ""' \
+  <<<"$(deployment_for_digest_json worker "$expected_digest")")"
+scheduler_deployment_id="$(jq -r '.id // ""' \
+  <<<"$(deployment_for_digest_json scheduler "$expected_digest")")"
+
+if [[ -z "$manifest_status" ]]; then
+  manifest_status="prepared"
+  recorded_rollout_phase="previous"
+  write_manifest "$manifest_status" "$recorded_rollout_phase"
+fi
+
+require_latest_digest() {
+  local expected="$1"
+  local stage="$2"
+  local observed
+  observed="$(image_digest "$latest_ref")"
+  [[ "$observed" == "$expected" ]] \
+    || fail "GHCR latest changed during $stage: $observed"
+}
+
+promote_latest_digest() {
+  local expected_current="$1"
+  local desired_digest="$2"
+  local desired_ref="$3"
+  local stage="$4"
   revalidate_dev_head
-  [[ "$(image_digest "$latest_ref")" == "$initial_latest_digest" ]] \
-    || fail "GHCR latest changed concurrently before promotion"
-  verify_sha_image "$sha_ref"
-  [[ "$(image_digest "$sha_ref")" == "$expected_digest" ]] \
-    || fail "target SHA tag changed before promotion"
-  log "promoting the exact target digest to $latest_ref"
+  [[ "$(image_digest "$desired_ref")" == "$desired_digest" ]] \
+    || fail "$stage source reference changed before promotion"
+  [[ "$(image_digest "$latest_ref")" == "$expected_current" ]] \
+    || fail "GHCR latest changed concurrently before $stage promotion"
+  log "promoting $stage digest to $latest_ref"
   docker buildx imagetools create --prefer-index=false \
-    --tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}" >/dev/null
-fi
-latest_digest="$(image_digest "$latest_ref")"
-[[ "$latest_digest" == "$expected_digest" ]] \
-  || fail "latest digest $latest_digest does not match SHA digest $expected_digest"
-require_target_latest() {
-  local latest_digest
-  latest_digest="$(image_digest "$latest_ref")"
-  [[ "$latest_digest" == "$expected_digest" ]] \
-    || fail "GHCR latest changed during release: $latest_digest"
+    --tag "$latest_ref" "${IMAGE_REPO}@${desired_digest}" >/dev/null
+  require_latest_digest "$desired_digest" "$stage promotion"
 }
 
 deploy_role() {
   local service="$1"
+  local desired_digest="$2"
+  local stage="$3"
   local active active_id active_digest latest latest_id latest_status latest_digest
   local redeploy_output deployment_id
-  require_target_latest
+  require_latest_digest "$desired_digest" "$stage"
   active="$(active_deployment_json "$service")"
   active_id="$(jq -r '.id // ""' <<<"$active")"
   active_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
-  if [[ "$active_digest" == "$expected_digest" ]]; then
-    log "$service already runs the target digest: $active_id"
+  if [[ "$active_digest" == "$desired_digest" ]]; then
+    log "$service already runs the $stage digest: $active_id"
     printf '%s\n' "$active_id"
     return 0
   fi
-  [[ "$active_digest" == "$previous_digest" ]] \
-    || fail "$service cannot resume from digest $active_digest"
+  if [[ "$active_digest" != "$previous_digest" \
+    && "$active_digest" != "$rollback_compatible_digest" \
+    && "$active_digest" != "$expected_digest" ]]; then
+    fail "$service cannot resume from digest $active_digest"
+  fi
 
   latest="$(latest_deployment_json "$service")"
   latest_id="$(jq -r '.id // ""' <<<"$latest")"
   latest_status="$(jq -r '.status // ""' <<<"$latest")"
   latest_digest="$(jq -r '.meta.imageDigest // ""' <<<"$latest")"
   if [[ -n "$latest_id" && "$latest_id" != "$active_id" ]]; then
-    if [[ "$latest_digest" == "$expected_digest" ]]; then
+    if [[ "$latest_digest" == "$desired_digest" ]]; then
       case "$latest_status" in
         SUCCESS)
           printf '%s\n' "$latest_id"
           return 0
           ;;
         QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL)
-          log "resuming in-flight $service deployment: $latest_id"
-          wait_for_deployment "$service" "$latest_id" "$expected_digest" >/dev/null
+          log "resuming in-flight $stage $service deployment: $latest_id"
+          wait_for_deployment "$service" "$latest_id" "$desired_digest" >/dev/null
           printf '%s\n' "$latest_id"
           return 0
           ;;
@@ -751,8 +872,8 @@ deploy_role() {
     fi
   fi
 
-  require_target_latest
-  log "redeploying Railway $service from source"
+  require_latest_digest "$desired_digest" "$stage"
+  log "redeploying Railway $service from $stage source"
   redeploy_output="$(railway redeploy \
     --project "$RAILWAY_PROJECT_ID" \
     --environment "$RAILWAY_ENVIRONMENT" \
@@ -766,18 +887,146 @@ deploy_role() {
     [[ -n "$deployment_id" && "$deployment_id" != "$latest_id" ]] \
       || fail "Railway redeploy returned no trackable deployment ID for $service"
   fi
-  wait_for_deployment "$service" "$deployment_id" "$expected_digest" >/dev/null
+  wait_for_deployment "$service" "$deployment_id" "$desired_digest" >/dev/null
   printf '%s\n' "$deployment_id"
 }
 
-api_deployment_id="$(deploy_role api)"
-wait_for_api_health
-log "API ready: $api_deployment_id"
-worker_deployment_id="$(deploy_role worker)"
-log "Worker ready: $worker_deployment_id"
-scheduler_deployment_id="$(deploy_role scheduler)"
-log "Scheduler ready: $scheduler_deployment_id"
-require_target_latest
+bridge_rollout_directive() {
+  local latest_digest api_digest worker_digest scheduler_digest
+  local -a recorded_args
+  latest_digest="$(image_digest "$latest_ref")"
+  api_digest="$(jq -r '.meta.imageDigest // ""' <<<"$(active_deployment_json api)")"
+  worker_digest="$(jq -r '.meta.imageDigest // ""' <<<"$(active_deployment_json worker)")"
+  scheduler_digest="$(jq -r '.meta.imageDigest // ""' <<<"$(active_deployment_json scheduler)")"
+  recorded_args=()
+  if [[ -n "$recorded_rollout_phase" ]]; then
+    recorded_args=(--recorded-phase "$recorded_rollout_phase")
+  fi
+  python3 scripts/release_rollout_state.py \
+    --latest "$latest_digest" \
+    --api "$api_digest" \
+    --worker "$worker_digest" \
+    --scheduler "$scheduler_digest" \
+    --previous "$previous_digest" \
+    --target "$expected_digest" \
+    --compatibility "$rollback_compatible_digest" \
+    "${recorded_args[@]}"
+}
+
+run_capability_bridge_rollout() {
+  local directive observed_phase next_phase action
+  while true; do
+    directive="$(bridge_rollout_directive)" \
+      || fail "Railway rollout state is not one of the nine safe bridge checkpoints"
+    observed_phase="$(jq -r '.observed_phase' <<<"$directive")"
+    next_phase="$(jq -r '.next_phase' <<<"$directive")"
+    action="$(jq -r '.action' <<<"$directive")"
+
+    if [[ "$recorded_rollout_phase" != "$observed_phase" \
+      && !( "$recorded_rollout_phase" == "complete" && "$action" == "complete" ) ]]; then
+      recorded_rollout_phase="$observed_phase"
+      manifest_status="deploying"
+      write_manifest "$manifest_status" "$recorded_rollout_phase"
+    fi
+
+    case "$action" in
+      promote_compatibility_latest)
+        manifest_status="deploying"
+        write_manifest "$manifest_status" "$observed_phase"
+        promote_latest_digest \
+          "$previous_digest" \
+          "$rollback_compatible_digest" \
+          "$rollback_compatible_ref" \
+          "compatibility"
+        ;;
+      deploy_compatibility_api)
+        compatibility_api_deployment_id="$(
+          deploy_role api "$rollback_compatible_digest" compatibility
+        )"
+        wait_for_api_health
+        ;;
+      deploy_compatibility_worker)
+        compatibility_worker_deployment_id="$(
+          deploy_role worker "$rollback_compatible_digest" compatibility
+        )"
+        ;;
+      deploy_compatibility_scheduler)
+        compatibility_scheduler_deployment_id="$(
+          deploy_role scheduler "$rollback_compatible_digest" compatibility
+        )"
+        ;;
+      promote_target_latest)
+        promote_latest_digest \
+          "$rollback_compatible_digest" \
+          "$expected_digest" \
+          "$sha_ref" \
+          "target"
+        ;;
+      deploy_target_worker)
+        worker_deployment_id="$(deploy_role worker "$expected_digest" target)"
+        ;;
+      deploy_target_api)
+        api_deployment_id="$(deploy_role api "$expected_digest" target)"
+        wait_for_api_health
+        ;;
+      deploy_target_scheduler)
+        scheduler_deployment_id="$(deploy_role scheduler "$expected_digest" target)"
+        ;;
+      complete)
+        recorded_rollout_phase="complete"
+        manifest_status="completed"
+        write_manifest "$manifest_status" "$recorded_rollout_phase"
+        return 0
+        ;;
+      *) fail "rollout validator returned unknown action: $action" ;;
+    esac
+
+    recorded_rollout_phase="$next_phase"
+    manifest_status="deploying"
+    write_manifest "$manifest_status" "$recorded_rollout_phase"
+  done
+}
+
+run_standard_rollout() {
+  local initial_latest_digest
+  initial_latest_digest="$(image_digest "$latest_ref")"
+  if [[ "$initial_latest_digest" != "$previous_digest" \
+    && "$initial_latest_digest" != "$expected_digest" ]]; then
+    fail "GHCR latest changed to unrelated digest $initial_latest_digest"
+  fi
+  manifest_status="deploying"
+  recorded_rollout_phase="previous"
+  write_manifest "$manifest_status" "$recorded_rollout_phase"
+  if [[ "$initial_latest_digest" != "$expected_digest" ]]; then
+    promote_latest_digest "$previous_digest" "$expected_digest" "$sha_ref" target
+  fi
+  recorded_rollout_phase="target_latest"
+  write_manifest "$manifest_status" "$recorded_rollout_phase"
+
+  api_deployment_id="$(deploy_role api "$expected_digest" target)"
+  wait_for_api_health
+  recorded_rollout_phase="standard_target_api"
+  write_manifest "$manifest_status" "$recorded_rollout_phase"
+  worker_deployment_id="$(deploy_role worker "$expected_digest" target)"
+  recorded_rollout_phase="standard_target_worker"
+  write_manifest "$manifest_status" "$recorded_rollout_phase"
+  scheduler_deployment_id="$(deploy_role scheduler "$expected_digest" target)"
+  recorded_rollout_phase="standard_target_scheduler"
+  write_manifest "$manifest_status" "$recorded_rollout_phase"
+}
+
+if [[ "$bridge_required" == "true" ]]; then
+  log "activating review Outbox capability bridge: ${previous_review_outbox_capability} -> ${target_review_outbox_capability}"
+  run_capability_bridge_rollout
+else
+  log "review Outbox capability unchanged; using the standard API-first rollout"
+  run_standard_rollout
+fi
+
+api_deployment_id="$(jq -r '.id // ""' <<<"$(active_deployment_json api)")"
+worker_deployment_id="$(jq -r '.id // ""' <<<"$(active_deployment_json worker)")"
+scheduler_deployment_id="$(jq -r '.id // ""' <<<"$(active_deployment_json scheduler)")"
+require_latest_digest "$expected_digest" "final verification"
 
 final_latest_digest="$(image_digest "$latest_ref")"
 [[ "$final_latest_digest" == "$expected_digest" ]] \
@@ -793,8 +1042,9 @@ validate_railway_config
 validate_railway_colocation
 validate_railway_image_auto_updates
 revalidate_dev_head
-require_target_latest
-write_manifest "completed"
+require_latest_digest "$expected_digest" "final verification"
+recorded_rollout_phase="complete"
+write_manifest "completed" "$recorded_rollout_phase"
 
 log "release complete: $full_sha -> $expected_digest"
 log "migration-compatible rollback: $rollback_compatible_ref -> $rollback_compatible_digest"

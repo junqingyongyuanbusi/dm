@@ -112,6 +112,13 @@ class Settings(BaseSettings):
     # 强命中时由 LLM 生成同语言回复；低置信度先走占位符保护的查询翻译回退。
     # 英语事实源不变；und/检测失败、无强命中、official-contact、守卫不符一律 HANDOFF。
     multilingual_knowledge_reply_enabled: bool = False
+    # Language identity is advisory in review mode: deterministic fact/provenance
+    # checks still fail closed, while uncertain language observations create a draft.
+    multilingual_language_policy: Literal["legacy_hard", "review"] = "legacy_hard"
+    # Selector rollout is independent from multilingual generation so shadow evidence
+    # can be collected before any candidate choice changes.
+    rag_selector_mode: Literal["off", "shadow", "live"] = "off"
+    rag_selector_canary_bps: int = Field(default=0, ge=0, le=10000)
     english_knowledge_only_enabled: bool = False
     knowledge_corpus_version: str = "unversioned"
     multilingual_calibration_report_path: Path = Path(

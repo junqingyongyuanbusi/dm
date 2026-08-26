@@ -1,14 +1,18 @@
 import hashlib
 import uuid
+from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select, text, update
+from sqlalchemy.exc import DBAPIError
 
 import social_reply.infrastructure.queue.broker  # noqa: F401
 from social_reply.application.knowledge.localizations import (
     LocalizationDraftInput,
+    LocalizationValidationError,
     create_localization_draft,
     publish_localization,
+    revoke_localization,
 )
 from social_reply.application.knowledge.retrieval import KnowledgeRetrievalResult
 from social_reply.application.message_delivery import outbox as outbox_module
@@ -18,6 +22,7 @@ from social_reply.connectors import registry
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
@@ -38,6 +43,11 @@ class _FakeTelegramSender:
 
     async def aclose(self):
         return None
+
+
+class _OpenKillSwitch:
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
+        return False
 
 
 class _CrossLingualTestEmbedder:
@@ -84,6 +94,27 @@ class _RaisingLLM:
         raise RuntimeError("llm unavailable")
 
 
+class _NoCallLLM:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def _fail(self, operation: str):
+        self.calls.append(operation)
+        raise AssertionError(f"approved verbatim reply called LLM operation: {operation}")
+
+    async def decide(self, context):
+        return await self._fail("decide")
+
+    async def translate_to_english(self, text):
+        return await self._fail("translate_to_english")
+
+    async def detect_language_tag(self, text):
+        return await self._fail("detect_language_tag")
+
+    async def verify_grounding(self, **kwargs):
+        return await self._fail("verify_grounding")
+
+
 
 @pytest.fixture
 async def multilingual_runtime(monkeypatch):
@@ -99,6 +130,12 @@ async def multilingual_runtime(monkeypatch):
     registry._senders.clear()
     runner._embedder = _CrossLingualTestEmbedder()
     runner._llm = None
+    monkeypatch.setattr(runner, "_make_killswitch", lambda: _OpenKillSwitch())
+    monkeypatch.setattr(
+        outbox_module,
+        "make_killswitch_checker",
+        lambda: _OpenKillSwitch(),
+    )
 
     async def fake_get_platform_sender(account_id):
         return _FakeTelegramSender()
@@ -146,6 +183,7 @@ async def _seed_conversation(session, *, text: str, tenant_id: str = "default"):
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key=f"telegram:test:{account_id}",
+            decision_generation=1,
         )
     )
     message_id = uuid.uuid4()
@@ -158,6 +196,7 @@ async def _seed_conversation(session, *, text: str, tenant_id: str = "default"):
             text=text,
             chatwoot_message_id=55,
             reply_target={"chat_id": "localization-user"},
+            decision_generation=1,
         )
     )
     await ensure_state(session, conversation_id, "BOT_ACTIVE")
@@ -254,6 +293,133 @@ async def _publish_ja_localization(
     return artifact
 
 
+async def _seed_localized_outbox(
+    session,
+    *,
+    authority: str,
+    status: str,
+):
+    account_id, conversation_id, message_id = await _seed_conversation(
+        session,
+        text=_JA_QUERY,
+    )
+    document_id, content_hash = await _seed_english_policy(session)
+    artifact = await _publish_ja_localization(session, document_id=document_id)
+    chunk_id = await session.scalar(
+        select(models.KnowledgeChunk.id).where(
+            models.KnowledgeChunk.document_id == document_id
+        )
+    )
+    outbox_id = uuid.uuid4()
+    approval = authority in {"approval", "legacy_approval"}
+    canonical_approval = authority == "approval"
+    payload = {"text": artifact.localized_text, "visibility": "public"}
+    if authority == "legacy_approval":
+        payload["approval"] = "admin"
+    await session.execute(
+        insert(models.OutboxMessage).values(
+            id=outbox_id,
+            tenant_id="default",
+            conversation_id=conversation_id,
+            platform_account_id=account_id,
+            destination_type="telegram_dm",
+            destination_id="localization-user",
+            message_type="text",
+            payload=payload,
+            reply_to_message_id=message_id,
+            origin_kind="DRAFT_APPROVAL" if canonical_approval else "DECISION",
+            actor_kind="ADMIN_HUMAN" if approval else "BOT",
+            idempotency_key=f"localized-{authority}-{outbox_id}",
+            status=status,
+        )
+    )
+    decision_values = {
+        "tenant_id": "default",
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "action": "draft" if approval else "auto_reply",
+        "reply_text": artifact.localized_text,
+        "original_reply_text": artifact.localized_text if approval else None,
+        "final_reply_text": artifact.localized_text if approval else None,
+        "review_action": "ACCEPTED" if approval else None,
+        "reviewed_by": "user:reviewer" if approval else None,
+        "reviewed_at": datetime.now(UTC) if approval else None,
+        "reply_visibility": "public",
+        "reason_codes": [],
+        "source": "knowledge_localization",
+        "request_language": "ja",
+        "reply_language": "ja",
+        "resolved_locale": "ja",
+        "knowledge_localization_id": artifact.id,
+        "knowledge_localization_release_id": artifact.release_id,
+        "knowledge_localization_text_hash": artifact.text_hash,
+        "knowledge_localization_source_hash": artifact.source_content_hash,
+        "knowledge_content_hash": content_hash,
+        "knowledge_document_id": document_id,
+        "knowledge_chunk_id": chunk_id,
+        "decision_generation": 1,
+        "outbox_id": None if canonical_approval else outbox_id,
+        "review_outbox_id": outbox_id if canonical_approval else None,
+    }
+    await session.execute(insert(models.ReplyDecision).values(**decision_values))
+    await session.commit()
+    return artifact, outbox_id
+
+
+@pytest.mark.parametrize("authority", ["decision", "approval", "legacy_approval"])
+async def test_localization_revoke_detects_every_sending_outbox_link(session, authority):
+    artifact, _outbox_id = await _seed_localized_outbox(
+        session,
+        authority=authority,
+        status="SENDING",
+    )
+
+    with pytest.raises(LocalizationValidationError, match="localization has a sending outbox"):
+        await revoke_localization(
+            session,
+            tenant_id="default",
+            artifact_id=artifact.id,
+            actor="user:reviewer",
+            reason="test revoke",
+        )
+    await session.rollback()
+
+
+async def test_public_send_preflight_locks_localization_until_transaction_finishes(
+    session,
+    multilingual_runtime,
+):
+    artifact, outbox_id = await _seed_localized_outbox(
+        session,
+        authority="decision",
+        status="PENDING",
+    )
+
+    async with get_session_factory()() as delivery_session:
+        outbox = await delivery_session.get(models.OutboxMessage, outbox_id)
+        assert (
+            await outbox_module._public_bot_send_preflight(
+                delivery_session,
+                outbox=outbox,
+                payload_text=artifact.localized_text,
+            )
+            is None
+        )
+
+        async with get_session_factory()() as revoke_session:
+            await revoke_session.execute(text("SET LOCAL lock_timeout = '250ms'"))
+            with pytest.raises(DBAPIError):
+                await revoke_localization(
+                    revoke_session,
+                    tenant_id="default",
+                    artifact_id=artifact.id,
+                    actor="user:reviewer",
+                    reason="test concurrent revoke",
+                )
+            await revoke_session.rollback()
+        await delivery_session.rollback()
+
+
 async def _run(session, *, text: str, tenant_id: str = "default"):
     account_id, conversation_id, message_id = await _seed_conversation(
         session, text=text, tenant_id=tenant_id
@@ -263,6 +429,7 @@ async def _run(session, *, text: str, tenant_id: str = "default"):
         conversation_id,
         message_id,
         account_id,
+        decision_generation=1,
     )
     return conversation_id, outbox_id
 
@@ -380,8 +547,8 @@ async def test_wrong_language_reply_handoffs_before_outbox(session, multilingual
     assert outbox_id is None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "handoff"
-    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
-    await _assert_handoff(session, conversation_id, "GUARD_LANGUAGE_MISMATCH")
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in decision.reason_codes
+    await _assert_handoff(session, conversation_id, "GUARD_LANGUAGE_SCRIPT_MISMATCH")
 
 
 async def test_grounding_failure_handoffs(session, multilingual_runtime):
@@ -420,19 +587,37 @@ async def test_official_contact_never_uses_runtime_generation(session, multiling
     await _assert_handoff(session, conversation_id, "MULTILINGUAL_OFFICIAL_CONTACT_REVIEW")
 
 
-async def test_english_official_contact_handoffs_before_generation(session, multilingual_runtime):
+async def test_english_official_contact_uses_approved_verbatim_without_generation(
+    session, multilingual_runtime
+):
     question = "Could you please explain how long a refund usually takes in business days?"
-    await _seed_english_policy(session, question=question, is_official_contact=True)
-    runner._llm = _RaisingLLM()
+    contact_reply = "Official support: support@example.com"
+    await _seed_english_policy(
+        session,
+        question=question,
+        reply=contact_reply,
+        is_official_contact=True,
+    )
+    no_call_llm = _NoCallLLM()
+    runner._llm = no_call_llm
 
-    conversation_id, outbox_id = await _run(session, text=question)
+    _conversation_id, outbox_id = await _run(session, text=question)
 
-    assert outbox_id is None
+    assert outbox_id is not None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "handoff"
-    assert "MULTILINGUAL_OFFICIAL_CONTACT_REVIEW" in decision.reason_codes
+    assert decision.action == "auto_reply"
+    assert decision.reply_text == contact_reply
+    assert decision.source == "knowledge"
+    assert "KNOWLEDGE_VERBATIM" in decision.reason_codes
+    assert "MULTILINGUAL_RUNTIME_GENERATION" not in decision.reason_codes
+    assert "MULTILINGUAL_OFFICIAL_CONTACT_REVIEW" not in decision.reason_codes
     assert decision.multilingual_contract_version is None
-    await _assert_handoff(session, conversation_id, "MULTILINGUAL_OFFICIAL_CONTACT_REVIEW")
+    assert decision.grounding_verified is None
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == "SENT"
+    assert outbox.payload["text"] == contact_reply
+    assert _SENT_TEXTS == [contact_reply]
+    assert no_call_llm.calls == []
 
 
 async def test_query_translation_failure_keeps_original_handoff(
@@ -476,7 +661,11 @@ async def test_bot_draft_private_note_survives_runtime_preflight(
     )
 
     outbox_id = await runner.run_and_persist_decision(
-        snapshot, conversation_id, message_id, account_id
+        snapshot,
+        conversation_id,
+        message_id,
+        account_id,
+        decision_generation=1,
     )
 
     assert outbox_id is not None

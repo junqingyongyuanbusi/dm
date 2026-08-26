@@ -206,7 +206,7 @@ allowlist，且 DNS 解析结果全部为公共目标。会话按 thread 建立�
 以避免串人；24 小时自动回复限额按 account+sender 跨 thread 统计。轮询 RawEvent 只保存 UID、
 UIDVALIDITY、size 和可选 SHA-256，不保存 RFC822 正文。
 
-当前迁移唯一 head 为 `f2d9c4b8e631`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
+当前迁移唯一 head 为 `a7c3e9d1b624`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
 目标凭证后，必须先做 Phase 0 TLS/login/readonly 检查，再执行 draft-only real smoke。完整步骤见
 [Email operator runbook](docs/email-integration.md)。
 
@@ -249,6 +249,19 @@ X 使用部署级 Consumer App 和 Tenant 级共享 `webhook_url`，再按 `for_
 → Telegram / Facebook / Instagram / WhatsApp / Feishu / Email / X / XChat
 ```
 
+英语知识库的多语言路径先解析客户语种；可靠的非英语查询会先受保护地译成英语，再按
+tenant、brand、platform、发布状态和 verified-English 范围做 exact + PostgreSQL
+pgvector/全文检索。非精确流量默认使用答案级 similarity + margin 闸门，也可按稳定的万分桶
+进入 `off|shadow|live` selector；sampled live 选中的候选只要求达到 similarity 下限，不再依赖
+旧 top-1 margin。exact 命中绕过 selector，shadow 只记证据，sampled live 的失败或弃权会 fail
+closed。
+
+`MULTILINGUAL_LANGUAGE_POLICY=legacy_hard` 保留未知/回错语言即 HANDOFF 的历史行为；`review`
+只把语种身份当作审阅信号，让已通过事实、出处、实体、联系方式、数值货币和 grounding 硬校验的
+候选进入私有 DRAFT，绝不自动公开发送。默认发布组合是 `legacy_hard`、`RAG_SELECTOR_MODE=off`、
+`RAG_SELECTOR_CANARY_BPS=0`，先做 bounded shadow，再审阅证据和草稿队列，最后才允许小流量
+review/live canary。
+
 PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；Redis 只承载 Dramatiq、kill switch、OAuth 临时状态和可重建缓存。Scheduler 会恢复带版本化 dispatch contract 的新 RawEvent、DecisionJob 和 Outbox；历史缺少安全重建参数的 `PENDING` RawEvent 不会被猜测执行。Worker 提交 Outbox 后仍走低延迟 Fast Path。
 
 账号的 `PlatformAccount.automation_default` 是跨多个会话使用的账号级自动化策略；单个 `HumanWorkItem` 只影响自己的会话。转人工先进入 `WAITING/HANDOFF_PENDING`，认领会在同一锁定事务中进入 `CLAIMED/HUMAN_ACTIVE` 并取消该会话尚未发送的决策型 Bot Outbox。解决工作项会在一次操作中恢复账号当前策略（Meta 自动外发门禁不允许时安全回落到 `BOT_DRAFT_ONLY`），无需再点击恢复。等待或人工处理中收到的消息仍会持久化为 `ignore` 决策且不会在解决后补发；只有解决后的下一条新消息按恢复后的账号策略处理。其他会话不受影响。
@@ -261,6 +274,7 @@ PostgreSQL 是入站证据、消息、任务、决策和 Outbox 的事实源；R
 - [Feishu operator runbook](docs/feishu-integration.md)
 - [Email operator runbook](docs/email-integration.md)
 - [生产迁移](docs/production-migration.md)
+- [多语言 RAG 开源方案调研](docs/multilingual-oss-research.md)
 - [Railway 生产发布](scripts/publish_railway_release.sh)
 - [文档地图与历史材料](docs/README.md)
 
@@ -278,7 +292,7 @@ DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
 REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 7 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `f2d9c4b8e631`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `a7c3e9d1b624`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
 
 ## X 贴文评论自动回复
 
@@ -346,7 +360,9 @@ XAA 的完整事件枚举里没有任何回复/评论专用事件（只有 `post
 
 ## 回复模板导入（知识库）
 
-CSV 格式（UTF-8，表头必需 `question,reply`，可选 `brand_id,platform,category,is_official_contact`）。所有新建/导入行均为草稿，明确发布前不会参与检索：
+CSV 格式（UTF-8，表头必需 `question,reply`，可选
+`brand_id,platform,category,is_official_contact,protected_values_json`）。所有新建/导入行均为草稿，
+明确发布前不会参与检索：
 
 | 列 | 必需 | 说明 |
 | --- | --- | --- |
@@ -356,6 +372,7 @@ CSV 格式（UTF-8，表头必需 `question,reply`，可选 `brand_id,platform,c
 | platform | 否 | 平台，留空表示全平台 |
 | category | 否 | 分类标签 |
 | is_official_contact | 否 | 仅接受 true/false/1/0/yes/no（不区分大小写）；空白为 false |
+| protected_values_json | 否 | 严格 JSON 字符串数组；最多 32 项，每项最多 128 个字符，且必须逐字出现在本行 `reply` 中；空白等同空数组 |
 
 ```bash
 uv run python -m apps.cli.import_knowledge 模板.csv --brand default

@@ -76,3 +76,10 @@ def test_prompt_sink_rejects_arbitrary_persona_text() -> None:
             conversation_key="test",
             voice_preferences=hostile,
         )
+
+
+def test_mirror_user_language_instruction_is_not_treated_as_bcp47_tag() -> None:
+    prompt = _build_system_prompt((), target_language="mirror-user")
+
+    assert "Mirror the natural language and writing system" in prompt
+    assert "Required reply language for this decision: mirror-user" not in prompt

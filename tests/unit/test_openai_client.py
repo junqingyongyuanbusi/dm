@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from social_reply.domain.reply.decision import ReplyAction, RiskLevel, Visibility
-from social_reply.domain.reply.llm import LLMContext
+from social_reply.domain.reply.llm import LLMContext, RAGCandidate
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 
 _CTX = LLMContext(text="你们几点营业？", conversation_key="cw:1:2")
@@ -368,3 +368,81 @@ async def test_语言兜底判定使用_structured_output_且不篡改客户原�
     payload = json.loads(captured[0].content)
     assert payload["response_format"]["json_schema"]["name"] == "language_detection"
     assert payload["messages"][-1] == {"role": "user", "content": "Hola"}
+
+
+_RAG_CANDIDATES = (
+    RAGCandidate(
+        candidate_id="candidate-1",
+        question="How long does verification take?",
+        approved_answer="Verification takes 3 business days.",
+        similarity=0.91,
+    ),
+    RAGCandidate(
+        candidate_id="candidate-2",
+        question="How do I report incorrect broker information?",
+        approved_answer="Submit a correction through the broker profile.",
+        similarity=0.82,
+    ),
+)
+
+
+@pytest.mark.asyncio
+async def test_rag_selector_accepts_only_an_allowlisted_candidate():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        schema = payload["response_format"]["json_schema"]["schema"]
+        assert set(schema["properties"]) == {"selected_candidate_id"}
+        return _completion_response(json.dumps({"selected_candidate_id": "candidate-1"}))
+
+    result = await _client(handler).select_rag_answer(
+        query="Cuanto tarda?",
+        candidates=_RAG_CANDIDATES,
+    )
+    assert result.selected_candidate_id == "candidate-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"selected_candidate_id": None},
+        {"selected_candidate_id": "candidate-999"},
+        {"selected_candidate_id": "candidate-1", "reply_text": "invented"},
+    ],
+)
+async def test_rag_selector_abstains_on_null_invalid_id_or_invalid_pair(output):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response(json.dumps(output))
+
+    result = await _client(handler).select_rag_answer(
+        query="question",
+        candidates=_RAG_CANDIDATES,
+    )
+    assert result.selected_candidate_id is None
+
+
+@pytest.mark.asyncio
+async def test_rag_selector_timeout_abstains():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("timeout")
+
+    result = await _client(handler).select_rag_answer(
+        query="question",
+        candidates=_RAG_CANDIDATES,
+    )
+    assert result.selected_candidate_id is None
+
+
+@pytest.mark.asyncio
+async def test_rag_verifier_returns_relevance_and_faithfulness():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response(json.dumps({"relevant": True, "faithful": False}))
+
+    result = await _client(handler).verify_rag_answer(
+        query="How long?",
+        approved_reply="Three business days.",
+        candidate_reply="Five business days.",
+        target_language="en",
+    )
+    assert result.relevant is True
+    assert result.faithful is False

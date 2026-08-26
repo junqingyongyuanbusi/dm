@@ -1,4 +1,3 @@
-import hashlib
 import uuid
 from dataclasses import dataclass
 
@@ -6,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.knowledge.retrieval import chunk_embedding_values
+from social_reply.domain.knowledge.policy import knowledge_revision_hash, normalize_protected_values
 from social_reply.infrastructure.database.models import AuditLog, KnowledgeChunk, KnowledgeDocument
 
 
@@ -18,6 +18,7 @@ class KnowledgeDraft:
     platform: str | None
     category: str | None
     is_official_contact: bool
+    protected_values: tuple[str, ...]
     source_language: str
     language_verified: bool
     detected_language: str
@@ -38,6 +39,7 @@ def build_knowledge_draft(
     platform: str | None = None,
     category: str | None = None,
     is_official_contact: bool = False,
+    protected_values: tuple[str, ...] = (),
     source_language: str = "und",
     language_verified: bool = False,
     detected_language: str = "und",
@@ -46,6 +48,14 @@ def build_knowledge_draft(
     import_batch_id: uuid.UUID | None = None,
 ) -> KnowledgeDraft:
     content = f"问：{question}\n答：{reply}"
+    normalized_protected_values = normalize_protected_values(protected_values)
+    if len(normalized_protected_values) > 32:
+        raise ValueError("protected_values cannot contain more than 32 entries")
+    for value in normalized_protected_values:
+        if len(value) > 128:
+            raise ValueError("protected value cannot exceed 128 characters")
+        if value not in reply:
+            raise ValueError(f"protected value is absent from reply: {value}")
     return KnowledgeDraft(
         tenant_id=tenant_id,
         question=question,
@@ -54,6 +64,7 @@ def build_knowledge_draft(
         platform=platform,
         category=category,
         is_official_contact=is_official_contact,
+        protected_values=normalized_protected_values,
         source_language=source_language,
         language_verified=language_verified,
         detected_language=detected_language,
@@ -62,7 +73,7 @@ def build_knowledge_draft(
         import_batch_id=import_batch_id,
         content=content,
         embed_text=question,
-        content_hash=hashlib.sha256(content.encode()).hexdigest(),
+        content_hash=knowledge_revision_hash(content, normalized_protected_values),
     )
 
 
@@ -98,6 +109,7 @@ async def persist_knowledge_draft(
         category=draft.category,
         question=draft.question,
         reply=draft.reply,
+        protected_values=list(draft.protected_values),
         status="draft",
         is_official_contact=draft.is_official_contact,
         source_language=draft.source_language,

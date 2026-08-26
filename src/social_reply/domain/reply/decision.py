@@ -32,6 +32,10 @@ class ReplyDecision:
     handoff_team: str | None = None
     reason_codes: tuple[str, ...] = ()
     source: str = "llm"  # rule / llm / guard
+    decision_release_sha: str | None = None
+    retrieval_policy_version: str | None = None
+    selector_version: str | None = None
+    rag_evidence: dict | None = None
     request_language: str = "und"
     reply_language: str = "und"
     resolved_locale: str = "und"

@@ -5,11 +5,11 @@ from collections import Counter
 from dataclasses import replace
 
 from social_reply.domain.platform_accounts import PLATFORM_CAPABILITY_SPECS
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.language import (
-    dominant_script,
     expected_scripts_for,
     reply_language_matches,
+    reply_script_matches,
 )
 
 # 语言校验强度。strict：语种由确定性检测判定，可复核，沿用完整的语言身份断言。
@@ -18,6 +18,11 @@ from social_reply.domain.reply.language import (
 # grounding_verified is True 才放行，安全链条不因此断裂。
 LANGUAGE_VERIFICATION_STRICT = "strict"
 LANGUAGE_VERIFICATION_LENIENT = "lenient"
+
+# Language identity is an observation, not a deterministic safety fact. Keep the old hard
+# behavior available during rollout, while review mode preserves the candidate for human review.
+LANGUAGE_POLICY_LEGACY_HARD = "legacy_hard"
+LANGUAGE_POLICY_REVIEW = "review"
 
 # Account numbers, long digit strings, and email addresses must not be echoed.
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
@@ -99,17 +104,6 @@ _CURRENCY_PATTERNS = (
 # 字母」的显式边界；尾随数字并入实体本体，使 MT4/MT5 这类版本号可比对而非截成 MT。
 _PROTECTED_ENTITY = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Z]{2,}\d*s?|[A-Z][a-z]+[A-Z][A-Za-z]*)(?![A-Za-z])"
-)
-_KNOWN_PROTECTED_ENTITIES = (
-    "WikiFX",
-    "Meta",
-    "Google",
-    "Telegram",
-    "WhatsApp",
-    "Facebook",
-    "Instagram",
-    "Feishu",
-    "OpenAI",
 )
 _FACT_SEPARATOR = re.compile(r"(?i)\b(?:and|or|ou|y|e)\b|[;,，；]|或|和|以及")
 
@@ -225,14 +219,28 @@ def _normalize_entity(value: str) -> str:
     return value
 
 
-def protected_entities(text: str) -> tuple[str, ...]:
+def protected_entities(
+    text: str,
+    *,
+    protected_values: tuple[str, ...] = (),
+) -> tuple[str, ...]:
     regex_entities = [
         entity
         for entity in (_normalize_entity(match) for match in _PROTECTED_ENTITY.findall(text))
         if entity not in {"USD", "EUR", "GBP", "CNY", "RMB", "JPY", "USDT"}
     ]
-    known_entities = [entity for entity in _KNOWN_PROTECTED_ENTITIES if entity in text]
-    return tuple(dict.fromkeys([*regex_entities, *known_entities]))
+    knowledge_entities = [
+        value
+        for value in protected_values
+        if value
+        and re.search(
+            (r"(?<![A-Za-z0-9])" if value[0].isascii() and value[0].isalnum() else "")
+            + re.escape(value)
+            + (r"(?![A-Za-z0-9])" if value[-1].isascii() and value[-1].isalnum() else ""),
+            text,
+        )
+    ]
+    return tuple(dict.fromkeys([*regex_entities, *knowledge_entities]))
 
 
 def redact_pii(text: str) -> str:
@@ -252,6 +260,23 @@ def _downgrade(decision: ReplyDecision, code: str) -> ReplyDecision:
         decision,
         action=ReplyAction.HANDOFF,
         reply_text=None,
+        reason_codes=decision.reason_codes + (code,),
+        source="guard",
+    )
+
+
+def _apply_language_mismatch(
+    decision: ReplyDecision,
+    code: str,
+    *,
+    language_policy: str,
+) -> ReplyDecision:
+    if language_policy != LANGUAGE_POLICY_REVIEW:
+        return _downgrade(decision, code)
+    return replace(
+        decision,
+        action=ReplyAction.DRAFT,
+        reply_visibility=Visibility.PRIVATE,
         reason_codes=decision.reason_codes + (code,),
         source="guard",
     )
@@ -286,21 +311,23 @@ def _fact_tokens_match(candidate: str, approved: str, language: str) -> tuple[bo
     return False, True
 
 
-def run_final_guard(
+def run_hard_output_guard(
     decision: ReplyDecision,
     platform: str,
     *,
     approved_official_contact_reply: str | None = None,
     expected_reply_language: str = "und",
     approved_knowledge_reply: str | None = None,
+    approved_knowledge_protected_values: tuple[str, ...] = (),
     approved_localization_text: str | None = None,
     approved_localization_text_hash: str | None = None,
     approved_localization_protected_values: tuple[str, ...] = (),
-    customer_text: str | None = None,
-    language_verification: str = LANGUAGE_VERIFICATION_STRICT,
 ) -> ReplyDecision:
-    """纯确定性输出闸门；任一项失败降级为 handoff 并记录 reason_code。
-    仅对 auto_reply 生效——其它 action 原样返回。"""
+    """Run only deterministic output-safety checks.
+
+    Any failure hands off and clears the candidate. Language identity is deliberately excluded so
+    an uncertain language detector cannot skip fact, entity, contact, or PII checks.
+    """
     if decision.action is not ReplyAction.AUTO_REPLY:
         return decision
     text = decision.reply_text or ""
@@ -324,40 +351,6 @@ def run_final_guard(
         and approved_official_contact_reply is not None
         and text == approved_official_contact_reply
     ) or approved_localization
-    if expected_reply_language != "und":
-        if language_verification == LANGUAGE_VERIFICATION_LENIENT:
-            # 语种是模型判定的，确定性检测复核不了；只在能拿到确凿的文字系统冲突时拦截。
-            # reply_language 必须落成目标语言而非 und——投递层对 und 是硬拒绝。
-            decision = replace(
-                decision,
-                reply_language=expected_reply_language,
-                reason_codes=decision.reason_codes + ("LANGUAGE_MODEL_ATTESTED",),
-            )
-            reply_script = dominant_script(text)
-            customer_script = dominant_script(customer_text)
-            if customer_script and reply_script and reply_script != customer_script:
-                return _downgrade(decision, "GUARD_LANGUAGE_SCRIPT_MISMATCH")
-        else:
-            # 必须逐字保留的实体不得充当语种证据：下面的实体闸门已强制它们与英语
-            # 标准答案完全一致，再让它们抬高拉丁字母占比，等于自相矛盾地把一条
-            # 忠实译文判成回错语言。
-            language_ok, observed_language = reply_language_matches(
-                expected_reply_language,
-                text,
-                extra_allowed_scripts=expected_scripts_for(customer_text),
-                neutral_terms=(
-                    protected_entities(approved_knowledge_reply)
-                    if approved_knowledge_reply is not None
-                    else ()
-                )
-                + approved_localization_protected_values,
-            )
-            if observed_language == "und" and approved_contact:
-                observed_language = expected_reply_language
-                language_ok = True
-            decision = replace(decision, reply_language=observed_language)
-            if not language_ok:
-                return _downgrade(decision, "GUARD_LANGUAGE_MISMATCH")
     if approved_knowledge_reply is not None:
         facts_ok, units_verified = _fact_tokens_match(
             text, approved_knowledge_reply, expected_reply_language
@@ -368,8 +361,140 @@ def run_final_guard(
             decision = replace(
                 decision, reason_codes=decision.reason_codes + ("FACT_UNIT_UNVERIFIED",)
             )
-        if set(protected_entities(text)) != set(protected_entities(approved_knowledge_reply)):
+        if set(
+            protected_entities(text, protected_values=approved_knowledge_protected_values)
+        ) != set(
+            protected_entities(
+                approved_knowledge_reply,
+                protected_values=approved_knowledge_protected_values,
+            )
+        ):
             return _downgrade(decision, "GUARD_KNOWLEDGE_ENTITY_MISMATCH")
     if has_contact_like(text) and not approved_contact:
         return _downgrade(decision, "GUARD_PII_LEAK")
     return decision
+
+
+def run_language_observation_guard(
+    decision: ReplyDecision,
+    *,
+    approved_official_contact_reply: str | None = None,
+    expected_reply_language: str = "und",
+    approved_knowledge_reply: str | None = None,
+    approved_knowledge_protected_values: tuple[str, ...] = (),
+    approved_localization_protected_values: tuple[str, ...] = (),
+    customer_text: str | None = None,
+    language_verification: str = LANGUAGE_VERIFICATION_STRICT,
+    language_policy: str = LANGUAGE_POLICY_LEGACY_HARD,
+) -> ReplyDecision:
+    """Observe output language after deterministic and semantic safety checks.
+
+    ``legacy_hard`` preserves the historical handoff behavior. ``review`` records the same signal
+    on a private draft without discarding the candidate text.
+    """
+    if decision.action is not ReplyAction.AUTO_REPLY or expected_reply_language == "und":
+        return decision
+
+    text = decision.reply_text or ""
+    approved_contact = (
+        decision.source == "knowledge"
+        and approved_official_contact_reply is not None
+        and text == approved_official_contact_reply
+    ) or decision.source == "knowledge_localization"
+    neutral_terms = (
+        protected_entities(
+            approved_knowledge_reply,
+            protected_values=approved_knowledge_protected_values,
+        )
+        if approved_knowledge_reply is not None
+        else ()
+    ) + approved_localization_protected_values
+    extra_allowed_scripts = expected_scripts_for(
+        customer_text,
+        include_all=expected_reply_language == "mirror-user",
+    )
+    if language_verification == LANGUAGE_VERIFICATION_LENIENT:
+        # The model-attested language remains routing metadata. A writing-system conflict is still
+        # deterministic enough to reject in every policy; only language identity is reviewable.
+        decision = replace(
+            decision,
+            reply_language=expected_reply_language,
+            reason_codes=decision.reason_codes + ("LANGUAGE_MODEL_ATTESTED",),
+        )
+        if not reply_script_matches(
+            expected_reply_language,
+            text,
+            extra_allowed_scripts=extra_allowed_scripts,
+            neutral_terms=neutral_terms,
+        ):
+            return _downgrade(
+                decision,
+                "GUARD_LANGUAGE_SCRIPT_MISMATCH",
+            )
+        return decision
+
+    # Protected values must be copied verbatim, so they carry no useful language evidence.
+    language_ok, observed_language = reply_language_matches(
+        expected_reply_language,
+        text,
+        extra_allowed_scripts=extra_allowed_scripts,
+        neutral_terms=neutral_terms,
+    )
+    if observed_language == "und" and approved_contact:
+        observed_language = expected_reply_language
+        language_ok = True
+    decision = replace(decision, reply_language=observed_language)
+    if not reply_script_matches(
+        expected_reply_language,
+        text,
+        extra_allowed_scripts=extra_allowed_scripts,
+        neutral_terms=neutral_terms,
+    ):
+        return _downgrade(decision, "GUARD_LANGUAGE_SCRIPT_MISMATCH")
+    if not language_ok:
+        return _apply_language_mismatch(
+            decision,
+            "GUARD_LANGUAGE_MISMATCH",
+            language_policy=language_policy,
+        )
+    return decision
+
+
+def run_final_guard(
+    decision: ReplyDecision,
+    platform: str,
+    *,
+    approved_official_contact_reply: str | None = None,
+    expected_reply_language: str = "und",
+    approved_knowledge_reply: str | None = None,
+    approved_knowledge_protected_values: tuple[str, ...] = (),
+    approved_localization_text: str | None = None,
+    approved_localization_text_hash: str | None = None,
+    approved_localization_protected_values: tuple[str, ...] = (),
+    customer_text: str | None = None,
+    language_verification: str = LANGUAGE_VERIFICATION_STRICT,
+    language_policy: str = LANGUAGE_POLICY_LEGACY_HARD,
+) -> ReplyDecision:
+    """Compatibility wrapper for callers that do not run a semantic verifier between phases."""
+    decision = run_hard_output_guard(
+        decision,
+        platform,
+        approved_official_contact_reply=approved_official_contact_reply,
+        expected_reply_language=expected_reply_language,
+        approved_knowledge_reply=approved_knowledge_reply,
+        approved_knowledge_protected_values=approved_knowledge_protected_values,
+        approved_localization_text=approved_localization_text,
+        approved_localization_text_hash=approved_localization_text_hash,
+        approved_localization_protected_values=approved_localization_protected_values,
+    )
+    return run_language_observation_guard(
+        decision,
+        approved_official_contact_reply=approved_official_contact_reply,
+        expected_reply_language=expected_reply_language,
+        approved_knowledge_reply=approved_knowledge_reply,
+        approved_knowledge_protected_values=approved_knowledge_protected_values,
+        approved_localization_protected_values=approved_localization_protected_values,
+        customer_text=customer_text,
+        language_verification=language_verification,
+        language_policy=language_policy,
+    )

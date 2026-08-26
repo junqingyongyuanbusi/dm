@@ -413,21 +413,21 @@ def test_local_environment_template_disables_future_platforms() -> None:
 def test_email_documentation_and_migration_head_contract() -> None:
     root = Path(__file__).resolve().parents[2]
     assert _configuration_email_keys(root / "docs/configuration.md") == set(_EMAIL_ENV_DEFAULTS)
-    assert _migration_heads(root / "migrations/versions") == {"f2d9c4b8e631"}
+    assert _migration_heads(root / "migrations/versions") == {"a7c3e9d1b624"}
 
     production_migration = (root / "docs/production-migration.md").read_text()
     docs_readme = (root / "docs/README.md").read_text()
     root_readme = (root / "README.md").read_text()
     assert re.search(
-        r"current Alembic graph has one head: `f2d9c4b8e631`",
+        r"current Alembic graph has one head: `a7c3e9d1b624`",
         production_migration,
     )
     assert re.search(
-        r"Alembic graph has one current head:\s*`f2d9c4b8e631`",
+        r"Alembic graph has one current head:\s*`a7c3e9d1b624`",
         docs_readme,
     )
     assert re.search(
-        r"current revision 等于唯一 head `f2d9c4b8e631`",
+        r"current revision 等于唯一 head `a7c3e9d1b624`",
         root_readme,
     )
 
@@ -553,6 +553,25 @@ def test_x_mention_ingest_requires_both_activity_and_public_reply() -> None:
 def test_multilingual_runtime_requires_knowledge_retrieval() -> None:
     with pytest.raises(ValueError, match="requires KNOWLEDGE_RETRIEVAL_ENABLED"):
         _make(testing=True, multilingual_knowledge_reply_enabled=True)
+
+
+@pytest.mark.parametrize("policy", ["legacy_hard", "review"])
+def test_multilingual_language_policy_is_typed(policy: str) -> None:
+    settings = _make(testing=True, multilingual_language_policy=policy)
+    assert settings.multilingual_language_policy == policy
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "live"])
+def test_rag_selector_rollout_settings(mode: str) -> None:
+    settings = _make(testing=True, rag_selector_mode=mode, rag_selector_canary_bps=4321)
+    assert settings.rag_selector_mode == mode
+    assert settings.rag_selector_canary_bps == 4321
+
+
+@pytest.mark.parametrize("basis_points", [-1, 10001])
+def test_rag_selector_canary_bounds(basis_points: int) -> None:
+    with pytest.raises(ValueError):
+        _make(testing=True, rag_selector_canary_bps=basis_points)
 
 
 def test_multilingual_runtime_forces_english_scope_in_code_not_settings() -> None:

@@ -1,31 +1,39 @@
 # Multilingual reply OSS research
 
-> Status: researched candidate components and public failure evidence; no production winner selected.
-> Accessed: 2026-08-19.
+> Status: PostgreSQL is the current backend; external retrieval/model candidates remain unselected.
+> Accessed: 2026-08-25.
 >
 > This document informs an offline bake-off and staged architecture. It does not authorize multilingual live mode. Production enablement still requires the repository's calibration, reviewed end-to-end holdout, version/hash consistency, and human approval gates.
 
 ## Decision summary
 
-For this repository, the safest near-term path is **not** to replace the application with a RAG framework or immediately migrate to OpenSearch. First make the existing PostgreSQL path fail closed and complete one reviewed-localization vertical slice:
+For this repository, the safest near-term path is **not** to replace the application with a RAG
+framework or immediately migrate to a separate vector service. Keep PostgreSQL + pgvector +
+PostgreSQL full-text search, compare exact vector scan with filtered HNSW Recall@k, and roll out the
+selector and language-review policy independently:
 
 ```text
 inbox message
-  -> fail-closed language detection
+  -> scoped language resolution
+  -> protected English query translation when reliable and non-English
   -> scoped PostgreSQL exact/dense/lexical retrieval
-  -> answer-level confidence gate
-  -> approved localization artifact
-  -> structured action decision
-  -> deterministic language/fact/entity/contact guards
-  -> Outbox or HANDOFF
+  -> legacy similarity/margin gate or sampled selector with a similarity floor
+  -> approved localization or grounded generation
+  -> deterministic fact/provenance/entity/contact guards
+  -> semantic verifier, then language observation
+  -> Outbox, private review DRAFT, or HANDOFF
 ```
 
-OpenSearch, Qwen3, BGE-M3, query translation, and reranking should remain versioned candidates until representative DM data proves a quality, latency, cost, and operational advantage.
+OpenSearch, Qdrant, Qwen3, BGE-M3, alternative query-translation strategies, and reranking should
+remain versioned candidates until representative DM data proves a quality, latency, cost, and
+operational advantage.
 
 ## Candidate matrix
 
 | Candidate | License evidence | Deployment shape | Strengths | Risks / fit for this repository |
 | --- | --- | --- | --- | --- |
+| PostgreSQL FTS + pgvector | PostgreSQL and pgvector use permissive open-source licenses | Existing durable database; exact scan or HNSW/IVFFlat index | Keeps tenant/publish/version filters and retrieval evidence in the current transaction boundary; exact scan is practical at the current corpus size | Approximate-index filtering occurs after ANN scanning and can reduce in-scope recall; benchmark exact scan and iterative HNSW under real filters |
+| Qdrant | Apache-2.0 repository | Separate Rust vector service with payload indexes and dense/sparse/hybrid query support | Purpose-built filtered vector retrieval and scalable rebuildable collections | Adds projection, synchronization and recovery operations; cannot become the durable source for tenant, publication or policy state |
 | OpenSearch + k-NN + Neural Search | Apache-2.0 repositories | Separate JVM cluster; optional ML Commons/model-serving nodes; versioned mappings and search pipelines | Mature lexical/vector/hybrid search, ANN pre-filtering, scalable projection | Adds another distributed system; filter behavior is version/query-shape sensitive; must remain a rebuildable projection of PostgreSQL |
 | Qwen3-Embedding / Qwen3-Reranker | Qwen model-card YAML publishes `apache-2.0`; repository license discoverability has an open concern | Transformers, Sentence Transformers, vLLM, or TEI; GPU strongly preferred for 4B/8B | Multilingual, instruction-aware, MRL/custom dimensions; separate reranker family | 8B embedding outputs up to 4096 dimensions, incompatible with current `Vector(1536)`; serving needs explicit truncation/batching/memory limits |
 | FlagEmbedding / BGE-M3 | MIT repository | Python/PyTorch or separate serving layer | 100+ languages; dense, sparse, and multi-vector outputs; 1024 dense dimensions | Toolkit, not a production service; sparse/multi-vector modes require new storage and retrieval contracts |
@@ -38,6 +46,35 @@ OpenSearch, Qwen3, BGE-M3, query translation, and reranking should remain versio
 | NLLB-200 distilled 600M | Model card: CC-BY-NC | Local Transformers | Broad research language coverage | Model card says research-only and not released for production deployment; not a commercial-production default |
 
 ## Verified failure evidence
+
+### pgvector filtering and exact-search baseline
+
+- [pgvector filtering documentation](https://github.com/pgvector/pgvector#filtering) states that with
+  approximate indexes filtering is applied after the index is scanned. It recommends increasing
+  `hnsw.ef_search`, enabling iterative scans in 0.8.0+, partial indexes, or partitioning depending on
+  filter selectivity.
+- The same official documentation exposes
+  `SET LOCAL hnsw.iterative_scan = strict_order`, which scans farther while preserving strict result
+  ordering. Extension version/support must be verified in the deployed image rather than assumed.
+
+Implication: SQL predicates still prevent an out-of-scope row from being returned, but a shared
+multi-tenant ANN scan can fail to surface enough eligible rows. At approximately 716 verified
+published English documents, exact vector scan is a required candidate. Compare it with HNSW using
+tenant, brand, platform, publication, language, and embedding-version filters and report Recall@k,
+latency, and plans from the actual production extension version.
+
+### Qdrant as an optional projection
+
+- [Qdrant filtering documentation](https://qdrant.tech/documentation/concepts/filtering/) documents
+  payload filters and payload indexes for constrained vector queries.
+- [Qdrant hybrid-query documentation](https://qdrant.tech/documentation/concepts/hybrid-queries/)
+  documents multi-stage dense, sparse, and fusion queries.
+- [The Qdrant repository](https://github.com/qdrant/qdrant) publishes its Apache-2.0 implementation.
+
+Implication: Qdrant becomes relevant only if measured corpus growth, filtered ANN latency, or
+dense+sparse retrieval quality justifies operating a second service. Publish/revoke/version changes
+must project from PostgreSQL through durable work, and the collection must remain disposable and
+rebuildable.
 
 ### OpenSearch filtering and hybrid search
 
@@ -63,7 +100,10 @@ Implication: multilingual embedding, query translation, and English BM25 must be
 - [Lingua issue #293](https://github.com/pemistahl/lingua-py/issues/293) reports English text being classified as French or Latin when it contains French organization/place names, plus false positives in restricted-language configurations.
 - The current repository already treats pure-Han `返金希望` as ambiguous between Chinese and Japanese. This is the correct safety posture unless reliable context resolves it.
 
-Implication: `detected_language` is evidence, not country or locale. `resolved_locale` must be a separate decision based on exact approved artifact availability and explicit/platform preference. Ambiguous or mixed text remains HANDOFF.
+Implication: `detected_language` is evidence, not country or locale. `resolved_locale` must be a
+separate decision based on exact approved artifact availability and explicit/platform preference.
+Ambiguous or mixed text remains HANDOFF under `legacy_hard`; `review` may preserve an otherwise safe
+candidate only as a private draft.
 
 ### Qwen serving, dimensions, and long inputs
 
@@ -88,17 +128,22 @@ Implication: runtime translation must not become the source of truth for officia
 
 ### Stage 1: safe PostgreSQL vertical slice
 
-Keep PostgreSQL as the durable fact source and current retrieval backend. Implement:
+Keep PostgreSQL as the durable fact source and current retrieval backend. Maintain and validate:
 
 1. strict embedding response and dimension validation;
 2. retrieval errors as unconditional HANDOFF when knowledge retrieval is enabled;
 3. `detected_language` and `resolved_locale` as distinct provenance;
-4. reviewed localization artifacts bound to the exact English knowledge content hash/revision;
-5. deterministic artifact rendering through the existing structured action contract and final guards;
-6. missing/stale/wrong-locale artifact as HANDOFF;
-7. real Japanese hot-path integration tests through ReplyDecision and Outbox.
+4. exact-scan versus filtered-HNSW recall and latency measurement;
+5. reviewed localization artifacts bound to the exact English knowledge content hash/revision;
+6. deterministic facts and entity preservation before language observation;
+7. selector `shadow` evidence before a bounded `live` canary;
+8. language-only uncertainty routed to private review, never automatic public sending;
+9. real multilingual hot-path integration tests through ReplyDecision and Outbox.
 
-Only languages with a published artifact are eligible for automatic replies.
+Reviewed localization is the highest-trust wording path. Runtime-generated replies may be eligible
+without a localization artifact only after a strong English knowledge match, hard fact/entity/contact
+checks, semantic grounding, language policy, account automation state, and send-time Outbox checks all
+pass. An unresolved request language under `review` is always a private draft.
 
 ### Stage 2: offline candidate bake-off
 
@@ -121,9 +166,12 @@ Report by language, tenant, brand/platform/account scope:
 - HANDOFF rate and safe automation coverage;
 - p50/p95 latency, timeout/OOM rate, and variable cost.
 
-### Stage 3: optional OpenSearch projection
+### Stage 3: optional external search projection
 
-Adopt OpenSearch only if the bake-off demonstrates a material advantage over PostgreSQL. PostgreSQL remains authoritative. Publish/revoke changes project through a transactional outbox into a versioned index. A release references one immutable index/model/normalization contract; no application-side post-filtering is allowed.
+Adopt Qdrant or OpenSearch only if the bake-off demonstrates a material advantage over PostgreSQL.
+PostgreSQL remains authoritative. Publish/revoke changes project through durable Outbox work into a
+versioned index. A release references one immutable index/model/normalization contract; no
+application-side post-filtering is allowed.
 
 ### Stage 4: optional translation fallback
 

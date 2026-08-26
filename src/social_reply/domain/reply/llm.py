@@ -13,6 +13,25 @@ APPROVED_VERBATIM_SENTINEL = "__APPROVED_VERBATIM__"
 
 
 @dataclass(frozen=True)
+class RAGCandidate:
+    candidate_id: str
+    question: str
+    approved_answer: str
+    similarity: float
+
+
+@dataclass(frozen=True)
+class RAGSelectionResult:
+    selected_candidate_id: str | None
+
+
+@dataclass(frozen=True)
+class RAGVerificationResult:
+    relevant: bool
+    faithful: bool
+
+
+@dataclass(frozen=True)
 class LLMContext:
     text: str
     conversation_key: str
@@ -42,6 +61,22 @@ class LLMClient(Protocol):
         candidate_reply: str,
         target_language: str,
     ) -> bool: ...
+
+    async def select_rag_answer(
+        self,
+        *,
+        query: str,
+        candidates: tuple[RAGCandidate, ...],
+    ) -> RAGSelectionResult: ...
+
+    async def verify_rag_answer(
+        self,
+        *,
+        query: str,
+        approved_reply: str,
+        candidate_reply: str,
+        target_language: str,
+    ) -> RAGVerificationResult: ...
 
     async def translate_to_english(self, text: str) -> str | None:
         """查询翻译回退用：把客户查询译成英语。不可用/失败返回 None（fail-closed）。"""
@@ -81,6 +116,25 @@ class StubLLMClient:
         target_language: str,
     ) -> bool:
         return True
+
+    async def select_rag_answer(
+        self,
+        *,
+        query: str,
+        candidates: tuple[RAGCandidate, ...],
+    ) -> RAGSelectionResult:
+        # The stub cannot translate or judge relevance. Abstaining keeps tests and local smoke safe.
+        return RAGSelectionResult(selected_candidate_id=None)
+
+    async def verify_rag_answer(
+        self,
+        *,
+        query: str,
+        approved_reply: str,
+        candidate_reply: str,
+        target_language: str,
+    ) -> RAGVerificationResult:
+        return RAGVerificationResult(relevant=True, faithful=True)
 
     async def translate_to_english(self, text: str) -> str | None:
         # Stub 不提供翻译：回退路径静默关闭，不影响主路径。

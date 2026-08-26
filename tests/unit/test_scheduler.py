@@ -191,6 +191,23 @@ async def test_one_tick_submits_all_due_specs_and_isolates_exceptions(caplog):
     assert not any(record.message == "scheduler sweep future failed" for record in caplog.records)
 
 
+async def test_empty_successful_sweep_is_debug_only(caplog):
+    async def empty() -> list[str]:
+        return []
+
+    spec = scheduler.SweepSpec("empty", "core", 3, 5, empty)
+    runtime = scheduler.SweepRuntime(False, 0, None, False)
+
+    with caplog.at_level(logging.DEBUG):
+        await scheduler._run_sweep(spec, runtime, clock=lambda: 1)
+
+    record = next(
+        record for record in caplog.records if record.message == "scheduler sweep completed"
+    )
+    assert record.levelno == logging.DEBUG
+    assert record.recovered_count == 0
+
+
 async def test_due_intervals_coalesce_without_overlap_and_warn_once(caplog):
     release = asyncio.Event()
     calls = 0

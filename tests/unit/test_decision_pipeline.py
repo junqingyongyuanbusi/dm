@@ -4,7 +4,12 @@ from social_reply.application.reply_decision.jobs import snapshot_from_dict, sna
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
-from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, StubLLMClient
+from social_reply.domain.reply.guard import LANGUAGE_POLICY_REVIEW
+from social_reply.domain.reply.llm import (
+    APPROVED_VERBATIM_SENTINEL,
+    RAGVerificationResult,
+    StubLLMClient,
+)
 from social_reply.domain.reply.voice import DEFAULT_VOICE_PREFERENCES
 
 
@@ -509,3 +514,147 @@ async def test_grounding_verifier_accepts_faithful_localization():
     assert decision.action is ReplyAction.AUTO_REPLY
     assert decision.grounding_verified is True
     assert decision.grounding_verifier_version == "grounding-v1"
+
+
+async def test_grounding_verifier_runs_before_language_review_observation():
+    events = []
+
+    class GroundingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Refunds take 3 business days.",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            events.append("grounding")
+            return True
+
+    decision = await run_decision_pipeline(
+        _snap(text="¿Cuántos días tarda el reembolso?"),
+        llm=GroundingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds take 3 business days.",
+        target_language="es",
+        apply_legacy_rules=False,
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert events == ["grounding"]
+    assert decision.grounding_verified is True
+    assert decision.action is ReplyAction.DRAFT
+    assert decision.reply_text == "Refunds take 3 business days."
+    assert decision.reply_visibility is Visibility.PRIVATE
+    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+
+
+@pytest.mark.parametrize("verifier_result", [False, RuntimeError("verifier unavailable")])
+async def test_grounding_rejection_beats_language_review_observation(verifier_result):
+    class GroundingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Refunds take 3 business days.",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            if isinstance(verifier_result, Exception):
+                raise verifier_result
+            return verifier_result
+
+    decision = await run_decision_pipeline(
+        _snap(text="返金には何日かかりますか？"),
+        llm=GroundingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds take 3 business days.",
+        target_language="ja",
+        apply_legacy_rules=False,
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert "GUARD_KNOWLEDGE_SEMANTIC_MISMATCH" in decision.reason_codes
+    assert "GUARD_LANGUAGE_MISMATCH" not in decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("verification", "expected_reason"),
+    (
+        (
+            RAGVerificationResult(relevant=False, faithful=True),
+            "GUARD_KNOWLEDGE_RELEVANCE_MISMATCH",
+        ),
+        (
+            RAGVerificationResult(relevant=True, faithful=False),
+            "GUARD_KNOWLEDGE_SEMANTIC_MISMATCH",
+        ),
+    ),
+)
+async def test_rag_verifier_failure_precedes_language_review(
+    verification: RAGVerificationResult,
+    expected_reason: str,
+) -> None:
+    class VerifierLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Refunds take 3 business days.",
+                confidence=0.99,
+            )
+
+        async def verify_rag_answer(self, **kwargs):
+            assert kwargs["query"] == "返金には何日かかりますか？"
+            return verification
+
+        async def verify_grounding(self, **kwargs):
+            raise AssertionError("the v2 verifier must take precedence")
+
+    decision = await run_decision_pipeline(
+        _snap(text="返金には何日かかりますか？"),
+        llm=VerifierLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds take 3 business days.",
+        target_language="ja",
+        apply_legacy_rules=False,
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert expected_reason in decision.reason_codes
+    assert "GUARD_LANGUAGE_MISMATCH" not in decision.reason_codes
+
+
+async def test_hard_guard_failure_skips_grounding_verifier_before_language_review():
+    class GroundingLLM:
+        async def decide(self, context):
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="返金には5営業日かかります。",
+                confidence=0.99,
+            )
+
+        async def verify_grounding(self, **kwargs):
+            raise AssertionError("hard guard failures must skip grounding")
+
+    decision = await run_decision_pipeline(
+        _snap(text="返金には何日かかりますか？"),
+        llm=GroundingLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved evidence",),
+        approved_knowledge_reply="Refunds take 3 business days.",
+        target_language="ja",
+        apply_legacy_rules=False,
+        language_policy=LANGUAGE_POLICY_REVIEW,
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reply_text is None
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" in decision.reason_codes
+    assert decision.grounding_verified is None

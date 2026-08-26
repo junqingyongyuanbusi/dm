@@ -1,6 +1,7 @@
 """回复模板 CSV 导入：content_hash 幂等 + 批量 embedding"""
 
 import csv
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -43,6 +44,19 @@ def parse_optional_bool(value: str | None) -> bool:
     raise ValueError(f"is_official_contact must be true/false, got {value!r}")
 
 
+def parse_protected_values(value: str | None) -> tuple[str, ...]:
+    """Parse an optional JSON string array; semantic checks run in build_knowledge_draft."""
+    if not (value or "").strip():
+        return ()
+    try:
+        parsed = json.loads(value or "")
+    except json.JSONDecodeError as exc:
+        raise ValueError("protected_values_json must be a JSON string array") from exc
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        raise ValueError("protected_values_json must be a JSON string array")
+    return tuple(parsed)
+
+
 def _parse_rows(
     f: TextIO,
     *,
@@ -76,6 +90,7 @@ def _parse_rows(
                 platform=(raw.get("platform") or "").strip() or None,
                 category=(raw.get("category") or "").strip() or None,
                 is_official_contact=parse_optional_bool(raw.get("is_official_contact")),
+                protected_values=parse_protected_values(raw.get("protected_values_json")),
                 detected_language=detected_language,
                 language_detection_status=detection_status,
                 source_file=source_name,

@@ -40,6 +40,8 @@ async def generate_multilingual_reply(
     email_auto_reply_allowed: bool,
     fallback_reason_codes: tuple[str, ...] = (),
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
+    language_policy: str = "legacy_hard",
+    approved_knowledge_protected_values: tuple[str, ...] = (),
 ) -> ReplyDecision:
     """Generate a guarded same-language reply from the canonical English knowledge hit."""
     try:
@@ -50,12 +52,14 @@ async def generate_multilingual_reply(
             knowledge=(_knowledge_evidence(selected),),
             require_knowledge=False,
             approved_knowledge_reply=selected.reply,
+            approved_knowledge_protected_values=approved_knowledge_protected_values,
             target_language=target_language,
             apply_legacy_rules=False,
             history=history,
             voice_preferences=voice_preferences,
             email_auto_reply_allowed=email_auto_reply_allowed,
             language_verification=language_verification,
+            language_policy=language_policy,
         )
     except Exception:
         logger.exception("multilingual generation failed; forcing handoff")

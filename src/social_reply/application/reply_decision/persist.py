@@ -1,3 +1,5 @@
+import math
+import re
 import uuid
 
 from sqlalchemy import select
@@ -17,6 +19,7 @@ from social_reply.application.message_delivery.intents import (
     decision_idempotency_key,
 )
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
+from social_reply.application.reply_decision.rag_selection import RAG_SELECTION_METHODS
 from social_reply.domain.automation.state_machine import AutomationStateEnum
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.infrastructure.database import models
@@ -24,6 +27,7 @@ from social_reply.infrastructure.database.advisory_locks import (
     acquire_conversation_delivery_xact_lock,
 )
 from social_reply.shared.config import get_settings
+from social_reply.shared.release import current_release_sha
 
 
 class ChatwootDecisionDeferred(RuntimeError):
@@ -32,6 +36,226 @@ class ChatwootDecisionDeferred(RuntimeError):
 
 class DecisionDeliveryConfigurationError(RuntimeError):
     pass
+
+
+_RAG_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "retrieval_policy_version",
+        "retrieval_mode",
+        "embedding_version",
+        "selector_mode",
+        "canary_bucket",
+        "selection_method",
+        "selector_version",
+        "selector_latency_ms",
+        "selected_answer_hash",
+        "selected_content_hash",
+        "selector_answer_hash",
+        "selector_content_hash",
+        "candidates",
+        "guard",
+        "verifier",
+    }
+)
+_RAG_CANDIDATE_KEYS = frozenset(
+    {
+        "answer_hash",
+        "content_hashes",
+        "similarity",
+        "hybrid_rank",
+        "vector_rank",
+        "arms",
+    }
+)
+_RAG_GUARD_KEYS = frozenset({"reason_codes"})
+_RAG_VERIFIER_KEYS = frozenset({"relevant", "faithful", "version", "latency_ms"})
+_RAG_ARM_KEY = re.compile(r"^(?:native|translated)_(?:hybrid|vector)_rank$")
+_RAG_HASH = re.compile(r"^[0-9a-f]{64}$")
+_RAG_METADATA_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,63}$")
+_RAG_REASON_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_RAG_RETRIEVAL_MODES = frozenset(
+    {"exact", "vector_hybrid", "vector_hybrid+query_translation"}
+)
+def _metadata_version(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 64:
+        raise ValueError(f"{field}_invalid")
+    return normalized
+
+
+def _rag_evidence(value: dict | None) -> dict | None:
+    """Validate compact retrieval metadata and reject any evidence body."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("rag_evidence_invalid")
+
+    def normalize(node, *, depth: int):
+        if depth > 4:
+            raise ValueError("rag_evidence_too_deep")
+        if isinstance(node, dict):
+            if len(node) > 64:
+                raise ValueError("rag_evidence_too_large")
+            result = {}
+            for key, item in node.items():
+                if not isinstance(key, str) or not key or len(key) > 64:
+                    raise ValueError("rag_evidence_key_invalid")
+                result[key] = normalize(item, depth=depth + 1)
+            return result
+        if isinstance(node, (list, tuple)):
+            if len(node) > 100:
+                raise ValueError("rag_evidence_too_large")
+            return [normalize(item, depth=depth + 1) for item in node]
+        if isinstance(node, uuid.UUID):
+            return str(node)
+        if isinstance(node, str):
+            if len(node) > 256:
+                raise ValueError("rag_evidence_string_too_long")
+            return node
+        if isinstance(node, bool) or node is None or isinstance(node, int):
+            return node
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError("rag_evidence_number_invalid")
+            return node
+        raise ValueError("rag_evidence_value_invalid")
+
+    normalized = normalize(value, depth=0)
+    if set(normalized) != _RAG_TOP_LEVEL_KEYS:
+        raise ValueError("rag_evidence_key_forbidden")
+    if normalized.get("schema_version") != "rag-evidence-v1":
+        raise ValueError("rag_evidence_schema_invalid")
+    if normalized.get("retrieval_policy_version") != "hybrid-union-selector-v2":
+        raise ValueError("rag_evidence_retrieval_policy_invalid")
+    if normalized.get("retrieval_mode") not in {*_RAG_RETRIEVAL_MODES, None}:
+        raise ValueError("rag_evidence_retrieval_mode_invalid")
+
+    def require_metadata_token(value, field: str, *, optional: bool = False) -> None:
+        if value is None and optional:
+            return
+        if not isinstance(value, str) or _RAG_METADATA_TOKEN.fullmatch(value) is None:
+            raise ValueError(f"rag_evidence_{field}_invalid")
+
+    def require_hash(value, field: str, *, optional: bool = False) -> None:
+        if value is None and optional:
+            return
+        if not isinstance(value, str) or _RAG_HASH.fullmatch(value) is None:
+            raise ValueError(f"rag_evidence_{field}_invalid")
+
+    def require_nonnegative_number(value, field: str, *, optional: bool = False) -> None:
+        if value is None and optional:
+            return
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"rag_evidence_{field}_invalid")
+
+    require_metadata_token(
+        normalized.get("embedding_version"),
+        "embedding_version",
+        optional=True,
+    )
+    if normalized.get("selector_mode") not in {"off", "shadow", "live"}:
+        raise ValueError("rag_evidence_selector_mode_invalid")
+    canary_bucket = normalized.get("canary_bucket")
+    if isinstance(canary_bucket, bool) or not isinstance(canary_bucket, int) or not (
+        0 <= canary_bucket < 10000
+    ):
+        raise ValueError("rag_evidence_canary_bucket_invalid")
+    if normalized.get("selection_method") not in RAG_SELECTION_METHODS:
+        raise ValueError("rag_evidence_selection_method_invalid")
+    require_metadata_token(
+        normalized.get("selector_version"),
+        "selector_version",
+        optional=True,
+    )
+    require_nonnegative_number(
+        normalized.get("selector_latency_ms"),
+        "selector_latency",
+        optional=True,
+    )
+    for field in (
+        "selected_answer_hash",
+        "selected_content_hash",
+        "selector_answer_hash",
+        "selector_content_hash",
+    ):
+        require_hash(normalized.get(field), field, optional=True)
+
+    candidates = normalized.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) > 3:
+        raise ValueError("rag_evidence_candidates_invalid")
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate) != _RAG_CANDIDATE_KEYS:
+            raise ValueError("rag_evidence_candidate_invalid")
+        require_hash(candidate.get("answer_hash"), "candidate_answer_hash")
+        content_hashes = candidate.get("content_hashes")
+        if (
+            not isinstance(content_hashes, list)
+            or not 1 <= len(content_hashes) <= 8
+            or any(
+                not isinstance(value, str) or _RAG_HASH.fullmatch(value) is None
+                for value in content_hashes
+            )
+        ):
+            raise ValueError("rag_evidence_candidate_content_hashes_invalid")
+        similarity = candidate.get("similarity")
+        if (
+            isinstance(similarity, bool)
+            or not isinstance(similarity, (int, float))
+            or not 0 <= similarity <= 1
+        ):
+            raise ValueError("rag_evidence_candidate_similarity_invalid")
+        ranks = (candidate.get("hybrid_rank"), candidate.get("vector_rank"))
+        if all(rank is None for rank in ranks) or any(
+            rank is not None
+            and (isinstance(rank, bool) or not isinstance(rank, int) or rank < 1)
+            for rank in ranks
+        ):
+            raise ValueError("rag_evidence_candidate_rank_invalid")
+        arms = candidate.get("arms")
+        if not isinstance(arms, dict) or any(
+            _RAG_ARM_KEY.fullmatch(key) is None for key in arms
+        ):
+            raise ValueError("rag_evidence_arms_invalid")
+        if any(
+            isinstance(rank, bool) or not isinstance(rank, int) or rank < 1
+            for rank in arms.values()
+        ):
+            raise ValueError("rag_evidence_arm_rank_invalid")
+
+    guard = normalized.get("guard")
+    if not isinstance(guard, dict) or set(guard) != _RAG_GUARD_KEYS:
+        raise ValueError("rag_evidence_guard_invalid")
+    reason_codes = guard.get("reason_codes")
+    if (
+        not isinstance(reason_codes, list)
+        or len(reason_codes) > 16
+        or any(
+            not isinstance(reason, str) or _RAG_REASON_CODE.fullmatch(reason) is None
+            for reason in reason_codes
+        )
+    ):
+        raise ValueError("rag_evidence_reason_codes_invalid")
+    verifier = normalized.get("verifier")
+    if verifier is not None and (
+        not isinstance(verifier, dict) or set(verifier) != _RAG_VERIFIER_KEYS
+    ):
+        raise ValueError("rag_evidence_verifier_invalid")
+    if verifier is not None:
+        if any(
+            value is not None and not isinstance(value, bool)
+            for value in (verifier.get("relevant"), verifier.get("faithful"))
+        ):
+            raise ValueError("rag_evidence_verifier_result_invalid")
+        require_metadata_token(verifier.get("version"), "verifier_version", optional=True)
+        require_nonnegative_number(
+            verifier.get("latency_ms"),
+            "verifier_latency",
+            optional=True,
+        )
+    return normalized
 
 
 def ensure_decision_delivery_available(
@@ -75,6 +299,15 @@ async def persist_decision(
     返回 outbox_id 或 None。调用方负责 commit。"""
     outbox_id: uuid.UUID | None = None
     message_type: str | None = None
+    release_sha = current_release_sha()
+    if decision.decision_release_sha not in {None, release_sha}:
+        raise ValueError("decision_release_sha_mismatch")
+    retrieval_policy_version = _metadata_version(
+        decision.retrieval_policy_version,
+        "retrieval_policy_version",
+    )
+    selector_version = _metadata_version(decision.selector_version, "selector_version")
+    rag_evidence = _rag_evidence(decision.rag_evidence)
     account = (
         await session.execute(
             select(
@@ -199,6 +432,10 @@ async def persist_decision(
                 reason_codes=list(decision.reason_codes),
                 source=decision.source,
                 prompt_version=prompt_version,
+                decision_release_sha=release_sha,
+                retrieval_policy_version=retrieval_policy_version,
+                selector_version=selector_version,
+                rag_evidence=rag_evidence,
                 request_language=decision.request_language,
                 reply_language=decision.reply_language,
                 resolved_locale=decision.resolved_locale,

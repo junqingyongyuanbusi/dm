@@ -292,6 +292,7 @@ async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, mig
             review_action="PENDING",
             reason_codes=["INSUFFICIENT_KNOWLEDGE"],
             source="rule",
+            decision_generation=0,
         )
     )
     await session.execute(
@@ -388,6 +389,7 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
                 review_action="PENDING",
                 reason_codes=["INSUFFICIENT_KNOWLEDGE"],
                 source="rule",
+                decision_generation=0,
             )
         )
         await session.execute(
@@ -521,10 +523,20 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
         work_created_at=now,
     )
     outbox_id = uuid.uuid4()
-    queued_message_id, empty_message_id = uuid.uuid4(), uuid.uuid4()
+    queued_message_id, empty_message_id, stale_message_id = (
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+    await session.execute(
+        update(models.Conversation)
+        .where(models.Conversation.id == conversation_id)
+        .values(decision_generation=2)
+    )
     for candidate_id, text in (
         (queued_message_id, "Already queued inbound"),
         (empty_message_id, "Empty draft inbound"),
+        (stale_message_id, "Stale draft inbound"),
     ):
         await session.execute(
             insert(models.Message).values(
@@ -555,10 +567,11 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
             status="SENT",
         )
     )
-    for decision_message_id, reply_text, linked_outbox in (
-        (message_id, "Ready for review", None),
-        (queued_message_id, "Already queued", outbox_id),
-        (empty_message_id, "   ", None),
+    for decision_message_id, reply_text, linked_outbox, generation in (
+        (message_id, "Ready for review", None, 2),
+        (queued_message_id, "Already queued", outbox_id, 2),
+        (empty_message_id, "   ", None, 2),
+        (stale_message_id, "Stale historical draft", None, 1),
     ):
         await session.execute(
             insert(models.ReplyDecision).values(
@@ -572,7 +585,8 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
                 review_action="PENDING",
                 reason_codes=["INSUFFICIENT_KNOWLEDGE"],
                 source="rule",
-                outbox_id=linked_outbox,
+                decision_generation=generation,
+                review_outbox_id=linked_outbox,
             )
         )
     await session.commit()
@@ -585,6 +599,7 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
     assert page.status_code == 200
     assert "Ready for review" in page.text
     assert "Already queued" not in page.text
+    assert "Stale historical draft" not in page.text
     assert counts.json()["drafts"] == 1
 
 
@@ -1107,6 +1122,7 @@ async def test_draft_edit_records_final_text_and_outbox_provenance(
             review_action="PENDING",
             reason_codes=[],
             source="llm",
+            decision_generation=0,
         )
     )
     await session.commit()
@@ -1127,7 +1143,7 @@ async def test_draft_edit_records_final_text_and_outbox_provenance(
     assert response.status_code == 303
     session.expire_all()
     decision = await session.get(models.ReplyDecision, decision_id)
-    outbox = await session.get(models.OutboxMessage, decision.outbox_id)
+    outbox = await session.get(models.OutboxMessage, decision.review_outbox_id)
     assert decision.original_reply_text == "Original reply"
     assert decision.final_reply_text == "Edited human reply"
     assert decision.review_action == "EDITED"
@@ -1136,6 +1152,72 @@ async def test_draft_edit_records_final_text_and_outbox_provenance(
     assert outbox.reply_to_message_id == message_id
     assert outbox.origin_kind == "DRAFT_APPROVAL"
     assert outbox.actor_kind == "ADMIN_HUMAN"
+
+
+async def test_approve_draft_rejects_stale_generation_before_creating_outbox(
+    session, migrated_db, monkeypatch
+):
+    now = datetime.now(UTC)
+    _account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="stale-approval",
+        display_name="Stale approval customer",
+        work_created_at=now,
+    )
+    decision_id = uuid.uuid4()
+    await session.execute(
+        update(models.Conversation)
+        .where(models.Conversation.id == conversation_id)
+        .values(decision_generation=2)
+    )
+    await session.execute(
+        insert(models.ReplyDecision).values(
+            id=decision_id,
+            tenant_id="default",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            action="draft",
+            reply_text="Historical reply",
+            original_reply_text="Historical reply",
+            review_action="PENDING",
+            reason_codes=[],
+            source="llm",
+            decision_generation=1,
+        )
+    )
+    await session.commit()
+
+    dispatched: list[uuid.UUID] = []
+
+    async def fake_dispatch(*_args, **_kwargs):
+        dispatched.append(decision_id)
+
+    from social_reply.application.account_management import admin_console
+
+    monkeypatch.setattr(admin_console, "dispatch_actor", fake_dispatch)
+    async with _app_client() as client:
+        csrf = await _login(client)
+        response = await client.post(
+            f"/admin/decisions/{decision_id}/approve",
+            data={"csrf_token": csrf},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "draft_stale_conversation_input"
+    assert dispatched == []
+    assert (
+        await session.scalar(
+            select(models.OutboxMessage.id).where(
+                models.OutboxMessage.origin_kind == "DRAFT_APPROVAL",
+                models.OutboxMessage.conversation_id == conversation_id,
+            )
+        )
+        is None
+    )
+    session.expire_all()
+    decision = await session.get(models.ReplyDecision, decision_id)
+    assert decision.review_action == "PENDING"
+    assert decision.review_outbox_id is None
 
 
 async def test_accounts_page_renders_seven_channel_tiles(migrated_db, monkeypatch):
@@ -3048,6 +3130,7 @@ async def test_knowledge_csv_import_bad_header(session, migrated_db, monkeypatch
         page = await client.get("/admin/knowledge?notice=import_bad_csv")
     assert page is not None and page.status_code == 200
     assert "CSV 无效" in page.text
+    assert "protected_values_json" in page.text
 
 
 async def test_knowledge_csv_import_rejects_bad_tenant_and_csrf(migrated_db, monkeypatch):

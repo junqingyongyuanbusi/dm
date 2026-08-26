@@ -1172,6 +1172,15 @@ class ReplyDecision(Base):
             "AND knowledge_localization_source_hash ~ '^[0-9a-f]{64}$')",
             name="ck_reply_decisions_localization_provenance",
         ),
+        CheckConstraint(
+            "rag_evidence IS NULL "
+            "OR jsonb_typeof(rag_evidence) IS NOT DISTINCT FROM 'object'",
+            name="ck_reply_decisions_rag_evidence_object",
+        ),
+        UniqueConstraint(
+            "review_outbox_id",
+            name="uq_reply_decisions_review_outbox_id",
+        ),
         Index(
             "ix_reply_decisions_decision_job_id",
             "decision_job_id",
@@ -1198,6 +1207,10 @@ class ReplyDecision(Base):
     reason_codes: Mapped[list] = mapped_column(JSONB, default=list)
     source: Mapped[str] = mapped_column(Text)  # rule / llm / guard
     prompt_version: Mapped[str | None] = mapped_column(Text)
+    decision_release_sha: Mapped[str | None] = mapped_column(String(64))
+    retrieval_policy_version: Mapped[str | None] = mapped_column(String(64))
+    selector_version: Mapped[str | None] = mapped_column(String(64))
+    rag_evidence: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     request_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
     reply_language: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
     resolved_locale: Mapped[str] = mapped_column(String(35), default="und", server_default="und")
@@ -1231,6 +1244,9 @@ class ReplyDecision(Base):
     decision_generation: Mapped[int | None] = mapped_column(BigInteger)
     decision_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     outbox_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outbox_messages.id"))
+    review_outbox_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("outbox_messages.id", name="fk_reply_decisions_review_outbox_id")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -1254,6 +1270,10 @@ class KnowledgeDocument(Base):
             "status IN ('draft', 'published')",
             name="ck_knowledge_documents_status",
         ),
+        CheckConstraint(
+            "jsonb_typeof(protected_values) IS NOT DISTINCT FROM 'array'",
+            name="ck_knowledge_documents_protected_values_array",
+        ),
         # 词法检索（BM25 近似）：question 的 tsvector GIN 索引，用于混合检索的关键词一路，
         # 补向量对专有名词（pip/broker/品牌名）召回不足的短板。'simple' 分词器不做词干/停用词，
         # 对多语言与短模板更稳（避免 english 词干把 "pips"→"pip" 误并或丢词）。
@@ -1270,6 +1290,9 @@ class KnowledgeDocument(Base):
     category: Mapped[str | None] = mapped_column(String(64))
     question: Mapped[str] = mapped_column(Text)  # 模板触发问题/关键词
     reply: Mapped[str] = mapped_column(Text)  # 标准回复
+    protected_values: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
     # 生成列：DB 自动维护 question 的 tsvector，导入/更新无需手工计算（DRY）
     question_tsv: Mapped[str] = mapped_column(
         TSVECTOR, Computed("to_tsvector('simple', question)", persisted=True)

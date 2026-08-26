@@ -41,13 +41,15 @@ from social_reply.domain.platform_accounts import (
     is_active_account_status,
     normalize_account_capability,
 )
-from social_reply.domain.reply.language import languages_match
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.guard import run_hard_output_guard
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
     hold_connection_advisory_lock,
     hold_conversation_delivery_lock,
 )
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.killswitch import make_killswitch_checker
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -442,7 +444,10 @@ def _send_state_allowed(
     origin_kind = _effective_origin_kind(row, payload)
     return (
         (origin_kind == "DECISION" and state == "BOT_ACTIVE")
-        or (origin_kind == "DRAFT_APPROVAL" and state == "BOT_DRAFT_ONLY")
+        or (
+            origin_kind == "DRAFT_APPROVAL"
+            and state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
+        )
         or (origin_kind == "MANUAL_REPLY" and state == "HUMAN_ACTIVE")
         or (origin_kind == "SYSTEM_NOTICE" and state in {"HANDOFF_PENDING", "HUMAN_ACTIVE"})
     )
@@ -491,6 +496,262 @@ async def _email_replies_sent_in_window(
     )
 
 
+async def _public_bot_send_preflight(
+    session: AsyncSession,
+    *,
+    outbox: models.OutboxMessage,
+    payload_text: str,
+) -> str | None:
+    """Re-authorize a public send derived from a bot decision immediately before I/O."""
+    if outbox.message_type == "private_note":
+        return None
+    payload = dict(outbox.payload) if isinstance(outbox.payload, dict) else {}
+    authority = _effective_origin_kind(outbox, payload)
+    if authority not in {"DECISION", "DRAFT_APPROVAL"}:
+        return None
+
+    predecessor_approval = (
+        outbox.origin_kind == "DRAFT_APPROVAL" and outbox.actor_kind == "ADMIN_HUMAN"
+    )
+    legacy_approval = (
+        outbox.origin_kind == "DECISION"
+        and outbox.actor_kind == "ADMIN_HUMAN"
+        and payload.get("approval") == "admin"
+    )
+    if authority == "DECISION":
+        decision_link = models.ReplyDecision.outbox_id == outbox.id
+    elif predecessor_approval:
+        decision_link = or_(
+            models.ReplyDecision.review_outbox_id == outbox.id,
+            and_(
+                models.ReplyDecision.review_outbox_id.is_(None),
+                models.ReplyDecision.outbox_id == outbox.id,
+            ),
+        )
+    else:
+        decision_link = models.ReplyDecision.outbox_id == outbox.id
+    decisions = (
+        await session.scalars(
+            select(models.ReplyDecision).where(decision_link).limit(2)
+        )
+    ).all()
+    if len(decisions) > 1:
+        return "PUBLIC_SEND_PROVENANCE_INVALID"
+    decision = decisions[0] if decisions else None
+    if decision is None:
+        return "PUBLIC_SEND_PROVENANCE_INVALID"
+    conversation = await session.get(models.Conversation, outbox.conversation_id)
+    account = await session.get(models.PlatformAccount, outbox.platform_account_id)
+    source_message = (
+        await session.get(models.Message, decision.message_id)
+        if decision.message_id is not None
+        else None
+    )
+    if (
+        conversation is None
+        or account is None
+        or decision.tenant_id != outbox.tenant_id
+        or decision.conversation_id != outbox.conversation_id
+        or conversation.tenant_id != outbox.tenant_id
+        or conversation.platform_account_id != outbox.platform_account_id
+        or account.tenant_id != outbox.tenant_id
+        or conversation.brand_id != account.brand_id
+        or conversation.platform != account.platform
+        or account.status not in LEGACY_ACTIVE_ACCOUNT_STATUSES
+        or decision.message_id is None
+        or decision.message_id != outbox.reply_to_message_id
+        or source_message is None
+        or source_message.id != outbox.reply_to_message_id
+        or source_message.conversation_id != outbox.conversation_id
+        or source_message.direction != "inbound"
+        or source_message.decision_generation != decision.decision_generation
+    ):
+        return "PUBLIC_SEND_SCOPE_INVALID"
+    if (
+        decision.decision_generation is None
+        or decision.decision_generation != conversation.decision_generation
+    ):
+        return "STALE_CONVERSATION_INPUT"
+
+    try:
+        disabled = await make_killswitch_checker().is_disabled(
+            account.brand_id,
+            str(account.id),
+            account.tenant_id,
+        )
+    except Exception:
+        logger.exception(
+            "kill switch lookup failed during public send preflight",
+            extra={
+                "tenant_id": account.tenant_id,
+                "brand_id": account.brand_id,
+                "account_id": str(account.id),
+                "outbox_id": str(outbox.id),
+            },
+        )
+        return "KILLSWITCH_UNAVAILABLE"
+    if disabled:
+        return "KILLSWITCH"
+
+    if authority == "DECISION":
+        if decision.action != "auto_reply" or payload_text != decision.reply_text:
+            return "PUBLIC_SEND_PAYLOAD_MISMATCH"
+    elif (
+        decision.action != "draft"
+        or decision.review_action not in {"ACCEPTED", "EDITED"}
+        or not decision.reviewed_by
+        or decision.reviewed_at is None
+        or not (
+            decision.review_outbox_id == outbox.id
+            or (
+                predecessor_approval
+                and decision.review_outbox_id is None
+                and decision.outbox_id == outbox.id
+            )
+            or (legacy_approval and decision.outbox_id == outbox.id)
+        )
+        or payload_text != decision.final_reply_text
+    ):
+        return "DRAFT_APPROVAL_PROVENANCE_INVALID"
+
+    settings = get_settings()
+    if decision.multilingual_contract_version == _LEGACY_EXPERIMENTAL_CONTRACT_VERSION:
+        return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
+    if decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION:
+        if not settings.multilingual_knowledge_reply_enabled:
+            return "MULTILINGUAL_LIVE_DISABLED"
+        if (
+            decision.grounding_verified is not True
+            or decision.knowledge_match_status != "strong"
+            or decision.knowledge_similarity is None
+            or decision.knowledge_min_similarity_threshold is None
+            or decision.knowledge_similarity < decision.knowledge_min_similarity_threshold
+        ):
+            return "MULTILINGUAL_PROVENANCE_INVALID"
+        if decision.knowledge_gate_version == "strong-gate-v1":
+            if (
+                decision.knowledge_min_margin_threshold is None
+                or (
+                    decision.knowledge_similarity_margin is not None
+                    and decision.knowledge_similarity_margin
+                    < decision.knowledge_min_margin_threshold
+                )
+            ):
+                return "MULTILINGUAL_PROVENANCE_INVALID"
+        elif decision.knowledge_gate_version != "selector-gate-v2":
+            return "MULTILINGUAL_PROVENANCE_INVALID"
+
+    knowledge_identity = (
+        decision.knowledge_document_id,
+        decision.knowledge_chunk_id,
+        decision.knowledge_content_hash,
+    )
+    if (
+        decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION
+        and not any(value is not None for value in knowledge_identity)
+    ):
+        return "MULTILINGUAL_KNOWLEDGE_IDENTITY_INVALID"
+    source_row = None
+    if any(value is not None for value in knowledge_identity):
+        if any(value is None for value in knowledge_identity):
+            return "MULTILINGUAL_KNOWLEDGE_IDENTITY_INVALID"
+        source_row = (
+            await session.execute(
+                select(models.KnowledgeDocument, models.KnowledgeChunk)
+                .join(
+                    models.KnowledgeChunk,
+                    (models.KnowledgeChunk.tenant_id == models.KnowledgeDocument.tenant_id)
+                    & (models.KnowledgeChunk.document_id == models.KnowledgeDocument.id),
+                )
+                .where(
+                    models.KnowledgeDocument.tenant_id == decision.tenant_id,
+                    models.KnowledgeDocument.id == decision.knowledge_document_id,
+                    models.KnowledgeChunk.id == decision.knowledge_chunk_id,
+                    models.KnowledgeChunk.content_hash == decision.knowledge_content_hash,
+                    models.KnowledgeDocument.brand_id == account.brand_id,
+                    or_(
+                        models.KnowledgeDocument.platform.is_(None),
+                        models.KnowledgeDocument.platform == account.platform,
+                    ),
+                    models.KnowledgeDocument.status == "published",
+                    models.KnowledgeDocument.source_language == "en",
+                    models.KnowledgeDocument.language_verified.is_(True),
+                )
+            )
+        ).one_or_none()
+        if source_row is None:
+            return "MULTILINGUAL_SOURCE_REVOKED"
+
+    artifact = None
+    localization_identity = (
+        decision.knowledge_localization_id,
+        decision.knowledge_localization_release_id,
+        decision.knowledge_localization_text_hash,
+        decision.knowledge_localization_source_hash,
+    )
+    if any(value is not None for value in localization_identity):
+        if source_row is None or any(value is None for value in localization_identity):
+            return "LOCALIZATION_PROVENANCE_INVALID"
+        document, chunk = source_row
+        artifact = await session.scalar(
+            select(models.KnowledgeLocalization).where(
+                models.KnowledgeLocalization.tenant_id == decision.tenant_id,
+                models.KnowledgeLocalization.id == decision.knowledge_localization_id,
+                models.KnowledgeLocalization.document_id == document.id,
+                models.KnowledgeLocalization.release_id
+                == decision.knowledge_localization_release_id,
+            ).with_for_update()
+        )
+        if artifact is None:
+            return "LOCALIZATION_RELEASE_MISSING"
+        if (
+            artifact.status != "published"
+            or not artifact.auto_reply_allowed
+            or not artifact.reviewed_by
+            or artifact.reviewed_at is None
+            or artifact.text_hash != decision.knowledge_localization_text_hash
+            or artifact.source_content_hash != decision.knowledge_localization_source_hash
+            or chunk.content_hash != decision.knowledge_localization_source_hash
+            or hashlib.sha256(artifact.localized_text.encode()).hexdigest() != artifact.text_hash
+            or (document.is_official_contact and not artifact.official_contact_authorized)
+        ):
+            return "LOCALIZATION_RELEASE_REVOKED"
+
+    document = source_row[0] if source_row is not None else None
+    guard_source = decision.source
+    if artifact is not None:
+        guard_source = "knowledge_localization"
+    elif document is not None and document.is_official_contact:
+        guard_source = "knowledge"
+    guarded = run_hard_output_guard(
+        ReplyDecision(
+            action=ReplyAction.AUTO_REPLY,
+            reply_text=payload_text,
+            source=guard_source,
+        ),
+        account.platform,
+        approved_official_contact_reply=(
+            document.reply if document is not None and document.is_official_contact else None
+        ),
+        expected_reply_language=(decision.resolved_locale or "und"),
+        approved_knowledge_reply=(document.reply if document is not None else None),
+        approved_knowledge_protected_values=(
+            tuple(document.protected_values or ()) if document is not None else ()
+        ),
+        approved_localization_text=(artifact.localized_text if artifact is not None else None),
+        approved_localization_text_hash=(artifact.text_hash if artifact is not None else None),
+        approved_localization_protected_values=(
+            tuple(artifact.protected_values or ()) if artifact is not None else ()
+        ),
+    )
+    if guarded.action is not ReplyAction.AUTO_REPLY:
+        return next(
+            (code for code in reversed(guarded.reason_codes) if code.startswith("GUARD_")),
+            "GUARD_OUTPUT_INVALID",
+        )
+    return None
+
+
 async def _localization_send_preflight(
     session: AsyncSession,
     *,
@@ -499,175 +760,29 @@ async def _localization_send_preflight(
     payload_text: str,
     message_type: str,
 ) -> str | None:
-    decision = (
-        await session.execute(
-            select(
-                models.ReplyDecision.tenant_id,
-                models.ReplyDecision.resolved_locale,
-                models.ReplyDecision.request_language,
-                models.ReplyDecision.reply_language,
-                models.ReplyDecision.multilingual_contract_version,
-                models.ReplyDecision.reply_text,
-                models.ReplyDecision.action,
-                models.ReplyDecision.grounding_verified,
-                models.ReplyDecision.knowledge_match_status,
-                models.ReplyDecision.knowledge_gate_version,
-                models.ReplyDecision.knowledge_similarity,
-                models.ReplyDecision.knowledge_similarity_margin,
-                models.ReplyDecision.knowledge_min_similarity_threshold,
-                models.ReplyDecision.knowledge_min_margin_threshold,
-                models.ReplyDecision.knowledge_content_hash,
-                models.ReplyDecision.knowledge_document_id,
-                models.ReplyDecision.knowledge_chunk_id,
-                models.ReplyDecision.knowledge_localization_id,
-                models.ReplyDecision.knowledge_localization_release_id,
-                models.ReplyDecision.knowledge_localization_text_hash,
-                models.ReplyDecision.knowledge_localization_source_hash,
-            ).where(models.ReplyDecision.outbox_id == outbox_id)
-        )
-    ).one_or_none()
-    if decision is None:
+    """Compatibility wrapper for existing localization integration tests."""
+    if message_type == "private_note":
         return None
-    settings = get_settings()
-    if decision.multilingual_contract_version == _LEGACY_EXPERIMENTAL_CONTRACT_VERSION:
-        return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
-    if decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION:
-        if not settings.multilingual_knowledge_reply_enabled:
-            return "MULTILINGUAL_LIVE_DISABLED"
-        is_draft = message_type == "private_note" or decision.action == "draft"
-        if not is_draft and (
-            decision.action != "auto_reply"
-            or decision.grounding_verified is not True
-            or decision.knowledge_match_status != "strong"
-            or decision.knowledge_gate_version != "strong-gate-v1"
-            or decision.knowledge_similarity is None
-            or decision.knowledge_min_similarity_threshold is None
-            or decision.knowledge_similarity < decision.knowledge_min_similarity_threshold
-            or decision.knowledge_min_margin_threshold is None
-            or (
-                decision.knowledge_similarity_margin is not None
-                and decision.knowledge_similarity_margin < decision.knowledge_min_margin_threshold
-            )
-        ):
-            return "MULTILINGUAL_PROVENANCE_INVALID"
-        # 语言自洽性复核。注意与 guard 的耦合：lenient 校验（语种由模型判定、
-        # 确定性检测复核不了）必须把 reply_language 落成目标语言而非 und，否则
-        # 合格回复会在这里被拒发。那条路径的语义忠实度由上面的
-        # grounding_verified is True 承担——两者缺一，安全链条就断了。
-        if not is_draft and (
-            decision.request_language == "und"
-            or decision.reply_language == "und"
-            or not languages_match(decision.request_language, decision.reply_language)
-            or not languages_match(decision.request_language, decision.resolved_locale)
-        ):
-            return "MULTILINGUAL_LANGUAGE_INVALID"
-
-        if payload_text != decision.reply_text:
-            return "MULTILINGUAL_PAYLOAD_MISMATCH"
-        if not decision.knowledge_content_hash:
-            return "MULTILINGUAL_KNOWLEDGE_INVALID"
-        if not decision.knowledge_document_id or not decision.knowledge_chunk_id:
-            return "MULTILINGUAL_KNOWLEDGE_IDENTITY_INVALID"
-        source_exists = await session.scalar(
-            select(models.KnowledgeChunk.id)
-            .join(
-                models.KnowledgeDocument,
-                (models.KnowledgeDocument.tenant_id == models.KnowledgeChunk.tenant_id)
-                & (models.KnowledgeDocument.id == models.KnowledgeChunk.document_id),
-            )
-            .join(
-                models.PlatformAccount,
-                models.PlatformAccount.id == platform_account_id,
-            )
-            .where(
-                models.PlatformAccount.id == platform_account_id,
-                models.PlatformAccount.tenant_id == decision.tenant_id,
-                models.PlatformAccount.status.in_(LEGACY_ACTIVE_ACCOUNT_STATUSES),
-                models.KnowledgeChunk.tenant_id == decision.tenant_id,
-                models.KnowledgeDocument.tenant_id == models.PlatformAccount.tenant_id,
-                models.KnowledgeDocument.id == decision.knowledge_document_id,
-                models.KnowledgeChunk.id == decision.knowledge_chunk_id,
-                models.KnowledgeDocument.brand_id == models.PlatformAccount.brand_id,
-                or_(
-                    models.KnowledgeDocument.platform.is_(None),
-                    models.KnowledgeDocument.platform == models.PlatformAccount.platform,
-                ),
-                models.KnowledgeChunk.content_hash == decision.knowledge_content_hash,
-                models.KnowledgeDocument.status == "published",
-                models.KnowledgeDocument.source_language == "en",
-                models.KnowledgeDocument.language_verified.is_(True),
-                models.KnowledgeDocument.is_official_contact.is_(False),
-            )
-            .limit(1)
-        )
-        return None if source_exists is not None else "MULTILINGUAL_SOURCE_REVOKED"
-    if decision.knowledge_localization_id is None:
-        return None
-    if (
-        decision.resolved_locale == "und"
-        or decision.knowledge_localization_release_id is None
-        or decision.knowledge_localization_text_hash is None
-        or decision.knowledge_localization_source_hash is None
-    ):
-        return "LOCALIZATION_PROVENANCE_INVALID"
-    row = (
-        await session.execute(
-            select(
-                models.KnowledgeLocalization,
-                models.KnowledgeDocument.status.label("document_status"),
-                models.KnowledgeDocument.source_language,
-                models.KnowledgeDocument.language_verified,
-                models.KnowledgeChunk.content_hash.label("current_source_hash"),
-            )
-            .join(
-                models.KnowledgeDocument,
-                (models.KnowledgeDocument.tenant_id == models.KnowledgeLocalization.tenant_id)
-                & (models.KnowledgeDocument.id == models.KnowledgeLocalization.document_id),
-            )
-            .join(
-                models.KnowledgeChunk,
-                (models.KnowledgeChunk.tenant_id == models.KnowledgeDocument.tenant_id)
-                & (models.KnowledgeChunk.document_id == models.KnowledgeDocument.id),
-            )
-            .where(
-                models.KnowledgeLocalization.tenant_id == decision.tenant_id,
-                models.KnowledgeLocalization.id == decision.knowledge_localization_id,
-                models.KnowledgeLocalization.release_id
-                == decision.knowledge_localization_release_id,
-                models.KnowledgeChunk.content_hash == decision.knowledge_localization_source_hash,
-            )
-            .with_for_update(of=models.KnowledgeLocalization)
-        )
-    ).one_or_none()
-    if row is None:
-        return "LOCALIZATION_RELEASE_MISSING"
-    artifact = row.KnowledgeLocalization
-    if (
-        artifact.status != "published"
-        or artifact.release_id != decision.knowledge_localization_release_id
-        or not artifact.auto_reply_allowed
-        or not artifact.reviewed_by
-        or artifact.reviewed_at is None
-        or artifact.locale != decision.resolved_locale
-        or artifact.text_hash != decision.knowledge_localization_text_hash
-        or artifact.source_content_hash != decision.knowledge_localization_source_hash
-        or row.current_source_hash != decision.knowledge_localization_source_hash
-        or row.document_status != "published"
-        or row.source_language != "en"
-        or not row.language_verified
-        or payload_text != artifact.localized_text
-        or hashlib.sha256(payload_text.encode()).hexdigest() != artifact.text_hash
-    ):
-        return "LOCALIZATION_RELEASE_REVOKED"
-    return None
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    if outbox is None or outbox.platform_account_id != platform_account_id:
+        return "PUBLIC_SEND_SCOPE_INVALID"
+    return await _public_bot_send_preflight(
+        session,
+        outbox=outbox,
+        payload_text=payload_text,
+    )
 
 
-async def _handoff_localization_failure(
+async def _handoff_public_send_failure(
     session: AsyncSession,
     *,
     outbox: models.OutboxMessage,
     reason_code: str,
 ) -> None:
+    if reason_code == "STALE_CONVERSATION_INPUT":
+        # This Outbox belongs to historical work. Cancelling it must not change the
+        # automation state for the newer conversation generation.
+        return
     state = (
         await session.execute(
             select(models.AutomationState)
@@ -721,29 +836,6 @@ async def _deliver_outbox_locked(
         await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == oid))
     ).scalar_one()
     attempt_no = row.attempt_count + 1
-    if row.origin_kind == "DECISION" and row.actor_kind == "BOT":
-        generation = (
-            await session.execute(
-                select(
-                    models.ReplyDecision.decision_generation,
-                    models.Conversation.decision_generation,
-                )
-                .join(
-                    models.Conversation,
-                    models.Conversation.id == models.ReplyDecision.conversation_id,
-                )
-                .where(models.ReplyDecision.outbox_id == oid)
-            )
-        ).one_or_none()
-        if generation is not None and generation[0] is not None and generation[0] != generation[1]:
-            return await _stop_before_send(
-                session,
-                oid,
-                "CANCELLED",
-                "STALE_CONVERSATION_INPUT",
-                attempt_no,
-                count_attempt=False,
-            )
     if not isinstance(row.payload, dict):
         return await _stop_before_send(
             session,
@@ -763,32 +855,29 @@ async def _deliver_outbox_locked(
             attempt_no,
             count_attempt=False,
         )
-    localization_error = None
-    if row.origin_kind == "DECISION" and row.actor_kind == "BOT":
-        localization_error = await _localization_send_preflight(
-            session,
-            outbox_id=oid,
-            platform_account_id=row.platform_account_id,
-            payload_text=payload["text"],
-            message_type=row.message_type,
-        )
-    if localization_error is not None:
-        await _handoff_localization_failure(
+    is_direct = row.destination_type != "chatwoot_conversation"
+    is_public = row.message_type != "private_note"
+    preflight_error = None
+    if is_public:
+        preflight_error = await _public_bot_send_preflight(
             session,
             outbox=row,
-            reason_code=localization_error,
+            payload_text=payload["text"],
+        )
+    if preflight_error is not None:
+        await _handoff_public_send_failure(
+            session,
+            outbox=row,
+            reason_code=preflight_error,
         )
         return await _stop_before_send(
             session,
             oid,
             "CANCELLED",
-            localization_error,
+            preflight_error,
             attempt_no,
             count_attempt=False,
         )
-
-    is_direct = row.destination_type != "chatwoot_conversation"
-    is_public = row.message_type != "private_note"
 
     if is_direct and not is_public:
         return await _stop_before_send(
@@ -1005,33 +1094,25 @@ async def _deliver_outbox_locked(
                     attempt_no,
                     count_attempt=False,
                 )
-            if row.origin_kind == "DECISION" and row.actor_kind == "BOT":
-                generation = (
-                    await session.execute(
-                        select(
-                            models.ReplyDecision.decision_generation,
-                            models.Conversation.decision_generation,
-                        )
-                        .join(
-                            models.Conversation,
-                            models.Conversation.id == models.ReplyDecision.conversation_id,
-                        )
-                        .where(models.ReplyDecision.outbox_id == oid)
-                    )
-                ).one_or_none()
-                if (
-                    generation is not None
-                    and generation[0] is not None
-                    and generation[0] != generation[1]
-                ):
-                    return await _stop_before_send(
-                        session,
-                        oid,
-                        "CANCELLED",
-                        "STALE_CONVERSATION_INPUT",
-                        attempt_no,
-                        count_attempt=False,
-                    )
+            preflight_error = await _public_bot_send_preflight(
+                session,
+                outbox=row,
+                payload_text=payload["text"],
+            )
+            if preflight_error is not None:
+                await _handoff_public_send_failure(
+                    session,
+                    outbox=row,
+                    reason_code=preflight_error,
+                )
+                return await _stop_before_send(
+                    session,
+                    oid,
+                    "CANCELLED",
+                    preflight_error,
+                    attempt_no,
+                    count_attempt=False,
+                )
             state = await session.scalar(
                 select(models.AutomationState.state).where(
                     models.AutomationState.conversation_id == row.conversation_id

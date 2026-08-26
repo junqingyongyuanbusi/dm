@@ -18,16 +18,93 @@ configuration snapshots matched.
 The one-time CI bootstrap/mirror/promotion controls have been removed. Current CI publishes only
 immutable full-SHA tags. `latest` promotion and every subsequent Railway rollout belong exclusively
 to `scripts/publish_railway_release.sh`; Railway native image auto-update must remain disabled.
-The current Alembic graph has one head: `f2d9c4b8e631`. Database migration verifies schema state
+The current Alembic graph has one head: `a7c3e9d1b624`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
 
+## Reply review and RAG provenance revision
+
+Revision `a7c3e9d1b624` is additive after historical predecessor `f2d9c4b8e631`. It separates the
+customer-facing Outbox created by Admin draft approval into `ReplyDecision.review_outbox_id`, adds
+the immutable application release, retrieval-policy and selector versions plus compact
+`rag_evidence`, and adds `KnowledgeDocument.protected_values` for exact entities that translation
+and generation must preserve.
+
+The migration moves a legacy `outbox_id` into `review_outbox_id` only when the linked Outbox is
+authority-tagged `DRAFT_APPROVAL + ADMIN_HUMAN`; all other legacy links stay in `outbox_id`. Its
+`protected_values` backfill is deliberately bounded to a finite exact-case list of known global
+brand/product names. It does not run free-form entity extraction and does not place message or
+answer bodies in `rag_evidence`. Because the protection policy is part of knowledge identity, the
+migration rewrites affected chunk hashes in the same transaction. Existing decisions and reviewed
+localizations retain their old source hashes and become stale; they are never silently authorized
+under policy metadata that was not present when they were generated or reviewed.
+
+Deploy the schema with `MULTILINGUAL_LANGUAGE_POLICY=legacy_hard`, `RAG_SELECTOR_MODE=off`, and
+`RAG_SELECTOR_CANARY_BPS=0` consistently on API, Worker, and Scheduler. Reaching this head does not
+authorize language-review routing or live selector control. The migration-compatible predecessor
+image overlays the additive graph through `a7c3e9d1b624` and advertises that head; application
+rollback keeps PostgreSQL at `a7c3e9d1b624` and uses that compatibility image rather than the raw
+predecessor.
+
+The target image advertises
+`com.nexory.reply-core.review-outbox-contract=review-outbox-dual-read-v1`. A predecessor without the
+label is normalized to `legacy`; its compatibility image explicitly retains that capability while
+adding only the migration graph. `scripts/publish_railway_release.sh` activates the forward bridge
+only for the exact `legacy -> review-outbox-dual-read-v1` transition. When predecessor and target
+both advertise `review-outbox-dual-read-v1`, the normal API-first release order remains in force. Any
+other capability transition fails before `latest` or Railway is changed.
+
+For the bridge transition, the release script writes a rollback-eligible `deploying` manifest before
+the first `latest` retag and persists the rollout phase after every verified mutation. The only
+accepted sequence is:
+
+1. retag `latest` to the migration-compatible predecessor;
+2. deploy compatibility API and require `/healthz`; this API applies `a7c3e9d1b624`;
+3. deploy compatibility Worker, then compatibility Scheduler;
+4. retag `latest` to the target digest;
+5. deploy target Worker, then target API and require `/healthz`, then target Scheduler.
+
+This order removes the new-API/old-Worker window. During the old-API/new-Worker window, the target
+Worker's authority-scoped dual read accepts either canonical `review_outbox_id` or the predecessor's
+post-migration `outbox_id` without allowing new API code to dual-write them.
+
+Every resume re-reads GHCR `latest` plus the active API, Worker and Scheduler digests and passes that
+four-value state, along with the recorded manifest phase, to `scripts/release_rollout_state.py`.
+Only its nine monotonic checkpoints are accepted. A state that skips a role, reverses target and
+compatibility order, contains an unrelated digest, or is behind the recorded phase fails closed.
+Each of the two `latest` retags compares the observed source digest immediately before mutation and
+verifies the resulting digest immediately afterward.
+
+The compatibility image preserves the predecessor application, which does not understand
+`review_outbox_id`. During a compatibility rollback, pause Admin draft approvals and treat the draft
+review queue as degraded: the predecessor cannot surface a pending Chatwoot draft when `outbox_id`
+points to its private-note Outbox. Existing customer-facing `DRAFT_APPROVAL + ADMIN_HUMAN` Outboxes
+remain authority-driven, and persisted `review_action` prevents an already reviewed decision from
+being approved twice. Do not dual-write approval delivery into `outbox_id`; that would recreate the
+private-note/customer-delivery ambiguity removed by this migration.
+
+Alembic downgrade restores `review_outbox_id` into the predecessor `outbox_id` only when the
+decision has no separate private-note link. If both links are populated, or any knowledge document
+still has protected values, downgrade fails before dropping any column because the predecessor
+schema cannot represent that state without losing provenance or reply policy. After an explicitly
+reviewed policy reconciliation has cleared protected values, downgrade restores legacy content-only
+chunk hashes. The normal rollback is still the migration-compatible application image with
+PostgreSQL kept at `a7c3e9d1b624`; a database downgrade requires reviewed data reconciliation or
+restore.
+
+Adding these assets to the repository does not run the migration or release production. This task
+does not promote GHCR `latest` or deploy Railway; the standard CI, image promotion, health, digest,
+schema, capability, and rollout-state verification steps still apply when a production release is
+authorized.
 
 ## Reviewed localization revision
 
 Revision `b7d2e4f6a901` is additive after `a6f1c3d8e205`. It adds tenant-scoped reviewed localization artifacts, pinned release provenance on decisions, composite knowledge-tenant constraints, and send-time localization checks. Deploy it with multilingual live, retrieval shadow, and English-only mode still disabled on API, Worker, and Scheduler. The migration does not authorize production multilingual sending and does not prove OpenRouter cross-language retrieval quality.
 
-The migration-compatible rollback image must overlay both `a6f1c3d8e205` and the current head migration `f2d9c4b8e631` onto the active predecessor image and advertise database head `f2d9c4b8e631`. Application rollback keeps PostgreSQL at the new additive head; it does not downgrade or delete localization audit history.
+The migration-compatible rollback image must overlay the additive migration graph through
+`a7c3e9d1b624` onto the active predecessor image and advertise database head `a7c3e9d1b624`.
+Application rollback keeps PostgreSQL at the new additive head; it does not downgrade or delete
+localization or decision-provenance audit history.
 
 ## Synthetic evaluation foundation revision
 
@@ -43,17 +120,19 @@ candidate execution is available.
 
 ### Migration-compatible rollback
 
-The raw predecessor image does not contain revision `a6f1c3d8e205` and must not be restarted after
-the database reaches this head. Before promoting GHCR `latest`,
+The raw predecessor image may not contain the migration graph through `a7c3e9d1b624` and must not be
+restarted after the database reaches that head. Before promoting GHCR `latest`,
 `scripts/publish_railway_release.sh` now builds an auxiliary migration-compatible rollback image from
-the exact active predecessor digest and overlays only the additive evaluation migration. Its OCI
-revision remains the predecessor application SHA; labels record the target release SHA, predecessor
-digest and database head.
+the exact active predecessor digest and overlays the additive migration graph from the evaluation
+foundation through current head `a7c3e9d1b624`. Its OCI revision remains the predecessor application
+SHA; labels record the target release SHA, predecessor digest and database head.
 
-The release script verifies this image before changing `latest` or Railway. It upgrades an isolated
-test database with the target image, then runs the predecessor image's `scripts.prepare_database` and
-`scripts.assert_database_ready` against head `f2d9c4b8e631`. A release aborts before production
-mutation if the predecessor application plus overlaid migration graph cannot complete database preparation and exact-head readiness checks.
+The release script verifies this image before changing `latest` or Railway. Against an isolated
+database, the compatibility image runs `scripts.prepare_database` first, exactly as the bridge API
+does in production. The compatibility image then proves exact-head readiness, followed by the target
+image's Worker readiness check and idempotent API preparation. A release aborts before production
+mutation if the compatibility API cannot migrate to `a7c3e9d1b624`, either image cannot accept that
+exact head, or the target API cannot prepare it idempotently.
 
 The release manifest records the compatibility tag and digest. Preserve the `deploying`/`completed` manifest in the operator's durable release evidence store; the ignored local `dist/` copy is not the sole retention mechanism. To roll back application behavior
 without downgrading PostgreSQL, run from a trusted checkout containing that manifest:
@@ -67,12 +146,20 @@ scripts/rollback_railway_migration_compatible.sh \
 The rollback script atomically retags GHCR `latest` to the compatibility digest, then redeploys
 API, waits for `/healthz`, and redeploys Worker and Scheduler. It verifies all three roles run the
 same compatibility digest and that production configuration remains fail-closed. PostgreSQL stays at
-`f2d9c4b8e631`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
+`a7c3e9d1b624`; the raw `railway-pre-<target-short-sha>` tag and predecessor deployment IDs are audit
 evidence only and are not executable rollback targets after migration.
 
 This rollback also works when the target API migrated the database but crashed before Uvicorn became
 healthy, because the compatibility image is built, pushed and smoke-tested before `latest` is
 promoted.
+
+Once the compatibility API has advanced PostgreSQL, a raw predecessor Worker or Scheduler cannot
+restart: its local Alembic graph does not recognize the new head. If a forward rollout stops between
+compatibility API and the other compatibility roles, rerun the same release script so the validator
+continues with compatibility Worker and Scheduler. Do not restart or redeploy the raw predecessor,
+do not manually retag `latest`, and do not edit the persisted phase to force progress. To abandon an
+already-mutated rollout, use the recorded migration-compatible rollback digest and the reviewed
+rollback script; PostgreSQL remains at `a7c3e9d1b624`.
 
 ## Multilingual runtime generation
 
@@ -87,20 +174,45 @@ KNOWLEDGE_RETRIEVAL_ENABLED=true
 MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true
 ```
 
-The runner forces `verified_english_only=True` for this path. It uses direct cross-language retrieval,
-then a protected query-translation retry when the answer-level match is weak. It generates from the
-English approved answer, checks output language and grounding, and sends only after the existing Outbox
-preflight. Unknown language, no strong match, official contact, wrong-language output, failed grounding,
-or provider failure becomes `HANDOFF`; `BOT_DRAFT_ONLY` keeps a private-note draft for review.
+The runner forces `verified_english_only=True` for this path. It translates a reliably non-English
+query before exact, lexical, and vector retrieval, then generates from the selected English approved
+answer and sends only after hard facts, grounding, language observation, and existing Outbox
+preflight. Unknown language under `legacy_hard`, no strong match, unauthorized official contact,
+failed grounding, or provider failure becomes `HANDOFF`. Under
+`MULTILINGUAL_LANGUAGE_POLICY=review`, language uncertainty or a wrong-language observation alone
+preserves a candidate only as a private `DRAFT`; deterministic facts, provenance, protected
+entities, contacts, numbers, currencies, and writing-system conflicts still fail closed.
 
 The old `MULTILINGUAL_SUPPORTED_LANGUAGES`, `MULTILINGUAL_LIVE_LOCALES`, and experimental account
 configuration are retired and must not be added to Railway variables. Existing reviewed localization
 records remain readable and their pending Outbox rows continue to receive provenance checks, but new
 runtime decisions do not require artifacts.
 
-For a bounded release, deploy API, Worker, and Scheduler with the same values and verify the normal CI,
-health, digest, and Outbox checks. No multilingual calibration report or per-language rollout gate is
-required by startup configuration.
+For a bounded release, deploy API, Worker, and Scheduler with the same values and verify the normal
+CI, health, digest, and Outbox checks. Keep language policy at `legacy_hard` and selector at `off/0`
+for the baseline; enable bounded `shadow` evidence before any `review` or `live` canary. Startup
+validation does not substitute for reviewed evidence or a representative holdout.
+
+### Language and selector rollout
+
+Use one consistent setting tuple across all three roles and change it in this order:
+
+1. Deploy `MULTILINGUAL_LANGUAGE_POLICY=legacy_hard`, `RAG_SELECTOR_MODE=off`, and
+   `RAG_SELECTOR_CANARY_BPS=0`.
+2. Confirm the expected image digest, sole database head, `/healthz`, and baseline decision/Outbox
+   behavior.
+3. Set `RAG_SELECTOR_MODE=shadow` with a bounded non-zero basis-point sample. The selector records
+   compact evidence but cannot change the selected answer.
+4. Review selector evidence, guard/verifier results, HANDOFFs, and the private draft queue.
+5. Only then enable `MULTILINGUAL_LANGUAGE_POLICY=review` and/or a small `live` selector canary;
+   increase `RAG_SELECTOR_CANARY_BPS` gradually after each reviewed interval.
+6. Roll back behavior by restoring `legacy_hard`, `off`, and `0` consistently on API, Worker, and
+   Scheduler. Do not downgrade PostgreSQL.
+
+The sample is stable per `tenant_id:conversation_key`, SHA-256 hashed into 10,000 buckets. Exact
+question matches bypass selector control; out-of-sample traffic retains legacy top-1 behavior. In a
+sampled `live` bucket, selector failure or abstention fails closed instead of silently choosing the
+legacy answer.
 
 ## Platform secret encryption
 
@@ -276,7 +388,7 @@ EMAIL_ALLOWED_HOSTS=imap.larksuite.com,smtp.larksuite.com
 ```
 
 Use the standard API-first release order. API owns database preparation: require its deployment to
-reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `f2d9c4b8e631` before
+reach `SUCCESS`, `/healthz` to pass and Alembic to report the sole head `a7c3e9d1b624` before
 starting or replacing Worker and Scheduler. Then require all three roles to run the same image
 digest and the same Email flags/allowlist. Do not enable Email on a new API while an old Worker or
 Scheduler remains.
@@ -607,7 +719,7 @@ historical open work.
 Before upgrade, take and verify a PostgreSQL backup. Deploy API, Worker and Scheduler with
 `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false` and identical sender lease, retry and sweep settings.
 After API migrates the database, require all three roles to reach one image digest and confirm the
-unique Alembic head is `f2d9c4b8e631`. Do not enable callbacks while an old API can still receive a
+unique Alembic head is `a7c3e9d1b624`. Do not enable callbacks while an old API can still receive a
 card action or an old Worker/Scheduler is running.
 
 Configure one Tenant at a time:

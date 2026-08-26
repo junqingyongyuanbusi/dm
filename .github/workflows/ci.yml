@@ -124,6 +124,7 @@ jobs:
             --tag reply-core-ci:${GITHUB_SHA} \
             --load \
             .
+          test "$(docker image inspect reply-core-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.review-outbox-contract"}}')" = "review-outbox-dual-read-v1"
       - name: Build migration-compatible rollback contract image
         run: |
           set -euo pipefail
@@ -137,11 +138,13 @@ jobs:
             --build-arg "BUILD_DATE=1970-01-01T00:00:00Z" \
             --build-arg "SOURCE_URL=https://github.com/${GITHUB_REPOSITORY}" \
             --build-arg "BASE_DIGEST=${base_digest}" \
+            --build-arg "BASE_REVIEW_OUTBOX_CAPABILITY=review-outbox-dual-read-v1" \
             --tag reply-core-compat-ci:${GITHUB_SHA} \
             .
-          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.database-head"}}')" = "f2d9c4b8e631"
+          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.database-head"}}')" = "a7c3e9d1b624"
           test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.rollback-target-release"}}')" = "${GITHUB_SHA}"
-          test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "f2d9c4b8e631"
+          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.review-outbox-contract"}}')" = "review-outbox-dual-read-v1"
+          test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "a7c3e9d1b624"
       - name: Verify image contract
         run: scripts/verify_production_image.sh "reply-core-ci:${GITHUB_SHA}" "$GITHUB_SHA"
       - name: Export verified production image

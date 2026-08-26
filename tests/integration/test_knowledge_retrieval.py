@@ -18,6 +18,7 @@ from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.llm import RAGSelectionResult, RAGVerificationResult
 from social_reply.infrastructure.database import models
 from social_reply.shared.config import get_settings
 
@@ -38,6 +39,7 @@ async def _seed_chunk(
     embedding_version=None,
     reply=None,
     is_official_contact=False,
+    protected_values=(),
 ):
     doc_id = uuid.uuid4()
     await session.execute(
@@ -49,6 +51,7 @@ async def _seed_chunk(
             reply=reply or content,
             status=status,
             is_official_contact=is_official_contact,
+            protected_values=list(protected_values),
         )
     )
     embedding = (await _EMBEDDER.embed([content]))[0]
@@ -85,6 +88,24 @@ async def test_exact_duplicate_answer_variants_are_one_approved_answer(session):
     assert result.exact_match is True
     assert result.exact_ambiguous is False
     assert result.hits
+
+
+async def test_exact_same_answer_with_different_protected_values_is_ambiguous(session):
+    reply = "Use Acme Portal with MT4."
+    await _seed_chunk(
+        session,
+        "platform",
+        reply=reply,
+        protected_values=("Acme Portal",),
+    )
+    await _seed_chunk(session, "platform", reply=reply, protected_values=("MT4",))
+
+    result = await retrieve_exact_knowledge_result(
+        session, "platform", tenant_id="default", brand_id="b1", platform="telegram"
+    )
+
+    assert result.exact_match is False
+    assert result.exact_ambiguous is True
 
 
 
@@ -621,6 +642,67 @@ async def test_multilingual_strong_match_generates_same_language_and_persists_ev
     assert decision.grounding_verified is True
 
 
+async def test_live_selector_can_choose_non_top1_above_similarity_floor(session, knowledge_enabled):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("RAG_SELECTOR_MODE", "live")
+    knowledge_enabled.setenv("RAG_SELECTOR_CANARY_BPS", "10000")
+    get_settings.cache_clear()
+
+    class SelectorLLM:
+        rag_selector_id = "selector-test-v1"
+        rag_verifier_id = "verifier-test-v2"
+
+        async def translate_to_english(self, text):
+            return "How long does verification take?"
+
+        async def select_rag_answer(self, **kwargs):
+            assert len(kwargs["candidates"]) == 2
+            return RAGSelectionResult(selected_candidate_id="candidate-2")
+
+        async def decide(self, context):
+            assert len(context.knowledge) == 1
+            assert "Verification takes 7 days." in context.knowledge[0]
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="验证需要 7 天。",
+                confidence=0.99,
+            )
+
+        async def verify_rag_answer(self, **kwargs):
+            assert kwargs["approved_reply"] == "Verification takes 7 days."
+            assert kwargs["candidate_reply"] == "验证需要 7 天。"
+            return RAGVerificationResult(relevant=True, faithful=True)
+
+    runner._llm = SelectorLLM()
+    result = _multilingual_result(similarity=0.95, second_similarity=0.90)
+
+    async def fake_fetch(snapshot, **kwargs):
+        return result
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "验证需要多久？"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.reply_text == "验证需要 7 天。"
+    assert decision.knowledge_content_hash == "b" * 64
+    assert decision.knowledge_gate_version == "selector-gate-v2"
+    assert decision.knowledge_similarity == 0.90
+    assert decision.knowledge_similarity_margin == pytest.approx(0.05)
+    assert decision.selector_version == "selector-test-v1"
+    assert decision.grounding_verified is True
+    evidence_text = repr(decision.rag_evidence)
+    assert "Refunds take" not in evidence_text
+    assert "Verification takes" not in evidence_text
+    assert "验证需要" not in evidence_text
+
+
 @pytest.mark.parametrize(
     ("result", "expected_reason"),
     [
@@ -660,7 +742,9 @@ async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
     assert expected_reason in decision.reason_codes
 
 
-async def test_multilingual_wrong_language_is_blocked_before_outbox(session, knowledge_enabled):
+async def test_multilingual_script_conflict_is_blocked_after_grounding_before_outbox(
+    session, knowledge_enabled
+):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("ENGLISH_KNOWLEDGE_ONLY_ENABLED", "true")
     get_settings.cache_clear()
@@ -692,10 +776,10 @@ async def test_multilingual_wrong_language_is_blocked_before_outbox(session, kno
         _snapshot(account_id, text), conv_id, msg_id, account_id
     )
     assert outbox_id is None
-    assert llm.verifier_called is False
+    assert llm.verifier_called is True
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "handoff"
-    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in decision.reason_codes
 
 
 class _TranslatingLLM:

@@ -4,13 +4,15 @@
 
 The direct account platform contract currently covers seven platforms: Telegram, Facebook,
 Instagram, WhatsApp, Feishu, X and Email. The Alembic graph has one current head:
-`f2d9c4b8e631`. Email protocol/unit coverage does not by itself imply that a real mailbox credential
+`a7c3e9d1b624`. Email protocol/unit coverage does not by itself imply that a real mailbox credential
 or live provider E2E has been validated.
 
 - [Runtime architecture](architecture.md): process ownership, state boundaries, message paths and
-  reliability invariants.
+  reliability invariants, including the English-corpus multilingual RAG and review path.
 - [Configuration reference](configuration.md): application, module-level and deployment-only
-  environment variables.
+  environment variables, language policy, selector canary semantics and retrieval backend choice.
+- [Multilingual English-corpus replies](multilingual-reviewed-localization.md): operator-facing
+  runtime flow, fail-closed boundaries and reviewed-localization preference.
 - [Platform account control plane](admin-control-plane.md): account, credential, tenant and
   provisioning trust boundaries.
 - [Feishu integration operator runbook](feishu-integration.md): self-built application Bot setup,
@@ -27,13 +29,18 @@ or live provider E2E has been validated.
 When documents disagree, executable code and Alembic migrations define behavior. Update the current
 architecture/configuration documents in the same change that alters their contracts.
 
-## Proposed research / not runtime authority
+## Research and proposals / not runtime authority
+
+- [Multilingual reply OSS research](multilingual-oss-research.md): primary-source candidate and
+  failure-evidence review for PostgreSQL/pgvector, Qdrant, OpenSearch, embedding/reranking frameworks,
+  language detection and translation. It informs the current architecture but does not authorize a
+  production mode or override executable policy.
 
 - [Multilingual knowledge replies ADR](proposals/multilingual-knowledge-replies-adr.md):
-  proposed architecture and bake-off contract for replying in the customer's language from a
-  canonical English knowledge base. The Phase 1 trusted-local, synthetic-only internal schema and
-  library foundation is implemented; the runtime/live architecture and real dm bake-off are not,
-  no architecture winner has been selected, and runtime configuration remains unchanged.
+  earlier proposed architecture and bake-off contract for replying in the customer's language from
+  a canonical English knowledge base. Current runtime behavior is defined by
+  [architecture.md](architecture.md), [configuration.md](configuration.md), code and migrations;
+  proposal-only assumptions do not override them.
 - [Multilingual knowledge replies sources](proposals/multilingual-knowledge-replies-sources.md):
   stable papers and official documentation used by the proposed ADR.
 

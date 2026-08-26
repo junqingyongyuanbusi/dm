@@ -1,4 +1,4 @@
-"""Fail-closed language detection for customer-facing reply enforcement."""
+"""Best-effort language and writing-system signals for routing and review metadata."""
 
 from __future__ import annotations
 
@@ -408,9 +408,9 @@ def languages_match(expected: str, observed: str) -> bool:
     return expected_parts[1] == observed_parts[1]
 
 
-# detect_language 可能产出的全部标签。输出闸门据此决定能否复核回复语种：表内的
-# 标签可以严格校验；表外的（例如模型判出的 ne、am）确定性检测本就判不出来，严格
-# 校验必然误杀，只能退到文字系统一致性。由各候选表推导而来，不手工维护第二份清单。
+# detect_language 可能产出的全部标签。语言观察层据此判断能否用同一检测器
+# 复核模型的语种声明；表外标签（例如模型判出的 ne、am）只能留作人工审阅信号。
+# 由各候选表推导而来，不手工维护第二份清单。
 _DETERMINISTIC_TAGS: frozenset[str] = frozenset(
     {"ja", "ko", AMBIGUOUS_CHINESE, "th", "el", "he", "bn"}
     | _CHINESE_SCRIPT_TAGS
@@ -429,12 +429,12 @@ _DETERMINISTIC_TAGS: frozenset[str] = frozenset(
 
 
 def is_deterministically_verifiable(tag: str) -> bool:
-    """detect_language 是否可能产出该标签——即输出闸门能否复核回复真的用了它。"""
+    """detect_language 是否可能产出该标签，供语言观察层选择信号强度。"""
     return tag in _DETERMINISTIC_TAGS
 
 
-# 各语言允许出现的文字系统。这张表天然追不上世界上的语言——例如它收了 ru/uk/bg
-# 却漏了同用西里尔文的 mk/sr/be/kk/mn，导致这些能被正确检测的语言反被闸门误杀。
+# 各语言常见的文字系统，仅用于产生审阅信号。这张表天然追不上世界上的语言：
+# 例如它收了 ru/uk/bg 却漏了同用西里尔文的 mk/sr/be/kk/mn，因此不能成为发送授权。
 # 因此调用方可用 allowed_scripts 参数直接给出期望集合（通常取客户原文的主导文字
 # 系统），本表只作为无上下文时的回退。
 _LANGUAGE_ALLOWED_SCRIPTS: dict[str, frozenset[str]] = {
@@ -484,13 +484,20 @@ def dominant_script(text: str | None) -> str:
     return script if count / total >= 0.6 else ""
 
 
-def expected_scripts_for(text: str | None) -> frozenset[str] | None:
-    """由客户原文推导回复额外允许的文字系统：主导文字系统 ∪ 拉丁（品牌名、URL 等）。
+def expected_scripts_for(
+    text: str | None,
+    *,
+    include_all: bool = False,
+) -> frozenset[str] | None:
+    """由客户原文推导回复允许的文字系统。
 
-    结果与按语言查表的结果取并集，只放宽不收紧——日语这类混合书写系统的语言，
-    客户原文的主导脚本可能只是 kana，绝不能因此把回复里的 han 判成越界。
-    判不出主导文字系统时返回 None。
+    已解析语言仍使用「主导文字系统 ∪ 拉丁」作为语言表的补充。未解析的
+    ``mirror-user`` 路径使用客户原文出现的全部文字系统，避免把客户自己的混合
+    书写误判为冲突，同时不允许回复引入原文没有的新文字系统。
     """
+    if include_all:
+        scripts = frozenset(_letter_scripts(_normalize_for_detection(text)))
+        return scripts or None
     script = dominant_script(text)
     return frozenset({script, "latin"}) if script else None
 
@@ -498,7 +505,7 @@ def expected_scripts_for(text: str | None) -> frozenset[str] | None:
 def _strip_neutral_terms(text: str, terms: tuple[str, ...]) -> str:
     """删掉必须逐字保留的语言中立术语（品牌名、监管机构缩写、MT4 这类产品名）。
 
-    输出闸门强制这些 token 与英语标准答案完全一致，它们本身不携带任何语种信息。
+    确定性实体校验已要求这些 token 与英语标准答案一致，它们本身不携带语种信息。
     留在文本里只会抬高拉丁字母占比，把一条正确的日语/中文回复判成「回错语言」：
     实测「マーケットチャートには MT4、MT5、または TradingView…」这类答案在生产
     语料里占 31.8%，逐条误杀。长术语先删，避免短前缀吃掉长实体。
@@ -508,6 +515,64 @@ def _strip_neutral_terms(text: str, terms: tuple[str, ...]) -> str:
         if term:
             stripped = stripped.replace(term, " ")
     return stripped
+
+
+def reply_script_matches(
+    expected: str,
+    text: str,
+    *,
+    extra_allowed_scripts: frozenset[str] | None = None,
+    neutral_terms: tuple[str, ...] = (),
+) -> bool:
+    assessable = _strip_neutral_terms(text, neutral_terms)
+    normalized_expected = expected.casefold()
+    primary = (
+        "mirror-user"
+        if normalized_expected == "mirror-user"
+        else normalized_expected.split("-", 1)[0]
+    )
+    if primary == "mirror-user":
+        if extra_allowed_scripts is None:
+            return True
+        allowed_scripts = extra_allowed_scripts
+    else:
+        allowed_scripts = _LANGUAGE_ALLOWED_SCRIPTS.get(primary, frozenset({"latin"}))
+    if extra_allowed_scripts and primary != "mirror-user":
+        allowed_scripts = allowed_scripts | extra_allowed_scripts
+
+    neutral_stripped = _strip_language_neutral_tokens(assessable)
+    sentence_safe = re.sub(r"(?<=\d)[.,](?=\d)", ":", neutral_stripped)
+    fragments = re.split(r"[.!?。！？；;\n]+", sentence_safe)
+    for fragment in fragments:
+        cleaned_fragment = fragment.strip()
+        letter_count = sum(unicodedata.category(char).startswith("L") for char in cleaned_fragment)
+        if letter_count < _MIN_LETTERS:
+            continue
+        # 文字系统越界对短片段同样有判别力（"你好"、"Спасибо" 都判得出），先拦这一层。
+        fragment_script = dominant_script(cleaned_fragment)
+        if fragment_script and fragment_script not in allowed_scripts:
+            return False
+
+    scripts = _letter_scripts(neutral_stripped)
+    total = sum(scripts.values())
+    if total == 0:
+        return True
+    disallowed = sum(count for script, count in scripts.items() if script not in allowed_scripts)
+    if primary == "mirror-user":
+        return disallowed == 0
+    if disallowed / total > 0.1:
+        return False
+    non_latin_allowed = allowed_scripts - {"latin"}
+    if non_latin_allowed:
+        latin = scripts["latin"]
+        expected_non_latin = sum(
+            count
+            for script, count in scripts.items()
+            if script in non_latin_allowed
+        )
+        if expected_non_latin == 0 or latin / total > 0.35:
+            return False
+    return True
 
 
 def reply_language_matches(
@@ -522,43 +587,24 @@ def reply_language_matches(
     observed = observed_detection.tag
     if not observed_detection.is_reliable or not languages_match(expected, observed):
         return False, observed
-
-    primary = expected.split("-", 1)[0].casefold()
-    allowed_scripts = _LANGUAGE_ALLOWED_SCRIPTS.get(primary, frozenset({"latin"}))
-    if extra_allowed_scripts:
-        allowed_scripts = allowed_scripts | extra_allowed_scripts
+    if not reply_script_matches(
+        expected,
+        text,
+        extra_allowed_scripts=extra_allowed_scripts,
+        neutral_terms=neutral_terms,
+    ):
+        return False, observed
 
     neutral_stripped = _strip_language_neutral_tokens(assessable)
     sentence_safe = re.sub(r"(?<=\d)[.,](?=\d)", ":", neutral_stripped)
-    fragments = re.split(r"[.!?。！？；;\n]+", sentence_safe)
-    for fragment in fragments:
+    for fragment in re.split(r"[.!?。！？；;\n]+", sentence_safe):
         cleaned_fragment = fragment.strip()
         letter_count = sum(unicodedata.category(char).startswith("L") for char in cleaned_fragment)
         if letter_count < _MIN_LETTERS:
             continue
-        # 文字系统越界对短片段同样有判别力（"你好"、"Спасибо" 都判得出），先拦这一层。
-        fragment_script = dominant_script(cleaned_fragment)
-        if fragment_script and fragment_script not in allowed_scripts:
-            return False, observed
         fragment_detection = detect_language(cleaned_fragment)
-        # 判不出语种 ≠ 语种错了。问候语和短承接句在任何门槛下都判不出来（实测 "Hello"
-        # 的 top1 是 st、"Sure" 是 fr、"No problem" 是 bs），把"判不出"当违规会误杀
-        # 11.6% 的已审核英文答案——它们逐字发送也过不了闸门，永远只能转人工。
-        # 回错语言这个唯一需要拦住的错误，由「片段可靠地检出了另一种语言」负责。
+        # 判不出语种 ≠ 语种错了。只有可靠检出另一语种时才产生语言身份不一致信号。
         if fragment_detection.is_reliable and not languages_match(expected, fragment_detection.tag):
-            return False, observed
-
-    scripts = _letter_scripts(neutral_stripped)
-    total = sum(scripts.values())
-    if total == 0:
-        return True, observed
-    disallowed = sum(count for script, count in scripts.items() if script not in allowed_scripts)
-    if disallowed / total > 0.1:
-        return False, observed
-    if primary not in {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr"}:
-        latin = scripts["latin"]
-        non_latin = total - latin
-        if non_latin > 0 and latin / total > 0.35:
             return False, observed
     return True, observed
 

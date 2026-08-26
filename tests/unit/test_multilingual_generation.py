@@ -105,7 +105,7 @@ async def test_wrong_language_generation_handoffs() -> None:
     )
 
     assert decision.action is ReplyAction.HANDOFF
-    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in decision.reason_codes
 
 
 @pytest.mark.asyncio

@@ -218,6 +218,9 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Enables English-corpus multilingual runtime generation; non-English requests use the detected language, with no language or account allowlist; requires knowledge retrieval |
 | `KNOWLEDGE_LOCALIZATION_ENABLED` | `false` | Prefer human-reviewed localized text over runtime generation; requires `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true` and a non-empty live-locale list |
 | `KNOWLEDGE_LOCALIZATION_LIVE_LOCALES` | empty | Comma-separated send allowlist for reviewed localizations; published locales outside it still fall back to runtime generation |
+| `MULTILINGUAL_LANGUAGE_POLICY` | `legacy_hard` | `legacy_hard` keeps uncertain/wrong-language output fail-closed as HANDOFF; `review` may preserve language-only uncertainty as a private DRAFT after every hard guard passes |
+| `RAG_SELECTOR_MODE` | `off` | `off`, `shadow`, or `live`; controls sampled non-exact candidate selection independently from language policy |
+| `RAG_SELECTOR_CANARY_BPS` | `0` | Stable selector sample in basis points, `0..10000`; the bucket is derived from tenant and conversation identity |
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
@@ -227,8 +230,9 @@ The runtime replies in whatever language it resolves for the customer message, w
 allowlist anywhere in the code. Resolution is a three-stage cascade:
 
 1. **Deterministic detection** (`domain/reply/language.py`) — writing-system rules plus Lingua.
-   Pure, synchronous, and shared with knowledge import, localization checks and Outbox validation,
-   so its behaviour must not drift.
+   Pure and synchronous. Its result selects the prompt language and informs translation/retrieval
+   routing, knowledge metadata, localization checks, and post-generation observation. It is not an
+   Outbox safety assertion.
 2. **LLM fallback** (`application/reply_decision/language_resolution.py`) — consulted when the
    deterministic result is `und`, or when it lands on a known-confusable sibling pair. Lingua only
    ever chooses between Hindi and Marathi on Devanagari text and returns confident wrong answers on
@@ -236,7 +240,9 @@ allowlist anywhere in the code. Resolution is a three-stage cascade:
    while correctly detected Russian scored 0.383. The trigger is therefore the candidate set, not a
    confidence threshold. Messages with no meaningful letters (emoji, digits, bare links) never reach
    the model.
-3. **Give up** — still `und`, so the decision hands off with `UNKNOWN_LANGUAGE`.
+3. **Unresolved:** still `und`. `legacy_hard` hands off with `UNKNOWN_LANGUAGE`; `review` may
+   retrieve and generate for human review, but the result is always a private DRAFT and is never
+   eligible for automatic public delivery.
 
 The resolved provenance is stored in `reply_decisions.request_language_source` as
 `current_message`, `recent_user_history` or `llm_fallback`.
@@ -245,17 +251,38 @@ There is no configuration for the fallback. It reuses the existing `OPENAI_*` se
 grounding timeout, and switches itself off when the client cannot detect languages — the same
 convention as `translate_to_english`.
 
-### Output guard verification strength
+`MULTILINGUAL_LANGUAGE_POLICY` changes only how language-identity uncertainty is routed:
 
-`run_final_guard` grades its language check by that provenance:
+- `legacy_hard` preserves the historical HANDOFF for an unresolved request language, a detected
+  output-language mismatch, or a script mismatch;
+- `review` treats language identity as advisory after hard safety and grounding checks. It preserves
+  a language-identity mismatch only as `DRAFT` with private visibility so Admin can review it;
+  a writing-system conflict remains a hard HANDOFF.
 
-- **strict** (deterministic detection) — unchanged full language-identity assertion.
-- **lenient** (`llm_fallback`) — the deterministic detector cannot review a language it could not
-  identify in the first place, so the guard falls back to writing-system consistency between the
-  customer message and the reply, tags the decision `LANGUAGE_MODEL_ATTESTED`, and leaves semantic
-  fidelity to the grounding verifier. Outbox already refuses to send unless `grounding_verified` is
-  true, so the chain stays closed. Lenient decisions must write a real language tag into
-  `reply_language`; `und` is rejected at delivery.
+The policy never relaxes deterministic facts, knowledge provenance, protected entities, official
+contact authorization, numbers, currencies, semantic grounding, tenant/account scope, the kill
+switch, idempotency, or Outbox preflight. A failure in any of those layers still discards the
+candidate and fails closed.
+
+### Language observation strength
+
+After deterministic hard checks and grounding, `run_language_observation_guard` records how strongly
+the pipeline can observe language identity:
+
+- **strict** (deterministic detection) — compares the observed output language with the prompt target.
+- **lenient** (a tag the deterministic detector cannot verify): the guard falls back to
+  writing-system consistency between the customer message and reply, tags the decision
+  `LANGUAGE_MODEL_ATTESTED`, and leaves semantic fidelity to the grounding verifier. A writing-system
+  conflict remains HANDOFF under both policies; only language identity uncertainty becomes a private
+  DRAFT under `review`.
+
+Language identity is prompt/routing metadata plus this policy-controlled observation. Outbox does
+not re-detect it, compare request and reply language tags, or reject a decision merely because
+`reply_language=und`. Under `review`, language-only uncertainty cannot become an automatic public
+reply because the pipeline has already made it a private DRAFT. Public bot-derived delivery remains
+fail-closed on grounding and deterministic fact, number/currency, protected-entity, contact/PII, and
+knowledge/localization provenance checks, in addition to its normal scope, payload-binding, account,
+conversation, kill-switch, and idempotency preflight.
 
 Allowed writing systems are the per-language table **union** the customer message's dominant script.
 The table alone cannot keep up — it lists `ru`/`uk`/`bg` but omits Macedonian, Serbian, Belarusian,
@@ -279,10 +306,11 @@ question preceded a plain greeting produced handoff 4/4, and 4/4 auto-reply once
 The filter applies only to model context. Language resolution still sees the full history, because
 unanswered customer messages remain valid evidence of the customer's language.
 
-Multilingual runtime generation requires only `KNOWLEDGE_RETRIEVAL_ENABLED=true` and
+Multilingual runtime generation requires `KNOWLEDGE_RETRIEVAL_ENABLED=true` and
 `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true`. It retrieves verified-English knowledge in code and
-relies on the existing language, grounding, contact, kill-switch, and Outbox guards. It does not
-require a calibration report or language allowlist.
+relies on language observation, hard fact/entity/contact checks, grounding, kill switch, and Outbox
+guards. Configuration validation does not prove retrieval calibration or authorize a live selector
+rollout.
 
 ### Non-English retrieval: translation comes first
 
@@ -301,6 +329,54 @@ Translating first restores two arms that are dead for non-English text:
 Ordering matters for correctness, not just recall. Treating translation as a
 "retrieve, and retry only if not strong" fallback lets a *confident but wrong* cross-lingual match
 skip translation entirely, because a wrong top1 can still clear the strong gate.
+
+### Candidate selector and canary semantics
+
+The selector deduplicates the hybrid/vector candidate union by approved-answer identity and receives
+at most three candidates. Its rollout is deterministic per conversation:
+
+- bucket = the first eight bytes of SHA-256 over `tenant_id:conversation_key`, modulo 10,000;
+- `off`: the selector is not invoked and the legacy top-1 assessment controls the answer;
+- `shadow`: only buckets below `RAG_SELECTOR_CANARY_BPS` invoke the selector and record its proposed
+  candidate/evidence; the legacy answer still controls the decision;
+- `live`: only sampled buckets let the selector control non-exact selection; outside the sample the
+  legacy answer remains in control;
+- exact question matches bypass selector control in every mode;
+- failure, invalid output, or abstention in sampled `live` traffic fails closed.
+
+The selector returns only a candidate ID from the supplied allowlist. It does not generate customer
+text; both legacy and selected candidates use the same reviewed-localization or canonical generation
+and grounding path.
+
+`RAG_SELECTOR_MODE` and `MULTILINGUAL_LANGUAGE_POLICY` are separate axes. The required rollout is
+`legacy_hard/off/0` baseline, bounded `shadow`, evidence and draft-queue review, then at most a small
+`review` and/or `live` canary with gradual basis-point increases. Restore `legacy_hard/off/0` on API,
+Worker, and Scheduler to roll behavior back.
+
+Each evaluated decision stores `decision_release_sha`, `retrieval_policy_version`,
+`selector_version`, and bounded `rag_evidence`: candidate ranks, similarities and hashes, canary
+bucket, selection method, latency, and guard/verifier results. The evidence object must not contain a
+query, message, prompt, question, answer, reply, contact, or other body text. Knowledge
+`protected_values` are exact entity strings that translation and generation must preserve. Their
+normalized set is part of the knowledge revision hash and approved-answer identity, so a policy-only
+change is imported as a new revision and conflicting policies are never deduplicated together.
+
+### Retrieval backend choice
+
+PostgreSQL remains the business fact source and the current retrieval backend, using pgvector plus
+PostgreSQL full-text search. The corpus is approximately 716 verified published English documents,
+so an exact vector scan must be benchmarked against HNSW. pgvector documents that approximate-index
+filters are applied after ANN scanning: SQL scope filters still prevent cross-tenant rows from being
+returned, but a shared multi-tenant HNSW index can lose in-scope Recall@k. If HNSW is retained, verify
+the deployed extension supports `SET LOCAL hnsw.iterative_scan = strict_order` and test recall under
+tenant, brand, and platform filters.
+
+Qdrant is not a second durable store. It is only a future rebuildable projection if measured scale or
+dense+sparse retrieval needs justify the extra service. Haystack, LlamaIndex, and RAGFlow do not
+replace this application's tenant scope, durable jobs, safety policy, human review, or Outbox, so they
+are experiment tooling rather than the runtime architecture. See
+[multilingual-oss-research.md](multilingual-oss-research.md) for primary-source evidence and the
+candidate matrix.
 
 ### Switching the embedding model
 

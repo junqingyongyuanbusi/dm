@@ -1,9 +1,11 @@
 import uuid
 
 import httpx
-from sqlalchemy import insert, select
+import pytest
+from sqlalchemy import insert, select, update
 
 from apps.api.main import create_app
+from social_reply.application.message_delivery import outbox as outbox_module
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
@@ -18,8 +20,14 @@ async def _login(client: httpx.AsyncClient) -> str:
     return csrf
 
 
-async def test_admin_approved_draft_can_send_while_conversation_remains_draft_only(
-    session, monkeypatch
+class _OpenKillSwitch:
+    async def is_disabled(self, brand_id, account_id, tenant_id="default"):
+        return False
+
+
+@pytest.mark.parametrize("automation_state", ["BOT_ACTIVE", "BOT_DRAFT_ONLY"])
+async def test_admin_approved_draft_can_send_in_bot_modes(
+    session, monkeypatch, automation_state
 ):
     account_id, contact_id, conversation_id, message_id, decision_id = (
         uuid.uuid4() for _ in range(5)
@@ -53,11 +61,12 @@ async def test_admin_approved_draft_can_send_while_conversation_remains_draft_on
             platform_account_id=account_id,
             contact_id=contact_id,
             conversation_key=f"telegram:{account_id}:user",
+            decision_generation=1,
         )
     )
     await session.execute(
         insert(models.AutomationState).values(
-            conversation_id=conversation_id, state="BOT_DRAFT_ONLY", state_version=1
+            conversation_id=conversation_id, state=automation_state, state_version=1
         )
     )
     await session.execute(
@@ -68,6 +77,7 @@ async def test_admin_approved_draft_can_send_while_conversation_remains_draft_on
             sender_type="contact",
             text="hello",
             reply_target={"chat_id": 123},
+            decision_generation=1,
         )
     )
     await session.execute(
@@ -82,6 +92,7 @@ async def test_admin_approved_draft_can_send_while_conversation_remains_draft_on
             source="rule",
             prompt_version="v1",
             state_version_at_decision=1,
+            decision_generation=1,
         )
     )
     await session.commit()
@@ -102,6 +113,11 @@ async def test_admin_approved_draft_can_send_while_conversation_remains_draft_on
     monkeypatch.setattr(
         "social_reply.application.message_delivery.outbox.get_platform_sender", get_sender
     )
+    monkeypatch.setattr(
+        outbox_module,
+        "make_killswitch_checker",
+        lambda: _OpenKillSwitch(),
+    )
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
@@ -112,8 +128,45 @@ async def test_admin_approved_draft_can_send_while_conversation_remains_draft_on
         response = await client.post(
             f"/admin/decisions/{decision_id}/approve", data={"csrf_token": csrf}
         )
+        replay = await client.post(
+            f"/admin/decisions/{decision_id}/approve", data={"csrf_token": csrf}
+        )
+        conflict = await client.post(
+            f"/admin/decisions/{decision_id}/approve",
+            data={"csrf_token": csrf, "final_reply_text": "conflicting reply"},
+        )
+        await session.execute(
+            update(models.Conversation)
+            .where(models.Conversation.id == conversation_id)
+            .values(decision_generation=2)
+        )
+        await session.commit()
+        stale_replay = await client.post(
+            f"/admin/decisions/{decision_id}/approve", data={"csrf_token": csrf}
+        )
     assert response.status_code == 303
+    assert replay.status_code == 303
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "draft_approval_conflict"
+    assert stale_replay.status_code == 409
+    assert stale_replay.json()["detail"] == "draft_stale_conversation_input"
     assert sent == [({"chat_id": 123}, "approved reply")]
     outbox = (await session.execute(select(models.OutboxMessage))).scalar_one()
     assert outbox.status == "SENT"
     assert outbox.payload["approval"] == "admin"
+    approved_outbox_id = outbox.id
+    session.expire_all()
+    decision = await session.get(models.ReplyDecision, decision_id)
+    assert decision.outbox_id is None
+    assert decision.review_outbox_id == approved_outbox_id
+    audits = list(
+        (
+            await session.execute(
+                select(models.AuditLog).where(
+                    models.AuditLog.action == "APPROVE_DRAFT",
+                    models.AuditLog.subject_id == str(decision_id),
+                )
+            )
+        ).scalars()
+    )
+    assert len(audits) == 1

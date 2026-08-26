@@ -2,6 +2,7 @@
 
 import logging
 import signal
+import sys
 import threading
 import time
 from collections.abc import Callable, Coroutine
@@ -36,6 +37,25 @@ Sweep = Callable[[], Coroutine[Any, Any, list[Any]]]
 
 logger = logging.getLogger(__name__)
 _SHUTDOWN_GRACE_SECONDS = 5.0
+
+
+class _BelowWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.WARNING
+
+
+def _configure_logging() -> None:
+    """Keep routine scheduler telemetry out of Railway's stderr error stream."""
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.DEBUG)
+    stdout_handler.addFilter(_BelowWarning())
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=(stdout_handler, stderr_handler),
+        force=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -238,7 +258,8 @@ async def _run_sweep(
             },
         )
     else:
-        logger.info(
+        log = logger.info if recovered_count else logger.debug
+        log(
             "scheduler sweep completed",
             extra={
                 "sweep_name": spec.name,
@@ -382,7 +403,7 @@ def _drain_running_sweeps(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    _configure_logging()
     settings = get_settings()
     specs = _build_sweep_specs(settings)
     stop = threading.Event()

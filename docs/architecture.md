@@ -46,7 +46,10 @@ PostgreSQL owns:
 - local operations inbox state in `HumanWorkItem`, including tenant-scoped claim ownership and optimistic versioning;
 - Feishu handoff routes, operator authorization, notification intents and card-action receipts;
 - `ProvisioningJob`, `DecisionJob`, `ReplyDecision` and `OutboxMessage` state;
-- immutable Outbox origin, actor and explicit reply-target provenance for bot decisions, draft approvals and manual replies;
+- immutable Outbox origin, actor and explicit reply-target provenance for bot decisions, draft
+  approvals and manual replies;
+- decision release/retrieval/selector provenance, bounded text-free RAG evidence, and exact knowledge
+  values protected from translation or generation drift;
 - delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps;
 - tenant-scoped `EvaluationRun` and `EvaluationDecision` rows for the trusted-local,
   synthetic-only internal evaluation foundation.
@@ -138,6 +141,60 @@ Webhook ingestion plus X and Email polling persist `RawEvent` evidence before no
 
 Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes.
 
+### English-corpus multilingual RAG path
+
+When knowledge retrieval and multilingual replies are enabled, the decision worker keeps published,
+language-verified English knowledge as the factual source and processes a new message in this order:
+
+```text
+tenant/account/conversation snapshot + rules + kill switch
+  -> resolve customer language from current message and recent user history
+  -> reliably non-English query: protected translation to English
+  -> tenant + brand + platform + published + verified-English scoped retrieval
+  -> exact match, otherwise PostgreSQL vector/lexical candidate union
+  -> legacy answer-level similarity/margin gate or sampled selector with a similarity floor
+  -> approved localization when available, otherwise grounded target-language generation
+  -> deterministic fact/provenance/contact/entity/number/currency guards
+  -> semantic grounding verifier
+  -> language observation policy
+  -> AUTO_REPLY, private DRAFT, or HANDOFF
+  -> transactional persistence and send-time Outbox revalidation
+```
+
+`MULTILINGUAL_LANGUAGE_POLICY=legacy_hard` preserves the existing fail-closed HANDOFF for uncertain
+or wrong-language output. In `review`, language identity is advisory: that signal may preserve an
+otherwise safe candidate only as a private DRAFT. It cannot soften deterministic facts, knowledge
+provenance, protected entities, official-contact authorization, numbers, currencies, grounding,
+writing-system conflicts, tenant scope, kill switch, or send-time checks. An unresolved request
+language in `review` likewise cannot produce an automatic public reply.
+
+The selector rollout is independently gated by `RAG_SELECTOR_MODE=off|shadow|live` and a stable
+`RAG_SELECTOR_CANARY_BPS` bucket. The bucket is SHA-256 of `tenant_id:conversation_key` modulo
+10,000. `off` never invokes the selector. `shadow` invokes it only in sampled buckets and records
+evidence without changing the legacy top-1 answer. `live` controls only non-exact selection inside
+sampled buckets; exact matches bypass control, out-of-sample traffic keeps legacy choice, and sampled
+selector failure or abstention fails closed. The selector returns only an allowlisted candidate ID;
+the selected hit always continues through the same reviewed-localization or canonical generation and
+grounding path, so the canary changes selection without silently changing rendering.
+
+Each evaluated decision records its immutable image release, retrieval-policy and selector versions,
+candidate ranks/similarities/hashes, canary bucket, and guard/verifier results. `rag_evidence` is
+bounded metadata and must never contain a query, message, prompt, question, answer, reply, contact, or
+other body text. `KnowledgeDocument.protected_values` carries exact entities that generation and
+translation guards must preserve. Normalized protected values are part of the immutable knowledge
+revision hash and canonical answer identity. Equal wording with different protection policy remains
+separate and exact-policy ambiguity fails closed instead of selecting the weaker representative.
+No-delivery runtime logs expose bounded reason-code enums for operational counting, never message or
+knowledge bodies.
+
+PostgreSQL plus pgvector and PostgreSQL full-text search remain the current retrieval backend and
+durable source. With approximately 716 verified published English documents, exact vector scan is a
+required benchmark against HNSW, not merely a fallback. pgvector applies approximate-index filters
+after ANN scanning, so any shared HNSW design must measure tenant/brand/platform-filtered Recall@k
+and verify support for `SET LOCAL hnsw.iterative_scan = strict_order`. Qdrant is only a future,
+rebuildable projection if measured scale or dense+sparse requirements justify it; PostgreSQL remains
+authoritative.
+
 ## Local human operations path
 
 The built-in Admin and PostgreSQL inbox are the native operations path; they do not depend on
@@ -173,7 +230,9 @@ policy. A manual reply creates or claims work, moves the conversation to `HUMAN_
 pending or failed bot-decision Outboxes, and records `actor_id` plus `reply_to_message_id`. Bot
 decisions use `DECISION/BOT`, approved drafts use `DRAFT_APPROVAL/ADMIN_HUMAN`, and manual sends use
 `MANUAL_REPLY/ADMIN_HUMAN`, so the Outbox row is the durable provenance bridge from operator action
-to outbound history. Direct-platform delivery is independent of Chatwoot; accounts deliberately
+to outbound history. `ReplyDecision.outbox_id` remains the private Chatwoot-note or legacy delivery
+compatibility link; `review_outbox_id` identifies the customer-facing Outbox created by Admin draft
+approval. Direct-platform delivery is independent of Chatwoot; accounts deliberately
 using a Chatwoot destination still require their persisted conversation mapping.
 
 When Feishu handoff notifications are enabled, the HANDOFF persistence transaction also creates or
@@ -392,7 +451,8 @@ These public systems informed semantics only; Social Reply does not add them as 
 
 - API, Worker, and Scheduler must receive the same feature flags, including `FEISHU_ENABLED`,
   `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED`, `EMAIL_ENABLED` and
-  `EMAIL_AUTO_REPLY_ENABLED`, and the same `PLATFORM_SECRET_KEYS`.
+  `EMAIL_AUTO_REPLY_ENABLED`, `MULTILINGUAL_LANGUAGE_POLICY`, `RAG_SELECTOR_MODE`, and
+  `RAG_SELECTOR_CANARY_BPS`, and the same `PLATFORM_SECRET_KEYS`.
 - Only API performs migration; Worker and Scheduler start after the database reaches head.
 - PostgreSQL and Redis are private infrastructure endpoints. Only API is exposed through the public
   ingress/tunnel.

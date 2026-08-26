@@ -5,7 +5,6 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
-import redis.asyncio as aioredis
 from sqlalchemy import select, update
 
 from social_reply.application.knowledge.localizations import load_approved_localization
@@ -13,7 +12,6 @@ from social_reply.application.knowledge.query_translation import translate_query
 from social_reply.application.knowledge.retrieval import (
     KnowledgeHit,
     KnowledgeRetrievalResult,
-    canonical_answer_identity,
     retrieve_exact_knowledge_result,
     retrieve_hybrid_knowledge_result,
 )
@@ -34,9 +32,18 @@ from social_reply.application.reply_decision.pipeline import (
     DecisionSnapshot,
     run_decision_pipeline,
 )
+from social_reply.application.reply_decision.rag_selection import (
+    OFFICIAL_CONTACT_REVIEW_METHOD,
+    RETRIEVAL_POLICY_VERSION,
+    RAGCandidateOption,
+    build_rag_candidates,
+    rag_evidence,
+    selector_is_enabled,
+)
 from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbeddingClient
+from social_reply.domain.knowledge.policy import KnowledgeAnswerIdentity, canonical_answer_identity
 from social_reply.domain.platform_accounts import LEGACY_ACTIVE_ACCOUNT_STATUSES
-from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
+from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import (
     LANGUAGE_VERIFICATION_LENIENT,
     LANGUAGE_VERIFICATION_STRICT,
@@ -53,7 +60,7 @@ from social_reply.infrastructure.database.advisory_locks import (
     acquire_conversation_delivery_xact_lock,
 )
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.infrastructure.killswitch import KillSwitchChecker
+from social_reply.infrastructure.killswitch import KillSwitchChecker, make_killswitch_checker
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -61,6 +68,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PERSONA = ResolvedPersona(text=DEFAULT_PERSONA, revision=None)
 _MULTILINGUAL_SENTINEL_VERSION = "approved-verbatim-v1"
 _MULTILINGUAL_GATE_VERSION = "strong-gate-v1"
+_RAG_SELECTOR_GATE_VERSION = "selector-gate-v2"
 
 _llm: LLMClient | None = None
 
@@ -100,19 +108,8 @@ def _get_llm_or_none() -> LLMClient | None:
         return None
 
 
-_redis = None
-
-
-def _get_redis():
-    # 模块级共享 client（惰性初始化）：避免每次决策 from_url 新建连接池
-    global _redis
-    if _redis is None:
-        _redis = aioredis.from_url(get_settings().redis_url)
-    return _redis
-
-
 def _make_killswitch() -> KillSwitchChecker:
-    return KillSwitchChecker(_get_redis())
+    return make_killswitch_checker()
 
 
 @dataclass(frozen=True)
@@ -192,7 +189,11 @@ async def _fetch_knowledge(
                     brand_id=snapshot.brand_id,
                     platform=snapshot.platform,
                     embedding_version=embedder.version,
-                    top_k=settings.knowledge_top_k,
+                    top_k=(
+                        max(settings.knowledge_top_k, 3)
+                        if settings.rag_selector_mode != "off"
+                        else settings.knowledge_top_k
+                    ),
                     min_similarity=settings.knowledge_min_similarity,
                     verified_english_only=verified_english_only,
                 )
@@ -231,6 +232,121 @@ class KnowledgeMatchAssessment:
     status: str = "none"
 
 
+@dataclass(frozen=True)
+class RAGSelectorAssessment:
+    candidates: tuple[RAGCandidateOption, ...]
+    enabled: bool
+    bucket: int
+    selected: RAGCandidateOption | None = None
+    latency_ms: float | None = None
+    selector_version: str | None = None
+    method: str = "legacy_top1"
+
+
+def _preserve_unresolved_language_review(decision: ReplyDecision) -> ReplyDecision:
+    """Keep a safe candidate reviewable without persisting the prompt-only mirror directive."""
+    if decision.action not in {ReplyAction.AUTO_REPLY, ReplyAction.DRAFT}:
+        return decision
+    reason_codes = decision.reason_codes
+    if "UNKNOWN_LANGUAGE_REVIEW" not in reason_codes:
+        reason_codes += ("UNKNOWN_LANGUAGE_REVIEW",)
+    return replace(
+        decision,
+        action=ReplyAction.DRAFT,
+        reply_visibility=Visibility.PRIVATE,
+        reply_language="und",
+        resolved_locale="und",
+        reason_codes=reason_codes,
+    )
+
+
+async def _assess_with_rag_selector(
+    snapshot: DecisionSnapshot,
+    result: KnowledgeRetrievalResult,
+    *,
+    mode: str,
+    canary_bps: int,
+) -> RAGSelectorAssessment:
+    candidates = build_rag_candidates(result)
+    enabled, bucket = selector_is_enabled(
+        mode=mode,
+        canary_bps=canary_bps,
+        key=f"{snapshot.tenant_id}:{snapshot.conversation_key}",
+    )
+    if result.exact_ambiguous:
+        return RAGSelectorAssessment(
+            candidates=candidates,
+            enabled=False,
+            bucket=bucket,
+            method="exact_ambiguous",
+        )
+    if result.exact_match:
+        selected = candidates[0] if candidates else None
+        return RAGSelectorAssessment(
+            candidates=candidates,
+            enabled=False,
+            bucket=bucket,
+            selected=selected,
+            method="exact",
+        )
+    # Official contact details are deterministic templates, not semantic answer options. They may
+    # only be used after an unambiguous exact match, so never expose approximate contact candidates
+    # to the selector (including shadow mode).
+    selector_candidates = tuple(
+        candidate for candidate in candidates if not candidate.hit.is_official_contact
+    )
+    if candidates and not selector_candidates:
+        return RAGSelectorAssessment(
+            candidates=(),
+            enabled=False,
+            bucket=bucket,
+            method=OFFICIAL_CONTACT_REVIEW_METHOD,
+        )
+    candidates = selector_candidates
+    if not enabled or not candidates:
+        method = "selector_canary_off" if mode in {"shadow", "live"} else "legacy_top1"
+        return RAGSelectorAssessment(
+            candidates=candidates,
+            enabled=False,
+            bucket=bucket,
+            method=method,
+        )
+    llm = _get_llm_or_none()
+    selector = getattr(llm, "select_rag_answer", None) if llm is not None else None
+    if selector is None:
+        return RAGSelectorAssessment(
+            candidates=candidates,
+            enabled=True,
+            bucket=bucket,
+            method=f"selector_{mode}_abstain",
+        )
+    started = time.perf_counter()
+    try:
+        result_value = await selector(
+            query=snapshot.text or "",
+            candidates=tuple(candidate.to_llm_candidate() for candidate in candidates),
+        )
+    except Exception:
+        logger.exception("RAG selector raised unexpectedly; treating as abstain")
+        result_value = None
+    latency_ms = (time.perf_counter() - started) * 1000
+    selected_id = result_value.selected_candidate_id if result_value is not None else None
+    selected = next(
+        (candidate for candidate in candidates if candidate.candidate_id == selected_id),
+        None,
+    )
+    valid = selected is not None
+    return RAGSelectorAssessment(
+        candidates=candidates,
+        enabled=True,
+        bucket=bucket,
+        selected=selected if valid else None,
+        latency_ms=latency_ms,
+        selector_version=getattr(llm, "rag_selector_id", "rag-selector-v1"),
+        method=f"selector_{mode}" if valid else f"selector_{mode}_abstain",
+    )
+
+
 
 
 def _assess_answer_match(
@@ -253,9 +369,13 @@ def _assess_answer_match(
         )
     if result.exact_match and result.hits:
         return KnowledgeMatchAssessment(selected=result.hits[0], strong=True, status="strong")
-    best_per_answer: dict[tuple[str, bool], KnowledgeHit] = {}
+    best_per_answer: dict[KnowledgeAnswerIdentity, KnowledgeHit] = {}
     for hit in result.vector_hits:
-        answer_identity = canonical_answer_identity(hit.reply, hit.is_official_contact)
+        answer_identity = canonical_answer_identity(
+            hit.reply,
+            hit.is_official_contact,
+            hit.protected_values,
+        )
         current = best_per_answer.get(answer_identity)
         if current is None or hit.similarity > current.similarity:
             best_per_answer[answer_identity] = hit
@@ -291,6 +411,11 @@ def _merge_knowledge_results(
                     by_chunk[hit.chunk_id] = hit
         return tuple(sorted(by_chunk.values(), key=lambda hit: hit.similarity, reverse=True))
 
+    arm_evidence = {
+        key: dict(value) for key, value in primary.arm_evidence.items()
+    }
+    for content_hash, values in translated.arm_evidence.items():
+        arm_evidence.setdefault(content_hash, {}).update(values)
     return replace(
         primary,
         hits=merge_hits(primary.hits, translated.hits),
@@ -300,7 +425,20 @@ def _merge_knowledge_results(
         query_embedding=translated.query_embedding or primary.query_embedding,
         embedding_version=translated.embedding_version or primary.embedding_version,
         retrieval_mode="vector_hybrid+query_translation",
+        arm_evidence=arm_evidence,
     )
+
+
+def _tag_retrieval_arm(
+    result: KnowledgeRetrievalResult,
+    arm: str,
+) -> KnowledgeRetrievalResult:
+    evidence = {key: dict(value) for key, value in result.arm_evidence.items()}
+    for rank, hit in enumerate(result.hits, start=1):
+        evidence.setdefault(hit.content_hash, {})[f"{arm}_hybrid_rank"] = rank
+    for rank, hit in enumerate(result.vector_hits, start=1):
+        evidence.setdefault(hit.content_hash, {})[f"{arm}_vector_rank"] = rank
+    return replace(result, arm_evidence=evidence)
 
 async def _translate_query(snapshot: DecisionSnapshot) -> str | None:
     """把非英语查询译成英语；LLM 不可用或翻译失败返回 None（调用方退回原文检索）。"""
@@ -335,13 +473,20 @@ async def _retrieve_translation_first(
     返回 (检索结果, 是否用上了译文)。
     """
     if translated_query is None:
-        return await _fetch_knowledge(snapshot, verified_english_only=True), False
-    english = await _fetch_knowledge(
-        snapshot, verified_english_only=True, query_text=translated_query
+        native = await _fetch_knowledge(snapshot, verified_english_only=True)
+        return _tag_retrieval_arm(native, "native"), False
+    english = _tag_retrieval_arm(
+        await _fetch_knowledge(
+            snapshot, verified_english_only=True, query_text=translated_query
+        ),
+        "translated",
     )
     if english.exact_match:
         return english, True
-    native = await _fetch_knowledge(snapshot, verified_english_only=True)
+    native = _tag_retrieval_arm(
+        await _fetch_knowledge(snapshot, verified_english_only=True),
+        "native",
+    )
     if native.error_code:
         return (native, False) if english.error_code else (english, True)
     if english.error_code:
@@ -627,6 +772,11 @@ async def run_and_persist_decision(
             is_english_request = (
                 language.is_reliable and language.tag.split("-", 1)[0].casefold() == "en"
             )
+            unresolved_language_review = (
+                language_should_detect
+                and not language.is_reliable
+                and settings.multilingual_language_policy == "review"
+            )
             # 闸门严格度取决于确定性检测能否复核这个标签，而不是标签的来源。按来源
             # 判会在模型判出 en 时退到只比对文字系统——那样一句法语回复也能通过，
             # 恰好放过了「回错语言」这类唯一需要拦住的错误。
@@ -645,19 +795,60 @@ async def run_and_persist_decision(
             )
             knowledge_result, query_translation_used = (
                 await _retrieve_translation_first(snapshot, translated_query=translated_query)
-                if should_retrieve and language.is_reliable
+                if should_retrieve and (language.is_reliable or unresolved_language_review)
                 else (KnowledgeRetrievalResult(), False)
             )
             gate_min_similarity = settings.knowledge_auto_reply_min_similarity
             gate_min_margin = settings.knowledge_auto_reply_min_margin
-            assessment = _assess_answer_match(
+            legacy_assessment = _assess_answer_match(
                 knowledge_result,
                 min_similarity=gate_min_similarity,
                 min_margin=gate_min_margin,
             )
             gate_evaluated = (
-                should_retrieve and language.is_reliable and not knowledge_result.error_code
+                should_retrieve
+                and (language.is_reliable or unresolved_language_review)
+                and not knowledge_result.error_code
             )
+            selector_target_language = language.tag if language.is_reliable else "mirror-user"
+            selector_assessment = (
+                await _assess_with_rag_selector(
+                    snapshot,
+                    knowledge_result,
+                    mode=settings.rag_selector_mode,
+                    canary_bps=settings.rag_selector_canary_bps,
+                )
+                if gate_evaluated
+                else RAGSelectorAssessment(candidates=(), enabled=False, bucket=0)
+            )
+            selector_controls_choice = (
+                settings.rag_selector_mode == "live"
+                and selector_assessment.enabled
+                and not knowledge_result.exact_match
+                and not knowledge_result.exact_ambiguous
+            )
+            if selector_controls_choice:
+                selector_hit = (
+                    selector_assessment.selected.hit
+                    if selector_assessment.selected is not None
+                    else None
+                )
+                selector_strong = (
+                    selector_hit is not None and selector_hit.similarity >= gate_min_similarity
+                )
+                assessment = KnowledgeMatchAssessment(
+                    selected=selector_hit,
+                    second=legacy_assessment.second,
+                    margin=legacy_assessment.margin,
+                    strong=selector_strong,
+                    status=(
+                        "strong"
+                        if selector_strong
+                        else ("weak" if selector_hit is not None else "abstain")
+                    ),
+                )
+            else:
+                assessment = legacy_assessment
             selected = assessment.selected
 
             # 审核译文优先于运行时生成：命中文档在该语种下有已审核译文时直接用它。
@@ -687,7 +878,7 @@ async def run_and_persist_decision(
                     reason_codes=(knowledge_result.error_code,),
                     source="rule",
                 )
-            elif should_retrieve and not language.is_reliable:
+            elif should_retrieve and not language.is_reliable and not unresolved_language_review:
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
                     reason_codes=("UNKNOWN_LANGUAGE",),
@@ -696,13 +887,29 @@ async def run_and_persist_decision(
             elif should_retrieve and (not assessment.strong or selected is None):
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
-                    reason_codes=("NO_STRONG_KNOWLEDGE_MATCH",),
+                    reason_codes=(
+                        "RAG_SELECTOR_ABSTAIN"
+                        if selector_controls_choice and selected is None
+                        else "NO_STRONG_KNOWLEDGE_MATCH",
+                    ),
                     source="rule",
                 )
             elif (
                 should_retrieve
                 and selected is not None
                 and selected.is_official_contact
+                and not knowledge_result.exact_match
+            ):
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("OFFICIAL_CONTACT_EXACT_MATCH_REQUIRED",),
+                    source="rule",
+                )
+            elif (
+                should_retrieve
+                and selected is not None
+                and selected.is_official_contact
+                and not is_english_request
                 and not (
                     approved_localization is not None
                     and approved_localization.official_contact_authorized
@@ -723,6 +930,7 @@ async def run_and_persist_decision(
                 and approved_localization is None
                 and selected is not None
                 and (is_english_request or not selected.is_official_contact)
+                and not (is_english_request and selected.is_official_contact)
             )
             generation_llm: LLMClient | None = None
             if multilingual_generate:
@@ -759,7 +967,7 @@ async def run_and_persist_decision(
                 decision = await generate_multilingual_reply(
                     snapshot,
                     selected=selected,
-                    target_language=language.tag,
+                    target_language=selector_target_language,
                     history=model_history,
                     killswitch=killswitch,
                     llm=generation_llm,
@@ -769,9 +977,12 @@ async def run_and_persist_decision(
                         or (settings.email_enabled and settings.email_auto_reply_enabled)
                     ),
                     fallback_reason_codes=(
-                        ("QUERY_TRANSLATED",) if query_translation_used else ()
+                        *(("QUERY_TRANSLATED",) if query_translation_used else ()),
+                        *(("UNKNOWN_LANGUAGE_REVIEW",) if unresolved_language_review else ()),
                     ),
                     language_verification=language_verification,
+                    language_policy=settings.multilingual_language_policy,
+                    approved_knowledge_protected_values=selected.protected_values,
                 )
             else:
                 decision = await run_decision_pipeline(
@@ -801,11 +1012,17 @@ async def run_and_persist_decision(
                         else None
                     ),
                     forced_decision=forced_decision,
+                    approved_knowledge_protected_values=(
+                        selected.protected_values if selected is not None else ()
+                    ),
                     approved_localization=(
                         approved_localization if forced_decision is None else None
                     ),
                     target_language=(
-                        language.tag if should_retrieve and language.is_reliable else "und"
+                        selector_target_language
+                        if should_retrieve
+                        and (language.is_reliable or unresolved_language_review)
+                        else "und"
                     ),
                     apply_legacy_rules=False,
                     history=model_history,
@@ -814,7 +1031,60 @@ async def run_and_persist_decision(
                         or (settings.email_enabled and settings.email_auto_reply_enabled)
                     ),
                     language_verification=language_verification,
+                    language_policy=settings.multilingual_language_policy,
                 )
+            if unresolved_language_review:
+                decision = _preserve_unresolved_language_review(decision)
+            selected_candidate_id = next(
+                (
+                    candidate.candidate_id
+                    for candidate in selector_assessment.candidates
+                    if selected is not None
+                    and canonical_answer_identity(
+                        candidate.hit.reply,
+                        candidate.hit.is_official_contact,
+                        candidate.hit.protected_values,
+                    )
+                    == canonical_answer_identity(
+                        selected.reply,
+                        selected.is_official_contact,
+                        selected.protected_values,
+                    )
+                ),
+                None,
+            )
+            selector_candidate_id = (
+                selector_assessment.selected.candidate_id
+                if selector_assessment.selected is not None
+                else None
+            )
+            evidence = (
+                rag_evidence(
+                    candidates=selector_assessment.candidates,
+                    mode=settings.rag_selector_mode,
+                    canary_bucket=selector_assessment.bucket,
+                    selection_method=selector_assessment.method,
+                    selected_candidate_id=selected_candidate_id,
+                    selector_candidate_id=selector_candidate_id,
+                    selector_version=selector_assessment.selector_version,
+                    selector_latency_ms=selector_assessment.latency_ms,
+                    retrieval_mode=knowledge_result.retrieval_mode,
+                    embedding_version=knowledge_result.embedding_version,
+                    verifier={
+                        "relevant": (
+                            False
+                            if "GUARD_KNOWLEDGE_RELEVANCE_MISMATCH" in decision.reason_codes
+                            else (True if decision.grounding_verified is True else None)
+                        ),
+                        "faithful": decision.grounding_verified,
+                        "version": decision.grounding_verifier_version,
+                        "latency_ms": decision.grounding_latency_ms,
+                    },
+                    guard_reason_codes=decision.reason_codes,
+                )
+                if gate_evaluated
+                else None
+            )
             decision = replace(
                 decision,
                 request_language=(
@@ -865,11 +1135,18 @@ async def run_and_persist_decision(
                 ),
                 knowledge_similarity_margin=(assessment.margin if gate_evaluated else None),
                 knowledge_match_status=(assessment.status if gate_evaluated else None),
-                knowledge_gate_version=(_MULTILINGUAL_GATE_VERSION if gate_evaluated else None),
+                knowledge_gate_version=(
+                    _RAG_SELECTOR_GATE_VERSION
+                    if gate_evaluated and selector_controls_choice
+                    else (_MULTILINGUAL_GATE_VERSION if gate_evaluated else None)
+                ),
                 knowledge_min_similarity_threshold=(
                     gate_min_similarity if gate_evaluated else None
                 ),
                 knowledge_min_margin_threshold=(gate_min_margin if gate_evaluated else None),
+                retrieval_policy_version=(RETRIEVAL_POLICY_VERSION if gate_evaluated else None),
+                selector_version=selector_assessment.selector_version,
+                rag_evidence=evidence,
             )
         else:
             knowledge_result = (
@@ -1049,9 +1326,10 @@ async def run_and_persist_decision(
         )
     else:
         logger.info(
-            "reply_no_delivery conversation=%s decision_ms=%.1f action=%s",
+            "reply_no_delivery conversation=%s decision_ms=%.1f action=%s reason_codes=%s",
             snapshot.conversation_key,
             decision_ms,
             decision.action,
+            ",".join(decision.reason_codes[:16]) or "-",
         )
     return outbox_id

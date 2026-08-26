@@ -118,6 +118,68 @@ async def test_官方联系方式无效布尔值报错(migrated_db):
         )
 
 
+async def test_protected_values_are_tenant_knowledge_metadata(migrated_db, session):
+    csv_text = (
+        'question,reply,protected_values_json\n'
+        'platform,Use Acme Portal with MT4.,"[""Acme Portal"", ""MT4""]"\n'
+    )
+    await import_knowledge_rows(
+        io.StringIO(csv_text),
+        source_name="protected.csv",
+        embedder=FakeEmbeddingClient(),
+    )
+
+    doc = (await session.execute(select(KnowledgeDocument))).scalar_one()
+    assert doc.protected_values == ["Acme Portal", "MT4"]
+
+
+async def test_protected_value_revision_is_not_skipped_as_duplicate(migrated_db, session):
+    first = (
+        'question,reply,protected_values_json\n'
+        'platform,Use Acme Portal with MT4.,"[""Acme Portal""]"\n'
+    )
+    second = (
+        'question,reply,protected_values_json\n'
+        'platform,Use Acme Portal with MT4.,"[""MT4""]"\n'
+    )
+
+    first_report = await import_knowledge_rows(
+        io.StringIO(first),
+        source_name="protected-v1.csv",
+        embedder=FakeEmbeddingClient(),
+    )
+    second_report = await import_knowledge_rows(
+        io.StringIO(second),
+        source_name="protected-v2.csv",
+        embedder=FakeEmbeddingClient(),
+    )
+
+    assert first_report.inserted == 1
+    assert second_report.inserted == 1
+    documents = (await session.execute(select(KnowledgeDocument))).scalars().all()
+    chunks = (await session.execute(select(KnowledgeChunk))).scalars().all()
+    assert {tuple(document.protected_values) for document in documents} == {
+        ("Acme Portal",),
+        ("MT4",),
+    }
+    assert len({chunk.content_hash for chunk in chunks}) == 2
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['{"not":"an-array"}', '["missing"]', '[1]'],
+)
+async def test_invalid_protected_values_are_rejected(migrated_db, value):
+    escaped_value = value.replace('"', '""')
+    csv_text = f'question,reply,protected_values_json\nq,approved,"{escaped_value}"\n'
+    with pytest.raises(ValueError, match="protected"):
+        await import_knowledge_rows(
+            io.StringIO(csv_text),
+            source_name="invalid-protected.csv",
+            embedder=FakeEmbeddingClient(),
+        )
+
+
 async def test_缺表头中文报错(migrated_db, tmp_path):
     path = tmp_path / "missing.csv"
     path.write_text("q,a\nx,y\n", encoding="utf-8")

@@ -9,11 +9,13 @@
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.domain.knowledge.policy import canonical_answer_identity
 from social_reply.infrastructure.database.models import KnowledgeChunk, KnowledgeDocument
 
 
@@ -67,6 +69,7 @@ class KnowledgeHit:
     source_language: str = "und"
     language_verified: bool = False
     question: str = ""
+    protected_values: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,16 +82,14 @@ class KnowledgeRetrievalResult:
     error_code: str | None = None
     embedding_version: str | None = None
     retrieval_mode: str | None = None
+    # Safe rank/score metadata keyed by content_hash. Query and document bodies never belong here.
+    arm_evidence: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def normalize_question(value: str) -> str:
     """用于短问句/关键词模板精确匹配，忽略大小写和首尾/连续空白。"""
     return " ".join(value.casefold().strip().split())
 
-
-def canonical_answer_identity(reply: str, is_official_contact: bool) -> tuple[str, bool]:
-    """Stable identity for one approved answer inside a scoped knowledge set."""
-    return (" ".join(reply.casefold().split()), is_official_contact)
 
 async def retrieve_exact_knowledge_result(
     session: AsyncSession,
@@ -123,6 +124,7 @@ async def retrieve_exact_knowledge_result(
                 KnowledgeDocument.is_official_contact,
                 KnowledgeDocument.source_language,
                 KnowledgeDocument.language_verified,
+                KnowledgeDocument.protected_values,
             )
             .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
             .where(
@@ -159,13 +161,15 @@ async def retrieve_exact_knowledge_result(
             source_language=row.source_language,
             language_verified=row.language_verified,
             question=row.question,
+            protected_values=tuple(row.protected_values or ()),
         )
         for row in rows_by_document.values()
     )
     if not hits:
         return KnowledgeRetrievalResult()
     evidence = {
-        canonical_answer_identity(hit.reply, hit.is_official_contact) for hit in hits
+        canonical_answer_identity(hit.reply, hit.is_official_contact, hit.protected_values)
+        for hit in hits
     }
     if len(evidence) > 1:
         return KnowledgeRetrievalResult(
@@ -240,6 +244,7 @@ async def retrieve_knowledge(
             KnowledgeDocument.is_official_contact,
             KnowledgeDocument.source_language,
             KnowledgeDocument.language_verified,
+            KnowledgeDocument.protected_values,
             distance.label("distance"),
         )
         .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
@@ -277,6 +282,7 @@ async def retrieve_knowledge(
             source_language=row.source_language,
             language_verified=row.language_verified,
             question=row.question,
+            protected_values=tuple(row.protected_values or ()),
         )
         for row in rows
     ]
@@ -295,7 +301,7 @@ async def _retrieve_lexical(
     platform: str,
     limit: int,
     verified_english_only: bool = False,
-) -> list[tuple[uuid.UUID, uuid.UUID, str, str, str, str, bool, str, bool]]:
+) -> list[tuple[uuid.UUID, uuid.UUID, str, str, str, str, bool, str, bool, list]]:
     """Lexically retrieve published chunks and their official-contact classification.
 
     'simple' 分词器与建索引一致；plainto_tsquery 把用户输入按空白切词做 AND，
@@ -324,6 +330,7 @@ async def _retrieve_lexical(
             KnowledgeDocument.is_official_contact,
             KnowledgeDocument.source_language,
             KnowledgeDocument.language_verified,
+            KnowledgeDocument.protected_values,
         )
         .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
         .where(
@@ -353,6 +360,7 @@ async def _retrieve_lexical(
             row.is_official_contact,
             row.source_language,
             row.language_verified,
+            row.protected_values,
         )
         for row in rows
     ]
@@ -420,6 +428,7 @@ async def retrieve_hybrid_knowledge_result(
         is_official_contact,
         source_language,
         language_verified,
+        protected_values,
     ) in enumerate(lexical):
         scores[cid] = scores.get(cid, 0.0) + 1.0 / (_RRF_K + rank)
         if cid not in meta:
@@ -434,6 +443,7 @@ async def retrieve_hybrid_knowledge_result(
                 source_language=source_language,
                 language_verified=language_verified,
                 question=question,
+                protected_values=tuple(protected_values or ()),
             )
             best_similarity.setdefault(cid, 0.0)
 
@@ -456,6 +466,7 @@ async def retrieve_hybrid_knowledge_result(
                 source_language=base.source_language,
                 language_verified=base.language_verified,
                 question=base.question,
+                protected_values=base.protected_values,
             )
         )
     return KnowledgeRetrievalResult(hits=tuple(results), vector_hits=tuple(vector_hits))

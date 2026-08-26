@@ -39,6 +39,7 @@ def test_release_requires_app_and_state_service_colocation():
     assert "railway-compat-pre-${short_sha}" in script
     assert "deploy/Dockerfile.migration-compatible-rollback" in script
     assert "scripts/verify_migration_compatible_rollback.sh" in script
+    assert "scripts/release_rollout_state.py" in script
     assert "migration_compatible_rollback" in script
     assert Path("scripts/verify_migration_compatible_rollback.sh").stat().st_mode & 0o111
     assert script.index(
@@ -46,11 +47,17 @@ def test_release_requires_app_and_state_service_colocation():
     ) < script.index('rollback_compatible_digest="$(prepare_rollback_compatible_image')
     assert '"${IMAGE_REPO}@${expected_digest}"' in script
     assert '"${IMAGE_REPO}@${rollback_compatible_digest}"' in script
-    promotion = script.index('--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"')
-    assert script.index('write_manifest "deploying"') < promotion
-    assert '--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"' in script
+    bridge_case = script.index("promote_compatibility_latest)")
+    manifest = script.index(
+        'write_manifest "$manifest_status" "$observed_phase"', bridge_case
+    )
+    promotion = script.index("promote_latest_digest \\", bridge_case)
+    assert manifest < promotion
+    assert '[[ "$(image_digest "$latest_ref")" == "$expected_current" ]]' in script
     assert "invalid inherited release lock descriptor" in script
-    assert script.rindex("require_target_latest") < script.index('write_manifest "completed"')
+    assert script.rindex(
+        'require_latest_digest "$expected_digest" "final verification"'
+    ) < script.index('write_manifest "completed"')
 
 
 def test_ci_publishes_the_verified_image_as_immutable_ghcr_sha():
@@ -74,20 +81,62 @@ def test_ci_publishes_the_verified_image_as_immutable_ghcr_sha():
     assert Path("scripts/verify_production_image.sh").stat().st_mode & 0o111
 
 
-def test_release_promotes_latest_then_deploys_api_first():
+def test_release_bridges_legacy_review_outbox_contract_in_validated_order():
     script = Path("scripts/publish_railway_release.sh").read_text()
+    dockerfile = Path("Dockerfile").read_text()
+    compatibility_dockerfile = Path(
+        "deploy/Dockerfile.migration-compatible-rollback"
+    ).read_text()
     assert 'IMAGE_REPO="ghcr.io/junqingyongyuanbusi/reply-core"' in script
     assert "CI must publish $sha_ref before Railway release" in script
     assert "Railway native image auto-update must be disabled" in script
-    assert "resuming in-flight $service deployment" in script
+    assert "resuming in-flight $stage $service deployment" in script
     assert "refusing duplicate redeploy" in script
-    promotion = script.index('--tag "$latest_ref" "${IMAGE_REPO}@${expected_digest}"')
-    api = script.index('api_deployment_id="$(deploy_role api)"')
-    health = script.index("wait_for_api_health", api)
-    worker = script.index('worker_deployment_id="$(deploy_role worker)"')
-    scheduler = script.index('scheduler_deployment_id="$(deploy_role scheduler)"')
-    assert promotion < api < health < worker < scheduler
+    assert 'TARGET_REVIEW_OUTBOX_CAPABILITY="review-outbox-dual-read-v1"' in script
+    assert "review-outbox-dual-read-v1" in dockerfile
+    assert "BASE_REVIEW_OUTBOX_CAPABILITY" in compatibility_dockerfile
+    assert "scripts/release_rollout_state.py" in script
+    assert "nine safe bridge checkpoints" in script
+
+    compatibility_latest = script.index("promote_compatibility_latest)")
+    compatibility_api = script.index("deploy_compatibility_api)")
+    compatibility_worker = script.index("deploy_compatibility_worker)")
+    compatibility_scheduler = script.index("deploy_compatibility_scheduler)")
+    target_latest = script.index("promote_target_latest)")
+    target_worker = script.index("deploy_target_worker)")
+    target_api = script.index("deploy_target_api)")
+    target_scheduler = script.index("deploy_target_scheduler)")
+    assert (
+        compatibility_latest
+        < compatibility_api
+        < compatibility_worker
+        < compatibility_scheduler
+        < target_latest
+        < target_worker
+        < target_api
+        < target_scheduler
+    )
+    assert script.count("promote_latest_digest \\") >= 2
+    assert 'write_manifest "$manifest_status" "$observed_phase"' in script
+    assert 'recorded_rollout_phase="$next_phase"' in script
     assert Path("scripts/publish_railway_release.sh").stat().st_mode & 0o111
+
+
+def test_compatibility_api_migrates_before_target_worker_readiness_smoke():
+    script = Path("scripts/verify_migration_compatible_rollback.sh").read_text()
+    compat_prepare = script.index(
+        'run_python_module "$compat_image" scripts.prepare_database'
+    )
+    compat_ready = script.index(
+        'run_python_module "$compat_image" scripts.assert_database_ready'
+    )
+    target_worker_ready = script.index(
+        'run_python_module "$target_image" scripts.assert_database_ready'
+    )
+    target_prepare = script.index(
+        'run_python_module "$target_image" scripts.prepare_database'
+    )
+    assert compat_prepare < compat_ready < target_worker_ready < target_prepare
 
 
 def test_migration_compatible_rollback_retags_latest_and_redeploys_in_order():
