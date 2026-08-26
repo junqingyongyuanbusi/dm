@@ -2,7 +2,10 @@ import logging
 import time
 from dataclasses import dataclass, replace
 
-from social_reply.application.reply_decision.language_resolution import resolve_reply_language
+from social_reply.application.reply_decision.language_resolution import (
+    LLM_FALLBACK_SOURCE,
+    resolve_reply_language,
+)
 from social_reply.domain.messages.canonical import ChannelType
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import (
@@ -316,13 +319,20 @@ async def run_decision_pipeline(
                 if approved_knowledge_reply is not None
                 else ()
             ) + (approved_localization.protected_values if approved_localization else ())
-            observed_reply_language = (
-                await resolve_reply_language(
-                    decision.reply_text,
-                    llm=llm,
-                    neutral_terms=neutral_terms,
+            reply_language = await resolve_reply_language(
+                decision.reply_text,
+                llm=llm,
+                neutral_terms=neutral_terms,
+            )
+            observed_reply_language = reply_language.tag
+            if (
+                reply_language.source == LLM_FALLBACK_SOURCE
+                and "LANGUAGE_MODEL_ATTESTED" not in decision.reason_codes
+            ):
+                decision = replace(
+                    decision,
+                    reason_codes=decision.reason_codes + ("LANGUAGE_MODEL_ATTESTED",),
                 )
-            ).tag
 
     # Phase 3: language identity is routing/review evidence, never a shortcut around safety.
     decision = run_language_observation_guard(

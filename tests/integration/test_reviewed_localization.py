@@ -528,27 +528,34 @@ async def test_english_request_keeps_canonical_verbatim_path(session, multilingu
     assert "MULTILINGUAL_RUNTIME_GENERATION" in decision.reason_codes
 
 
-async def test_unknown_language_handoffs(session, multilingual_runtime):
+async def test_unknown_language_becomes_private_review_draft(session, multilingual_runtime):
     await _seed_english_policy(session)
-    conversation_id, outbox_id = await _run(session, text="@@@ 123456")
+    runner._llm = _RuntimeLLM({"mirror-user": _SOURCE_REPLY})
+    _conversation_id, outbox_id = await _run(session, text="@@@ 123456")
 
     assert outbox_id is None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "handoff"
-    assert "UNKNOWN_LANGUAGE" in decision.reason_codes
-    await _assert_handoff(session, conversation_id, "UNKNOWN_LANGUAGE")
+    assert decision.action == "draft"
+    assert decision.reply_visibility == "private"
+    assert decision.reply_text == _SOURCE_REPLY
+    assert decision.request_language == "und"
+    assert decision.reply_language == "und"
+    assert "UNKNOWN_LANGUAGE_REVIEW" in decision.reason_codes
 
 
-async def test_wrong_language_reply_handoffs_before_outbox(session, multilingual_runtime):
+async def test_wrong_language_reply_becomes_private_draft_before_outbox(
+    session, multilingual_runtime
+):
     await _seed_english_policy(session)
     runner._llm = _RuntimeLLM({"ja": _SOURCE_REPLY})
-    conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
+    _conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
 
     assert outbox_id is None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "handoff"
-    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in decision.reason_codes
-    await _assert_handoff(session, conversation_id, "GUARD_LANGUAGE_SCRIPT_MISMATCH")
+    assert decision.action == "draft"
+    assert decision.reply_visibility == "private"
+    assert decision.reply_text == _SOURCE_REPLY
+    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
 
 
 async def test_grounding_failure_handoffs(session, multilingual_runtime):
@@ -578,6 +585,7 @@ async def test_llm_failure_handoffs(session, multilingual_runtime):
 
 async def test_official_contact_never_uses_runtime_generation(session, multilingual_runtime):
     await _seed_english_policy(session, is_official_contact=True)
+    runner._llm = _RuntimeLLM({}, translated_query=_SOURCE_QUESTION)
     conversation_id, outbox_id = await _run(session, text=_JA_QUERY)
 
     assert outbox_id is None
@@ -736,6 +744,8 @@ async def test_llm_language_fallback_unavailable_keeps_unknown_language_handoff(
     session, multilingual_runtime
 ):
     # 兜底能力不可用时必须退回原有的 fail-closed 行为，而不是猜一个语言。
+    multilingual_runtime.setenv("MULTILINGUAL_LANGUAGE_POLICY", "legacy_hard")
+    get_settings.cache_clear()
     await _seed_english_policy(session)
     runner._llm = _RuntimeLLM({"ne": _NE_REPLY}, detected_language=None)
 

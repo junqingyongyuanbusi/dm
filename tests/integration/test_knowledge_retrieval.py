@@ -742,7 +742,7 @@ async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
     assert expected_reason in decision.reason_codes
 
 
-async def test_multilingual_script_conflict_is_blocked_after_grounding_before_outbox(
+async def test_multilingual_wrong_language_becomes_private_review_after_grounding(
     session, knowledge_enabled
 ):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
@@ -775,11 +775,15 @@ async def test_multilingual_script_conflict_is_blocked_after_grounding_before_ou
     outbox_id = await runner.run_and_persist_decision(
         _snapshot(account_id, text), conv_id, msg_id, account_id
     )
-    assert outbox_id is None
+    assert outbox_id is not None
     assert llm.verifier_called is True
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "handoff"
-    assert "GUARD_LANGUAGE_SCRIPT_MISMATCH" in decision.reason_codes
+    assert decision.action == "draft"
+    assert decision.reply_visibility == "private"
+    assert decision.reply_text == "Refunds take 3 to 5 business days."
+    assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.message_type == "private_note"
 
 
 class _TranslatingLLM:
