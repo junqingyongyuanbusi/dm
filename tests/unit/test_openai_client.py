@@ -425,23 +425,56 @@ async def test_rag_selector_accepts_only_an_allowlisted_candidate():
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         schema = payload["response_format"]["json_schema"]["schema"]
-        assert set(schema["properties"]) == {"selected_candidate_id"}
-        return _completion_response(json.dumps({"selected_candidate_id": "candidate-1"}))
+        assert set(schema["properties"]) == {
+            "selected_candidate_id",
+            "directly_answers",
+            "requires_case_specific_data",
+            "has_conflict",
+        }
+        return _completion_response(
+            json.dumps(
+                {
+                    "selected_candidate_id": "candidate-1",
+                    "directly_answers": True,
+                    "requires_case_specific_data": False,
+                    "has_conflict": False,
+                }
+            )
+        )
 
     result = await _client(handler).select_rag_answer(
         query="Cuanto tarda?",
         candidates=_RAG_CANDIDATES,
     )
     assert result.selected_candidate_id == "candidate-1"
+    assert result.directly_answers is True
+    assert result.requires_case_specific_data is False
+    assert result.has_conflict is False
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "output",
     [
-        {"selected_candidate_id": None},
-        {"selected_candidate_id": "candidate-999"},
-        {"selected_candidate_id": "candidate-1", "reply_text": "invented"},
+        {
+            "selected_candidate_id": None,
+            "directly_answers": False,
+            "requires_case_specific_data": False,
+            "has_conflict": False,
+        },
+        {
+            "selected_candidate_id": "candidate-999",
+            "directly_answers": True,
+            "requires_case_specific_data": False,
+            "has_conflict": False,
+        },
+        {
+            "selected_candidate_id": "candidate-1",
+            "directly_answers": True,
+            "requires_case_specific_data": False,
+            "has_conflict": False,
+            "reply_text": "invented",
+        },
     ],
 )
 async def test_rag_selector_abstains_on_null_invalid_id_or_invalid_pair(output):
@@ -452,6 +485,42 @@ async def test_rag_selector_abstains_on_null_invalid_id_or_invalid_pair(output):
         query="question",
         candidates=_RAG_CANDIDATES,
     )
+    assert result.selected_candidate_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output",
+    [
+        {
+            "selected_candidate_id": "candidate-1",
+            "directly_answers": False,
+            "requires_case_specific_data": False,
+            "has_conflict": False,
+        },
+        {
+            "selected_candidate_id": "candidate-1",
+            "directly_answers": True,
+            "requires_case_specific_data": True,
+            "has_conflict": False,
+        },
+        {
+            "selected_candidate_id": "candidate-1",
+            "directly_answers": True,
+            "requires_case_specific_data": False,
+            "has_conflict": True,
+        },
+    ],
+)
+async def test_rag_selector_abstains_when_safety_flags_do_not_allow_selection(output):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response(json.dumps(output))
+
+    result = await _client(handler).select_rag_answer(
+        query="question",
+        candidates=_RAG_CANDIDATES,
+    )
+
     assert result.selected_candidate_id is None
 
 

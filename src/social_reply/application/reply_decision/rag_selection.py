@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,7 +16,9 @@ from social_reply.domain.knowledge.policy import (
     KnowledgeAnswerIdentity,
     canonical_answer_identity,
 )
-from social_reply.domain.reply.llm import RAGCandidate
+from social_reply.domain.reply.llm import RAGCandidate, RAGSelectionResult
+
+logger = logging.getLogger(__name__)
 
 RETRIEVAL_POLICY_VERSION = "hybrid-union-selector-v2"
 RAG_EVIDENCE_VERSION = "rag-evidence-v1"
@@ -53,6 +57,61 @@ class RAGCandidateOption:
             approved_answer=self.hit.reply,
             similarity=self.hit.similarity,
         )
+
+
+@dataclass(frozen=True)
+class RAGConsensusResult:
+    selected_candidate_id: str | None
+    forward_candidate_id: str | None
+    reverse_candidate_id: str | None
+
+    @property
+    def disagreed(self) -> bool:
+        return self.forward_candidate_id != self.reverse_candidate_id
+
+
+def _safe_selected_candidate_id(result: RAGSelectionResult | None) -> str | None:
+    if (
+        result is None
+        or result.selected_candidate_id is None
+        or not result.directly_answers
+        or result.requires_case_specific_data
+        or result.has_conflict
+    ):
+        return None
+    return result.selected_candidate_id
+
+
+async def select_rag_answer_with_consensus(
+    *,
+    selector: Callable[..., Awaitable[RAGSelectionResult]],
+    query: str,
+    candidates: tuple[RAGCandidate, ...],
+) -> RAGConsensusResult:
+    """Run original and reversed candidate orders; accept only two matching safe choices."""
+    selection_results: list[RAGSelectionResult | None] = []
+    for ordered_candidates in (candidates, tuple(reversed(candidates))):
+        try:
+            selection_results.append(
+                await selector(query=query, candidates=ordered_candidates)
+            )
+        except Exception:
+            logger.exception("RAG selector pass failed; treating that pass as abstain")
+            selection_results.append(None)
+    forward_candidate_id, reverse_candidate_id = (
+        _safe_selected_candidate_id(result) for result in selection_results
+    )
+    selected_candidate_id = (
+        forward_candidate_id
+        if forward_candidate_id is not None
+        and forward_candidate_id == reverse_candidate_id
+        else None
+    )
+    return RAGConsensusResult(
+        selected_candidate_id=selected_candidate_id,
+        forward_candidate_id=forward_candidate_id,
+        reverse_candidate_id=reverse_candidate_id,
+    )
 
 
 def stable_canary_bucket(key: str) -> int:

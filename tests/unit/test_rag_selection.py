@@ -151,11 +151,21 @@ async def test_selector_assessment_records_bounded_choice(monkeypatch, mode):
     class _Selector:
         rag_selector_id = "selector-test-v1"
 
+        def __init__(self):
+            self.candidate_orders = []
+
         async def select_rag_answer(self, **kwargs):
             assert len(kwargs["candidates"]) == 2
-            return RAGSelectionResult(selected_candidate_id="candidate-2")
+            self.candidate_orders.append(
+                tuple(candidate.candidate_id for candidate in kwargs["candidates"])
+            )
+            return RAGSelectionResult(
+                selected_candidate_id="candidate-2",
+                directly_answers=True,
+            )
 
-    monkeypatch.setattr(runner, "_get_llm_or_none", lambda: _Selector())
+    selector = _Selector()
+    monkeypatch.setattr(runner, "_get_llm_or_none", lambda: selector)
     result = KnowledgeRetrievalResult(
         hits=(
             _hit(1, "First approved answer.", 0.91),
@@ -177,6 +187,88 @@ async def test_selector_assessment_records_bounded_choice(monkeypatch, mode):
     assert not hasattr(assessment, "reply_text")
     assert assessment.selector_version == "selector-test-v1"
     assert assessment.method == f"selector_{mode}"
+    assert selector.candidate_orders == [
+        ("candidate-1", "candidate-2"),
+        ("candidate-2", "candidate-1"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "results",
+    [
+        (
+            RAGSelectionResult(selected_candidate_id="candidate-1", directly_answers=True),
+            RAGSelectionResult(selected_candidate_id="candidate-2", directly_answers=True),
+        ),
+        (
+            RAGSelectionResult(selected_candidate_id="candidate-1", directly_answers=True),
+            RAGSelectionResult(selected_candidate_id=None),
+        ),
+        (
+            RAGSelectionResult(
+                selected_candidate_id="candidate-1",
+                directly_answers=True,
+                has_conflict=True,
+            ),
+            RAGSelectionResult(selected_candidate_id="candidate-1", directly_answers=True),
+        ),
+    ],
+)
+async def test_selector_requires_two_safe_matching_choices(monkeypatch, results):
+    class _Selector:
+        rag_selector_id = "selector-test-v2"
+
+        def __init__(self):
+            self.results = iter(results)
+
+        async def select_rag_answer(self, **kwargs):
+            return next(self.results)
+
+    monkeypatch.setattr(runner, "_get_llm_or_none", lambda: _Selector())
+    result = KnowledgeRetrievalResult(
+        hits=(
+            _hit(1, "First approved answer.", 0.91),
+            _hit(2, "Second approved answer.", 0.88),
+        ),
+        vector_hits=(),
+    )
+
+    assessment = await runner._assess_with_rag_selector(
+        _snapshot(),
+        result,
+        mode="live",
+        canary_bps=10000,
+    )
+
+    assert assessment.enabled is True
+    assert assessment.selected is None
+    assert assessment.method == "selector_live_abstain"
+
+
+@pytest.mark.asyncio
+async def test_ineligible_match_records_candidates_without_calling_selector(monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "_get_llm_or_none",
+        lambda: pytest.fail("selector must only run for low-margin ambiguous matches"),
+    )
+    result = KnowledgeRetrievalResult(
+        hits=(_hit(1, "Approved answer.", 0.91),),
+        vector_hits=(_hit(1, "Approved answer.", 0.91),),
+    )
+
+    assessment = await runner._assess_with_rag_selector(
+        _snapshot(),
+        result,
+        mode="live",
+        canary_bps=10000,
+        eligible=False,
+    )
+
+    assert assessment.enabled is False
+    assert len(assessment.candidates) == 1
+    assert assessment.method == "legacy_top1"
 
 
 @pytest.mark.asyncio
@@ -277,7 +369,8 @@ async def test_non_exact_selector_never_receives_official_contact_candidate(monk
                 ordinary.reply
             ]
             return RAGSelectionResult(
-                selected_candidate_id=kwargs["candidates"][0].candidate_id
+                selected_candidate_id=kwargs["candidates"][0].candidate_id,
+                directly_answers=True,
             )
 
     monkeypatch.setattr(runner, "_get_llm_or_none", lambda: _Selector())

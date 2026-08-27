@@ -24,6 +24,9 @@ class RAGCandidate:
 @dataclass(frozen=True)
 class RAGSelectionResult:
     selected_candidate_id: str | None
+    directly_answers: bool = False
+    requires_case_specific_data: bool = False
+    has_conflict: bool = False
 
 
 @dataclass(frozen=True)

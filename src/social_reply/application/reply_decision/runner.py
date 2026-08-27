@@ -43,6 +43,7 @@ from social_reply.application.reply_decision.rag_selection import (
     RAGCandidateOption,
     build_rag_candidates,
     rag_evidence,
+    select_rag_answer_with_consensus,
     selector_is_enabled,
 )
 from social_reply.domain.knowledge.embeddings import EmbeddingClient, OpenAIEmbeddingClient
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PERSONA = ResolvedPersona(text=DEFAULT_PERSONA, revision=None)
 _MULTILINGUAL_SENTINEL_VERSION = "approved-verbatim-v1"
 _MULTILINGUAL_GATE_VERSION = "strong-gate-v1"
-_RAG_SELECTOR_GATE_VERSION = "selector-gate-v2"
+_RAG_SELECTOR_GATE_VERSION = "selector-gate-v3"
 
 _llm: LLMClient | None = None
 
@@ -271,6 +272,7 @@ async def _assess_with_rag_selector(
     *,
     mode: str,
     canary_bps: int,
+    eligible: bool = True,
 ) -> RAGSelectorAssessment:
     candidates = build_rag_candidates(result)
     enabled, bucket = selector_is_enabled(
@@ -308,6 +310,13 @@ async def _assess_with_rag_selector(
             method=OFFICIAL_CONTACT_REVIEW_METHOD,
         )
     candidates = selector_candidates
+    if not eligible:
+        return RAGSelectorAssessment(
+            candidates=candidates,
+            enabled=False,
+            bucket=bucket,
+            method="legacy_top1",
+        )
     if not enabled or not candidates:
         method = "selector_canary_off" if mode in {"shadow", "live"} else "legacy_top1"
         return RAGSelectorAssessment(
@@ -326,16 +335,14 @@ async def _assess_with_rag_selector(
             method=f"selector_{mode}_abstain",
         )
     started = time.perf_counter()
-    try:
-        result_value = await selector(
-            query=snapshot.text or "",
-            candidates=tuple(candidate.to_llm_candidate() for candidate in candidates),
-        )
-    except Exception:
-        logger.exception("RAG selector raised unexpectedly; treating as abstain")
-        result_value = None
+    llm_candidates = tuple(candidate.to_llm_candidate() for candidate in candidates)
+    consensus = await select_rag_answer_with_consensus(
+        selector=selector,
+        query=snapshot.text or "",
+        candidates=llm_candidates,
+    )
     latency_ms = (time.perf_counter() - started) * 1000
-    selected_id = result_value.selected_candidate_id if result_value is not None else None
+    selected_id = consensus.selected_candidate_id
     selected = next(
         (candidate for candidate in candidates if candidate.candidate_id == selected_id),
         None,
@@ -824,6 +831,10 @@ async def run_and_persist_decision(
                     knowledge_result,
                     mode=settings.rag_selector_mode,
                     canary_bps=settings.rag_selector_canary_bps,
+                    eligible=(
+                        legacy_assessment.status == "ambiguous"
+                        and not knowledge_result.exact_ambiguous
+                    ),
                 )
                 if gate_evaluated
                 else RAGSelectorAssessment(candidates=(), enabled=False, bucket=0)

@@ -657,7 +657,10 @@ async def test_live_selector_can_choose_non_top1_above_similarity_floor(session,
 
         async def select_rag_answer(self, **kwargs):
             assert len(kwargs["candidates"]) == 2
-            return RAGSelectionResult(selected_candidate_id="candidate-2")
+            return RAGSelectionResult(
+                selected_candidate_id="candidate-2",
+                directly_answers=True,
+            )
 
         async def decide(self, context):
             assert len(context.knowledge) == 1
@@ -692,7 +695,7 @@ async def test_live_selector_can_choose_non_top1_above_similarity_floor(session,
     assert decision.action == "auto_reply"
     assert decision.reply_text == "验证需要 7 天。"
     assert decision.knowledge_content_hash == "b" * 64
-    assert decision.knowledge_gate_version == "selector-gate-v2"
+    assert decision.knowledge_gate_version == "selector-gate-v3"
     assert decision.knowledge_similarity == 0.90
     assert decision.knowledge_similarity_margin == pytest.approx(0.05)
     assert decision.selector_version == "selector-test-v1"
@@ -701,6 +704,95 @@ async def test_live_selector_can_choose_non_top1_above_similarity_floor(session,
     assert "Refunds take" not in evidence_text
     assert "Verification takes" not in evidence_text
     assert "验证需要" not in evidence_text
+
+
+async def test_live_selector_is_not_called_for_high_margin_match(session, knowledge_enabled):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("RAG_SELECTOR_MODE", "live")
+    knowledge_enabled.setenv("RAG_SELECTOR_CANARY_BPS", "10000")
+    get_settings.cache_clear()
+
+    class HighMarginLLM:
+        rag_verifier_id = "verifier-test-v2"
+
+        async def select_rag_answer(self, **kwargs):
+            raise AssertionError("high-margin matches must bypass the selector")
+
+        async def decide(self, context):
+            assert "Refunds take 3–5 business days." in context.knowledge[0]
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Refunds take 3–5 business days.",
+                confidence=0.99,
+            )
+
+        async def verify_rag_answer(self, **kwargs):
+            return RAGVerificationResult(relevant=True, faithful=True)
+
+    runner._llm = HighMarginLLM()
+    result = _multilingual_result(similarity=0.95, second_similarity=0.80)
+
+    async def fake_fetch(snapshot, **kwargs):
+        return result
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "How long does a refund take?"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action in {"auto_reply", "draft"}
+    assert decision.knowledge_gate_version == "strong-gate-v1"
+    assert decision.rag_evidence["selection_method"] == "legacy_top1"
+
+
+async def test_live_selector_disagreement_handoffs_without_generation(
+    session,
+    knowledge_enabled,
+):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("RAG_SELECTOR_MODE", "live")
+    knowledge_enabled.setenv("RAG_SELECTOR_CANARY_BPS", "10000")
+    get_settings.cache_clear()
+
+    class DisagreeingSelectorLLM:
+        rag_selector_id = "selector-test-v2"
+
+        def __init__(self):
+            self.selected_ids = iter(("candidate-1", "candidate-2"))
+
+        async def select_rag_answer(self, **kwargs):
+            return RAGSelectionResult(
+                selected_candidate_id=next(self.selected_ids),
+                directly_answers=True,
+            )
+
+        async def decide(self, context):
+            raise AssertionError("generation must not run after selector disagreement")
+
+    runner._llm = DisagreeingSelectorLLM()
+    result = _multilingual_result(similarity=0.95, second_similarity=0.90)
+
+    async def fake_fetch(snapshot, **kwargs):
+        return result
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "How long does this take?"
+    account_id, conv_id, msg_id = await _seed_conversation(session, text)
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text), conv_id, msg_id, account_id
+    )
+
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert decision.reason_codes == ["RAG_SELECTOR_ABSTAIN"]
+    assert decision.rag_evidence["selection_method"] == "selector_live_abstain"
 
 
 @pytest.mark.parametrize(

@@ -1046,6 +1046,7 @@ async def test_public_send_binds_direct_and_approval_payloads(session):
     ("gate_version", "margin", "expected"),
     [
         ("selector-gate-v2", -1.0, None),
+        ("selector-gate-v3", -1.0, None),
         ("strong-gate-v1", None, None),
         ("strong-gate-v1", 0.01, "MULTILINGUAL_PROVENANCE_INVALID"),
         ("unknown-gate", 1.0, "MULTILINGUAL_PROVENANCE_INVALID"),

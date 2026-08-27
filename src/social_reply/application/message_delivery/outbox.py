@@ -672,7 +672,10 @@ async def _public_bot_send_preflight(
                 )
             ):
                 return "MULTILINGUAL_PROVENANCE_INVALID"
-        elif decision.knowledge_gate_version != "selector-gate-v2":
+        elif decision.knowledge_gate_version not in {
+            "selector-gate-v2",
+            "selector-gate-v3",
+        }:
             return "MULTILINGUAL_PROVENANCE_INVALID"
 
     knowledge_identity = (
