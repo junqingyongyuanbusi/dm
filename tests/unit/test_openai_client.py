@@ -5,7 +5,7 @@ import pytest
 
 from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import ReplyAction, RiskLevel, Visibility
-from social_reply.domain.reply.llm import LLMContext, RAGCandidate
+from social_reply.domain.reply.llm import LLMContext, RAGCandidate, RAGSelectionResult
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 
 _CTX = LLMContext(text="你们几点营业？", conversation_key="cw:1:2")
@@ -450,6 +450,64 @@ async def test_rag_selector_accepts_only_an_allowlisted_candidate():
     assert result.directly_answers is True
     assert result.requires_case_specific_data is False
     assert result.has_conflict is False
+
+
+@pytest.mark.asyncio
+async def test_rag_selector_treats_general_safety_limitations_as_direct_answers():
+    safety_candidates = (
+        RAGCandidate(
+            candidate_id="candidate-score-limit",
+            question=(
+                "If a broker has a high score on WikiFX, does that mean 100% no scam risk?"
+            ),
+            approved_answer=(
+                "A high score does not eliminate risk and should not be treated as a safety "
+                "guarantee."
+            ),
+            similarity=0.77,
+        ),
+        RAGCandidate(
+            candidate_id="candidate-paid-score",
+            question="Can a broker pay to increase its WikiFX score?",
+            approved_answer=(
+                "Ratings should be evaluated independently from advertising activity."
+            ),
+            similarity=0.74,
+        ),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        system_prompt = payload["messages"][0]["content"]
+        assert "correcting the user's premise" in system_prompt
+        assert "does not need to give a binary safe-or-unsafe conclusion" in system_prompt
+        assert "requires_case_specific_data=true only" in system_prompt
+        assert "cannot establish the safety of a specific broker" in system_prompt
+        assert "Never infer that a specific broker is safe" in system_prompt
+        return _completion_response(
+            json.dumps(
+                {
+                    "selected_candidate_id": "candidate-score-limit",
+                    "directly_answers": True,
+                    "requires_case_specific_data": False,
+                    "has_conflict": False,
+                }
+            )
+        )
+
+    client = _client(handler)
+    result = await client.select_rag_answer(
+        query="この業者、WikiFXで6点台なんだけど、使っても平気？",
+        candidates=safety_candidates,
+    )
+
+    assert client.rag_selector_id == "rag-selector-v3:gpt-4o-mini"
+    assert result == RAGSelectionResult(
+        selected_candidate_id="candidate-score-limit",
+        directly_answers=True,
+        requires_case_specific_data=False,
+        has_conflict=False,
+    )
 
 
 @pytest.mark.asyncio
