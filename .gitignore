@@ -9,6 +9,7 @@ dist/
 .run/
 .secrets/
 .serena/
+.spec-workflow/
 .worktrees/
 
 # Pi project runtime/install state; keep reviewed prompts, skills, settings, and extension source.

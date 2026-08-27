@@ -17,6 +17,7 @@ from social_reply.connectors.feishu.router import router as feishu_router
 from social_reply.connectors.meta.router import router as meta_router
 from social_reply.connectors.telegram.router import router as telegram_router
 from social_reply.shared.config import Settings, get_settings
+from social_reply.shared.logging import configure_safe_http_client_logging
 
 _X_OAUTH_CALLBACK_PATH = "/admin/oauth/x/callback"
 _OAUTH_CALLBACK_PATHS = {
@@ -70,6 +71,7 @@ def _install_application_logging() -> None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    configure_safe_http_client_logging()
     _install_access_log_redaction()
     _install_application_logging()
     app = FastAPI(title="Reply Core")

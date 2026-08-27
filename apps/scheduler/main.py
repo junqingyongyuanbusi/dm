@@ -31,6 +31,7 @@ from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision.jobs import sweep_decision_jobs
 from social_reply.infrastructure.queue.actor_loop import submit_on_actor_loop
 from social_reply.shared.config import Settings, get_settings
+from social_reply.shared.logging import configure_safe_http_client_logging
 
 Lane = Literal["core", "inspection"]
 Sweep = Callable[[], Coroutine[Any, Any, list[Any]]]
@@ -56,6 +57,7 @@ def _configure_logging() -> None:
         handlers=(stdout_handler, stderr_handler),
         force=True,
     )
+    configure_safe_http_client_logging()
 
 
 @dataclass(frozen=True)
