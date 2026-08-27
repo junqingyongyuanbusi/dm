@@ -106,6 +106,30 @@ _CURRENCY_PATTERNS = (
 _PROTECTED_ENTITY = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Z]{2,}\d*s?|[A-Z][a-z]+[A-Z][A-Za-z]*)(?![A-Za-z])"
 )
+# Uppercase prose is frequently used for emphasis in approved answers (for example,
+# "NEVER" or "SCAM"). Only well-known technical acronyms are protected implicitly;
+# tenant-specific uppercase names must be declared through ``protected_values``.
+_IMPLICITLY_PROTECTED_ACRONYMS = frozenset(
+    {
+        "AI",
+        "AML",
+        "API",
+        "CPU",
+        "EA",
+        "GPU",
+        "HTTP",
+        "HTTPS",
+        "IP",
+        "KYC",
+        "LLM",
+        "OTP",
+        "RAG",
+        "SDK",
+        "URL",
+        "VPN",
+        "VPS",
+    }
+)
 _FACT_SEPARATOR = re.compile(r"(?i)\b(?:and|or|ou|y|e)\b|[;,，；]|或|和|以及")
 
 
@@ -229,6 +253,11 @@ def protected_entities(
         entity
         for entity in (_normalize_entity(match) for match in _PROTECTED_ENTITY.findall(text))
         if entity not in {"USD", "EUR", "GBP", "CNY", "RMB", "JPY", "USDT"}
+        and (
+            entity in _IMPLICITLY_PROTECTED_ACRONYMS
+            or any(character.isdigit() for character in entity)
+            or not entity.isupper()
+        )
     ]
     knowledge_entities = [
         value

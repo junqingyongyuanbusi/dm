@@ -473,6 +473,40 @@ def test_acronym_entities_are_extracted_without_ascii_word_boundaries():
     assert set(protected_entities("MT4 と MT5 に対応しています")) == {"MT4", "MT5"}
 
 
+def test_uppercase_emphasis_words_are_not_treated_as_protected_entities():
+    assert protected_entities("MAJOR SCAM RED FLAG. Regulated brokers will NEVER ask.") == ()
+
+
+def test_explicit_uppercase_protected_value_remains_protected():
+    assert protected_entities(
+        "Use ACME for this workflow.",
+        protected_values=("ACME",),
+    ) == ("ACME",)
+
+
+def test_translation_can_localize_uppercase_emphasis_words():
+    approved_reply = (
+        "Yes, this is a classic forex scam tactic! Regulated brokers will NEVER ask "
+        "clients to pay separate taxes, unfreeze fees, or security deposits prior to "
+        "withdrawal. Stop transferring money and report to local police."
+    )
+    translated_reply = (
+        "これは典型的なFX詐欺の手口です。規制されたブローカーが、出金前に別途税金、"
+        "凍結解除手数料、保証金の支払いを求めることはありません。送金を止め、"
+        "地元の警察に相談してください。"
+    )
+
+    result = run_final_guard(
+        ReplyDecision(action=ReplyAction.AUTO_REPLY, reply_text=translated_reply),
+        "feishu",
+        expected_reply_language="ja",
+        approved_knowledge_reply=approved_reply,
+        customer_text="出金前に税金を払う必要がありますか？",
+    )
+
+    assert result.action is ReplyAction.AUTO_REPLY, result.reason_codes
+
+
 @pytest.mark.parametrize(
     "template",
     ("support@example.com", "https://support.example.com/contact"),
