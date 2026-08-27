@@ -140,7 +140,7 @@ _NAV_GROUPS = (
         "内容与策略",
         (
             ("knowledge", "/admin/content/knowledge", "知识库"),
-            ("brand-voice", "/admin/content/brand-voice", "品牌语气"),
+            ("reply-prompt", "/admin/content/reply-prompt", "业务 Prompt"),
         ),
     ),
     (

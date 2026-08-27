@@ -28,7 +28,7 @@ _CONTRACT_PROMPT_ANCHORS = (
     "short service numbers in contact context",
     "deterministically approved verbatim knowledge template",
     "Model-generated, copied, or modified contact details require handoff",
-    "code-compiled voice preferences may influence only brand voice, tone, and localization",
+    "Tenant business instructions may influence response priorities, explanations, tone",
     "auto_reply means send now",
     "draft means human review only",
     "Any high-risk case must use handoff",

@@ -15,6 +15,8 @@ _ENV_KEYS = [
     "CONTROL_API_KEY",
     "LLM_PROVIDER",
     "OPENAI_API_KEY",
+    "PROMPT_VERSION",
+    "REPLY_BUSINESS_PROMPT_ENABLED",
     "PLATFORM_SECRET_KEYS",
     "X_API_KEY",
     "X_API_SECRET",
@@ -149,7 +151,8 @@ def test_testing_true_默认值可用() -> None:
     assert settings.openai_base_url == "https://api.openai.com/v1"
     assert settings.openai_model == "gpt-4o-mini"
     assert settings.openai_timeout_seconds == 30.0
-    assert settings.prompt_version == "v1-wikifx-multilingual"
+    assert settings.prompt_version == "v2-editable-business-prompt"
+    assert settings.reply_business_prompt_enabled is False
     assert settings.x_legacy_dm_enabled is True
     assert settings.x_activity_enabled is True
     assert settings.xchat_enabled is True
@@ -413,21 +416,21 @@ def test_local_environment_template_disables_future_platforms() -> None:
 def test_email_documentation_and_migration_head_contract() -> None:
     root = Path(__file__).resolve().parents[2]
     assert _configuration_email_keys(root / "docs/configuration.md") == set(_EMAIL_ENV_DEFAULTS)
-    assert _migration_heads(root / "migrations/versions") == {"a7c3e9d1b624"}
+    assert _migration_heads(root / "migrations/versions") == {"b9d5e2f7c314"}
 
     production_migration = (root / "docs/production-migration.md").read_text()
     docs_readme = (root / "docs/README.md").read_text()
     root_readme = (root / "README.md").read_text()
     assert re.search(
-        r"current Alembic graph has one head: `a7c3e9d1b624`",
+        r"current Alembic graph has one head: `b9d5e2f7c314`",
         production_migration,
     )
     assert re.search(
-        r"Alembic graph has one current head:\s*`a7c3e9d1b624`",
+        r"Alembic graph has one current head:\s*`b9d5e2f7c314`",
         docs_readme,
     )
     assert re.search(
-        r"current revision 等于唯一 head `a7c3e9d1b624`",
+        r"current revision 等于唯一 head `b9d5e2f7c314`",
         root_readme,
     )
 

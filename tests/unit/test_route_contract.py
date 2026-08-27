@@ -28,7 +28,7 @@ def test_external_protocol_and_admin_routes_remain_stable() -> None:
 
     current_pages = {
         "/admin/content/knowledge",
-        "/admin/content/brand-voice",
+        "/admin/content/reply-prompt",
         "/admin/integrations/accounts",
         "/admin/integrations/accounts/new/{provider}",
         "/admin/integrations/provisioning-jobs/{job_id}",
@@ -39,6 +39,7 @@ def test_external_protocol_and_admin_routes_remain_stable() -> None:
     }
     legacy_pages = {
         "/admin/knowledge",
+        "/admin/content/brand-voice",
         "/admin/prompt",
         "/admin/accounts",
         "/admin/jobs/{job_id}",

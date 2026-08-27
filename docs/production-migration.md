@@ -31,11 +31,18 @@ succeeded.
 
 Revision `b9d5e2f7c314` is additive after `a7c3e9d1b624`. It creates the active Tenant + Brand
 `reply_business_prompts` pointer, immutable `reply_business_prompt_versions` history, and nullable
-Prompt version/hash provenance on `reply_decisions`. Existing `reply_prompts.persona` rows are safe
-code-compiled compatibility projections after the earlier governance migration; this revision
-copies each current projection into one immutable business-Prompt version without re-enabling the
-legacy arbitrary persona sink. Scopes without an existing row continue to use the code-owned
-default until their first Admin save.
+Prompt version/hash provenance on `reply_decisions`. The revision recompiles each existing
+`reply_prompts.voice_preferences` value through the finite code-owned mapping and copies that safe
+projection into one immutable business-Prompt version; it never executes or copies the legacy
+free-text `persona` column. Scopes without an existing row continue to use the code-owned default
+until their first Admin save.
+
+The migration takes a `SHARE ROW EXCLUSIVE` lock on `reply_prompts` before reading the backfill and
+installs a fail-closed trigger before releasing that lock. After the migration commits, legacy
+`reply_prompts` inserts, updates and deletes are rejected. This prevents a draining predecessor API
+from silently saving a legacy voice revision after the immutable backfill snapshot. The new Admin
+page writes only `reply_business_prompt_versions` and `reply_business_prompts`; the frozen legacy
+table remains a read-only compatibility projection for disabled target and predecessor runtimes.
 
 Deploy the target image and schema first with the following value explicit and identical on API,
 Worker and Scheduler:
@@ -47,23 +54,64 @@ REPLY_BUSINESS_PROMPT_ENABLED=false
 The API-owned database preparation may then advance PostgreSQL to `b9d5e2f7c314`; Worker and
 Scheduler readiness must confirm the same head. Verify `/admin/content/reply-prompt` displays the
 backfilled current text and that trial mode creates no `ReplyDecision` or `OutboxMessage`. To
-activate, set `REPLY_BUSINESS_PROMPT_ENABLED=true` on all three services before a coordinated
-API -> Worker -> Scheduler redeploy. Configuration validation rejects a missing, partial or
-cross-role-divergent value.
+activate, run `scripts/set_reply_business_prompt_gate.sh --enable`. It stages the same value on all
+three services, validates the stored configuration, then forces a coordinated Worker -> Scheduler
+-> API redeploy on the already verified digest. Keeping API last prevents Admin approval from
+creating Prompt-derived public work while an old disabled Worker is still active. Configuration
+validation rejects a missing, partial or cross-role-divergent value. Do not activate by editing and
+redeploying one service at a time. Every role transition records the old deployment IDs, waits for
+the replacement to become `SUCCESS`, then waits until every replaced deployment is `REMOVED` with
+`deploymentStopped=true`. `REMOVING` is non-terminal. The gate script does not advance to the next
+role or write its completion manifest while a same-digest process with the previous gate value can
+still finish work. Deployment runtime checks paginate the complete Railway deployment history and
+fail closed on an incomplete page or invalid cursor; they do not infer drain completion from the
+latest 100 status records.
 
 Once enabled, Admin saves are immediately visible to new generation. A scope advisory lock and
 optimistic revision prevent concurrent lost updates. Decision persistence rejects an old loaded
 version before creating a public Outbox, and delivery cancels a queued old-version Outbox with
-`STALE_REPLY_BUSINESS_PROMPT` before provider I/O. A send that already passed preflight is external
-I/O and cannot be recalled.
+`STALE_REPLY_BUSINESS_PROMPT` before provider I/O. Every new decision records the active Prompt
+epoch, including deterministic rules and approved knowledge paths, so gate activation also rejects
+legacy pending decisions without provenance. Delivery holds the same Tenant + Brand Prompt lock
+from preflight through provider I/O; a save that commits first makes delivery observe the new epoch,
+while a send that acquired the lock first finishes before the Admin save can commit and report the
+new version as active. The immutable system contract remains higher priority than the editable
+business policy encoded together with the current customer message as lower-authority structured
+`user` data supplied only to primary reply generation.
 
-Application rollback keeps PostgreSQL at `b9d5e2f7c314`: first set the shared gate to `false`, then
-use the migration-compatible predecessor image. The predecessor ignores the additive tables and
-continues from its last code-compiled `reply_prompts` projection; new business-Prompt edits are not
-silently copied back into that compatibility column. Alembic downgrade is allowed only while every
-version was created by the migration backfill. After any Admin save or rollback creates audit
-history, schema downgrade fails before dropping the tables; retain the additive schema or restore a
-reviewed pre-migration backup.
+The target image advertises
+`com.nexory.reply-core.business-prompt-contract=editable-business-prompt-v1`. A predecessor without
+that label is normalized to `legacy`, and its migration-compatible image preserves the predecessor
+capability label. This registry evidence, rather than assumptions about local Git history, decides
+whether rollback retirement is required.
+
+Application rollback keeps PostgreSQL at `b9d5e2f7c314` and must use
+`scripts/rollback_railway_migration_compatible.sh`. For an
+`editable-business-prompt-v1 -> legacy` transition after activation, that script first runs
+`scripts/set_reply_business_prompt_gate.sh --disable`. The still-current target API then retires
+every unsent Prompt-derived public reply, draft private note and approved-draft delivery, rejects
+pending drafts, moves affected active Bot conversations to human handoff, and records audit
+evidence. During an incomplete first release where the shared gate is still false and target API is
+not active, the script records that activation never occurred instead of trying to invoke a CLI in
+the predecessor image. Only after one of these states is fsync-written to the trusted release
+workspace as `dist/rollback-<sha>-business-prompt-retirement.json` does rollback retag `latest` and
+deploy the migration-compatible predecessor. Preserve this file together with the supplied release
+manifest; cross-host resume requires both files. While any target-capable deployment remains
+active, rollback never trusts an older local retirement file: it reruns the idempotent database scan
+and replaces the evidence. Evidence is reused only after all target runtimes are unavailable and the
+stored gate is false, so a restored and re-enabled target cannot make old evidence silently valid
+again. A retry after retagging never tries to run the new retirement CLI inside the legacy
+compatibility image. A `SENDING` row or incomplete retirement aborts before the image changes.
+
+The predecessor ignores the additive tables and continues from its last code-compiled
+`reply_prompts` projection; new business-Prompt edits are not silently copied back into that
+compatibility column. Alembic downgrade is allowed only when there is no decision Prompt provenance
+and every version was created by the migration backfill. After the feature has produced a decision,
+or any Admin save/rollback creates audit history, schema downgrade fails before dropping the tables;
+retain the additive schema or restore a reviewed pre-migration backup. The downgrade acquires
+`ACCESS EXCLUSIVE` locks on the decision, Prompt-version, active-pointer and legacy Prompt tables
+before evaluating either guard, preventing concurrent inserts from committing between the safety
+check and destructive DDL.
 
 ## Reply review and RAG provenance revision
 
@@ -115,6 +163,11 @@ Every resume re-reads GHCR `latest` plus the active API, Worker and Scheduler di
 four-value state, along with the recorded manifest phase, to `scripts/release_rollout_state.py`.
 Only its nine monotonic checkpoints are accepted. A state that skips a role, reverses target and
 compatibility order, contains an unrelated digest, or is behind the recorded phase fails closed.
+When the observed digest checkpoint is ahead of the recorded manifest after an interrupted
+deployment, the release script first waits for every replaced deployment to stop and verifies one
+active deployment per role before advancing the manifest or changing the next role. The bridge
+loop never writes `completed`; only the final digest, drain, configuration, region and health
+verification may do so.
 Each of the two `latest` retags compares the observed source digest immediately before mutation and
 verifies the resulting digest immediately afterward.
 

@@ -42,6 +42,15 @@ from social_reply.application.account_management.human_workflow import (
 )
 from social_reply.application.account_management.jobs import provisioning_job_is_in_flight
 from social_reply.application.account_management.oauth.common import notice
+from social_reply.application.account_management.reply_prompt_policy import (
+    ReplyBusinessPromptConflict,
+    ReplyBusinessPromptScopeError,
+    list_reply_prompt_brands,
+    list_reply_prompt_versions,
+    load_current_reply_business_prompt,
+    rollback_reply_business_prompt,
+    save_reply_business_prompt,
+)
 from social_reply.application.account_management.service import enable_xchat_for_account
 from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.application.knowledge.drafts import (
@@ -65,11 +74,6 @@ from social_reply.application.message_delivery.intents import (
     OutboxOrigin,
     create_or_get_outbox_intent,
 )
-from social_reply.application.reply_decision.persona import (
-    compile_voice_preferences,
-    load_persona,
-    parse_voice_preferences,
-)
 from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL, FEISHU_GROUP_MODE
 from social_reply.domain.automation.state_machine import (
     AutomationStateEnum,
@@ -77,17 +81,14 @@ from social_reply.domain.automation.state_machine import (
     flip_to_human_active,
 )
 from social_reply.domain.platform_accounts import capability_text_limit
+from social_reply.domain.reply.business_prompt import (
+    BUSINESS_PROMPT_MAX_CHARS,
+    BusinessPromptValidationError,
+)
 from social_reply.domain.reply.guard import has_contact_like, redact_pii
 from social_reply.domain.reply.language import assess_knowledge_language
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.domain.reply.openai_client import CONTRACT_PROMPT
-from social_reply.domain.reply.voice import (
-    VOICE_PREFERENCE_FIELDS,
-    VoiceEmoji,
-    VoiceEmpathy,
-    VoiceLength,
-    VoiceTone,
-)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
@@ -2065,6 +2066,14 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
         account = await session.get(models.PlatformAccount, conv.platform_account_id)
         if account is None or account.tenant_id != decision.tenant_id:
             raise HTTPException(status_code=409, detail="decision_tenant_scope_mismatch")
+        if (
+            decision.reply_business_prompt_content_hash is not None
+            and not get_settings().reply_business_prompt_enabled
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="draft_business_prompt_disabled",
+            )
         review_action = "ACCEPTED" if final_text == original_text else "EDITED"
         current_review_action = decision.review_action or "PENDING"
         if current_review_action in {"ACCEPTED", "EDITED"}:
@@ -2939,139 +2948,217 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
     )
 
 
-# ---------- 提示词品牌表达偏好 ----------
+# ---------- Editable reply business prompt ----------
 
 _PROMPT_BANNERS = {
-    "saved": ("ok", "结构化品牌语气偏好已保存，下一条 LLM 决策立即生效。"),
-    "voice_preferences_invalid": ("err", "品牌语气偏好无效，请只选择页面提供的选项。"),
+    "saved": ("ok", "业务 Prompt 已保存为新版本；启用开关时，下一次模型生成立即使用。"),
+    "rolled_back": ("ok", "历史内容已复制为新的活动版本。"),
+    "revision_conflict": ("err", "Prompt 已被其他管理员更新，请刷新后重新编辑。"),
+    "prompt_invalid": ("err", "Prompt 无效：不能为空、超过长度，或包含联系方式/疑似凭据。"),
+    "brand_invalid": ("err", "Brand 不存在或不属于当前 Tenant。"),
 }
-
-_VOICE_UI = {
-    "tone": (
-        "语气",
-        (
-            (VoiceTone.PROFESSIONAL.value, "专业"),
-            (VoiceTone.WARM.value, "温暖"),
-            (VoiceTone.FORMAL.value, "正式"),
-        ),
-    ),
-    "length": (
-        "篇幅",
-        (
-            (VoiceLength.CONCISE.value, "简洁"),
-            (VoiceLength.BALANCED.value, "均衡"),
-        ),
-    ),
-    "empathy": (
-        "同理心",
-        (
-            (VoiceEmpathy.STANDARD.value, "标准"),
-            (VoiceEmpathy.HIGH.value, "高同理心"),
-        ),
-    ),
-    "emoji": (
-        "Emoji",
-        (
-            (VoiceEmoji.NEVER.value, "不使用"),
-            (VoiceEmoji.SPARINGLY.value, "少量使用"),
-        ),
-    ),
-}
-
-
-def _voice_select(name: str, current: str) -> str:
-    field_label, field_options = _VOICE_UI[name]
-    options = "".join(
-        f'<option value="{value}"{" selected" if value == current else ""}>{label}</option>'
-        for value, label in field_options
-    )
-    return (
-        f'<label for="f-{name}">{field_label}</label>'
-        f'<select id="f-{name}" name="{name}" required>{options}</select>'
-    )
 
 
 def _prompt_tenant(principal: Principal, requested: str) -> str:
     return tenant_id_or_default(principal, requested)
 
 
+def _prompt_location(tenant_id: str, brand_id: str, *, notice: str = "") -> str:
+    parameters = {"tenant_id": tenant_id, "brand_id": brand_id}
+    if notice:
+        parameters["notice"] = notice
+    return f"/admin/content/reply-prompt?{urlencode(parameters)}"
+
+
+def _prompt_expected_revision(form: dict[str, str]) -> int:
+    try:
+        value = int(form.get("expected_revision", ""))
+    except ValueError as exc:
+        raise ReplyBusinessPromptConflict("reply_business_prompt_revision_conflict") from exc
+    if value < 0:
+        raise ReplyBusinessPromptConflict("reply_business_prompt_revision_conflict")
+    return value
+
+
+def _render_prompt_trial(decision) -> str:
+    rows = "".join(
+        f"<tr><td class='muted'>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>"
+        for label, value in (
+            ("动作", decision.action.value),
+            ("意图", decision.intent or "—"),
+            ("风险", decision.risk_level.value),
+            ("置信度", f"{decision.confidence:.2f}"),
+            ("原因码", ",".join(decision.reason_codes) or "—"),
+        )
+    )
+    reply = decision.reply_text or ""
+    reply_block = (
+        f"<div class='msg out' style='margin-top:10px'>{html.escape(reply)}</div>"
+        if reply
+        else "<p class='muted'>该动作不产生回复文本。</p>"
+    )
+    return (
+        '<div class="banner info" style="margin-top:14px">试运行结果仅展示，不写入数据库、'
+        "不创建 Outbox、不发送。</div>"
+        f'<div class="tablewrap"><table><tbody>{rows}</tbody></table></div>{reply_block}'
+    )
+
+
+def _render_prompt_version_row(
+    version,
+    *,
+    csrf: str,
+    tenant_id: str,
+    brand_id: str,
+    expected_revision: int,
+) -> str:
+    active_badge = '<span class="pill ok">当前</span>' if version.is_active else ""
+    rollback_form = (
+        ""
+        if version.is_active
+        else _rollback_prompt_form(
+            csrf,
+            tenant_id,
+            brand_id,
+            expected_revision,
+            version.id,
+        )
+    )
+    return (
+        f"<tr><td>r{version.revision} {active_badge}</td>"
+        "<td><details><summary>查看内容</summary><pre style='white-space:pre-wrap'>"
+        f"{html.escape(version.content)}</pre></details></td>"
+        f"<td>{html.escape(version.change_note or '—')}</td>"
+        f"<td>{html.escape(version.created_by)}<br><span class='muted'>"
+        f"{_fmt(version.created_at)} · {version.content_hash[:12]}</span></td>"
+        f"<td>{rollback_form}</td></tr>"
+    )
+
+
+async def _reply_prompt_page_response(
+    request: Request,
+    principal: Principal,
+    *,
+    tenant_id: str,
+    brand_id: str,
+    notice: str = "",
+    trial_result: str = "",
+) -> Response:
+    csrf = _csrf(request)
+    async with get_session_factory()() as session:
+        try:
+            resolved = await load_current_reply_business_prompt(session, tenant_id, brand_id)
+        except ReplyBusinessPromptScopeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        brands = await list_reply_prompt_brands(session, tenant_id)
+        versions = await list_reply_prompt_versions(session, tenant_id, brand_id)
+
+    banner = ""
+    if notice in _PROMPT_BANNERS:
+        tone, text = _PROMPT_BANNERS[notice]
+        banner = f'<div class="banner {tone}">{html.escape(text)}</div>'
+    feature_enabled = get_settings().reply_business_prompt_enabled
+    gate_banner = (
+        '<div class="banner ok">运行时开关已启用：保存提交后，新生成立即读取活动版本；旧版本待发回复会在发送前被取消。</div>'
+        if feature_enabled
+        else '<div class="banner warn">运行时开关尚未启用。你可以先保存和试运行；Worker 仍使用旧的代码编译语气，直到三个服务统一设置 REPLY_BUSINESS_PROMPT_ENABLED=true。</div>'
+    )
+    origin = (
+        '<span class="pill warn">代码默认 · 第 0 版</span>'
+        if resolved.is_default
+        else f'<span class="pill ok">活动版本 · 第 {resolved.revision} 版</span>'
+    )
+    brand_options = "".join(
+        f'<option value="{html.escape(value)}"{" selected" if value == brand_id else ""}>'
+        f"{html.escape(value)}</option>"
+        for value in brands
+    )
+    version_rows = "".join(
+        _render_prompt_version_row(
+            version,
+            csrf=csrf,
+            tenant_id=tenant_id,
+            brand_id=brand_id,
+            expected_revision=resolved.revision or 0,
+        )
+        for version in versions
+    ) or '<tr><td colspan="5" class="muted">尚无数据库版本；当前使用代码默认内容。</td></tr>'
+    body = f"""<h1>业务 Prompt</h1>
+<p class="lede">直接编辑主回复模型使用的 Tenant + Brand 业务指令。RAG、知识事实边界、六字段输出、语言校验、安全 Guard 和发送授权仍由代码固定。</p>{gate_banner}{banner}
+<section class="card"><h2>选择作用域</h2>
+<form method="get" action="/admin/content/reply-prompt">
+<label for="prompt-tenant">Tenant</label><input id="prompt-tenant" name="tenant_id" value="{html.escape(tenant_id)}" readonly>
+<label for="prompt-brand">Brand</label><select id="prompt-brand" name="brand_id">{brand_options}</select>
+<button class="btn-block">切换</button></form></section>
+
+<section class="card"><h2>当前业务 Prompt {origin}</h2>
+<p class="hint">最多 {BUSINESS_PROMPT_MAX_CHARS} 字符。禁止写入联系方式、密钥、Token 或密码。保存采用乐观版本校验，并追加不可变历史。</p>
+<form method="post" action="/admin/content/reply-prompt/save">
+<input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="tenant_id" value="{html.escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="{html.escape(brand_id)}">
+<input type="hidden" name="expected_revision" value="{resolved.revision or 0}">
+<label for="business-prompt-content">业务指令</label>
+<textarea id="business-prompt-content" name="content" maxlength="{BUSINESS_PROMPT_MAX_CHARS}" style="min-height:300px" required>{html.escape(resolved.instructions.text)}</textarea>
+<label for="business-prompt-note">变更说明（可选）</label>
+<input id="business-prompt-note" name="change_note" maxlength="240" placeholder="例如：强调先确认客户诉求，再给出简洁步骤">
+<button class="btn-block">保存并创建新版本</button></form></section>
+
+<section class="card"><h2>试运行</h2>
+<p class="hint">使用当前已保存的业务 Prompt 调用主回复模型；不会写决策、创建 Outbox 或发送消息。</p>
+<form method="post" action="/admin/content/reply-prompt/trial">
+<input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="tenant_id" value="{html.escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="{html.escape(brand_id)}">
+{_input("text", "测试消息（模拟客户当前消息）")}
+<button class="btn-block">试运行</button></form>{trial_result}</section>
+
+<section class="card"><h2>版本历史</h2>
+<p class="hint">回滚不会改写旧版本，而是把所选内容复制成新的活动版本。</p>
+<div class="tablewrap"><table><thead><tr><th>版本</th><th>内容</th><th>说明</th><th>审计</th><th>操作</th></tr></thead><tbody>{version_rows}</tbody></table></div></section>
+
+<section class="card"><h2>代码固定安全契约</h2>
+<p class="hint">以下内容始终作为更高优先级的 system 契约，后台不可编辑；业务 Prompt 与当前客户消息一起编码为较低权限的结构化 user 数据。辅助 Prompt（检索选择、grounding、翻译、语言检测）也不会接收业务 Prompt。</p>
+<pre class="thread" style="white-space:pre-wrap">{html.escape(CONTRACT_PROMPT)}</pre></section>"""
+    response = HTMLResponse(
+        _page("业务 Prompt", body, active="reply-prompt", show_users=principal.is_superadmin)
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return _ensure_csrf(response, request, csrf)
+
+
+def _rollback_prompt_form(
+    csrf: str,
+    tenant_id: str,
+    brand_id: str,
+    expected_revision: int,
+    version_id: uuid.UUID,
+) -> str:
+    return f"""<form class="inline" method="post" action="/admin/content/reply-prompt/versions/{version_id}/rollback">
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{html.escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="{html.escape(brand_id)}"><input type="hidden" name="expected_revision" value="{expected_revision}">
+<button class="btn-sm btn-ghost">恢复为新版本</button></form>"""
+
+
+@router.get("/content/reply-prompt", response_class=HTMLResponse)
 @router.get("/content/brand-voice", response_class=HTMLResponse)
 @router.get("/prompt", response_class=HTMLResponse)
 async def prompt_page(request: Request, notice: str = "", tenant_id: str = "") -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
-    csrf = _csrf(request)
     tenant = _prompt_tenant(principal, tenant_id)
     brand = (request.query_params.get("brand_id") or "default").strip() or "default"
-    async with get_session_factory()() as session:
-        resolved = await load_persona(session, tenant, brand)
-    banner = ""
-    if notice in _PROMPT_BANNERS:
-        tone, text = _PROMPT_BANNERS[notice]
-        banner = f'<div class="banner {tone}">{html.escape(text)}</div>'
-    origin = (
-        '<span class="pill warn">代码内置默认</span>'
-        if resolved.is_default
-        else f'<span class="pill ok">已自定义 · 第 {resolved.revision} 版</span>'
+    return await _reply_prompt_page_response(
+        request,
+        principal,
+        tenant_id=tenant,
+        brand_id=brand,
+        notice=notice,
     )
-    trial = ""
-    if request.query_params.get("trial"):
-        trial = _render_trial(request)
-    preferences = resolved.preferences
-    voice_fields = "".join(
-        _voice_select(name, getattr(preferences, name).value) for name in _VOICE_UI
-    )
-    body = f"""<h1>品牌语气</h1><p class="lede">设置有限、可审计的品牌表达偏好；后台不接受任意系统指令，系统身份、事实边界、动作含义和安全规则固定且不可覆盖。</p>{banner}
-<section class="card"><h2>结构化品牌语气偏好 {origin}</h2>
-<p class="hint">这些选项只影响需要 LLM 生成回复时的代码内置表达条款。知识库原文直答不经过它；无法添加自由文本或覆盖安全契约。</p>
-<form method="post" action="/admin/prompt/save"><input type="hidden" name="csrf_token" value="{csrf}">
-<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
-<input type="hidden" name="brand_id" value="{html.escape(brand)}">
-{voice_fields}
-<button class="btn-block">保存</button></form>
-<details class="collapse"><summary>查看代码编译后的语气条款</summary><div class="inner"><pre class="thread" style="white-space:pre-wrap">{html.escape(resolved.text)}</pre></div></details></section>
-
-<section class="card"><h2>系统固定追加</h2>
-<p class="hint">以下不可变契约始终拼在代码编译的语气条款之后，后台无法删除或覆盖；严格六字段 schema 也由代码控制。</p>
-<pre class="thread" style="white-space:pre-wrap">{html.escape(CONTRACT_PROMPT)}</pre></section>
-
-<section class="card"><h2>试运行</h2>
-<p class="hint">用当前保存并由代码编译的语气偏好跑一次真实 LLM 调用，只看结果，不写库、不建 outbox、不发送。</p>
-<form method="post" action="/admin/prompt/trial"><input type="hidden" name="csrf_token" value="{csrf}">
-<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">
-<input type="hidden" name="brand_id" value="{html.escape(brand)}">
-{_input("text", "测试消息（模拟客户发来的内容）")}
-<button class="btn-block">试运行</button></form>{trial}</section>"""
-    response = HTMLResponse(
-        _page("品牌语气", body, active="brand-voice", show_users=principal.is_superadmin)
-    )
-    return _ensure_csrf(response, request, csrf)
 
 
-def _render_trial(request: Request) -> str:
-    q = request.query_params
-    if q.get("trial") == "failed":
-        return '<div class="banner err">试运行失败：LLM 调用出错，请检查供应商配置与额度。</div>'
-    rows = "".join(
-        f"<tr><td class='muted'>{html.escape(label)}</td><td>{html.escape(q.get(key) or '—')}</td></tr>"
-        for label, key in (
-            ("动作", "action"),
-            ("意图", "intent"),
-            ("风险", "risk"),
-            ("置信度", "confidence"),
-            ("原因码", "codes"),
-        )
-    )
-    reply = q.get("reply") or ""
-    reply_block = (
-        f"<div class='msg out' style='margin-top:10px'>{html.escape(reply)}</div>"
-        if reply
-        else "<p class='muted'>该动作不产生对外回复。</p>"
-    )
-    return f"""<div class="tablewrap" style="margin-top:14px"><table><tbody>{rows}</tbody></table></div>{reply_block}"""
-
-
+@router.post("/content/reply-prompt/save")
 @router.post("/prompt/save")
 async def prompt_save(request: Request) -> Response:
     principal = await _web_principal(request)
@@ -3079,75 +3166,97 @@ async def prompt_save(request: Request) -> Response:
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    if set(form) != {
+        "csrf_token",
+        "tenant_id",
+        "brand_id",
+        "expected_revision",
+        "content",
+        "change_note",
+    }:
+        raise HTTPException(status_code=422, detail="reply_business_prompt_fields_invalid")
     tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
     brand = (form.get("brand_id") or "default").strip() or "default"
-    allowed_fields = {"csrf_token", "tenant_id", "brand_id"} | VOICE_PREFERENCE_FIELDS
     try:
-        if set(form) - allowed_fields:
-            raise ValueError("voice_preferences_invalid")
-        preferences = parse_voice_preferences(
-            {name: form.get(name) or "" for name in VOICE_PREFERENCE_FIELDS}
-        )
-    except ValueError:
+        expected_revision = _prompt_expected_revision(form)
+        async with get_session_factory()() as session:
+            await save_reply_business_prompt(
+                session,
+                tenant_id=tenant,
+                brand_id=brand,
+                content=form.get("content", ""),
+                expected_revision=expected_revision,
+                actor=principal.actor,
+                change_note=form.get("change_note"),
+            )
+            await session.commit()
+    except ReplyBusinessPromptConflict:
         return RedirectResponse(
-            "/admin/prompt?notice=voice_preferences_invalid",
+            _prompt_location(tenant, brand, notice="revision_conflict"),
             status_code=status.HTTP_303_SEE_OTHER,
         )
-    persona = compile_voice_preferences(preferences)
-    voice_preferences = preferences.to_dict()
-    async with get_session_factory()() as session:
-        row = (
-            await session.execute(
-                select(models.ReplyPrompt).where(
-                    models.ReplyPrompt.tenant_id == tenant,
-                    models.ReplyPrompt.brand_id == brand,
-                )
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            revision = 1
-            session.add(
-                models.ReplyPrompt(
-                    tenant_id=tenant,
-                    brand_id=brand,
-                    persona=persona,
-                    voice_preferences=voice_preferences,
-                    revision=revision,
-                    updated_by=principal.actor,
-                )
-            )
-        else:
-            revision = row.revision + 1
-            row.persona = persona
-            row.voice_preferences = voice_preferences
-            row.revision = revision
-            row.updated_by = principal.actor
-        await session.execute(
-            models.AuditLog.__table__.insert().values(
-                tenant_id=tenant,
-                category="admin_action",
-                actor=principal.actor,
-                action="SET_REPLY_PERSONA",
-                subject_type="reply_prompt",
-                subject_id=f"{tenant}:{brand}",
-                detail={
-                    "revision": revision,
-                    "voice_preferences": voice_preferences,
-                },
-            )
+    except BusinessPromptValidationError:
+        return RedirectResponse(
+            _prompt_location(tenant, brand, notice="prompt_invalid"),
+            status_code=status.HTTP_303_SEE_OTHER,
         )
-        await session.commit()
-    return RedirectResponse("/admin/prompt?notice=saved", status_code=status.HTTP_303_SEE_OTHER)
+    except ReplyBusinessPromptScopeError:
+        return RedirectResponse(
+            _prompt_location(tenant, "default", notice="brand_invalid"),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    return RedirectResponse(
+        _prompt_location(tenant, brand, notice="saved"),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
-@router.post("/prompt/trial")
-async def prompt_trial(request: Request) -> Response:
-    """Run compiled voice preferences through the LLM without persistence or delivery."""
+@router.post("/content/reply-prompt/versions/{version_id}/rollback")
+async def prompt_rollback(version_id: uuid.UUID, request: Request) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    if set(form) != {"csrf_token", "tenant_id", "brand_id", "expected_revision"}:
+        raise HTTPException(status_code=422, detail="reply_business_prompt_fields_invalid")
+    tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
+    brand = (form.get("brand_id") or "default").strip() or "default"
+    try:
+        expected_revision = _prompt_expected_revision(form)
+        async with get_session_factory()() as session:
+            await rollback_reply_business_prompt(
+                session,
+                tenant_id=tenant,
+                brand_id=brand,
+                source_version_id=version_id,
+                expected_revision=expected_revision,
+                actor=principal.actor,
+            )
+            await session.commit()
+    except ReplyBusinessPromptConflict:
+        notice = "revision_conflict"
+    except (BusinessPromptValidationError, ReplyBusinessPromptScopeError):
+        notice = "brand_invalid"
+    else:
+        notice = "rolled_back"
+    return RedirectResponse(
+        _prompt_location(tenant, brand, notice=notice),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/content/reply-prompt/trial")
+@router.post("/prompt/trial")
+async def prompt_trial(request: Request) -> Response:
+    """Run the current business Prompt through the primary model without persistence."""
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    if set(form) != {"csrf_token", "tenant_id", "brand_id", "text"}:
+        raise HTTPException(status_code=422, detail="reply_business_prompt_fields_invalid")
     tenant = _prompt_tenant(principal, form.get("tenant_id", ""))
     brand = (form.get("brand_id") or "default").strip() or "default"
     text = (form.get("text") or "").strip()
@@ -3156,30 +3265,32 @@ async def prompt_trial(request: Request) -> Response:
     from social_reply.application.reply_decision.runner import _get_llm
 
     async with get_session_factory()() as session:
-        resolved = await load_persona(session, tenant, brand)
+        try:
+            resolved = await load_current_reply_business_prompt(session, tenant, brand)
+        except ReplyBusinessPromptScopeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
     try:
         decision = await _get_llm().decide(
             LLMContext(
                 text=redact_pii(text),
-                conversation_key=f"trial:{tenant}",
-                voice_preferences=resolved.preferences,
+                conversation_key=f"trial:{tenant}:{brand}",
+                business_prompt=resolved.instructions,
             )
         )
+        trial_result = _render_prompt_trial(decision)
     except Exception:
-        logger.exception("prompt trial failed tenant=%s", tenant)
-        return RedirectResponse("/admin/prompt?trial=failed", status_code=status.HTTP_303_SEE_OTHER)
-    params = urlencode(
-        {
-            "trial": "1",
-            "action": decision.action.value,
-            "intent": decision.intent or "",
-            "risk": decision.risk_level.value,
-            "confidence": f"{decision.confidence:.2f}",
-            "codes": ",".join(decision.reason_codes),
-            "reply": decision.reply_text or "",
-        }
+        logger.exception("business prompt trial failed tenant=%s brand=%s", tenant, brand)
+        trial_result = (
+            '<div class="banner err" style="margin-top:14px">试运行失败：LLM 调用出错，'
+            "请检查供应商配置与额度。</div>"
+        )
+    return await _reply_prompt_page_response(
+        request,
+        principal,
+        tenant_id=tenant,
+        brand_id=brand,
+        trial_result=trial_result,
     )
-    return RedirectResponse(f"/admin/prompt?{params}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 # ---------- System health ----------

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import (
     ReplyAction,
     ReplyDecision,
@@ -41,6 +42,7 @@ class LLMContext:
     # role ∈ {"user", "assistant"}，不含当前这条。默认空 → 单轮行为不变。
     history: tuple[tuple[str, str], ...] = ()
     voice_preferences: VoicePreferences | None = None
+    business_prompt: BusinessPromptInstructions | None = None
     target_language: str = "und"
     approved_verbatim_available: bool = False
 
@@ -49,6 +51,10 @@ class LLMContext:
             self.voice_preferences, VoicePreferences
         ):
             raise TypeError("voice_preferences_must_be_typed")
+        if self.business_prompt is not None and not isinstance(
+            self.business_prompt, BusinessPromptInstructions
+        ):
+            raise TypeError("business_prompt_must_be_typed")
 
 
 class LLMClient(Protocol):

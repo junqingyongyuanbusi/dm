@@ -7,6 +7,7 @@ from social_reply.application.reply_decision.language_resolution import (
     resolve_reply_language,
 )
 from social_reply.domain.messages.canonical import ChannelType
+from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import (
     LANGUAGE_POLICY_REVIEW,
@@ -119,6 +120,7 @@ async def run_decision_pipeline(
     apply_legacy_rules: bool = True,
     history: tuple[tuple[str, str], ...] = (),
     voice_preferences: VoicePreferences | None = None,
+    business_prompt: BusinessPromptInstructions | None = None,
     email_auto_reply_allowed: bool = True,
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
     language_policy: str = LANGUAGE_POLICY_REVIEW,
@@ -227,6 +229,7 @@ async def run_decision_pipeline(
                     knowledge=knowledge,
                     history=safe_history,
                     voice_preferences=voice_preferences,
+                    business_prompt=business_prompt,
                     target_language=target_language,
                     approved_verbatim_available=verbatim_after_decision is not None,
                 )

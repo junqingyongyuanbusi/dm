@@ -45,7 +45,7 @@ ${PUBLIC_BASE_URL}/admin
 
 控制面与 webhook 数据面分离：
 
-- Web 控制面：`/admin`，使用分组导航：运营（工作队列、对话）、内容与策略（知识库、品牌语气）、集成（平台账号、Feishu 人工通知）和系统（健康、安全控制、用户）；PostgreSQL 服务端会话，浏览器仅持有 opaque HTTP-only Cookie，并使用 CSRF 防护；
+- Web 控制面：`/admin`，使用分组导航：运营（工作队列、对话）、内容与策略（知识库、业务 Prompt）、集成（平台账号、Feishu 人工通知）和系统（健康、安全控制、用户）；PostgreSQL 服务端会话，浏览器仅持有 opaque HTTP-only Cookie，并使用 CSRF 防护；
 - 当前页面路径以 `/admin/content/*`、`/admin/integrations/*`、`/admin/system/*` 为主，原 `/admin/accounts`、`/admin/knowledge`、`/admin/prompt`、`/admin/health`、`/admin/users` 和 `/admin/feishu-handoff` 继续作为兼容路由；
 - OAuth callback 路径保持 `/admin/oauth/*/callback`，不会随浏览器信息架构移动；
 - Provisioning API：`/api/v1/platform-accounts/*`，使用独立 `CONTROL_API_KEY`，只供服务间调用；
@@ -206,7 +206,7 @@ allowlist，且 DNS 解析结果全部为公共目标。会话按 thread 建立�
 以避免串人；24 小时自动回复限额按 account+sender 跨 thread 统计。轮询 RawEvent 只保存 UID、
 UIDVALIDITY、size 和可选 SHA-256，不保存 RFC822 正文。
 
-当前迁移唯一 head 为 `a7c3e9d1b624`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
+当前迁移唯一 head 为 `b9d5e2f7c314`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
 目标凭证后，必须先做 Phase 0 TLS/login/readonly 检查，再执行 draft-only real smoke。完整步骤见
 [Email operator runbook](docs/email-integration.md)。
 
@@ -292,7 +292,7 @@ DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
 REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 7 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `a7c3e9d1b624`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `b9d5e2f7c314`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
 
 ## X 贴文评论自动回复
 
@@ -346,16 +346,17 @@ XAA 的完整事件枚举里没有任何回复/评论专用事件（只有 `post
 - 发送侧复用既有 `x_post_reply`（`POST /2/tweets` + `reply.in_reply_to_tweet_id`），Guard 按 280 字限长。
 - 嵌套回复（别人回复评论者、没 @ 你）不会触发事件。这与 X「仅在用户与你互动时回复」的要求一致。
 
-## 提示词品牌表达偏好（后台可配）
+## 回复业务 Prompt（后台可编辑）
 
-`/admin/content/brand-voice` 不再接受自由文本系统指令，只允许选择 `tone`、`length`、`empathy`、`emoji` 四个有限枚举。保存后 API 同时写入规范 JSON `voice_preferences` 和代码编译的兼容 `persona` 文本；新 Worker 只读取 JSON 并编译固定英文条款，旧 Worker 在混合版本窗口也只能看到代码生成文本。
+`/admin/content/reply-prompt` 展示当前 Tenant + Brand 的活动业务 Prompt，并允许管理员直接编辑自由文本。`/admin/content/brand-voice` 与 `/admin/prompt` 暂时保留为兼容入口。每次保存都会追加不可变版本并立即切换活动指针；历史版本只能通过“复制为新版本”回滚，不能改写。
 
-**WikiFX 身份、同语言回复策略、领域事实边界、动作含义、风险/可见性规则和安全策略不可编辑。** 这些规则与严格六字段输出 schema 由代码固定追加。数据库中的旧 `persona` 任意文本永远不会被新代码执行；缺失或畸形 JSON 会安全回落到代码编译的默认偏好。
+**WikiFX 身份、同语言回复策略、领域事实边界、动作含义、风险/可见性规则和安全策略不可编辑。** 这些规则与严格六字段输出 schema 位于更高优先级的 system 契约；业务 Prompt 与当前客户消息一起编码为较低权限的结构化 user 数据，只进入主回复模型，不进入检索选择、grounding、翻译或语言检测等辅助模型调用。
 
-- 作用域按 `(tenant_id, brand_id)`；未配置的租户使用规范默认值 `professional/concise/standard/never`。
-- 每次保存 `revision` 自增，并写进 `reply_decisions.prompt_version`（形如 `v1-wikifx-multilingual#r7`）；审计 `SET_REPLY_PERSONA` 只记录结构化枚举，不记录任意文本或字符数。
-- **试运行**使用当前保存并编译的偏好，只回显结果，不写 `reply_decisions`、不建 Outbox、不发送；客户 PII 仍先脱敏。
-- `PERSONA_MAX_CHARS=4000` 仅保留为代码编译输出不变量，不是后台输入额度。
+- 作用域按 `(tenant_id, brand_id)`；没有数据库版本时，页面显示代码默认业务 Prompt。
+- 保存使用乐观 revision 校验和 Tenant + Brand advisory lock，写入不可变版本、活动指针及 `SET_REPLY_BUSINESS_PROMPT` 审计；决策保存 Prompt 版本与内容哈希来源。
+- `REPLY_BUSINESS_PROMPT_ENABLED=true` 必须在 API、Worker、Scheduler 三角色协调启用。启用后，每个新决策（包括确定性规则或知识原文路径）都记录活动 Prompt epoch；使用旧版本生成的结果无法持久化为公开投递，缺少新 epoch 的历史待发消息或已过期 Outbox 会在发送前取消。发送与 Prompt 激活使用同一 scope lock，因此保存成功不会与尚未开始的旧版本 provider I/O 交叉。
+- **试运行**只回显主回复模型结果，不写 `reply_decisions`、不建 Outbox、不发送；客户 PII 仍先脱敏。
+- 输入最多 4,000 字符，并拒绝联系方式、控制字符和疑似凭据。
 - 检索知识作为不可信 JSON 数据传给模型。只有已发布模板参与检索；官方联系方式仅在命中的已分类模板被确定性原文发送且回复与批准模板完全一致时获得 PII 例外。模型生成、复制或修改的联系方式一律转人工。
 
 ## 回复模板导入（知识库）

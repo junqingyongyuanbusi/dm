@@ -21,6 +21,10 @@ from social_reply.application.message_delivery.contracts import (
     TextSendCommand,
     parse_direct_text_command,
 )
+from social_reply.application.reply_decision.business_prompt import (
+    business_prompt_lock_key,
+    business_prompt_provenance_is_current,
+)
 from social_reply.application.reply_decision.multilingual_generation import (
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
 )
@@ -46,6 +50,7 @@ from social_reply.domain.reply.guard import run_hard_output_guard
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
     hold_connection_advisory_lock,
+    hold_connection_advisory_shared_lock,
     hold_conversation_delivery_lock,
 )
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -573,6 +578,36 @@ async def _public_bot_send_preflight(
     ):
         return "STALE_CONVERSATION_INPUT"
 
+    if (
+        decision.reply_business_prompt_version_id is not None
+        and decision.reply_business_prompt_content_hash is None
+    ):
+        return "REPLY_BUSINESS_PROMPT_PROVENANCE_INVALID"
+    settings = get_settings()
+    business_prompt_enabled = getattr(
+        settings,
+        "reply_business_prompt_enabled",
+        False,
+    )
+    if (
+        decision.reply_business_prompt_content_hash is not None
+        and not business_prompt_enabled
+    ):
+        return "REPLY_BUSINESS_PROMPT_DISABLED"
+    if business_prompt_enabled and decision.reply_business_prompt_content_hash is None:
+        return "REPLY_BUSINESS_PROMPT_PROVENANCE_REQUIRED"
+    if decision.reply_business_prompt_content_hash is not None:
+        prompt_is_current = await business_prompt_provenance_is_current(
+            session,
+            tenant_id=account.tenant_id,
+            brand_id=account.brand_id,
+            version_id=decision.reply_business_prompt_version_id,
+            content_hash=decision.reply_business_prompt_content_hash,
+            acquire_lock=False,
+        )
+        if not prompt_is_current:
+            return "STALE_REPLY_BUSINESS_PROMPT"
+
     try:
         disabled = await make_killswitch_checker().is_disabled(
             account.brand_id,
@@ -614,7 +649,6 @@ async def _public_bot_send_preflight(
     ):
         return "DRAFT_APPROVAL_PROVENANCE_INVALID"
 
-    settings = get_settings()
     if decision.multilingual_contract_version == _LEGACY_EXPERIMENTAL_CONTRACT_VERSION:
         return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
     if decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION:
@@ -1180,5 +1214,33 @@ async def deliver_outbox(outbox_id: str) -> str:
         return "SKIPPED_NOT_CLAIMABLE"
 
     async with hold_conversation_delivery_lock(conversation_id) as connection:
+        prompt_lock_key: str | None = None
+        async with AsyncSession(bind=connection, expire_on_commit=False) as scope_session:
+            outbox = await scope_session.get(models.OutboxMessage, oid)
+            if outbox is not None and outbox.message_type != "private_note":
+                payload = dict(outbox.payload) if isinstance(outbox.payload, dict) else {}
+                if _effective_origin_kind(outbox, payload) in {"DECISION", "DRAFT_APPROVAL"}:
+                    account = await scope_session.get(
+                        models.PlatformAccount,
+                        outbox.platform_account_id,
+                    )
+                    if account is not None:
+                        prompt_lock_key = business_prompt_lock_key(
+                            account.tenant_id,
+                            account.brand_id,
+                        )
+            await scope_session.commit()
+        if prompt_lock_key is not None:
+            # Keep Prompt activation and provider I/O linearly ordered. A save that wins this
+            # lock makes preflight observe the new version; a send that wins completes before
+            # the Admin save can commit and report the new version as active.
+            async with hold_connection_advisory_shared_lock(connection, prompt_lock_key):
+                async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+                    return await _deliver_outbox_locked(
+                        session,
+                        connection,
+                        oid,
+                        conversation_id,
+                    )
         async with AsyncSession(bind=connection, expire_on_commit=False) as session:
             return await _deliver_outbox_locked(session, connection, oid, conversation_id)

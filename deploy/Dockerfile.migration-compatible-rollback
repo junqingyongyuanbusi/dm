@@ -10,6 +10,7 @@ ARG SOURCE_URL=https://github.com/junqingyongyuanbusi/dm
 ARG BASE_DIGEST=unknown
 ARG DATABASE_HEAD=unknown
 ARG BASE_REVIEW_OUTBOX_CAPABILITY=legacy
+ARG BASE_BUSINESS_PROMPT_CAPABILITY=legacy
 
 USER root
 COPY --chown=10001:10001 migrations/versions/ /app/migrations/versions/
@@ -21,7 +22,8 @@ LABEL org.opencontainers.image.revision="${APP_REVISION}" \
       com.nexory.reply-core.rollback-base-digest="${BASE_DIGEST}" \
       com.nexory.reply-core.rollback-target-release="${TARGET_RELEASE_SHA}" \
       com.nexory.reply-core.database-head="${DATABASE_HEAD}" \
-      com.nexory.reply-core.review-outbox-contract="${BASE_REVIEW_OUTBOX_CAPABILITY}"
+      com.nexory.reply-core.review-outbox-contract="${BASE_REVIEW_OUTBOX_CAPABILITY}" \
+      com.nexory.reply-core.business-prompt-contract="${BASE_BUSINESS_PROMPT_CAPABILITY}"
 
 ENV RELEASE_SHA="${APP_REVISION}"
 USER appuser

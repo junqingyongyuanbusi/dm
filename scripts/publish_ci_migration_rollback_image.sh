@@ -11,6 +11,8 @@ target_sha="$2"
 local_target_image="$3"
 source_url="$4"
 evidence_path="$5"
+readonly LEGACY_BUSINESS_PROMPT_CAPABILITY="legacy"
+readonly TARGET_BUSINESS_PROMPT_CAPABILITY="editable-business-prompt-v1"
 
 fail() {
   printf '[ci-rollback-image] ERROR: %s\n' "$*" >&2
@@ -70,12 +72,27 @@ image_metadata() {
   docker buildx imagetools inspect "$1" --format '{{json .Image}}'
 }
 
+image_business_prompt_capability() {
+  local reference="$1"
+  local capability
+  capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.business-prompt-contract"] // "legacy"' \
+    <<<"$(image_metadata "$reference")")"
+  case "$capability" in
+    "$LEGACY_BUSINESS_PROMPT_CAPABILITY"|"$TARGET_BUSINESS_PROMPT_CAPABILITY")
+      printf '%s\n' "$capability"
+      ;;
+    *) fail "$reference has unknown business Prompt capability: ${capability:-missing}" ;;
+  esac
+}
+
 write_evidence() {
   local required="$1"
   local compatibility_digest="$2"
   local predecessor_digest="$3"
   local predecessor_revision="$4"
   local database_head="$5"
+  local predecessor_business_prompt_capability="$6"
   mkdir -p "$(dirname "$evidence_path")"
   jq -n \
     --argjson required "$required" \
@@ -84,12 +101,14 @@ write_evidence() {
     --arg predecessor_digest "$predecessor_digest" \
     --arg predecessor_app_revision "$predecessor_revision" \
     --arg database_head "$database_head" \
+    --arg predecessor_business_prompt_capability "$predecessor_business_prompt_capability" \
     '{
       required: $required,
       tag: (if $required then $tag else "" end),
       digest: $digest,
       predecessor_digest: $predecessor_digest,
       predecessor_app_revision: $predecessor_app_revision,
+      predecessor_business_prompt_capability: $predecessor_business_prompt_capability,
       database_head: $database_head,
       verification: (if $required then "ci-isolated-database" else "not-required" end)
     }' >"$evidence_path"
@@ -101,8 +120,9 @@ verify_compatibility_image() {
   local expected_app_revision="$3"
   local expected_database_head="$4"
   local expected_capability="$5"
+  local expected_business_prompt_capability="$6"
   local metadata revision labeled_source purpose labeled_base labeled_target labeled_head
-  local capability image_os architecture
+  local capability business_prompt_capability image_os architecture
   metadata="$(image_metadata "$reference")"
   revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
   labeled_source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
@@ -111,6 +131,9 @@ verify_compatibility_image() {
   labeled_target="$(jq -r '.config.Labels["com.nexory.reply-core.rollback-target-release"] // ""' <<<"$metadata")"
   labeled_head="$(jq -r '.config.Labels["com.nexory.reply-core.database-head"] // ""' <<<"$metadata")"
   capability="$(jq -r '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // ""' <<<"$metadata")"
+  business_prompt_capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.business-prompt-contract"] // "legacy"' \
+    <<<"$metadata")"
   image_os="$(jq -r '.os // ""' <<<"$metadata")"
   architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
   [[ "$revision" == "$expected_app_revision" ]] \
@@ -127,12 +150,17 @@ verify_compatibility_image() {
     || fail "$reference has unexpected database head: $labeled_head"
   [[ "$capability" == "$expected_capability" ]] \
     || fail "$reference has unexpected review Outbox capability: $capability"
+  [[ "$business_prompt_capability" == "$expected_business_prompt_capability" ]] \
+    || fail "$reference has unexpected business Prompt capability: $business_prompt_capability"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
 
 target_digest="$(image_digest "$target_ref")"
 latest_digest="$(image_digest "$latest_ref")"
+target_business_prompt_capability="$(image_business_prompt_capability "$target_ref")"
+[[ "$target_business_prompt_capability" == "$TARGET_BUSINESS_PROMPT_CAPABILITY" ]] \
+  || fail "$target_ref does not advertise the editable business Prompt contract"
 
 # A rerun after rollout can no longer infer the predecessor from latest. The immutable
 # compatibility tag is sufficient evidence because the first successful CI run created it before
@@ -140,7 +168,8 @@ latest_digest="$(image_digest "$latest_ref")"
 if [[ "$latest_digest" == "$target_digest" ]]; then
   if [[ "$(image_state "$compatibility_ref")" == "absent" ]]; then
     log "latest already points to target and no compatibility image exists; treating this as a non-migration release"
-    write_evidence false "" "$target_digest" "$target_sha" ""
+    write_evidence false "" "$target_digest" "$target_sha" "" \
+      "$target_business_prompt_capability"
     exit 0
   fi
   compatibility_metadata="$(image_metadata "$compatibility_ref")"
@@ -148,16 +177,17 @@ if [[ "$latest_digest" == "$target_digest" ]]; then
   predecessor_revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$compatibility_metadata")"
   database_head="$(jq -r '.config.Labels["com.nexory.reply-core.database-head"] // ""' <<<"$compatibility_metadata")"
   predecessor_capability="$(jq -r '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // ""' <<<"$compatibility_metadata")"
+  predecessor_business_prompt_capability="$(image_business_prompt_capability "$compatibility_ref")"
   verify_compatibility_image \
     "$compatibility_ref" "$predecessor_digest" "$predecessor_revision" \
-    "$database_head" "$predecessor_capability"
+    "$database_head" "$predecessor_capability" "$predecessor_business_prompt_capability"
   compatibility_digest="$(image_digest "$compatibility_ref")"
   scripts/verify_migration_compatible_rollback.sh \
     "${image_repository}@${target_digest}" \
     "${image_repository}@${compatibility_digest}" \
     "$database_head"
   write_evidence true "$compatibility_digest" "$predecessor_digest" \
-    "$predecessor_revision" "$database_head"
+    "$predecessor_revision" "$database_head" "$predecessor_business_prompt_capability"
   exit 0
 fi
 
@@ -165,6 +195,9 @@ predecessor_digest="$latest_digest"
 predecessor_metadata="$(image_metadata "${image_repository}@${predecessor_digest}")"
 predecessor_revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$predecessor_metadata")"
 predecessor_capability="$(jq -r '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // "legacy"' <<<"$predecessor_metadata")"
+predecessor_business_prompt_capability="$(
+  image_business_prompt_capability "${image_repository}@${predecessor_digest}"
+)"
 [[ "$predecessor_revision" =~ ^[0-9a-f]{40}$ ]] \
   || fail "predecessor image has invalid app revision: ${predecessor_revision:-missing}"
 git cat-file -e "${predecessor_revision}^{commit}" 2>/dev/null \
@@ -177,7 +210,8 @@ set -e
 case "$migration_diff_status" in
   0)
     log "no migration graph change; compatibility image is not required"
-    write_evidence false "" "$predecessor_digest" "$predecessor_revision" ""
+    write_evidence false "" "$predecessor_digest" "$predecessor_revision" "" \
+      "$predecessor_business_prompt_capability"
     exit 0
     ;;
   1) ;;
@@ -211,6 +245,7 @@ else
     --build-arg "BASE_DIGEST=${predecessor_digest}" \
     --build-arg "DATABASE_HEAD=${database_head}" \
     --build-arg "BASE_REVIEW_OUTBOX_CAPABILITY=${predecessor_capability}" \
+    --build-arg "BASE_BUSINESS_PROMPT_CAPABILITY=${predecessor_business_prompt_capability}" \
     --tag "$compatibility_ref" \
     --push \
     .
@@ -218,7 +253,7 @@ fi
 
 verify_compatibility_image \
   "$compatibility_ref" "$predecessor_digest" "$predecessor_revision" \
-  "$database_head" "$predecessor_capability"
+  "$database_head" "$predecessor_capability" "$predecessor_business_prompt_capability"
 compatibility_digest="$(image_digest "$compatibility_ref")"
 [[ "$compatibility_digest" != "$target_digest" ]] \
   || fail "compatibility image unexpectedly matches target digest"
@@ -228,5 +263,5 @@ scripts/verify_migration_compatible_rollback.sh \
   "${image_repository}@${compatibility_digest}" \
   "$database_head"
 write_evidence true "$compatibility_digest" "$predecessor_digest" \
-  "$predecessor_revision" "$database_head"
+  "$predecessor_revision" "$database_head" "$predecessor_business_prompt_capability"
 log "published and verified $compatibility_ref at $compatibility_digest"

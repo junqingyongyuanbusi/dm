@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from social_reply.application.knowledge.retrieval import KnowledgeHit
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
+from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.guard import LANGUAGE_VERIFICATION_STRICT
 from social_reply.domain.reply.llm import LLMClient
@@ -38,6 +39,7 @@ async def generate_multilingual_reply(
     llm: LLMClient,
     voice_preferences: VoicePreferences,
     email_auto_reply_allowed: bool,
+    business_prompt: BusinessPromptInstructions | None = None,
     fallback_reason_codes: tuple[str, ...] = (),
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
     language_policy: str = "review",
@@ -57,6 +59,7 @@ async def generate_multilingual_reply(
             apply_legacy_rules=False,
             history=history,
             voice_preferences=voice_preferences,
+            business_prompt=business_prompt,
             email_auto_reply_allowed=email_auto_reply_allowed,
             language_verification=language_verification,
             language_policy=language_policy,

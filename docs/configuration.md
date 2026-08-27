@@ -230,6 +230,12 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
 
+Stage the first editable Prompt release with `REPLY_BUSINESS_PROMPT_ENABLED=false` on all roles.
+After the target digest and schema are healthy, use
+`scripts/set_reply_business_prompt_gate.sh --enable`; use the same script with `--disable` for a
+coordinated runtime rollback. The script validates a single stored value and forces every role to
+restart on the same current digest. Direct one-service gate edits are not a supported rollout path.
+
 ### Language resolution
 
 The runtime replies in whatever language it resolves for the customer message, with no language

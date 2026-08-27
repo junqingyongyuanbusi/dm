@@ -18,6 +18,7 @@ expected_sha="$2"
 [[ "$(docker run --rm --entrypoint id "$image" -g)" == "10001" ]]
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" == "$expected_sha" ]]
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" == "https://github.com/junqingyongyuanbusi/dm" ]]
+[[ "$(docker image inspect "$image" --format '{{index .Config.Labels "com.nexory.reply-core.business-prompt-contract"}}')" == "editable-business-prompt-v1" ]]
 [[ "$(docker image inspect "$image" --format '{{.Architecture}}')" == "amd64" ]]
 docker run --rm --entrypoint sh "$image" -c 'test ! -w /app/src && test ! -w /app/.venv'
 docker run --rm --entrypoint sh "$image" -c \

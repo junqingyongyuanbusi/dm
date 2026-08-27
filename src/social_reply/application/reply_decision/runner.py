@@ -15,6 +15,11 @@ from social_reply.application.knowledge.retrieval import (
     retrieve_exact_knowledge_result,
     retrieve_hybrid_knowledge_result,
 )
+from social_reply.application.reply_decision.business_prompt import (
+    DEFAULT_RESOLVED_BUSINESS_PROMPT,
+    business_prompt_version_label,
+    load_business_prompt,
+)
 from social_reply.application.reply_decision.language_resolution import (
     resolve_customer_language,
 )
@@ -706,6 +711,8 @@ async def run_and_persist_decision(
     cutoff_seq = await _validate_decision_scope(snapshot, conversation_id, message_id, account_id)
     # 先给默认值：fail-closed 分支不走管线，但下面落库时仍要拿它拼 prompt_version。
     persona = _DEFAULT_PERSONA
+    business_prompt = DEFAULT_RESOLVED_BUSINESS_PROMPT
+    business_prompt_used = False
     prompt_contract_suffix = ""
     try:
         if snapshot.automation_state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}:
@@ -938,9 +945,20 @@ async def run_and_persist_decision(
             if multilingual_generate:
                 try:
                     async with get_session_factory()() as session:
-                        persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
+                        if settings.reply_business_prompt_enabled:
+                            business_prompt = await load_business_prompt(
+                                session,
+                                snapshot.tenant_id,
+                                snapshot.brand_id,
+                            )
+                        else:
+                            persona = await load_persona(
+                                session,
+                                snapshot.tenant_id,
+                                snapshot.brand_id,
+                            )
                 except Exception:
-                    logger.exception("persona load failed; forcing handoff")
+                    logger.exception("reply prompt load failed; forcing handoff")
                     forced_decision = ReplyDecision(
                         action=ReplyAction.HANDOFF,
                         reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
@@ -964,6 +982,7 @@ async def run_and_persist_decision(
                     prompt_contract_suffix = ""
 
             if multilingual_generate:
+                business_prompt_used = settings.reply_business_prompt_enabled
                 decision = await generate_multilingual_reply(
                     snapshot,
                     selected=selected,
@@ -972,6 +991,9 @@ async def run_and_persist_decision(
                     killswitch=killswitch,
                     llm=generation_llm,
                     voice_preferences=persona.preferences,
+                    business_prompt=(
+                        business_prompt.instructions if business_prompt_used else None
+                    ),
                     email_auto_reply_allowed=(
                         snapshot.platform != "email"
                         or (settings.email_enabled and settings.email_auto_reply_enabled)
@@ -1190,7 +1212,19 @@ async def run_and_persist_decision(
             history = await _fetch_history(conversation_id, cutoff_seq) if needs_llm_history else ()
             if needs_llm_history:
                 async with get_session_factory()() as session:
-                    persona = await load_persona(session, snapshot.tenant_id, snapshot.brand_id)
+                    if settings.reply_business_prompt_enabled:
+                        business_prompt = await load_business_prompt(
+                            session,
+                            snapshot.tenant_id,
+                            snapshot.brand_id,
+                        )
+                        business_prompt_used = True
+                    else:
+                        persona = await load_persona(
+                            session,
+                            snapshot.tenant_id,
+                            snapshot.brand_id,
+                        )
             decision = await run_decision_pipeline(
                 snapshot,
                 llm=_get_llm() if needs_llm_history else None,
@@ -1202,11 +1236,25 @@ async def run_and_persist_decision(
                 forced_decision=legacy_forced_decision,
                 history=history,
                 voice_preferences=persona.preferences,
+                business_prompt=(
+                    business_prompt.instructions if business_prompt_used else None
+                ),
                 email_auto_reply_allowed=(
                     snapshot.platform != "email"
                     or (settings.email_enabled and settings.email_auto_reply_enabled)
                 ),
             )
+    if settings.reply_business_prompt_enabled and not business_prompt_used:
+        # Every new decision carries the active Prompt epoch, including deterministic replies.
+        # This lets a coordinated gate activation reject every legacy queued decision while
+        # avoiding fragile inference from a final source that Guards may have rewritten.
+        async with get_session_factory()() as session:
+            business_prompt = await load_business_prompt(
+                session,
+                snapshot.tenant_id,
+                snapshot.brand_id,
+            )
+        business_prompt_used = True
     handoff_notification_ids: list[uuid.UUID] = []
     async with get_session_factory()() as session:
         if decision_job_id is not None:
@@ -1251,6 +1299,11 @@ async def run_and_persist_decision(
                         await aggregate_raw_event_decisions(session, raw_event_id)
                 await session.commit()
                 raise DecisionSuperseded("decision_generation_superseded")
+        effective_prompt_version = (
+            business_prompt_version_label(settings.prompt_version, business_prompt)
+            if business_prompt_used
+            else prompt_version_label(settings.prompt_version, persona)
+        )
         outbox_id = await persist_decision(
             session,
             snapshot,
@@ -1258,7 +1311,8 @@ async def run_and_persist_decision(
             message_id,
             account_id,
             decision,
-            prompt_version_label(settings.prompt_version, persona) + prompt_contract_suffix,
+            effective_prompt_version + prompt_contract_suffix,
+            business_prompt=(business_prompt if business_prompt_used else None),
             decision_job_id=decision_job_id,
             decision_generation=decision_generation,
             decision_claim_token=claim_token,

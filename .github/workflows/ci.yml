@@ -108,7 +108,8 @@ jobs:
             scripts/publish_ci_migration_rollback_image.sh \
             scripts/verify_production_image.sh \
             scripts/verify_migration_compatible_rollback.sh \
-            scripts/rollback_railway_migration_compatible.sh
+            scripts/rollback_railway_migration_compatible.sh \
+            scripts/set_reply_business_prompt_gate.sh
           )
           for release_script in "${release_scripts[@]}"; do
             bash -n "$release_script"
@@ -118,6 +119,7 @@ jobs:
           test -x scripts/verify_production_image.sh
           test -x scripts/verify_migration_compatible_rollback.sh
           test -x scripts/rollback_railway_migration_compatible.sh
+          test -x scripts/set_reply_business_prompt_gate.sh
       - name: Build linux/amd64 production image
         run: |
           set -euo pipefail
@@ -131,6 +133,7 @@ jobs:
             --load \
             .
           test "$(docker image inspect reply-core-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.review-outbox-contract"}}')" = "review-outbox-dual-read-v1"
+          test "$(docker image inspect reply-core-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.business-prompt-contract"}}')" = "editable-business-prompt-v1"
       - name: Build migration-compatible rollback contract image
         run: |
           set -euo pipefail
@@ -148,11 +151,13 @@ jobs:
             --build-arg "BASE_DIGEST=${base_digest}" \
             --build-arg "DATABASE_HEAD=${database_head}" \
             --build-arg "BASE_REVIEW_OUTBOX_CAPABILITY=review-outbox-dual-read-v1" \
+            --build-arg "BASE_BUSINESS_PROMPT_CAPABILITY=editable-business-prompt-v1" \
             --tag reply-core-compat-ci:${GITHUB_SHA} \
             .
           test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.database-head"}}')" = "$database_head"
           test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.rollback-target-release"}}')" = "${GITHUB_SHA}"
           test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.review-outbox-contract"}}')" = "review-outbox-dual-read-v1"
+          test "$(docker image inspect reply-core-compat-ci:${GITHUB_SHA} --format '{{index .Config.Labels "com.nexory.reply-core.business-prompt-contract"}}')" = "editable-business-prompt-v1"
           test "$(docker run --rm --entrypoint alembic reply-core-compat-ci:${GITHUB_SHA} heads | awk '{print $1; exit}')" = "$database_head"
       - name: Verify image contract
         run: scripts/verify_production_image.sh "reply-core-ci:${GITHUB_SHA}" "$GITHUB_SHA"

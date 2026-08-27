@@ -1177,6 +1177,16 @@ class ReplyDecision(Base):
             "OR jsonb_typeof(rag_evidence) IS NOT DISTINCT FROM 'object'",
             name="ck_reply_decisions_rag_evidence_object",
         ),
+        CheckConstraint(
+            "reply_business_prompt_content_hash IS NULL OR "
+            "reply_business_prompt_content_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_reply_decisions_business_prompt_hash",
+        ),
+        CheckConstraint(
+            "reply_business_prompt_version_id IS NULL OR "
+            "reply_business_prompt_content_hash IS NOT NULL",
+            name="ck_reply_decisions_business_prompt_provenance_pair",
+        ),
         UniqueConstraint(
             "review_outbox_id",
             name="uq_reply_decisions_review_outbox_id",
@@ -1207,6 +1217,10 @@ class ReplyDecision(Base):
     reason_codes: Mapped[list] = mapped_column(JSONB, default=list)
     source: Mapped[str] = mapped_column(Text)  # rule / llm / guard
     prompt_version: Mapped[str | None] = mapped_column(Text)
+    reply_business_prompt_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("reply_business_prompt_versions.id", ondelete="RESTRICT")
+    )
+    reply_business_prompt_content_hash: Mapped[str | None] = mapped_column(String(64))
     decision_release_sha: Mapped[str | None] = mapped_column(String(64))
     retrieval_policy_version: Mapped[str | None] = mapped_column(String(64))
     selector_version: Mapped[str | None] = mapped_column(String(64))
@@ -1460,6 +1474,88 @@ class KnowledgeLocalization(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoke_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReplyBusinessPromptVersion(Base):
+    """Immutable Tenant + Brand business-instruction revision."""
+
+    __tablename__ = "reply_business_prompt_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "brand_id",
+            "revision",
+            name="uq_reply_business_prompt_versions_scope_revision",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "brand_id",
+            "id",
+            name="uq_reply_business_prompt_versions_scope_id",
+        ),
+        CheckConstraint(
+            "revision > 0",
+            name="ck_reply_business_prompt_versions_revision",
+        ),
+        CheckConstraint(
+            "btrim(content) <> '' AND char_length(content) <= 4000",
+            name="ck_reply_business_prompt_versions_content",
+        ),
+        CheckConstraint(
+            "content_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_reply_business_prompt_versions_content_hash",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    brand_id: Mapped[str] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    change_note: Mapped[str | None] = mapped_column(String(240))
+    created_by: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ReplyBusinessPrompt(Base):
+    """Current active business-instruction pointer for one Tenant + Brand scope."""
+
+    __tablename__ = "reply_business_prompts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "brand_id",
+            name="uq_reply_business_prompts_scope",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "brand_id", "active_version_id"],
+            [
+                "reply_business_prompt_versions.tenant_id",
+                "reply_business_prompt_versions.brand_id",
+                "reply_business_prompt_versions.id",
+            ],
+            name="fk_reply_business_prompts_active_scope_version",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "revision > 0",
+            name="ck_reply_business_prompts_revision",
+        ),
+        CheckConstraint(
+            "content_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_reply_business_prompts_content_hash",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    brand_id: Mapped[str] = mapped_column(String(64))
+    active_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    revision: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    updated_by: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class ReplyPrompt(Base):

@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     tenant_id: str = "default"
     # Literal 收紧：配错 provider 在进程启动即报错，而非每条消息决策丢失
     llm_provider: Literal["stub", "openai"] = "stub"
-    prompt_version: str = "v1-wikifx-multilingual"
+    prompt_version: str = "v2-editable-business-prompt"
+    # Staged rollout gate. When disabled, Workers keep using the code-compiled legacy voice.
+    # Production must set this explicitly and consistently across all three service roles.
+    reply_business_prompt_enabled: bool = False
     chatwoot_base_url: str = "http://localhost:3000"
     chatwoot_api_token: str = "dev-local-token"
     # 控制面：CONTROL_API_KEY 仅供服务间调用；浏览器管理员使用签名会话。

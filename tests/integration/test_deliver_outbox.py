@@ -8,6 +8,9 @@ import httpx
 import pytest
 from sqlalchemy import insert, select, text, update
 
+from social_reply.application.account_management.reply_prompt_policy import (
+    save_reply_business_prompt,
+)
 from social_reply.application.knowledge.localizations import (
     LocalizationValidationError,
     revoke_localization,
@@ -329,6 +332,250 @@ async def _attach_published_localization(session, outbox_id: uuid.UUID) -> uuid.
     )
     await session.commit()
     return artifact_id
+
+
+async def test_stale_business_prompt_outbox_is_cancelled_before_send(session, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(
+        outbox_module,
+        "get_settings",
+        lambda: settings.model_copy(update={"reply_business_prompt_enabled": True}),
+    )
+    _conversation_id, outbox_id = await _seed(
+        session,
+        state="BOT_ACTIVE",
+        message_type="text",
+    )
+    first_prompt = await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="Answer directly and keep the explanation concise.",
+        expected_revision=0,
+        actor="user:admin",
+        change_note="Initial prompt",
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            reply_business_prompt_version_id=first_prompt.version_id,
+            reply_business_prompt_content_hash=first_prompt.content_hash,
+        )
+    )
+    await session.commit()
+    await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="Answer directly, then provide one practical next step.",
+        expected_revision=1,
+        actor="user:admin",
+        change_note="Add next step",
+    )
+    await session.commit()
+
+    assert await deliver_outbox(str(outbox_id)) == "CANCELLED"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == "CANCELLED"
+    assert outbox.last_error_code == "STALE_REPLY_BUSINESS_PROMPT"
+    assert get_chatwoot_client().sent == []
+
+
+@pytest.mark.parametrize("decision_source", ["llm", "guard", "knowledge"])
+async def test_enabled_business_prompt_gate_rejects_legacy_outbox_without_provenance(
+    session,
+    monkeypatch,
+    decision_source,
+):
+    _conversation_id, outbox_id = await _seed(
+        session,
+        state="BOT_ACTIVE",
+        message_type="text",
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(source=decision_source)
+    )
+    await session.commit()
+    settings = get_settings()
+    monkeypatch.setattr(
+        outbox_module,
+        "get_settings",
+        lambda: settings.model_copy(update={"reply_business_prompt_enabled": True}),
+    )
+
+    assert await deliver_outbox(str(outbox_id)) == "CANCELLED"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == "CANCELLED"
+    assert outbox.last_error_code == "REPLY_BUSINESS_PROMPT_PROVENANCE_REQUIRED"
+    assert get_chatwoot_client().sent == []
+
+
+async def test_disabled_business_prompt_gate_rejects_prompt_derived_outbox(
+    session,
+    monkeypatch,
+):
+    _conversation_id, outbox_id = await _seed(
+        session,
+        state="BOT_ACTIVE",
+        message_type="text",
+    )
+    prompt = await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="Answer directly and keep the explanation concise.",
+        expected_revision=0,
+        actor="user:admin",
+        change_note="Initial prompt",
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            reply_business_prompt_version_id=prompt.version_id,
+            reply_business_prompt_content_hash=prompt.content_hash,
+        )
+    )
+    await session.commit()
+    settings = get_settings()
+    monkeypatch.setattr(
+        outbox_module,
+        "get_settings",
+        lambda: settings.model_copy(update={"reply_business_prompt_enabled": False}),
+    )
+
+    assert await deliver_outbox(str(outbox_id)) == "CANCELLED"
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.last_error_code == "REPLY_BUSINESS_PROMPT_DISABLED"
+    assert get_chatwoot_client().sent == []
+
+
+async def test_prompt_save_waits_for_provider_send_holding_the_prompt_epoch_lock(
+    session,
+    monkeypatch,
+):
+    settings = get_settings()
+    monkeypatch.setattr(
+        outbox_module,
+        "get_settings",
+        lambda: settings.model_copy(update={"reply_business_prompt_enabled": True}),
+    )
+    _conversation_id, outbox_id = await _seed(
+        session,
+        state="BOT_ACTIVE",
+        message_type="text",
+    )
+    first_prompt = await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="Answer directly and keep the explanation concise.",
+        expected_revision=0,
+        actor="user:admin",
+        change_note="Initial prompt",
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            reply_business_prompt_version_id=first_prompt.version_id,
+            reply_business_prompt_content_hash=first_prompt.content_hash,
+        )
+    )
+    await session.commit()
+
+    provider_send_started = asyncio.Event()
+    provider_send_release = asyncio.Event()
+    fake_chatwoot = get_chatwoot_client()
+
+    async def controlled_create_message(**_kwargs):
+        provider_send_started.set()
+        await provider_send_release.wait()
+        return 4242
+
+    monkeypatch.setattr(fake_chatwoot, "create_message", controlled_create_message)
+    delivery_task = asyncio.create_task(deliver_outbox(str(outbox_id)))
+    await asyncio.wait_for(provider_send_started.wait(), timeout=2)
+
+    async def save_next_prompt() -> None:
+        async with get_session_factory()() as save_session:
+            await save_reply_business_prompt(
+                save_session,
+                tenant_id="default",
+                brand_id="b1",
+                content="Answer directly, then provide one practical next step.",
+                expected_revision=1,
+                actor="user:admin",
+                change_note="Add next step",
+            )
+            await save_session.commit()
+
+    save_task = asyncio.create_task(save_next_prompt())
+    await asyncio.sleep(0.1)
+    assert save_task.done() is False
+
+    provider_send_release.set()
+    assert await delivery_task == "SENT"
+    await asyncio.wait_for(save_task, timeout=2)
+
+    session.expire_all()
+    current_prompt = (
+        await session.execute(select(models.ReplyBusinessPrompt))
+    ).scalar_one()
+    assert current_prompt.revision == 2
+
+
+async def test_shared_prompt_epoch_lock_allows_same_brand_sends_to_run_concurrently(
+    session,
+    monkeypatch,
+):
+    _first_account_id, first_outbox_id = await _seed_direct_platform(
+        session,
+        platform="telegram",
+        destination_type="telegram_dm",
+        capability={"dm": True, "max_text_length": 4096},
+        target={"chat_id": "1001"},
+    )
+    _second_account_id, second_outbox_id = await _seed_direct_platform(
+        session,
+        platform="telegram",
+        destination_type="telegram_dm",
+        capability={"dm": True, "max_text_length": 4096},
+        target={"chat_id": "1002"},
+    )
+    both_sends_started = asyncio.Event()
+    release_sends = asyncio.Event()
+    started_count = 0
+
+    class Sender:
+        async def send_text(self, *, target, text):
+            nonlocal started_count
+            started_count += 1
+            if started_count == 2:
+                both_sends_started.set()
+            await release_sends.wait()
+            return f"telegram-concurrent-{target['chat_id']}"
+
+    async def get_sender(_account_id):
+        return Sender()
+
+    monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    first_task = asyncio.create_task(deliver_outbox(str(first_outbox_id)))
+    second_task = asyncio.create_task(deliver_outbox(str(second_outbox_id)))
+
+    await asyncio.wait_for(both_sends_started.wait(), timeout=2)
+    assert first_task.done() is False
+    assert second_task.done() is False
+
+    release_sends.set()
+    assert await first_task == "SENT"
+    assert await second_task == "SENT"
 
 
 async def test_disabled_chatwoot_outbox_fails_closed(session, monkeypatch):

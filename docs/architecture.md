@@ -50,6 +50,8 @@ PostgreSQL owns:
   approvals and manual replies;
 - decision release/retrieval/selector provenance, bounded text-free RAG evidence, and exact knowledge
   values protected from translation or generation drift;
+- active Tenant + Brand business Prompt pointers, immutable Prompt revisions, decision-time Prompt
+  hashes/version IDs, and Admin audit history;
 - delivery attempts, audit logs, knowledge documents/chunks, polling checkpoints, sync runs and gaps;
 - tenant-scoped `EvaluationRun` and `EvaluationDecision` rows for the trusted-local,
   synthetic-only internal evaluation foundation.
@@ -115,11 +117,11 @@ Both paths
   -> DecisionJob(PENDING, generation) in the same transaction
   -> supersede older active jobs and cancel their unsent bot decision Outboxes
   -> Worker claims DecisionJob(PROCESSING) with a random claim_token
-  -> commit claim; rules -> kill switch -> knowledge/history -> LLM -> final guard with no database transaction held
-  -> short final transaction locks the Conversation and validates job/generation/claim_token
+  -> commit claim; rules -> kill switch -> knowledge/history -> immutable system contract + lower-priority active business Prompt -> LLM -> final guard with no database transaction held
+  -> short final transaction locks the Conversation and validates job/generation/claim_token plus active Prompt revision
   -> ReplyDecision + OutboxMessage + DecisionJob(COMPLETED) in one transaction
   -> post-commit delivery fast path
-  -> send-time tenant/status/capability/window/takeover validation
+  -> send-time tenant/status/capability/window/takeover/Prompt-revision validation while the Prompt activation lock remains held through provider I/O
   -> account-scoped connector sender
   -> SENT / FAILED / NEEDS_REVIEW plus DeliveryAttempt
 ```

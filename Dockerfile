@@ -13,7 +13,8 @@ ARG SOURCE_URL=https://github.com/junqingyongyuanbusi/dm
 LABEL org.opencontainers.image.revision="${RELEASE_SHA}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.source="${SOURCE_URL}" \
-      com.nexory.reply-core.review-outbox-contract="review-outbox-dual-read-v1"
+      com.nexory.reply-core.review-outbox-contract="review-outbox-dual-read-v1" \
+      com.nexory.reply-core.business-prompt-contract="editable-business-prompt-v1"
 
 # uv 行为：不做符号链接（容器内无缓存卷）、字节码预编译加速冷启动
 ENV UV_COMPILE_BYTECODE=1 \

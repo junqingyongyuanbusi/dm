@@ -19,6 +19,13 @@ async def acquire_xact_lock(session: AsyncSession, key: str) -> None:
     )
 
 
+async def acquire_shared_xact_lock(session: AsyncSession, key: str) -> None:
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:key, 0))"),
+        {"key": key},
+    )
+
+
 async def acquire_conversation_delivery_xact_lock(
     session: AsyncSession,
     conversation_id: uuid.UUID,
@@ -27,9 +34,11 @@ async def acquire_conversation_delivery_xact_lock(
 
 
 @asynccontextmanager
-async def hold_connection_advisory_lock(
+async def _hold_connection_advisory_lock(
     connection: AsyncConnection,
     key: str,
+    *,
+    shared: bool,
 ) -> AsyncIterator[None]:
     """Hold a session advisory lock without owning caller business transactions.
 
@@ -40,9 +49,11 @@ async def hold_connection_advisory_lock(
     """
     if connection.in_transaction():
         raise RuntimeError("advisory_lock_requires_idle_connection")
+    lock_function = "pg_advisory_lock_shared" if shared else "pg_advisory_lock"
+    unlock_function = "pg_advisory_unlock_shared" if shared else "pg_advisory_unlock"
     try:
         await connection.execute(
-            text("SELECT pg_advisory_lock(hashtextextended(:key, 0))"),
+            text(f"SELECT {lock_function}(hashtextextended(:key, 0))"),
             {"key": key},
         )
         await connection.commit()
@@ -59,7 +70,7 @@ async def hold_connection_advisory_lock(
         else:
             try:
                 unlocked = await connection.scalar(
-                    text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                    text(f"SELECT {unlock_function}(hashtextextended(:key, 0))"),
                     {"key": key},
                 )
                 await connection.commit()
@@ -70,6 +81,25 @@ async def hold_connection_advisory_lock(
                     await connection.rollback()
                 await connection.invalidate()
                 raise
+
+
+@asynccontextmanager
+async def hold_connection_advisory_lock(
+    connection: AsyncConnection,
+    key: str,
+) -> AsyncIterator[None]:
+    async with _hold_connection_advisory_lock(connection, key, shared=False):
+        yield
+
+
+@asynccontextmanager
+async def hold_connection_advisory_shared_lock(
+    connection: AsyncConnection,
+    key: str,
+) -> AsyncIterator[None]:
+    """Allow concurrent readers while serializing against an exclusive mutation."""
+    async with _hold_connection_advisory_lock(connection, key, shared=True):
+        yield
 
 
 @asynccontextmanager

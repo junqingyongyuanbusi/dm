@@ -3,6 +3,7 @@ import pytest
 from social_reply.application.reply_decision.jobs import snapshot_from_dict, snapshot_to_dict
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot, run_decision_pipeline
 from social_reply.domain.messages.canonical import ChannelType
+from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import LANGUAGE_POLICY_REVIEW
 from social_reply.domain.reply.llm import (
@@ -47,6 +48,31 @@ async def test_bot_active_normal_question_auto_replies_via_llm():
     d = await run_decision_pipeline(_snap(), llm=StubLLMClient(), killswitch=_OpenSwitch())
     assert d.action is ReplyAction.AUTO_REPLY
     assert "STUB_LLM" in d.reason_codes
+
+
+async def test_primary_decision_receives_typed_business_prompt() -> None:
+    captured = {}
+
+    class _CaptureLLM:
+        async def decide(self, context):
+            captured["business_prompt"] = context.business_prompt
+            return ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="A direct answer.",
+                confidence=0.99,
+            )
+
+    instructions = BusinessPromptInstructions("Start with a direct answer.")
+    decision = await run_decision_pipeline(
+        _snap(text="Hello"),
+        llm=_CaptureLLM(),
+        killswitch=_OpenSwitch(),
+        apply_legacy_rules=False,
+        business_prompt=instructions,
+    )
+
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert captured["business_prompt"] is instructions
 
 
 async def test_short_same_language_reply_uses_model_fallback_and_auto_replies():

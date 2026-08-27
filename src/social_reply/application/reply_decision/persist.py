@@ -18,6 +18,10 @@ from social_reply.application.message_delivery.intents import (
     create_or_get_outbox_intent,
     decision_idempotency_key,
 )
+from social_reply.application.reply_decision.business_prompt import (
+    ResolvedBusinessPrompt,
+    require_current_business_prompt,
+)
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.application.reply_decision.rag_selection import RAG_SELECTION_METHODS
 from social_reply.domain.automation.state_machine import AutomationStateEnum
@@ -289,6 +293,7 @@ async def persist_decision(
     decision: ReplyDecision,
     prompt_version: str,
     *,
+    business_prompt: ResolvedBusinessPrompt | None = None,
     decision_job_id: uuid.UUID | None = None,
     decision_generation: int | None = None,
     decision_claim_token: uuid.UUID | None = None,
@@ -312,6 +317,7 @@ async def persist_decision(
         await session.execute(
             select(
                 models.PlatformAccount.tenant_id,
+                models.PlatformAccount.brand_id,
                 models.PlatformAccount.platform,
                 models.PlatformAccount.config,
                 models.PlatformAccount.chatwoot_inbox_id,
@@ -334,6 +340,17 @@ async def persist_decision(
         ).first()
         if existing is not None:
             return existing.outbox_id
+
+    if business_prompt is not None:
+        # Delivery holds these locks in the same order through provider I/O. Keeping one
+        # global order avoids a Prompt-save/HANDOFF/delivery deadlock cycle.
+        await acquire_conversation_delivery_xact_lock(session, conversation_id)
+        await require_current_business_prompt(
+            session,
+            tenant_id=account.tenant_id,
+            brand_id=account.brand_id,
+            prompt=business_prompt,
+        )
 
     if decision.action is ReplyAction.AUTO_REPLY:
         # CAS defense 1：仅当会话仍是 BOT_ACTIVE 且 version 未变时才写 outbox
@@ -432,6 +449,12 @@ async def persist_decision(
                 reason_codes=list(decision.reason_codes),
                 source=decision.source,
                 prompt_version=prompt_version,
+                reply_business_prompt_version_id=(
+                    business_prompt.version_id if business_prompt is not None else None
+                ),
+                reply_business_prompt_content_hash=(
+                    business_prompt.content_hash if business_prompt is not None else None
+                ),
                 decision_release_sha=release_sha,
                 retrieval_policy_version=retrieval_policy_version,
                 selector_version=selector_version,

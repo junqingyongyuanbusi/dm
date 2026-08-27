@@ -11,6 +11,8 @@ readonly PUBLIC_BASE_URL="https://relay.nexory.top"
 readonly SOURCE_URL="https://github.com/junqingyongyuanbusi/dm"
 readonly LEGACY_REVIEW_OUTBOX_CAPABILITY="legacy"
 readonly TARGET_REVIEW_OUTBOX_CAPABILITY="review-outbox-dual-read-v1"
+readonly LEGACY_BUSINESS_PROMPT_CAPABILITY="legacy"
+readonly TARGET_BUSINESS_PROMPT_CAPABILITY="editable-business-prompt-v1"
 readonly DEPLOY_TIMEOUT_SECONDS="${DEPLOY_TIMEOUT_SECONDS:-900}"
 readonly CI_TIMEOUT_SECONDS="${CI_TIMEOUT_SECONDS:-1200}"
 readonly RAILWAY_SERVICES=(api worker scheduler)
@@ -216,9 +218,23 @@ image_review_outbox_capability() {
   esac
 }
 
+image_business_prompt_capability() {
+  local reference="$1"
+  local capability
+  capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.business-prompt-contract"] // "legacy"' \
+    <<<"$(image_metadata "$reference")")"
+  case "$capability" in
+    "$LEGACY_BUSINESS_PROMPT_CAPABILITY"|"$TARGET_BUSINESS_PROMPT_CAPABILITY")
+      printf '%s\n' "$capability"
+      ;;
+    *) fail "$reference has unknown business Prompt capability: ${capability:-missing}" ;;
+  esac
+}
+
 verify_sha_image() {
   local reference="$1"
-  local metadata revision source image_os architecture capability
+  local metadata revision source image_os architecture capability business_prompt_capability
   metadata="$(image_metadata "$reference")"
   revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
   source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
@@ -227,10 +243,15 @@ verify_sha_image() {
   capability="$(jq -r \
     '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // ""' \
     <<<"$metadata")"
+  business_prompt_capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.business-prompt-contract"] // ""' \
+    <<<"$metadata")"
   [[ "$revision" == "$full_sha" ]] || fail "$reference has unexpected OCI revision: $revision"
   [[ "$source" == "$SOURCE_URL" ]] || fail "$reference has unexpected OCI source: $source"
   [[ "$capability" == "$TARGET_REVIEW_OUTBOX_CAPABILITY" ]] \
     || fail "$reference has unexpected review Outbox capability: ${capability:-missing}"
+  [[ "$business_prompt_capability" == "$TARGET_BUSINESS_PROMPT_CAPABILITY" ]] \
+    || fail "$reference has unexpected business Prompt capability: ${business_prompt_capability:-missing}"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
@@ -258,7 +279,9 @@ verify_rollback_compatible_image() {
   local app_revision="$3"
   local expected_capability="$4"
   local expected_database_head="$5"
-  local metadata revision source image_os architecture purpose labeled_base labeled_target database_head capability
+  local expected_business_prompt_capability="$6"
+  local metadata revision source image_os architecture purpose labeled_base labeled_target
+  local database_head capability business_prompt_capability
   metadata="$(image_metadata "$reference")"
   revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // ""' <<<"$metadata")"
   source="$(jq -r '.config.Labels["org.opencontainers.image.source"] // ""' <<<"$metadata")"
@@ -268,6 +291,9 @@ verify_rollback_compatible_image() {
   database_head="$(jq -r '.config.Labels["com.nexory.reply-core.database-head"] // ""' <<<"$metadata")"
   capability="$(jq -r \
     '.config.Labels["com.nexory.reply-core.review-outbox-contract"] // ""' \
+    <<<"$metadata")"
+  business_prompt_capability="$(jq -r \
+    '.config.Labels["com.nexory.reply-core.business-prompt-contract"] // "legacy"' \
     <<<"$metadata")"
   image_os="$(jq -r '.os // ""' <<<"$metadata")"
   architecture="$(jq -r '.architecture // ""' <<<"$metadata")"
@@ -284,6 +310,8 @@ verify_rollback_compatible_image() {
     || fail "$reference has unexpected database head: $database_head"
   [[ "$capability" == "$expected_capability" ]] \
     || fail "$reference has unexpected review Outbox capability: ${capability:-missing}"
+  [[ "$business_prompt_capability" == "$expected_business_prompt_capability" ]] \
+    || fail "$reference has unexpected business Prompt capability: ${business_prompt_capability:-missing}"
   [[ "$image_os/$architecture" == "linux/amd64" ]] \
     || fail "$reference has unexpected platform: $image_os/$architecture"
 }
@@ -294,13 +322,14 @@ require_ci_rollback_compatible_image() {
   local app_revision="$3"
   local base_capability="$4"
   local expected_database_head="$5"
+  local base_business_prompt_capability="$6"
   local state digest
   state="$(image_state "$reference")"
   [[ "$state" == "exists" ]] \
     || fail "CI did not publish required migration-compatible image: $reference"
   verify_rollback_compatible_image \
     "$reference" "$base_digest" "$app_revision" "$base_capability" \
-    "$expected_database_head"
+    "$expected_database_head" "$base_business_prompt_capability"
   digest="$(image_digest "$reference")"
   [[ "$digest" != "$expected_digest" ]] \
     || fail "rollback-compatible image unexpectedly matches target digest"
@@ -370,6 +399,16 @@ railway_source_image() {
   railway_service_node "$1" | jq -r '.source.image // ""'
 }
 
+railway_service_variable() {
+  local service="$1"
+  local variable_name="$2"
+  railway variable list \
+    --project "$RAILWAY_PROJECT_ID" \
+    --environment "$RAILWAY_ENVIRONMENT" \
+    --service "$service" \
+    --json | jq -er --arg name "$variable_name" '.[$name]'
+}
+
 railway_environment_config_json() {
   railway api \
     'query EnvironmentConfig($id: String!, $projectId: String!) { environment(id: $id, projectId: $projectId) { config } }' \
@@ -431,6 +470,127 @@ active_deployment_json() {
   '
 }
 
+deployment_runtime_json() {
+  local deployment_id="$1"
+  railway api \
+    'query DeploymentRuntime($id: String!) { deployment(id: $id) { id status deploymentStopped } }' \
+    --variables "$(jq -cn --arg id "$deployment_id" '{id: $id}')" \
+    | jq -e '.data.deployment'
+}
+
+service_deployment_runtimes_json() {
+  local service="$1"
+  local service_id after_cursor="" accumulated='[]'
+  local response page has_next_page next_cursor
+  service_id="$(railway_service_node "$service" | jq -r '.serviceId // ""')"
+  [[ -n "$service_id" ]] || fail "cannot resolve Railway service ID for $service"
+  while true; do
+    response="$(railway api \
+      'query ServiceDeployments($input: DeploymentListInput!, $first: Int!, $after: String) { deployments(input: $input, first: $first, after: $after) { edges { node { id status deploymentStopped } } pageInfo { hasNextPage endCursor } } }' \
+      --variables "$(jq -cn \
+        --arg projectId "$RAILWAY_PROJECT_ID" \
+        --arg environmentId "$RAILWAY_ENVIRONMENT_ID" \
+        --arg serviceId "$service_id" \
+        --arg after "$after_cursor" \
+        '{input:{projectId:$projectId,environmentId:$environmentId,serviceId:$serviceId},first:100,after:(if $after == "" then null else $after end)}')")" \
+      || fail "could not list Railway deployments for $service"
+    jq -e '.data.deployments.edges and .data.deployments.pageInfo' \
+      >/dev/null <<<"$response" || fail "invalid Railway deployment page for $service"
+    page="$(jq '[.data.deployments.edges[].node]' <<<"$response")"
+    accumulated="$(jq -cn \
+      --argjson accumulated "$accumulated" \
+      --argjson page "$page" \
+      '$accumulated + $page')"
+    has_next_page="$(jq -r '.data.deployments.pageInfo.hasNextPage' <<<"$response")"
+    [[ "$has_next_page" == "true" ]] || break
+    next_cursor="$(jq -r '.data.deployments.pageInfo.endCursor // ""' <<<"$response")"
+    [[ -n "$next_cursor" && "$next_cursor" != "$after_cursor" ]] \
+      || fail "invalid Railway deployment cursor for $service"
+    after_cursor="$next_cursor"
+  done
+  printf '%s\n' "$accumulated"
+}
+
+unstopped_deployment_ids() {
+  service_deployment_runtimes_json "$1" | jq -r '
+    .[] | select(.deploymentStopped == false) | .id
+  '
+}
+
+in_progress_deployment_ids() {
+  service_deployment_runtimes_json "$1" | jq -r '
+      .[]
+      | select(
+          .status == "QUEUED"
+          or .status == "INITIALIZING"
+          or .status == "WAITING"
+          or .status == "BUILDING"
+          or .status == "DEPLOYING"
+          or .status == "NEEDS_APPROVAL"
+          or .status == "REMOVING"
+        )
+      | .id
+    '
+}
+
+wait_for_replaced_deployments_to_stop() {
+  local service="$1"
+  local replacement_deployment_id="$2"
+  local replaced_deployment_ids="$3"
+  local deployment_id deadline runtime status deployment_stopped
+  [[ -n "$replaced_deployment_ids" ]] || return 0
+  while IFS= read -r deployment_id; do
+    [[ -n "$deployment_id" && "$deployment_id" != "$replacement_deployment_id" ]] \
+      || continue
+    deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
+    while (( SECONDS < deadline )); do
+      runtime="$(deployment_runtime_json "$deployment_id")" \
+        || fail "could not inspect replaced deployment $deployment_id"
+      status="$(jq -r '.status // ""' <<<"$runtime")"
+      deployment_stopped="$(jq -r '.deploymentStopped // false' <<<"$runtime")"
+      if [[ "$status" == "REMOVED" && "$deployment_stopped" == "true" ]]; then
+        log "$service replaced deployment is fully stopped: $deployment_id"
+        break
+      fi
+      case "$status" in
+        SUCCESS|REMOVING|REMOVED) ;;
+        FAILED|CRASHED|SKIPPED|SLEEPING)
+          [[ "$deployment_stopped" == "true" ]] && break
+          ;;
+        *) fail "$service replaced deployment $deployment_id has unsafe status $status" ;;
+      esac
+      sleep 5
+    done
+    [[ "$deployment_stopped" == "true" ]] \
+      || fail "$service replaced deployment did not stop: $deployment_id"
+  done <<<"$replaced_deployment_ids"
+}
+
+role_runtime_converged() {
+  local service="$1"
+  local expected_deployment_id="$2"
+  local expected_digest="$3"
+  local active_deployments deployment_runtimes
+  active_deployments="$(railway_service_node "$service" | jq \
+    '[.activeDeployments[] | select(.status == "SUCCESS")]')"
+  [[ "$(jq 'length' <<<"$active_deployments")" == "1" ]] \
+    || fail "$service has multiple active deployments"
+  [[ "$(jq -r '.[0].id // ""' <<<"$active_deployments")" == "$expected_deployment_id" ]] \
+    || fail "$service active deployment changed unexpectedly"
+  [[ "$(jq -r '.[0].meta.imageDigest // ""' <<<"$active_deployments")" == "$expected_digest" ]] \
+    || fail "$service active deployment has the wrong digest"
+  deployment_runtimes="$(service_deployment_runtimes_json "$service")"
+  jq -e --arg expected "$expected_deployment_id" '
+    [.[] | select(.deploymentStopped == false)]
+    | length == 1
+      and .[0].id == $expected
+      and .[0].status == "SUCCESS"
+  ' >/dev/null <<<"$deployment_runtimes" \
+    || fail "$service has another deployment whose instances are not stopped"
+  [[ -z "$(in_progress_deployment_ids "$service")" ]] \
+    || fail "$service still has an unresolved deployment"
+}
+
 latest_deployment_json() {
   local service="$1"
   railway deployment list \
@@ -486,7 +646,7 @@ wait_for_deployment() {
       FAILED|CRASHED|REMOVED|SKIPPED|SLEEPING)
         fail "$service deployment $deployment_id ended with $deployment_status"
         ;;
-      QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL|"") ;;
+      QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL|REMOVING|"") ;;
       *) fail "$service deployment $deployment_id returned unknown status $deployment_status" ;;
     esac
     sleep 5
@@ -527,6 +687,8 @@ write_manifest() {
     --arg rollback_schema_head "${rollback_database_head:-}" \
     --arg previous_review_outbox_capability "${previous_review_outbox_capability:-}" \
     --arg target_review_outbox_capability "${target_review_outbox_capability:-}" \
+    --arg previous_business_prompt_capability "${previous_business_prompt_capability:-}" \
+    --arg target_business_prompt_capability "${target_business_prompt_capability:-}" \
     --arg previous_api_deployment_id "${previous_api_deployment_id:-}" \
     --arg previous_worker_deployment_id "${previous_worker_deployment_id:-}" \
     --arg previous_scheduler_deployment_id "${previous_scheduler_deployment_id:-}" \
@@ -557,6 +719,10 @@ write_manifest() {
       review_outbox_contract: {
         previous: $previous_review_outbox_capability,
         target: $target_review_outbox_capability
+      },
+      business_prompt_contract: {
+        previous: $previous_business_prompt_capability,
+        target: $target_business_prompt_capability
       },
       previous_railway: {
         api_deployment_id: $previous_api_deployment_id,
@@ -694,6 +860,27 @@ previous_review_outbox_capability="$(
 target_review_outbox_capability="$(
   image_review_outbox_capability "${IMAGE_REPO}@${expected_digest}"
 )"
+previous_business_prompt_capability="$(
+  image_business_prompt_capability "${IMAGE_REPO}@${previous_digest}"
+)"
+target_business_prompt_capability="$(
+  image_business_prompt_capability "${IMAGE_REPO}@${expected_digest}"
+)"
+business_prompt_transition="false"
+case "${previous_business_prompt_capability}:${target_business_prompt_capability}" in
+  "${LEGACY_BUSINESS_PROMPT_CAPABILITY}:${TARGET_BUSINESS_PROMPT_CAPABILITY}")
+    business_prompt_transition="true"
+    for service in "${RAILWAY_SERVICES[@]}"; do
+      [[ "$(railway_service_variable "$service" REPLY_BUSINESS_PROMPT_ENABLED)" == "false" ]] \
+        || fail "first editable Prompt rollout requires REPLY_BUSINESS_PROMPT_ENABLED=false on $service"
+    done
+    log "verified editable Prompt rollout remains disabled on all roles"
+    ;;
+  "${TARGET_BUSINESS_PROMPT_CAPABILITY}:${TARGET_BUSINESS_PROMPT_CAPABILITY}") ;;
+  *)
+    fail "unsupported business Prompt capability transition: ${previous_business_prompt_capability} -> ${target_business_prompt_capability}"
+    ;;
+esac
 bridge_required="false"
 case "${previous_review_outbox_capability}:${target_review_outbox_capability}" in
   "${LEGACY_REVIEW_OUTBOX_CAPABILITY}:${TARGET_REVIEW_OUTBOX_CAPABILITY}")
@@ -715,7 +902,8 @@ if migration_graph_changed "$previous_app_revision"; then
     "$previous_digest" \
     "$previous_app_revision" \
     "$previous_review_outbox_capability" \
-    "$rollback_database_head")"
+    "$rollback_database_head" \
+    "$previous_business_prompt_capability")"
   [[ "$rollback_compatible_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || fail "invalid migration-compatible rollback digest: $rollback_compatible_digest"
   log "verified CI-published migration-compatible rollback image: $rollback_compatible_ref"
@@ -724,6 +912,10 @@ else
 fi
 if [[ "$bridge_required" == "true" && "$migration_compatibility_required" != "true" ]]; then
   fail "review Outbox capability bridge requires a CI-published migration-compatible image"
+fi
+if [[ "$business_prompt_transition" == "true" \
+  && "$migration_compatibility_required" != "true" ]]; then
+  fail "editable business Prompt capability transition requires a migration-compatible image"
 fi
 
 for service in "${RAILWAY_SERVICES[@]}"; do
@@ -759,11 +951,19 @@ if [[ -f "$manifest_path" ]]; then
   manifest_compatibility="$(
     jq -r '.migration_compatible_rollback.digest // ""' "$manifest_path"
   )"
+  manifest_previous_business_prompt_capability="$(
+    jq -r '.business_prompt_contract.previous // ""' "$manifest_path"
+  )"
+  manifest_target_business_prompt_capability="$(
+    jq -r '.business_prompt_contract.target // ""' "$manifest_path"
+  )"
   [[ "$manifest_sha" == "$full_sha" \
     && "$manifest_digest" == "$expected_digest" \
     && "$manifest_previous" == "$previous_digest" \
     && "$manifest_compatibility_required" == "$migration_compatibility_required" \
-    && "$manifest_compatibility" == "$rollback_compatible_digest" ]] \
+    && "$manifest_compatibility" == "$rollback_compatible_digest" \
+    && "$manifest_previous_business_prompt_capability" == "$previous_business_prompt_capability" \
+    && "$manifest_target_business_prompt_capability" == "$target_business_prompt_capability" ]] \
     || fail "existing release manifest does not match this rollout"
   manifest_status="$(jq -r '.status // ""' "$manifest_path")"
   recorded_rollout_phase="$(jq -r '.rollout_phase // ""' "$manifest_path")"
@@ -827,12 +1027,16 @@ deploy_role() {
   local desired_digest="$2"
   local stage="$3"
   local active active_id active_digest latest latest_id latest_status latest_digest
-  local redeploy_output deployment_id
+  local redeploy_output deployment_id replaced_deployment_ids
   require_latest_digest "$desired_digest" "$stage"
   active="$(active_deployment_json "$service")"
   active_id="$(jq -r '.id // ""' <<<"$active")"
   active_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
   if [[ "$active_digest" == "$desired_digest" ]]; then
+    replaced_deployment_ids="$(unstopped_deployment_ids "$service")"
+    wait_for_replaced_deployments_to_stop \
+      "$service" "$active_id" "$replaced_deployment_ids"
+    role_runtime_converged "$service" "$active_id" "$desired_digest"
     log "$service already runs the $stage digest: $active_id"
     printf '%s\n' "$active_id"
     return 0
@@ -847,23 +1051,33 @@ deploy_role() {
   latest_id="$(jq -r '.id // ""' <<<"$latest")"
   latest_status="$(jq -r '.status // ""' <<<"$latest")"
   latest_digest="$(jq -r '.meta.imageDigest // ""' <<<"$latest")"
+  replaced_deployment_ids="$(unstopped_deployment_ids "$service")"
   if [[ -n "$latest_id" && "$latest_id" != "$active_id" ]]; then
     if [[ "$latest_digest" == "$desired_digest" ]]; then
       case "$latest_status" in
         SUCCESS)
+          wait_for_replaced_deployments_to_stop \
+            "$service" "$latest_id" "$replaced_deployment_ids"
+          role_runtime_converged "$service" "$latest_id" "$desired_digest"
           printf '%s\n' "$latest_id"
           return 0
           ;;
         QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL)
           log "resuming in-flight $stage $service deployment: $latest_id"
           wait_for_deployment "$service" "$latest_id" "$desired_digest" >/dev/null
+          wait_for_replaced_deployments_to_stop \
+            "$service" "$latest_id" "$replaced_deployment_ids"
+          role_runtime_converged "$service" "$latest_id" "$desired_digest"
           printf '%s\n' "$latest_id"
           return 0
           ;;
         FAILED|CRASHED|REMOVED|SKIPPED|SLEEPING) ;;
+        REMOVING)
+          fail "$service desired deployment is being removed: $latest_id"
+          ;;
         *) fail "$service latest deployment has unknown status $latest_status" ;;
       esac
-    elif [[ "$latest_status" =~ ^(QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL)$ ]]; then
+    elif [[ "$latest_status" =~ ^(QUEUED|INITIALIZING|WAITING|BUILDING|DEPLOYING|NEEDS_APPROVAL|REMOVING)$ ]]; then
       fail "$service has unresolved in-flight deployment $latest_id with digest ${latest_digest:-unknown}; refusing duplicate redeploy"
     fi
   fi
@@ -884,6 +1098,9 @@ deploy_role() {
       || fail "Railway redeploy returned no trackable deployment ID for $service"
   fi
   wait_for_deployment "$service" "$deployment_id" "$desired_digest" >/dev/null
+  wait_for_replaced_deployments_to_stop \
+    "$service" "$deployment_id" "$replaced_deployment_ids"
+  role_runtime_converged "$service" "$deployment_id" "$desired_digest"
   printf '%s\n' "$deployment_id"
 }
 
@@ -909,6 +1126,21 @@ bridge_rollout_directive() {
     "${recorded_args[@]}"
 }
 
+converge_observed_runtime_state() {
+  local service active active_id active_digest runtime_deployment_ids
+  for service in "${RAILWAY_SERVICES[@]}"; do
+    active="$(active_deployment_json "$service")"
+    active_id="$(jq -r '.id // ""' <<<"$active")"
+    active_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
+    [[ -n "$active_id" && -n "$active_digest" ]] \
+      || fail "$service has no active deployment while recovering rollout state"
+    runtime_deployment_ids="$(unstopped_deployment_ids "$service")"
+    wait_for_replaced_deployments_to_stop \
+      "$service" "$active_id" "$runtime_deployment_ids"
+    role_runtime_converged "$service" "$active_id" "$active_digest"
+  done
+}
+
 run_capability_bridge_rollout() {
   local directive observed_phase next_phase action
   while true; do
@@ -920,6 +1152,8 @@ run_capability_bridge_rollout() {
 
     if [[ "$recorded_rollout_phase" != "$observed_phase" \
       && !( "$recorded_rollout_phase" == "complete" && "$action" == "complete" ) ]]; then
+      log "observed rollout is ahead of its manifest; verifying deployment drain before resume"
+      converge_observed_runtime_state
       recorded_rollout_phase="$observed_phase"
       manifest_status="deploying"
       write_manifest "$manifest_status" "$recorded_rollout_phase"
@@ -969,9 +1203,6 @@ run_capability_bridge_rollout() {
         scheduler_deployment_id="$(deploy_role scheduler "$expected_digest" target)"
         ;;
       complete)
-        recorded_rollout_phase="complete"
-        manifest_status="completed"
-        write_manifest "$manifest_status" "$recorded_rollout_phase"
         return 0
         ;;
       *) fail "rollout validator returned unknown action: $action" ;;
@@ -1033,6 +1264,7 @@ for service in "${RAILWAY_SERVICES[@]}"; do
   final_digest="$(jq -r '.meta.imageDigest // ""' <<<"$active")"
   [[ -n "$final_id" && "$final_digest" == "$expected_digest" ]] \
     || fail "$service active deployment does not match $expected_digest"
+  role_runtime_converged "$service" "$final_id" "$expected_digest"
 done
 validate_railway_config
 validate_railway_colocation

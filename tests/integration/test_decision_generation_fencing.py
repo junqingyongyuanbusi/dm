@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -12,16 +13,21 @@ from social_reply.application.account_management.human_workflow import (
     resume_bot,
     send_human_reply,
 )
+from social_reply.application.account_management.reply_prompt_policy import (
+    save_reply_business_prompt,
+)
 from social_reply.application.event_ingestion import processor as chatwoot_processor
 from social_reply.application.event_ingestion.direct import ingest_canonical_event
 from social_reply.application.event_ingestion.processor import process_raw_event
 from social_reply.application.reply_decision import jobs as decision_jobs
 from social_reply.application.reply_decision import runner as decision_runner
+from social_reply.application.reply_decision.business_prompt import BusinessPromptSuperseded
 from social_reply.application.reply_decision.jobs import (
     process_decision_job,
     reserve_conversation_generation,
     reserve_decision_job,
 )
+from social_reply.application.reply_decision.persist import persist_decision
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.application.reply_decision.runner import run_and_persist_decision
 from social_reply.domain.automation.state_machine import ensure_state
@@ -211,6 +217,182 @@ async def _assert_human_action(session, conversation_id, action):
         ).scalar_one()
         assert manual_outbox.actor_kind == "ADMIN_HUMAN"
         assert manual_outbox.payload["text"] == "Human reply wins"
+
+
+async def test_stale_business_prompt_cannot_create_decision_or_outbox(session):
+    account_id, conversation_id = await _seed_conversation(session)
+    message_id, _raw_event_id, snapshot = await _seed_generation_input(
+        session,
+        account_id,
+        conversation_id,
+    )
+    first_prompt = await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="Answer directly and keep the explanation concise.",
+        expected_revision=0,
+        actor="user:admin",
+        change_note="Initial prompt",
+    )
+    await session.commit()
+    await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="Answer directly, then provide one practical next step.",
+        expected_revision=1,
+        actor="user:admin",
+        change_note="Add next step",
+    )
+    await session.commit()
+
+    with pytest.raises(BusinessPromptSuperseded, match="reply_business_prompt_superseded"):
+        await persist_decision(
+            session,
+            snapshot,
+            conversation_id,
+            message_id,
+            account_id,
+            ReplyDecision(
+                action=ReplyAction.AUTO_REPLY,
+                reply_text="Here is a concise answer.",
+                confidence=0.95,
+                source="llm",
+            ),
+            "test-business-prompt",
+            business_prompt=first_prompt,
+        )
+    await session.rollback()
+
+    assert (
+        await session.execute(
+            select(models.ReplyDecision).where(models.ReplyDecision.message_id == message_id)
+        )
+    ).first() is None
+    assert (
+        await session.execute(
+            select(models.OutboxMessage).where(
+                models.OutboxMessage.reply_to_message_id == message_id
+            )
+        )
+    ).first() is None
+
+
+async def test_runner_persists_active_prompt_epoch_for_deterministic_decision(
+    session,
+    migrated_db,
+    monkeypatch,
+):
+    account_id, conversation_id = await _seed_conversation(session)
+    message_id, _raw_event_id, snapshot = await _seed_generation_input(
+        session,
+        account_id,
+        conversation_id,
+        text="诈骗",
+    )
+    account = await session.get(models.PlatformAccount, account_id)
+    account.config = {"delivery_mode": "direct"}
+    state = await session.get(models.AutomationState, conversation_id)
+    state.state = "BOT_DRAFT_ONLY"
+    await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="Answer directly and keep the explanation concise.",
+        expected_revision=0,
+        actor="user:admin",
+        change_note="Initial prompt",
+    )
+    await session.commit()
+
+    settings = decision_runner.get_settings()
+    monkeypatch.setattr(
+        decision_runner,
+        "get_settings",
+        lambda: settings.model_copy(update={"reply_business_prompt_enabled": True}),
+    )
+    monkeypatch.setattr(
+        decision_runner,
+        "_make_killswitch",
+        lambda: decision_runner._StaticKillSwitch(False),
+    )
+    outbox_id = await run_and_persist_decision(
+        replace(snapshot, automation_state="BOT_DRAFT_ONLY"),
+        conversation_id,
+        message_id,
+        account_id,
+    )
+
+    assert outbox_id is None
+    decision = (
+        await session.execute(
+            select(models.ReplyDecision).where(models.ReplyDecision.message_id == message_id)
+        )
+    ).scalar_one()
+    active_prompt = (
+        await session.execute(select(models.ReplyBusinessPrompt))
+    ).scalar_one()
+    assert decision.source == "rule"
+    assert decision.reply_business_prompt_version_id == active_prompt.active_version_id
+    assert decision.reply_business_prompt_content_hash == active_prompt.content_hash
+    assert decision.prompt_version.endswith("#bp1")
+
+
+async def test_runner_keeps_legacy_prompt_provenance_empty_when_gate_is_disabled(
+    session,
+    migrated_db,
+    monkeypatch,
+):
+    account_id, conversation_id = await _seed_conversation(session)
+    message_id, _raw_event_id, snapshot = await _seed_generation_input(
+        session,
+        account_id,
+        conversation_id,
+        text="诈骗",
+    )
+    account = await session.get(models.PlatformAccount, account_id)
+    account.config = {"delivery_mode": "direct"}
+    state = await session.get(models.AutomationState, conversation_id)
+    state.state = "BOT_DRAFT_ONLY"
+    await save_reply_business_prompt(
+        session,
+        tenant_id="default",
+        brand_id="b1",
+        content="This saved business Prompt must remain inactive while the gate is disabled.",
+        expected_revision=0,
+        actor="user:admin",
+        change_note="Staged prompt",
+    )
+    await session.commit()
+
+    settings = decision_runner.get_settings()
+    monkeypatch.setattr(
+        decision_runner,
+        "get_settings",
+        lambda: settings.model_copy(update={"reply_business_prompt_enabled": False}),
+    )
+    monkeypatch.setattr(
+        decision_runner,
+        "_make_killswitch",
+        lambda: decision_runner._StaticKillSwitch(False),
+    )
+    outbox_id = await run_and_persist_decision(
+        replace(snapshot, automation_state="BOT_DRAFT_ONLY"),
+        conversation_id,
+        message_id,
+        account_id,
+    )
+
+    assert outbox_id is None
+    decision = (
+        await session.execute(
+            select(models.ReplyDecision).where(models.ReplyDecision.message_id == message_id)
+        )
+    ).scalar_one()
+    assert decision.reply_business_prompt_version_id is None
+    assert decision.reply_business_prompt_content_hash is None
+    assert "#bp" not in decision.prompt_version
 
 
 async def test_new_generation_supersedes_job_and_cancels_stale_bot_outbox(session):

@@ -171,7 +171,7 @@ async def test_grouped_navigation_uses_new_information_architecture(migrated_db)
         assert group in page.text
     for path, label in (
         ("/admin/content/knowledge", "知识库"),
-        ("/admin/content/brand-voice", "品牌语气"),
+        ("/admin/content/reply-prompt", "业务 Prompt"),
         ("/admin/integrations/accounts", "平台账号"),
         ("/admin/integrations/feishu/handoff", "Feishu 人工通知"),
         ("/admin/system/health", "系统健康"),
@@ -190,7 +190,7 @@ async def test_new_page_routes_render_and_legacy_routes_remain_available(migrate
         await _login(client)
         pairs = (
             ("/admin/content/knowledge", "/admin/knowledge", "知识库"),
-            ("/admin/content/brand-voice", "/admin/prompt", "品牌语气"),
+            ("/admin/content/reply-prompt", "/admin/prompt", "业务 Prompt"),
             ("/admin/integrations/accounts", "/admin/accounts", "平台账号"),
             ("/admin/system/health", "/admin/health", "系统健康"),
         )

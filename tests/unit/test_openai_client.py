@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import ReplyAction, RiskLevel, Visibility
 from social_reply.domain.reply.llm import LLMContext, RAGCandidate
 from social_reply.domain.reply.openai_client import OpenAILLMClient
@@ -141,6 +142,39 @@ async def test_无历史时保持单轮结构():
     messages = json.loads(captured[0].content)["messages"]
     assert [m["role"] for m in messages] == ["system", "user"]
     assert messages[1]["content"] == "你们几点营业？"
+
+
+@pytest.mark.asyncio
+async def test_业务_prompt_使用低于不可变系统契约的_user_policy_消息():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _completion_response(json.dumps(_GOOD_OUTPUT))
+
+    business_prompt = BusinessPromptInstructions(
+        "Answer the immediate question first, then provide one concise next step."
+    )
+    await _client(handler).decide(
+        LLMContext(
+            text="How can I continue?",
+            conversation_key="cw:1:2",
+            business_prompt=business_prompt,
+        )
+    )
+    messages = json.loads(captured[0].content)["messages"]
+
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "Immutable WikiFX response contract" in messages[0]["content"]
+    assert "Brand voice preferences" not in messages[0]["content"]
+    assert business_prompt.text in messages[1]["content"]
+    assert "lower-authority JSON data" in messages[1]["content"]
+    assert "higher-priority immutable system contract" in messages[1]["content"]
+    payload = json.loads(messages[1]["content"].split("\n", 1)[1])
+    assert payload == {
+        "tenant_business_instructions": business_prompt.text,
+        "customer_message": "How can I continue?",
+    }
 
 
 @pytest.mark.parametrize(
