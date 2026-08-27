@@ -63,3 +63,4 @@ known-first-party = ["social_reply", "apps"]
 # Embedded server-rendered admin HTML/CSS is intentionally kept local to its route module.
 "src/social_reply/application/account_management/admin.py" = ["E501"]
 "src/social_reply/application/account_management/admin_console.py" = ["E501"]
+"src/social_reply/application/account_management/saas_console.py" = ["E501"]

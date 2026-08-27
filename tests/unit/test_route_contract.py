@@ -69,3 +69,30 @@ def test_control_api_v1_routes_remain_stable() -> None:
 
     for path, methods in expected.items():
         assert routes[path] == methods
+
+
+def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
+    routes = _route_methods()
+    tenant_pages = {
+        "/app": {"GET"},
+        "/app/t/{tenant_id}": {"GET"},
+        "/app/t/{tenant_id}/agents": {"GET"},
+        "/app/t/{tenant_id}/agents/{agent_id}": {"GET"},
+        "/app/t/{tenant_id}/agents/{agent_id}/{section}": {"GET"},
+        "/app/t/{tenant_id}/inbox": {"GET"},
+        "/app/t/{tenant_id}/knowledge": {"GET"},
+        "/app/t/{tenant_id}/knowledge/documents/{document_id}": {"GET"},
+        "/app/t/{tenant_id}/audit": {"GET"},
+        "/app/t/{tenant_id}/audit/{audit_id}": {"GET"},
+        "/app/t/{tenant_id}/journeys": {"GET"},
+        "/app/t/{tenant_id}/journeys/{journey_id}": {"GET"},
+        "/app/t/{tenant_id}/settings": {"GET"},
+    }
+    system_pages = {
+        "/admin/system/overview": {"GET"},
+        "/admin/system/audit": {"GET"},
+        "/help": {"GET"},
+    }
+
+    for path, methods in (tenant_pages | system_pages).items():
+        assert routes[path] == methods

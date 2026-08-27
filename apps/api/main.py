@@ -12,6 +12,7 @@ from social_reply.application.account_management.feishu_handoff_admin import (
 )
 from social_reply.application.account_management.oauth import router as oauth_router
 from social_reply.application.account_management.router import router as account_management_router
+from social_reply.application.account_management.saas_console import router as saas_console_router
 from social_reply.application.account_management.users import router as admin_users_router
 from social_reply.connectors.feishu.router import router as feishu_router
 from social_reply.connectors.meta.router import router as meta_router
@@ -114,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(feishu_handoff_admin_router)
     app.include_router(admin_users_router)
     app.include_router(oauth_router)
+    app.include_router(saas_console_router)
     app.include_router(account_management_router)
     if settings.chatwoot_enabled:
         from social_reply.application.event_ingestion.router import router as ingestion_router
