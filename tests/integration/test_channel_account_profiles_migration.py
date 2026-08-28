@@ -3,7 +3,6 @@ import uuid
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-
 from tests.integration.migration_support import (
     assert_alembic_succeeds,
     temporary_database,
