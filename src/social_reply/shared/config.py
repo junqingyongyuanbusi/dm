@@ -115,8 +115,9 @@ class Settings(BaseSettings):
     # 强命中时由 LLM 生成同语言回复；低置信度先走占位符保护的查询翻译回退。
     # 英语事实源不变；und/检测失败、无强命中、official-contact、守卫不符一律 HANDOFF。
     multilingual_knowledge_reply_enabled: bool = False
-    # 测试阶段的纯知识命中回复模式。开启后，强命中负责决定是否回复，生成模型只返回
-    # 客户可见文本；现有内容规则保留在普通路径，便于后续恢复。
+    # 测试阶段的纯知识命中回复模式。唯一/高 margin 命中走单候选文本生成；top1/top2
+    # 都过相似度 floor 但 margin 不足时，模型只能回答、澄清或放弃。现有内容规则保留
+    # 在普通路径，便于后续恢复。
     knowledge_match_only_reply_enabled: bool = False
     # Language identity is advisory in review mode: deterministic fact/provenance
     # checks still fail closed, while uncertain language observations create a draft.

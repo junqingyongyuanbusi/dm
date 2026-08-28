@@ -243,7 +243,7 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `KNOWLEDGE_VERBATIM_REPLY` | `false` | Return matched template text without LLM rewriting |
 | `REQUIRE_KNOWLEDGE` | `false` | Legacy path: handoff without calling LLM when retrieval has no match |
 | `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Enables English-corpus multilingual runtime generation; non-English requests use the detected language, with no language or account allowlist; requires knowledge retrieval |
-| `KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED` | `false` | Temporary coordinated test mode. A unique exact match, or answer-level similarity `>= 0.80` with margin `>= 0.08`, decides whether to reply. The model only generates text and the content, grounding, source-currentness, contact, and language Guards are bypassed. Requires knowledge retrieval and multilingual generation, and is incompatible with `RAG_SELECTOR_MODE=live`. API, Worker, and Scheduler must set the same explicit value. |
+| `KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED` | `false` | Temporary coordinated test mode. A unique exact match or a high-margin answer-level match uses the existing single-answer text generator. For a non-exact low-margin match, top1 and top2 must both meet `KNOWLEDGE_AUTO_REPLY_MIN_SIMILARITY`; a bounded model contract may answer from compatible approved facts, ask one clarification question, or abstain to handoff. Exact answer conflicts and candidates below the similarity floor still hand off. Content, grounding, source-currentness, contact, and language Guards remain bypassed. Requires knowledge retrieval and multilingual generation, and is incompatible with `RAG_SELECTOR_MODE=live`. API, Worker, and Scheduler must set the same explicit value. |
 | `KNOWLEDGE_LOCALIZATION_ENABLED` | `false` | Prefer human-reviewed localized text over runtime generation; requires `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true` and a non-empty live-locale list |
 | `KNOWLEDGE_LOCALIZATION_LIVE_LOCALES` | empty | Comma-separated send allowlist for reviewed localizations; published locales outside it still fall back to runtime generation |
 | `MULTILINGUAL_LANGUAGE_POLICY` | `review` | `review` preserves uncertain/wrong-language output as a private DRAFT after every hard guard passes; `legacy_hard` remains available as a rollback mode that converts it to HANDOFF |
@@ -258,8 +258,11 @@ localization checks, and send-time source checks remain in the code and continue
 switch is `false`. When the switch is `true`, only system-delivery correctness remains enforced:
 tenant/account/conversation scope, Kill Switch, automation takeover, generation fencing, Prompt
 currentness, payload/target binding, idempotency, platform capability, non-empty text, and platform
-length. Reply language is requested through the generation Prompt and is not verified after
-generation. Roll back by setting the switch to `false` on all three roles before redeploying them.
+length. Low-margin resolution keeps `knowledge_match_status=ambiguous` and records a separate
+contract, gate version, both candidate hashes/similarities, resolver outcome, and used candidate
+IDs. It never rewrites the retrieval result as a strong match. Reply language is requested through
+the generation Prompt and is not verified after generation. Roll back by setting the switch to
+`false` on all three roles before redeploying them.
 
 Stage the first editable Prompt release with `REPLY_BUSINESS_PROMPT_ENABLED=false` on all roles.
 After the target digest and schema are healthy, use

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import math
 import uuid
 from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
@@ -26,8 +27,13 @@ from social_reply.application.reply_decision.business_prompt import (
     business_prompt_provenance_is_current,
 )
 from social_reply.application.reply_decision.multilingual_generation import (
+    KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
+    KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION,
     KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+)
+from social_reply.application.reply_decision.rag_selection import (
+    MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
 )
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.connectors.email.contracts import email_address_identity_key
@@ -79,6 +85,102 @@ def _match_only_delivery_shape_error(platform: str, payload_text: str) -> str | 
     if len(payload_text) > maximum_text_length:
         return "GUARD_TOO_LONG"
     return None
+
+
+def _match_only_ambiguity_provenance_is_valid(
+    decision: models.ReplyDecision,
+) -> bool:
+    minimum_similarity = decision.knowledge_min_similarity_threshold
+    minimum_margin = decision.knowledge_min_margin_threshold
+    top1_similarity = decision.knowledge_similarity
+    top2_similarity = decision.knowledge_top2_similarity
+    margin = decision.knowledge_similarity_margin
+    if (
+        decision.knowledge_match_status != "ambiguous"
+        or decision.knowledge_gate_version
+        != KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION
+        or minimum_similarity is None
+        or minimum_margin is None
+        or top1_similarity is None
+        or top2_similarity is None
+        or margin is None
+        or top1_similarity < minimum_similarity
+        or top2_similarity < minimum_similarity
+        or not 0 <= margin < minimum_margin
+        or decision.knowledge_content_hash is None
+        or decision.knowledge_top2_content_hash is None
+        or decision.knowledge_content_hash == decision.knowledge_top2_content_hash
+        or not decision.selector_version
+    ):
+        return False
+    evidence = decision.rag_evidence
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("schema_version") != "rag-evidence-v2"
+        or evidence.get("selection_method")
+        != MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD
+        or evidence.get("selector_version") != decision.selector_version
+        or evidence.get("selected_content_hash")
+        != decision.knowledge_content_hash
+        or evidence.get("selector_answer_hash") is not None
+        or evidence.get("selector_content_hash") is not None
+    ):
+        return False
+    candidates = evidence.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 2:
+        return False
+    candidates_by_id = {
+        candidate.get("candidate_id"): candidate
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and isinstance(candidate.get("candidate_id"), str)
+    }
+    if set(candidates_by_id) != {"candidate-1", "candidate-2"}:
+        return False
+    candidate_expectations = (
+        (
+            "candidate-1",
+            decision.knowledge_content_hash,
+            top1_similarity,
+        ),
+        (
+            "candidate-2",
+            decision.knowledge_top2_content_hash,
+            top2_similarity,
+        ),
+    )
+    for candidate_id, content_hash, similarity in candidate_expectations:
+        candidate = candidates_by_id[candidate_id]
+        content_hashes = candidate.get("content_hashes")
+        candidate_similarity = candidate.get("similarity")
+        if (
+            not isinstance(content_hashes, list)
+            or content_hash not in content_hashes
+            or isinstance(candidate_similarity, bool)
+            or not isinstance(candidate_similarity, (int, float))
+            or not math.isclose(
+                candidate_similarity,
+                similarity,
+                rel_tol=0.0,
+                abs_tol=0.000001,
+            )
+        ):
+            return False
+    resolution = evidence.get("resolution")
+    if not isinstance(resolution, dict):
+        return False
+    outcome = resolution.get("outcome")
+    used_candidate_ids = resolution.get("used_candidate_ids")
+    if (
+        outcome not in {"answer", "clarify"}
+        or not isinstance(used_candidate_ids, list)
+        or not used_candidate_ids
+        or len(set(used_candidate_ids)) != len(used_candidate_ids)
+        or any(candidate_id not in candidates_by_id for candidate_id in used_candidate_ids)
+        or resolution.get("version") != decision.selector_version
+    ):
+        return False
+    return outcome != "clarify" or set(used_candidate_ids) == set(candidates_by_id)
 
 
 async def _await_send[T](awaitable: Awaitable[T]) -> T:
@@ -666,14 +768,22 @@ async def _public_bot_send_preflight(
 
     if decision.multilingual_contract_version == _LEGACY_EXPERIMENTAL_CONTRACT_VERSION:
         return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
-    match_only_contract = (
+    match_only_single_contract = (
         decision.multilingual_contract_version == KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
+    )
+    match_only_ambiguity_contract = (
+        decision.multilingual_contract_version
+        == KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION
+    )
+    match_only_contract = (
+        match_only_single_contract or match_only_ambiguity_contract
     )
     if match_only_contract:
         if not getattr(settings, "knowledge_match_only_reply_enabled", False):
             return "KNOWLEDGE_MATCH_ONLY_REPLY_DISABLED"
         if not settings.multilingual_knowledge_reply_enabled:
             return "MULTILINGUAL_LIVE_DISABLED"
+    if match_only_single_contract:
         if (
             decision.knowledge_match_status != "strong"
             or decision.knowledge_similarity is None
@@ -688,6 +798,10 @@ async def _public_bot_send_preflight(
             )
         ):
             return "MULTILINGUAL_PROVENANCE_INVALID"
+    if match_only_ambiguity_contract and not _match_only_ambiguity_provenance_is_valid(
+        decision
+    ):
+        return "MULTILINGUAL_PROVENANCE_INVALID"
     if decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION:
         if not settings.multilingual_knowledge_reply_enabled:
             return "MULTILINGUAL_LIVE_DISABLED"
@@ -725,6 +839,7 @@ async def _public_bot_send_preflight(
         in {
             MULTILINGUAL_GENERATION_CONTRACT_VERSION,
             KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
+            KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
         }
         and not any(value is not None for value in knowledge_identity)
     ):

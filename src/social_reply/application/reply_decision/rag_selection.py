@@ -22,13 +22,16 @@ logger = logging.getLogger(__name__)
 
 RETRIEVAL_POLICY_VERSION = "hybrid-union-selector-v2"
 RAG_EVIDENCE_VERSION = "rag-evidence-v1"
+RAG_AMBIGUITY_EVIDENCE_VERSION = "rag-evidence-v2"
 OFFICIAL_CONTACT_REVIEW_METHOD = "official_contact_review"
+MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD = "match_only_ambiguity_resolution"
 RAG_SELECTION_METHODS = frozenset(
     {
         "exact",
         "exact_ambiguous",
         "legacy_top1",
         "match_only_gate",
+        MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
         OFFICIAL_CONTACT_REVIEW_METHOD,
         "selector_canary_off",
         "selector_live",
@@ -69,6 +72,14 @@ class RAGConsensusResult:
     @property
     def disagreed(self) -> bool:
         return self.forward_candidate_id != self.reverse_candidate_id
+
+
+@dataclass(frozen=True)
+class RAGResolutionEvidence:
+    outcome: str
+    used_candidate_ids: tuple[str, ...]
+    version: str | None
+    latency_ms: float
 
 
 def _safe_selected_candidate_id(result: RAGSelectionResult | None) -> str | None:
@@ -236,6 +247,90 @@ def build_rag_candidates(
     return tuple(options)
 
 
+def build_ranked_rag_candidates(
+    result: KnowledgeRetrievalResult,
+    *,
+    ranked_hits: tuple[KnowledgeHit, ...],
+) -> tuple[RAGCandidateOption, ...]:
+    """Build stable candidate IDs from answer-level similarity order."""
+    hybrid_rank_by_chunk = {
+        hit.chunk_id: rank for rank, hit in enumerate(result.hits, start=1)
+    }
+    vector_rank_by_chunk = {
+        hit.chunk_id: rank for rank, hit in enumerate(result.vector_hits, start=1)
+    }
+    all_hits_by_chunk = {
+        hit.chunk_id: hit for hit in (*result.hits, *result.vector_hits)
+    }
+    arm_evidence = result.arm_evidence or {}
+    options: list[RAGCandidateOption] = []
+    seen_identities: set[KnowledgeAnswerIdentity] = set()
+    for index, representative in enumerate(ranked_hits, start=1):
+        identity = canonical_answer_identity(
+            representative.reply,
+            representative.is_official_contact,
+            representative.protected_values,
+        )
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        related_hits = [
+            hit
+            for hit in all_hits_by_chunk.values()
+            if canonical_answer_identity(
+                hit.reply,
+                hit.is_official_contact,
+                hit.protected_values,
+            )
+            == identity
+        ]
+        hybrid_rank = min(
+            (
+                hybrid_rank_by_chunk[hit.chunk_id]
+                for hit in related_hits
+                if hit.chunk_id in hybrid_rank_by_chunk
+            ),
+            default=None,
+        )
+        vector_rank = min(
+            (
+                vector_rank_by_chunk[hit.chunk_id]
+                for hit in related_hits
+                if hit.chunk_id in vector_rank_by_chunk
+            ),
+            default=None,
+        )
+        merged_arm_evidence: dict[str, Any] = {}
+        for hit in related_hits:
+            evidence = arm_evidence.get(hit.content_hash)
+            if not isinstance(evidence, dict):
+                continue
+            for key, value in evidence.items():
+                current = merged_arm_evidence.get(key)
+                if current is None or (
+                    isinstance(value, int)
+                    and isinstance(current, int)
+                    and value < current
+                ):
+                    merged_arm_evidence[key] = value
+        options.append(
+            RAGCandidateOption(
+                candidate_id=f"candidate-{index}",
+                hit=representative,
+                answer_hash=_answer_hash(identity),
+                content_hashes=tuple(
+                    sorted({hit.content_hash for hit in related_hits})[
+                        :MAX_EVIDENCE_CONTENT_HASHES
+                    ]
+                ),
+                hybrid_rank=hybrid_rank,
+                vector_rank=vector_rank,
+                arm_evidence=merged_arm_evidence,
+            )
+        )
+    return tuple(options)
+
+
 def rag_evidence(
     *,
     candidates: tuple[RAGCandidateOption, ...],
@@ -250,6 +345,7 @@ def rag_evidence(
     embedding_version: str | None,
     verifier: dict[str, Any] | None = None,
     guard_reason_codes: tuple[str, ...] = (),
+    resolution: RAGResolutionEvidence | None = None,
 ) -> dict[str, Any]:
     """Build bounded evidence without query, message, answer, reply, or contact text."""
     selected = next(
@@ -261,7 +357,11 @@ def rag_evidence(
         None,
     )
     evidence: dict[str, Any] = {
-        "schema_version": RAG_EVIDENCE_VERSION,
+        "schema_version": (
+            RAG_AMBIGUITY_EVIDENCE_VERSION
+            if resolution is not None
+            else RAG_EVIDENCE_VERSION
+        ),
         "retrieval_policy_version": RETRIEVAL_POLICY_VERSION,
         "retrieval_mode": retrieval_mode,
         "embedding_version": embedding_version,
@@ -280,6 +380,11 @@ def rag_evidence(
         ),
         "candidates": [
             {
+                **(
+                    {"candidate_id": candidate.candidate_id}
+                    if resolution is not None
+                    else {}
+                ),
                 "answer_hash": candidate.answer_hash,
                 "content_hashes": list(candidate.content_hashes),
                 "similarity": round(candidate.hit.similarity, 6),
@@ -292,4 +397,11 @@ def rag_evidence(
         "guard": {"reason_codes": list(guard_reason_codes[:16])},
         "verifier": verifier,
     }
+    if resolution is not None:
+        evidence["resolution"] = {
+            "outcome": resolution.outcome,
+            "used_candidate_ids": list(resolution.used_candidate_ids),
+            "version": resolution.version,
+            "latency_ms": round(resolution.latency_ms, 3),
+        }
     return evidence

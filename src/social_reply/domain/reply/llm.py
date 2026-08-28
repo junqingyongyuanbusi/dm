@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
@@ -35,6 +36,59 @@ class RAGVerificationResult:
     faithful: bool
 
 
+class KnowledgeAmbiguityOutcome(StrEnum):
+    ANSWER = "answer"
+    CLARIFY = "clarify"
+    ABSTAIN = "abstain"
+
+
+@dataclass(frozen=True)
+class KnowledgeAmbiguityResolution:
+    outcome: KnowledgeAmbiguityOutcome
+    reply_text: str
+    used_candidate_ids: tuple[str, ...]
+
+
+def normalize_knowledge_ambiguity_resolution(
+    resolution: KnowledgeAmbiguityResolution,
+    *,
+    allowed_candidate_ids: frozenset[str],
+) -> KnowledgeAmbiguityResolution | None:
+    if not isinstance(resolution, KnowledgeAmbiguityResolution):
+        return None
+    if not isinstance(resolution.outcome, KnowledgeAmbiguityOutcome):
+        return None
+    if not isinstance(resolution.reply_text, str):
+        return None
+    if not isinstance(resolution.used_candidate_ids, (list, tuple)) or any(
+        not isinstance(candidate_id, str)
+        for candidate_id in resolution.used_candidate_ids
+    ):
+        return None
+    reply_text = resolution.reply_text.strip()
+    used_candidate_ids = tuple(resolution.used_candidate_ids)
+    used_candidate_id_set = set(used_candidate_ids)
+    if len(used_candidate_id_set) != len(used_candidate_ids):
+        return None
+    if not used_candidate_id_set <= allowed_candidate_ids:
+        return None
+    if resolution.outcome is KnowledgeAmbiguityOutcome.ABSTAIN:
+        if reply_text or used_candidate_ids:
+            return None
+    elif not reply_text or not used_candidate_ids:
+        return None
+    if (
+        resolution.outcome is KnowledgeAmbiguityOutcome.CLARIFY
+        and used_candidate_id_set != allowed_candidate_ids
+    ):
+        return None
+    return KnowledgeAmbiguityResolution(
+        outcome=resolution.outcome,
+        reply_text=reply_text,
+        used_candidate_ids=used_candidate_ids,
+    )
+
+
 @dataclass(frozen=True)
 class LLMContext:
     text: str
@@ -61,10 +115,21 @@ class LLMContext:
 
 
 class LLMClient(Protocol):
+    knowledge_ambiguity_resolver_id: str
+
     async def decide(self, context: LLMContext) -> ReplyDecision: ...
 
     async def generate_knowledge_reply_text(self, context: LLMContext) -> str | None:
         """Generate customer-facing text without choosing a reply action."""
+        ...
+
+    async def resolve_knowledge_ambiguity(
+        self,
+        context: LLMContext,
+        *,
+        candidates: tuple[RAGCandidate, ...],
+    ) -> KnowledgeAmbiguityResolution:
+        """Resolve two sufficiently similar but competing approved answers."""
         ...
 
     async def verify_grounding(
@@ -106,6 +171,7 @@ class LLMClient(Protocol):
 
 class StubLLMClient:
     grounding_verifier_id = "grounding-v1:stub"
+    knowledge_ambiguity_resolver_id = "knowledge-ambiguity-resolver-v1:stub"
     """确定性桩：真实供应商接入前用于跑通管线（先 Stub 后接真）。
     不做任何网络调用，输出与输入无关的固定 auto_reply，便于端到端验证。"""
 
@@ -123,6 +189,18 @@ class StubLLMClient:
 
     async def generate_knowledge_reply_text(self, context: LLMContext) -> str | None:
         return "您好，已收到您的问题，我们会尽快为您解答。"
+
+    async def resolve_knowledge_ambiguity(
+        self,
+        context: LLMContext,
+        *,
+        candidates: tuple[RAGCandidate, ...],
+    ) -> KnowledgeAmbiguityResolution:
+        return KnowledgeAmbiguityResolution(
+            outcome=KnowledgeAmbiguityOutcome.ABSTAIN,
+            reply_text="",
+            used_candidate_ids=(),
+        )
 
     async def verify_grounding(
         self,

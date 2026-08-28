@@ -5,7 +5,12 @@ import pytest
 
 from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import ReplyAction, RiskLevel, Visibility
-from social_reply.domain.reply.llm import LLMContext, RAGCandidate, RAGSelectionResult
+from social_reply.domain.reply.llm import (
+    KnowledgeAmbiguityOutcome,
+    LLMContext,
+    RAGCandidate,
+    RAGSelectionResult,
+)
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 
 _CTX = LLMContext(text="你们几点营业？", conversation_key="cw:1:2")
@@ -483,6 +488,125 @@ _RAG_CANDIDATES = (
         similarity=0.82,
     ),
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output", "expected_outcome", "expected_used_ids"),
+    [
+        (
+            {
+                "outcome": "answer",
+                "reply_text": "Verification usually takes three business days.",
+                "used_candidate_ids": ["candidate-1"],
+            },
+            KnowledgeAmbiguityOutcome.ANSWER,
+            ("candidate-1",),
+        ),
+        (
+            {
+                "outcome": "clarify",
+                "reply_text": "Are you asking about verification or correcting broker data?",
+                "used_candidate_ids": ["candidate-1", "candidate-2"],
+            },
+            KnowledgeAmbiguityOutcome.CLARIFY,
+            ("candidate-1", "candidate-2"),
+        ),
+    ],
+    ids=["answer", "clarify"],
+)
+async def test_knowledge_ambiguity_resolver_returns_bounded_resolution(
+    output,
+    expected_outcome,
+    expected_used_ids,
+):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _completion_response(json.dumps(output))
+
+    client = _client(handler)
+    result = await client.resolve_knowledge_ambiguity(
+        LLMContext(
+            text="How long does this take?",
+            conversation_key="telegram:ambiguity",
+            target_language="en",
+        ),
+        candidates=_RAG_CANDIDATES,
+    )
+
+    assert result.outcome is expected_outcome
+    assert result.reply_text == output["reply_text"]
+    assert result.used_candidate_ids == expected_used_ids
+    assert client.knowledge_ambiguity_resolver_id == (
+        "knowledge-ambiguity-resolver-v1:gpt-4o-mini"
+    )
+    payload = json.loads(captured[0].content)
+    schema = payload["response_format"]["json_schema"]
+    assert schema["name"] == "knowledge_match_ambiguity_resolution"
+    assert set(schema["schema"]["properties"]) == {
+        "outcome",
+        "reply_text",
+        "used_candidate_ids",
+    }
+    system_prompt = payload["messages"][0]["content"]
+    assert "exactly two different approved answers" in system_prompt
+    assert "Return clarify" in system_prompt
+    assert "Return abstain" in system_prompt
+    assert "Required reply language: en" in system_prompt
+    assert "candidate-1" in system_prompt
+    assert "candidate-2" in system_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output",
+    [
+        {
+            "outcome": "answer",
+            "reply_text": "",
+            "used_candidate_ids": ["candidate-1"],
+        },
+        {
+            "outcome": "clarify",
+            "reply_text": "Which topic do you mean?",
+            "used_candidate_ids": ["candidate-1"],
+        },
+        {
+            "outcome": "answer",
+            "reply_text": "Unsupported selection.",
+            "used_candidate_ids": ["candidate-999"],
+        },
+        {
+            "outcome": "abstain",
+            "reply_text": "Not empty",
+            "used_candidate_ids": [],
+        },
+    ],
+    ids=["blank-answer", "partial-clarify", "unknown-id", "invalid-abstain"],
+)
+async def test_knowledge_ambiguity_resolver_invalid_output_abstains(output):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _completion_response(json.dumps(output))
+
+    result = await _client(handler).resolve_knowledge_ambiguity(
+        LLMContext(
+            text="question",
+            conversation_key="telegram:ambiguity",
+            target_language="mirror-user",
+        ),
+        candidates=_RAG_CANDIDATES,
+    )
+
+    assert calls == 2
+    assert result.outcome is KnowledgeAmbiguityOutcome.ABSTAIN
+    assert result.reply_text == ""
+    assert result.used_candidate_ids == ()
 
 
 @pytest.mark.asyncio

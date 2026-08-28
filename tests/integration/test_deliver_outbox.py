@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import uuid
 from contextlib import asynccontextmanager
@@ -20,6 +21,13 @@ from social_reply.application.message_delivery import sweep as sweep_module
 from social_reply.application.message_delivery.outbox import deliver_outbox
 from social_reply.application.message_delivery.sweep import sweep_outbox
 from social_reply.application.reply_decision import runner
+from social_reply.application.reply_decision.multilingual_generation import (
+    KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
+    KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION,
+)
+from social_reply.application.reply_decision.rag_selection import (
+    MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
+)
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.connectors.email.contracts import (
     email_address_identity_key,
@@ -246,6 +254,90 @@ async def _mark_match_only_reply(session, outbox_id: uuid.UUID) -> None:
             request_language="en",
             reply_language="en",
             resolved_locale="en",
+        )
+    )
+    await session.commit()
+
+
+async def _mark_ambiguity_match_only_reply(
+    session,
+    outbox_id: uuid.UUID,
+    *,
+    outcome: str = "answer",
+) -> None:
+    decision = await session.scalar(
+        select(models.ReplyDecision).where(models.ReplyDecision.outbox_id == outbox_id)
+    )
+    top1_content_hash = decision.knowledge_content_hash
+    top2_content_hash = "b" * 64
+    used_candidate_ids = (
+        ["candidate-1", "candidate-2"]
+        if outcome in {"answer", "clarify"}
+        else []
+    )
+    resolver_version = "resolver-test-v1"
+    evidence = {
+        "schema_version": "rag-evidence-v2",
+        "retrieval_policy_version": "hybrid-union-selector-v2",
+        "retrieval_mode": "vector_hybrid",
+        "embedding_version": "test-v1",
+        "selector_mode": "off",
+        "canary_bucket": 0,
+        "selection_method": MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
+        "selector_version": resolver_version,
+        "selector_latency_ms": 12.5,
+        "selected_answer_hash": "c" * 64,
+        "selected_content_hash": top1_content_hash,
+        "selector_answer_hash": None,
+        "selector_content_hash": None,
+        "candidates": [
+            {
+                "candidate_id": "candidate-1",
+                "answer_hash": "c" * 64,
+                "content_hashes": [top1_content_hash],
+                "similarity": 0.9,
+                "hybrid_rank": 1,
+                "vector_rank": 1,
+                "arms": {},
+            },
+            {
+                "candidate_id": "candidate-2",
+                "answer_hash": "d" * 64,
+                "content_hashes": [top2_content_hash],
+                "similarity": 0.86,
+                "hybrid_rank": 2,
+                "vector_rank": 2,
+                "arms": {},
+            },
+        ],
+        "guard": {"reason_codes": []},
+        "verifier": None,
+        "resolution": {
+            "outcome": outcome,
+            "used_candidate_ids": used_candidate_ids,
+            "version": resolver_version,
+            "latency_ms": 12.5,
+        },
+    }
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            multilingual_contract_version=KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
+            grounding_verified=None,
+            knowledge_match_status="ambiguous",
+            knowledge_gate_version=KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION,
+            knowledge_similarity=0.9,
+            knowledge_top2_content_hash=top2_content_hash,
+            knowledge_top2_similarity=0.86,
+            knowledge_similarity_margin=0.04,
+            knowledge_min_similarity_threshold=0.8,
+            knowledge_min_margin_threshold=0.08,
+            request_language="en",
+            reply_language="en",
+            resolved_locale="en",
+            selector_version=resolver_version,
+            rag_evidence=evidence,
         )
     )
     await session.commit()
@@ -1160,6 +1252,103 @@ async def test_match_only_send_bypasses_source_currentness(session, monkeypatch)
     monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
 
     assert await _preflight_reason(session, outbox_id) is None
+
+
+@pytest.mark.parametrize("outcome", ["answer", "clarify"])
+async def test_ambiguity_match_only_send_accepts_low_margin_resolution(
+    session,
+    monkeypatch,
+    outcome,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(session, outbox_id, approved_reply="Approved answer.")
+    await _mark_ambiguity_match_only_reply(session, outbox_id, outcome=outcome)
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": True,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert await _preflight_reason(session, outbox_id) is None
+
+
+@pytest.mark.parametrize(
+    "invalid_provenance",
+    [
+        "missing_top2",
+        "top2_below_floor",
+        "wrong_gate",
+        "wrong_status",
+        "invalid_resolution_outcome",
+        "invalid_candidate_reference",
+    ],
+)
+async def test_ambiguity_match_only_send_rejects_invalid_provenance(
+    session,
+    monkeypatch,
+    invalid_provenance,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(session, outbox_id, approved_reply="Approved answer.")
+    await _mark_ambiguity_match_only_reply(session, outbox_id)
+    decision = await session.scalar(
+        select(models.ReplyDecision).where(models.ReplyDecision.outbox_id == outbox_id)
+    )
+    values: dict = {}
+    if invalid_provenance == "missing_top2":
+        values["knowledge_top2_content_hash"] = None
+    elif invalid_provenance == "top2_below_floor":
+        values["knowledge_top2_similarity"] = 0.79
+    elif invalid_provenance == "wrong_gate":
+        values["knowledge_gate_version"] = "strong-gate-v1"
+    elif invalid_provenance == "wrong_status":
+        values["knowledge_match_status"] = "strong"
+    else:
+        evidence = copy.deepcopy(decision.rag_evidence)
+        if invalid_provenance == "invalid_resolution_outcome":
+            evidence["resolution"]["outcome"] = "abstain"
+            evidence["resolution"]["used_candidate_ids"] = []
+        else:
+            evidence["resolution"]["used_candidate_ids"] = ["candidate-999"]
+        values["rag_evidence"] = evidence
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(**values)
+    )
+    await session.commit()
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": True,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert await _preflight_reason(session, outbox_id) == "MULTILINGUAL_PROVENANCE_INVALID"
+
+
+async def test_ambiguity_match_only_send_requires_runtime_gate(session, monkeypatch):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(session, outbox_id, approved_reply="Approved answer.")
+    await _mark_ambiguity_match_only_reply(session, outbox_id)
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": False,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert (
+        await _preflight_reason(session, outbox_id)
+        == "KNOWLEDGE_MATCH_ONLY_REPLY_DISABLED"
+    )
 
 
 async def test_match_only_send_requires_runtime_gate_to_remain_enabled(

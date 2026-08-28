@@ -24,9 +24,12 @@ from social_reply.application.reply_decision.language_resolution import (
     resolve_customer_language,
 )
 from social_reply.application.reply_decision.multilingual_generation import (
+    KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
+    KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION,
     KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
     generate_multilingual_reply,
+    resolve_knowledge_ambiguity_reply,
 )
 from social_reply.application.reply_decision.persist import persist_decision
 from social_reply.application.reply_decision.persona import (
@@ -39,10 +42,13 @@ from social_reply.application.reply_decision.pipeline import (
     run_decision_pipeline,
 )
 from social_reply.application.reply_decision.rag_selection import (
+    MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
     OFFICIAL_CONTACT_REVIEW_METHOD,
     RETRIEVAL_POLICY_VERSION,
     RAGCandidateOption,
+    RAGResolutionEvidence,
     build_rag_candidates,
+    build_ranked_rag_candidates,
     rag_evidence,
     select_rag_answer_with_consensus,
     selector_is_enabled,
@@ -57,7 +63,11 @@ from social_reply.domain.reply.guard import (
     redact_pii,
 )
 from social_reply.domain.reply.language import is_deterministically_verifiable
-from social_reply.domain.reply.llm import LLMClient, StubLLMClient
+from social_reply.domain.reply.llm import (
+    KnowledgeAmbiguityOutcome,
+    LLMClient,
+    StubLLMClient,
+)
 from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
 from social_reply.domain.reply.openai_client import OpenAILLMClient
 from social_reply.domain.reply.rules import (
@@ -894,6 +904,31 @@ async def run_and_persist_decision(
             else:
                 assessment = legacy_assessment
             selected = assessment.selected
+            match_only_ambiguity_eligible = (
+                match_only_reply
+                and should_retrieve
+                and gate_evaluated
+                and not knowledge_result.exact_match
+                and not knowledge_result.exact_ambiguous
+                and assessment.status == "ambiguous"
+                and selected is not None
+                and assessment.second is not None
+                and selected.similarity >= gate_min_similarity
+                and assessment.second.similarity >= gate_min_similarity
+                and assessment.margin is not None
+                and assessment.margin < gate_min_margin
+            )
+            ambiguity_candidates = (
+                build_ranked_rag_candidates(
+                    knowledge_result,
+                    ranked_hits=(selected, assessment.second),
+                )
+                if match_only_ambiguity_eligible
+                and selected is not None
+                and assessment.second is not None
+                else ()
+            )
+            ambiguity_reply_result = None
 
             # 审核译文优先于运行时生成：命中文档在该语种下有已审核译文时直接用它。
             # 必须在下面的 official-contact 闸门之前解析——一份 official_contact_authorized
@@ -933,7 +968,16 @@ async def run_and_persist_decision(
                     reason_codes=("UNKNOWN_LANGUAGE",),
                     source="rule",
                 )
-            elif should_retrieve and (not assessment.strong or selected is None):
+            elif should_retrieve and knowledge_result.exact_ambiguous:
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("AMBIGUOUS_EXACT_KNOWLEDGE",),
+                    source="rule",
+                )
+            elif should_retrieve and (
+                (not assessment.strong and not match_only_ambiguity_eligible)
+                or selected is None
+            ):
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
                     reason_codes=(
@@ -974,11 +1018,32 @@ async def run_and_persist_decision(
                     source="rule",
                 )
 
+            if (
+                forced_decision is None
+                and match_only_ambiguity_eligible
+                and len(ambiguity_candidates) != 2
+            ):
+                forced_decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("KNOWLEDGE_AMBIGUITY_RESOLUTION_FAILED",),
+                    source="rule",
+                )
+            ambiguity_resolve = (
+                forced_decision is None
+                and match_only_ambiguity_eligible
+                and len(ambiguity_candidates) == 2
+                and selected is not None
+                and assessment.second is not None
+            )
             if match_only_reply:
                 # Temporarily disabled for match-only testing: localization and official-contact
                 # branches above remain intact for the normal runtime policy.
                 multilingual_generate = (
-                    should_retrieve and forced_decision is None and selected is not None
+                    should_retrieve
+                    and forced_decision is None
+                    and selected is not None
+                    and assessment.strong
+                    and not ambiguity_resolve
                 )
             else:
                 multilingual_generate = (
@@ -991,14 +1056,19 @@ async def run_and_persist_decision(
                     and not (is_english_request and selected.is_official_contact)
                 )
             generation_llm: LLMClient | None = None
-            if multilingual_generate:
+            generation_requested = multilingual_generate or ambiguity_resolve
+            if generation_requested:
                 generation_contract_version = (
-                    KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
-                    if match_only_reply
-                    else MULTILINGUAL_GENERATION_CONTRACT_VERSION
+                    KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION
+                    if ambiguity_resolve
+                    else (
+                        KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
+                        if match_only_reply
+                        else MULTILINGUAL_GENERATION_CONTRACT_VERSION
+                    )
                 )
                 prompt_contract_suffix = f"+{generation_contract_version}"
-            if multilingual_generate:
+            if generation_requested:
                 try:
                     async with get_session_factory()() as session:
                         if settings.reply_business_prompt_enabled:
@@ -1017,27 +1087,64 @@ async def run_and_persist_decision(
                     logger.exception("reply prompt load failed; forcing handoff")
                     forced_decision = ReplyDecision(
                         action=ReplyAction.HANDOFF,
-                        reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
+                        reason_codes=(
+                            "KNOWLEDGE_AMBIGUITY_RESOLUTION_FAILED"
+                            if ambiguity_resolve
+                            else "MULTILINGUAL_GENERATION_FAILED",
+                        ),
                         source="rule",
                         multilingual_contract_version=generation_contract_version,
                     )
                     multilingual_generate = False
+                    ambiguity_resolve = False
+                    generation_requested = False
                     prompt_contract_suffix = ""
-            if multilingual_generate:
+            if generation_requested:
                 try:
                     generation_llm = _get_llm()
                 except Exception:
                     logger.exception("multilingual LLM construction failed; forcing handoff")
                     forced_decision = ReplyDecision(
                         action=ReplyAction.HANDOFF,
-                        reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
+                        reason_codes=(
+                            "KNOWLEDGE_AMBIGUITY_RESOLUTION_FAILED"
+                            if ambiguity_resolve
+                            else "MULTILINGUAL_GENERATION_FAILED",
+                        ),
                         source="rule",
                         multilingual_contract_version=generation_contract_version,
                     )
                     multilingual_generate = False
+                    ambiguity_resolve = False
+                    generation_requested = False
                     prompt_contract_suffix = ""
 
-            if multilingual_generate:
+            if ambiguity_resolve:
+                business_prompt_used = settings.reply_business_prompt_enabled
+                ambiguity_reply_result = await resolve_knowledge_ambiguity_reply(
+                    snapshot,
+                    candidates=tuple(
+                        candidate.to_llm_candidate()
+                        for candidate in ambiguity_candidates
+                    ),
+                    target_language=selector_target_language,
+                    history=model_history,
+                    killswitch=killswitch,
+                    llm=generation_llm,
+                    voice_preferences=persona.preferences,
+                    business_prompt=(
+                        business_prompt.instructions if business_prompt_used else None
+                    ),
+                    email_auto_reply_allowed=(
+                        snapshot.platform != "email"
+                        or (settings.email_enabled and settings.email_auto_reply_enabled)
+                    ),
+                    fallback_reason_codes=(
+                        *(('QUERY_TRANSLATED',) if query_translation_used else ()),
+                    ),
+                )
+                decision = ambiguity_reply_result.decision
+            elif multilingual_generate:
                 business_prompt_used = settings.reply_business_prompt_enabled
                 decision = await generate_multilingual_reply(
                     snapshot,
@@ -1119,10 +1226,20 @@ async def run_and_persist_decision(
                 )
             if unresolved_language_review and not match_only_reply:
                 decision = _preserve_unresolved_language_review(decision)
+            evidence_candidates = (
+                ambiguity_candidates
+                if match_only_ambiguity_eligible
+                else selector_assessment.candidates
+            )
+            evidence_selection_method = (
+                MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD
+                if match_only_ambiguity_eligible
+                else selector_assessment.method
+            )
             selected_candidate_id = next(
                 (
                     candidate.candidate_id
-                    for candidate in selector_assessment.candidates
+                    for candidate in evidence_candidates
                     if selected is not None
                     and canonical_answer_identity(
                         candidate.hit.reply,
@@ -1139,19 +1256,56 @@ async def run_and_persist_decision(
             )
             selector_candidate_id = (
                 selector_assessment.selected.candidate_id
-                if selector_assessment.selected is not None
+                if not match_only_ambiguity_eligible
+                and selector_assessment.selected is not None
                 else None
+            )
+            resolution_evidence = (
+                RAGResolutionEvidence(
+                    outcome=(
+                        ambiguity_reply_result.outcome.value
+                        if ambiguity_reply_result is not None
+                        else KnowledgeAmbiguityOutcome.ABSTAIN.value
+                    ),
+                    used_candidate_ids=(
+                        ambiguity_reply_result.used_candidate_ids
+                        if ambiguity_reply_result is not None
+                        else ()
+                    ),
+                    version=(
+                        ambiguity_reply_result.resolver_version
+                        if ambiguity_reply_result is not None
+                        else None
+                    ),
+                    latency_ms=(
+                        ambiguity_reply_result.latency_ms
+                        if ambiguity_reply_result is not None
+                        else 0.0
+                    ),
+                )
+                if match_only_ambiguity_eligible
+                else None
+            )
+            evidence_selector_version = (
+                ambiguity_reply_result.resolver_version
+                if ambiguity_reply_result is not None
+                else selector_assessment.selector_version
+            )
+            evidence_selector_latency_ms = (
+                ambiguity_reply_result.latency_ms
+                if ambiguity_reply_result is not None
+                else selector_assessment.latency_ms
             )
             evidence = (
                 rag_evidence(
-                    candidates=selector_assessment.candidates,
+                    candidates=evidence_candidates,
                     mode=("off" if match_only_reply else settings.rag_selector_mode),
                     canary_bucket=selector_assessment.bucket,
-                    selection_method=selector_assessment.method,
+                    selection_method=evidence_selection_method,
                     selected_candidate_id=selected_candidate_id,
                     selector_candidate_id=selector_candidate_id,
-                    selector_version=selector_assessment.selector_version,
-                    selector_latency_ms=selector_assessment.latency_ms,
+                    selector_version=evidence_selector_version,
+                    selector_latency_ms=evidence_selector_latency_ms,
                     retrieval_mode=knowledge_result.retrieval_mode,
                     embedding_version=knowledge_result.embedding_version,
                     verifier={
@@ -1165,6 +1319,7 @@ async def run_and_persist_decision(
                         "latency_ms": decision.grounding_latency_ms,
                     },
                     guard_reason_codes=decision.reason_codes,
+                    resolution=resolution_evidence,
                 )
                 if gate_evaluated
                 else None
@@ -1187,10 +1342,12 @@ async def run_and_persist_decision(
                     and decision.source == "knowledge_localization"
                     else (
                         language.tag
-                        if multilingual_generate and language.is_reliable
+                        if (multilingual_generate or ambiguity_resolve)
+                        and language.is_reliable
                         else (
                             "mirror-user"
-                            if match_only_reply and multilingual_generate
+                            if match_only_reply
+                            and (multilingual_generate or ambiguity_resolve)
                             else ("en" if is_english_request and assessment.strong else "und")
                         )
                     )
@@ -1229,16 +1386,20 @@ async def run_and_persist_decision(
                 knowledge_similarity_margin=(assessment.margin if gate_evaluated else None),
                 knowledge_match_status=(assessment.status if gate_evaluated else None),
                 knowledge_gate_version=(
-                    _RAG_SELECTOR_GATE_VERSION
-                    if gate_evaluated and selector_controls_choice
-                    else (_MULTILINGUAL_GATE_VERSION if gate_evaluated else None)
+                    KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION
+                    if gate_evaluated and match_only_ambiguity_eligible
+                    else (
+                        _RAG_SELECTOR_GATE_VERSION
+                        if gate_evaluated and selector_controls_choice
+                        else (_MULTILINGUAL_GATE_VERSION if gate_evaluated else None)
+                    )
                 ),
                 knowledge_min_similarity_threshold=(
                     gate_min_similarity if gate_evaluated else None
                 ),
                 knowledge_min_margin_threshold=(gate_min_margin if gate_evaluated else None),
                 retrieval_policy_version=(RETRIEVAL_POLICY_VERSION if gate_evaluated else None),
-                selector_version=selector_assessment.selector_version,
+                selector_version=evidence_selector_version,
                 rag_evidence=evidence,
             )
         else:

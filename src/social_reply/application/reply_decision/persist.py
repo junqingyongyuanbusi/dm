@@ -62,6 +62,7 @@ _RAG_TOP_LEVEL_KEYS = frozenset(
         "verifier",
     }
 )
+_RAG_AMBIGUITY_TOP_LEVEL_KEYS = _RAG_TOP_LEVEL_KEYS | {"resolution"}
 _RAG_CANDIDATE_KEYS = frozenset(
     {
         "answer_hash",
@@ -72,8 +73,12 @@ _RAG_CANDIDATE_KEYS = frozenset(
         "arms",
     }
 )
+_RAG_AMBIGUITY_CANDIDATE_KEYS = _RAG_CANDIDATE_KEYS | {"candidate_id"}
 _RAG_GUARD_KEYS = frozenset({"reason_codes"})
 _RAG_VERIFIER_KEYS = frozenset({"relevant", "faithful", "version", "latency_ms"})
+_RAG_RESOLUTION_KEYS = frozenset(
+    {"outcome", "used_candidate_ids", "version", "latency_ms"}
+)
 _RAG_ARM_KEY = re.compile(r"^(?:native|translated)_(?:hybrid|vector)_rank$")
 _RAG_HASH = re.compile(r"^[0-9a-f]{64}$")
 _RAG_METADATA_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,63}$")
@@ -128,10 +133,17 @@ def _rag_evidence(value: dict | None) -> dict | None:
         raise ValueError("rag_evidence_value_invalid")
 
     normalized = normalize(value, depth=0)
-    if set(normalized) != _RAG_TOP_LEVEL_KEYS:
-        raise ValueError("rag_evidence_key_forbidden")
-    if normalized.get("schema_version") != "rag-evidence-v1":
+    schema_version = normalized.get("schema_version")
+    if schema_version == "rag-evidence-v1":
+        expected_top_level_keys = _RAG_TOP_LEVEL_KEYS
+        expected_candidate_keys = _RAG_CANDIDATE_KEYS
+    elif schema_version == "rag-evidence-v2":
+        expected_top_level_keys = _RAG_AMBIGUITY_TOP_LEVEL_KEYS
+        expected_candidate_keys = _RAG_AMBIGUITY_CANDIDATE_KEYS
+    else:
         raise ValueError("rag_evidence_schema_invalid")
+    if set(normalized) != expected_top_level_keys:
+        raise ValueError("rag_evidence_key_forbidden")
     if normalized.get("retrieval_policy_version") != "hybrid-union-selector-v2":
         raise ValueError("rag_evidence_retrieval_policy_invalid")
     if normalized.get("retrieval_mode") not in {*_RAG_RETRIEVAL_MODES, None}:
@@ -190,9 +202,19 @@ def _rag_evidence(value: dict | None) -> dict | None:
     candidates = normalized.get("candidates")
     if not isinstance(candidates, list) or len(candidates) > 3:
         raise ValueError("rag_evidence_candidates_invalid")
+    candidate_ids: set[str] = set()
     for candidate in candidates:
-        if not isinstance(candidate, dict) or set(candidate) != _RAG_CANDIDATE_KEYS:
+        if not isinstance(candidate, dict) or set(candidate) != expected_candidate_keys:
             raise ValueError("rag_evidence_candidate_invalid")
+        if schema_version == "rag-evidence-v2":
+            candidate_id = candidate.get("candidate_id")
+            if (
+                not isinstance(candidate_id, str)
+                or re.fullmatch(r"candidate-[1-9][0-9]*", candidate_id) is None
+                or candidate_id in candidate_ids
+            ):
+                raise ValueError("rag_evidence_candidate_id_invalid")
+            candidate_ids.add(candidate_id)
         require_hash(candidate.get("answer_hash"), "candidate_answer_hash")
         content_hashes = candidate.get("content_hashes")
         if (
@@ -258,6 +280,39 @@ def _rag_evidence(value: dict | None) -> dict | None:
             verifier.get("latency_ms"),
             "verifier_latency",
             optional=True,
+        )
+    if schema_version == "rag-evidence-v2":
+        resolution = normalized.get("resolution")
+        if (
+            not isinstance(resolution, dict)
+            or set(resolution) != _RAG_RESOLUTION_KEYS
+        ):
+            raise ValueError("rag_evidence_resolution_invalid")
+        outcome = resolution.get("outcome")
+        if outcome not in {"answer", "clarify", "abstain"}:
+            raise ValueError("rag_evidence_resolution_outcome_invalid")
+        used_candidate_ids = resolution.get("used_candidate_ids")
+        if (
+            not isinstance(used_candidate_ids, list)
+            or len(used_candidate_ids) > 2
+            or len(set(used_candidate_ids)) != len(used_candidate_ids)
+            or any(candidate_id not in candidate_ids for candidate_id in used_candidate_ids)
+        ):
+            raise ValueError("rag_evidence_resolution_candidates_invalid")
+        if outcome == "abstain" and used_candidate_ids:
+            raise ValueError("rag_evidence_resolution_abstain_invalid")
+        if outcome in {"answer", "clarify"} and not used_candidate_ids:
+            raise ValueError("rag_evidence_resolution_evidence_missing")
+        if outcome == "clarify" and set(used_candidate_ids) != candidate_ids:
+            raise ValueError("rag_evidence_resolution_clarify_invalid")
+        require_metadata_token(
+            resolution.get("version"),
+            "resolution_version",
+            optional=True,
+        )
+        require_nonnegative_number(
+            resolution.get("latency_ms"),
+            "resolution_latency",
         )
     return normalized
 

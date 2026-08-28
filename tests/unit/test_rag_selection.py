@@ -7,7 +7,10 @@ from social_reply.application.knowledge.retrieval import KnowledgeHit, Knowledge
 from social_reply.application.reply_decision import runner
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.application.reply_decision.rag_selection import (
+    MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
+    RAGResolutionEvidence,
     build_rag_candidates,
+    build_ranked_rag_candidates,
     rag_evidence,
     selector_is_enabled,
     stable_canary_bucket,
@@ -143,6 +146,64 @@ def test_evidence_never_contains_query_or_candidate_bodies():
     assert evidence["selected_content_hash"] == f"{1:064x}"
     assert evidence["selector_content_hash"] == f"{2:064x}"
     assert evidence["selector_answer_hash"] != evidence["selected_answer_hash"]
+
+
+def test_ranked_ambiguity_candidates_and_v2_evidence_share_stable_ids():
+    top1 = _hit(1, "First approved answer.", 0.90)
+    top2 = _hit(2, "Second approved answer.", 0.86)
+    result = KnowledgeRetrievalResult(
+        hits=(top2, top1),
+        vector_hits=(top1, top2),
+        retrieval_mode="vector_hybrid",
+        embedding_version="embedding-v1",
+    )
+    candidates = build_ranked_rag_candidates(
+        result,
+        ranked_hits=(top1, top2),
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "candidate-1",
+        "candidate-2",
+    ]
+    assert [candidate.hit.similarity for candidate in candidates] == [0.90, 0.86]
+    assert [
+        candidate.to_llm_candidate().approved_answer for candidate in candidates
+    ] == [top1.reply, top2.reply]
+
+    evidence = rag_evidence(
+        candidates=candidates,
+        mode="off",
+        canary_bucket=0,
+        selection_method=MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
+        selected_candidate_id="candidate-1",
+        selector_candidate_id=None,
+        selector_version="resolver-v1",
+        selector_latency_ms=12.5,
+        retrieval_mode=result.retrieval_mode,
+        embedding_version=result.embedding_version,
+        resolution=RAGResolutionEvidence(
+            outcome="answer",
+            used_candidate_ids=("candidate-1", "candidate-2"),
+            version="resolver-v1",
+            latency_ms=12.5,
+        ),
+    )
+
+    assert evidence["schema_version"] == "rag-evidence-v2"
+    assert [candidate["candidate_id"] for candidate in evidence["candidates"]] == [
+        "candidate-1",
+        "candidate-2",
+    ]
+    assert evidence["resolution"]["used_candidate_ids"] == [
+        "candidate-1",
+        "candidate-2",
+    ]
+    serialized = repr(evidence)
+    assert top1.reply not in serialized
+    assert top2.reply not in serialized
+    assert top1.question not in serialized
+    assert top2.question not in serialized
 
 
 @pytest.mark.asyncio
