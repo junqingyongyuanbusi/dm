@@ -165,7 +165,7 @@ async def test_tenant_user_can_start_oauth_only_for_own_tenant(session, migrated
         assert "oauth_token=tenant-request-token" in allowed.headers["location"]
         assert captured["namespace"] == "x"
         assert captured["payload"]["tenant_id"] == "tenant-a"
-        assert captured["payload"]["session_id"]
+        assert captured["payload"]["initiator_session_id"]
 
         denied = await client.post(
             "/admin/oauth/x/start",

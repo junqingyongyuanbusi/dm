@@ -915,7 +915,11 @@ def _render_agent_overview(
     elif len(active_accounts) != len(accounts):
         next_title = "修复不可用的渠道账号"
         next_description = f"{len(accounts) - len(active_accounts)} 个账号当前不可用。"
-        next_href = "/admin/integrations/accounts" if is_admin else f"{_tenant_root(tenant_id)}/profile"
+        next_href = (
+            "/admin/integrations/accounts"
+            if is_admin
+            else f"{_tenant_root(tenant_id)}/channels"
+        )
         action_label = "查看账号"
     elif not prompt_pointer:
         next_title = "补充业务指令"
@@ -1032,9 +1036,9 @@ def _render_agent_channels(
     account_href = (
         "/admin/integrations/accounts"
         if is_admin
-        else f"{_tenant_root(tenant_id)}/profile"
+        else f"{_tenant_root(tenant_id)}/channels"
     )
-    account_action_label = "管理账号" if is_admin else "查看我的账号"
+    account_action_label = "管理账号" if is_admin else "管理我的渠道"
     rows = "".join(
         f"<tr><td><strong>{escape(account.name)}</strong><br>"
         f'<span class="saas-muted">{escape(account.platform)}</span></td>'

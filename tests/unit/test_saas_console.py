@@ -180,6 +180,25 @@ def test_ordinary_user_agent_sections_never_link_to_admin_pages() -> None:
     assert "/app/t/tenant-a/knowledge-query" in knowledge_html
 
 
+def test_ordinary_user_repairs_unavailable_accounts_from_channels() -> None:
+    from social_reply.application.account_management import saas_console
+
+    unavailable_account = SimpleNamespace(status="disabled")
+
+    html = saas_console._render_agent_overview(
+        tenant_id="tenant-a",
+        agent_id="default",
+        accounts=[unavailable_account],
+        prompt_pointer=None,
+        knowledge_counts={"published": 0, "draft": 0},
+        is_admin=False,
+    )
+
+    assert "修复不可用的渠道账号" in html
+    assert "/app/t/tenant-a/channels" in html
+    assert "/app/t/tenant-a/profile" not in html
+
+
 def test_ordinary_user_without_accounts_gets_direct_authorization_action() -> None:
     from social_reply.application.account_management import saas_console
 
