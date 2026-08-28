@@ -1030,7 +1030,10 @@ async def test_live_selector_disagreement_handoffs_without_generation(
             _multilingual_result(similarity=0.9, second_similarity=0.86),
             "NO_STRONG_KNOWLEDGE_MATCH",
         ),
-        (_multilingual_result(exact=False, ambiguous=True), "NO_STRONG_KNOWLEDGE_MATCH"),
+        (
+            _multilingual_result(exact=False, ambiguous=True),
+            "AMBIGUOUS_EXACT_KNOWLEDGE",
+        ),
     ],
 )
 async def test_multilingual_weak_or_ambiguous_match_handoffs_without_llm(
