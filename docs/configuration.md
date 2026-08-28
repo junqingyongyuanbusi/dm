@@ -222,6 +222,7 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `KNOWLEDGE_VERBATIM_REPLY` | `false` | Return matched template text without LLM rewriting |
 | `REQUIRE_KNOWLEDGE` | `false` | Legacy path: handoff without calling LLM when retrieval has no match |
 | `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED` | `false` | Enables English-corpus multilingual runtime generation; non-English requests use the detected language, with no language or account allowlist; requires knowledge retrieval |
+| `KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED` | `false` | Temporary coordinated test mode. A unique exact match, or answer-level similarity `>= 0.80` with margin `>= 0.08`, decides whether to reply. The model only generates text and the content, grounding, source-currentness, contact, and language Guards are bypassed. Requires knowledge retrieval and multilingual generation, and is incompatible with `RAG_SELECTOR_MODE=live`. API, Worker, and Scheduler must set the same explicit value. |
 | `KNOWLEDGE_LOCALIZATION_ENABLED` | `false` | Prefer human-reviewed localized text over runtime generation; requires `MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true` and a non-empty live-locale list |
 | `KNOWLEDGE_LOCALIZATION_LIVE_LOCALES` | empty | Comma-separated send allowlist for reviewed localizations; published locales outside it still fall back to runtime generation |
 | `MULTILINGUAL_LANGUAGE_POLICY` | `review` | `review` preserves uncertain/wrong-language output as a private DRAFT after every hard guard passes; `legacy_hard` remains available as a rollback mode that converts it to HANDOFF |
@@ -229,6 +230,15 @@ size and an optional SHA-256 digest, not the RFC822 body. See
 | `RAG_SELECTOR_CANARY_BPS` | `0` | Stable selector sample in basis points, `0..10000`; the bucket is derived from tenant and conversation identity |
 | `CONVERSATION_HISTORY_LIMIT` | `20` | Prior messages sent to decision context; range 0-50 |
 | `CONVERSATION_HISTORY_MAX_CHARS` | `12000` | Total history character budget; range 0-50000 |
+
+`KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED` is intentionally a reversible test switch, not the default
+reply policy. Existing risk rules, LLM action contracts, output Guards, Grounding verification,
+localization checks, and send-time source checks remain in the code and continue to run when the
+switch is `false`. When the switch is `true`, only system-delivery correctness remains enforced:
+tenant/account/conversation scope, Kill Switch, automation takeover, generation fencing, Prompt
+currentness, payload/target binding, idempotency, platform capability, non-empty text, and platform
+length. Reply language is requested through the generation Prompt and is not verified after
+generation. Roll back by setting the switch to `false` on all three roles before redeploying them.
 
 Stage the first editable Prompt release with `REPLY_BUSINESS_PROMPT_ENABLED=false` on all roles.
 After the target digest and schema are healthy, use

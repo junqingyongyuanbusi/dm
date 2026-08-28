@@ -115,6 +115,9 @@ class Settings(BaseSettings):
     # 强命中时由 LLM 生成同语言回复；低置信度先走占位符保护的查询翻译回退。
     # 英语事实源不变；und/检测失败、无强命中、official-contact、守卫不符一律 HANDOFF。
     multilingual_knowledge_reply_enabled: bool = False
+    # 测试阶段的纯知识命中回复模式。开启后，强命中负责决定是否回复，生成模型只返回
+    # 客户可见文本；现有内容规则保留在普通路径，便于后续恢复。
+    knowledge_match_only_reply_enabled: bool = False
     # Language identity is advisory in review mode: deterministic fact/provenance
     # checks still fail closed, while uncertain language observations create a draft.
     multilingual_language_policy: Literal["legacy_hard", "review"] = "review"
@@ -214,6 +217,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED requires KNOWLEDGE_RETRIEVAL_ENABLED=true"
             )
+        if self.knowledge_match_only_reply_enabled:
+            if not self.knowledge_retrieval_enabled:
+                raise ValueError(
+                    "KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED requires "
+                    "KNOWLEDGE_RETRIEVAL_ENABLED=true"
+                )
+            if not self.multilingual_knowledge_reply_enabled:
+                raise ValueError(
+                    "KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED requires "
+                    "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED=true"
+                )
+            if self.rag_selector_mode == "live":
+                raise ValueError(
+                    "KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED is incompatible with "
+                    "RAG_SELECTOR_MODE=live"
+                )
         self.knowledge_localization_release = self.knowledge_localization_release.strip()
         # embedding 维度必须有对应的 pgvector 列，否则检索会在运行时才炸。
         from social_reply.application.knowledge.retrieval import (

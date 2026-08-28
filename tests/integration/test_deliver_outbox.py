@@ -230,6 +230,27 @@ async def _mark_current_multilingual(
     await session.commit()
 
 
+async def _mark_match_only_reply(session, outbox_id: uuid.UUID) -> None:
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            multilingual_contract_version="knowledge-match-only-reply-v1",
+            grounding_verified=None,
+            knowledge_match_status="strong",
+            knowledge_gate_version="strong-gate-v1",
+            knowledge_similarity=0.9,
+            knowledge_similarity_margin=0.1,
+            knowledge_min_similarity_threshold=0.8,
+            knowledge_min_margin_threshold=0.08,
+            request_language="en",
+            reply_language="en",
+            resolved_locale="en",
+        )
+    )
+    await session.commit()
+
+
 async def _convert_to_approval(session, outbox_id: uuid.UUID, *, final_text: str) -> None:
     await session.execute(
         update(models.OutboxMessage)
@@ -1077,6 +1098,90 @@ async def test_multilingual_send_uses_gate_version_not_language_identity(
     monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
 
     assert await _preflight_reason(session, outbox_id) == expected
+
+
+async def test_match_only_send_bypasses_content_guard_and_grounding(
+    session,
+    monkeypatch,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(
+        session,
+        outbox_id,
+        approved_reply="Refunds take 3 business days.",
+        protected_values=("WikiFX",),
+    )
+    await _mark_match_only_reply(session, outbox_id)
+    candidate = "Email private@example.com. OtherFX refunds take 99 days."
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(payload={"text": candidate, "visibility": "public"})
+    )
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(reply_text=candidate)
+    )
+    await session.commit()
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": True,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert await _preflight_reason(session, outbox_id) is None
+
+
+async def test_match_only_send_bypasses_source_currentness(session, monkeypatch):
+    _conversation_id, outbox_id = await _seed(session)
+    document_id, _chunk_id, _content_hash = await _attach_knowledge(
+        session,
+        outbox_id,
+        approved_reply="Approved answer.",
+    )
+    await _mark_match_only_reply(session, outbox_id)
+    await session.execute(
+        update(models.KnowledgeDocument)
+        .where(models.KnowledgeDocument.id == document_id)
+        .values(status="draft")
+    )
+    await session.commit()
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": True,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert await _preflight_reason(session, outbox_id) is None
+
+
+async def test_match_only_send_requires_runtime_gate_to_remain_enabled(
+    session,
+    monkeypatch,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(session, outbox_id, approved_reply="Approved answer.")
+    await _mark_match_only_reply(session, outbox_id)
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": False,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert (
+        await _preflight_reason(session, outbox_id)
+        == "KNOWLEDGE_MATCH_ONLY_REPLY_DISABLED"
+    )
 
 
 @pytest.mark.parametrize(

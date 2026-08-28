@@ -92,14 +92,22 @@ def _handoff(reason: str) -> ReplyDecision:
     )
 
 
-def apply_rules(text: str | None) -> ReplyDecision | None:
-    """Legacy deterministic rule path retained unchanged while the new feature flag is off."""
+def apply_empty_input_rule(text: str | None) -> ReplyDecision | None:
+    """Keep the non-text routing rule independent from optional risk phrase matching."""
     if text is None or not text.strip():
         return ReplyDecision(
             action=ReplyAction.HANDOFF,
             reason_codes=("EMPTY_OR_NON_TEXT",),
             source="rule",
         )
+    return None
+
+
+def apply_rules(text: str | None) -> ReplyDecision | None:
+    """Legacy deterministic rule path retained unchanged while the new feature flag is off."""
+    empty_input_decision = apply_empty_input_rule(text)
+    if empty_input_decision is not None:
+        return empty_input_decision
     if any(word in text for word in RISK_WORDS):
         return _handoff("RISK_WORD")
     return None
@@ -107,12 +115,9 @@ def apply_rules(text: str | None) -> ReplyDecision | None:
 
 def apply_multilingual_rules(text: str | None) -> ReplyDecision | None:
     """Fail closed on risk/failure/escalation semantics without blocking ordinary FAQ topics."""
-    if text is None or not text.strip():
-        return ReplyDecision(
-            action=ReplyAction.HANDOFF,
-            reason_codes=("EMPTY_OR_NON_TEXT",),
-            source="rule",
-        )
+    empty_input_decision = apply_empty_input_rule(text)
+    if empty_input_decision is not None:
+        return empty_input_decision
     normalized = text.casefold()
     if any(phrase.casefold() in normalized for phrase in MULTILINGUAL_RISK_PHRASES):
         return _handoff("MULTILINGUAL_RISK")

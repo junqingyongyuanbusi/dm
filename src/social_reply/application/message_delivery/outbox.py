@@ -26,6 +26,7 @@ from social_reply.application.reply_decision.business_prompt import (
     business_prompt_provenance_is_current,
 )
 from social_reply.application.reply_decision.multilingual_generation import (
+    KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
 )
 from social_reply.connectors.chatwoot.client import get_chatwoot_client
@@ -39,6 +40,8 @@ from social_reply.connectors.registry import get_platform_sender
 from social_reply.domain.platform_accounts import (
     DIRECT_DESTINATION_CAPABILITIES,
     LEGACY_ACTIVE_ACCOUNT_STATUSES,
+    PLATFORM_CAPABILITY_SPECS,
+    AccountPlatform,
     CapabilityKey,
     account_platform,
     capability_enabled,
@@ -64,6 +67,18 @@ _LEGACY_EXPERIMENTAL_CONTRACT_VERSION = "multilingual-experimental-runtime-v1"
 
 _MAX_ATTEMPTS = 5
 _CANCELLED_SEND_DRAIN_SECONDS = 30
+
+
+def _match_only_delivery_shape_error(platform: str, payload_text: str) -> str | None:
+    if not payload_text.strip():
+        return "GUARD_EMPTY"
+    try:
+        maximum_text_length = PLATFORM_CAPABILITY_SPECS[AccountPlatform(platform)].max_text_length
+    except ValueError:
+        maximum_text_length = 2000
+    if len(payload_text) > maximum_text_length:
+        return "GUARD_TOO_LONG"
+    return None
 
 
 async def _await_send[T](awaitable: Awaitable[T]) -> T:
@@ -651,6 +666,28 @@ async def _public_bot_send_preflight(
 
     if decision.multilingual_contract_version == _LEGACY_EXPERIMENTAL_CONTRACT_VERSION:
         return "EXPERIMENTAL_MULTILINGUAL_DISABLED"
+    match_only_contract = (
+        decision.multilingual_contract_version == KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
+    )
+    if match_only_contract:
+        if not getattr(settings, "knowledge_match_only_reply_enabled", False):
+            return "KNOWLEDGE_MATCH_ONLY_REPLY_DISABLED"
+        if not settings.multilingual_knowledge_reply_enabled:
+            return "MULTILINGUAL_LIVE_DISABLED"
+        if (
+            decision.knowledge_match_status != "strong"
+            or decision.knowledge_similarity is None
+            or decision.knowledge_min_similarity_threshold is None
+            or decision.knowledge_similarity < decision.knowledge_min_similarity_threshold
+            or decision.knowledge_gate_version != "strong-gate-v1"
+            or decision.knowledge_min_margin_threshold is None
+            or (
+                decision.knowledge_similarity_margin is not None
+                and decision.knowledge_similarity_margin
+                < decision.knowledge_min_margin_threshold
+            )
+        ):
+            return "MULTILINGUAL_PROVENANCE_INVALID"
     if decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION:
         if not settings.multilingual_knowledge_reply_enabled:
             return "MULTILINGUAL_LIVE_DISABLED"
@@ -684,7 +721,11 @@ async def _public_bot_send_preflight(
         decision.knowledge_content_hash,
     )
     if (
-        decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION
+        decision.multilingual_contract_version
+        in {
+            MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+            KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
+        }
         and not any(value is not None for value in knowledge_identity)
     ):
         return "MULTILINGUAL_KNOWLEDGE_IDENTITY_INVALID"
@@ -692,32 +733,38 @@ async def _public_bot_send_preflight(
     if any(value is not None for value in knowledge_identity):
         if any(value is None for value in knowledge_identity):
             return "MULTILINGUAL_KNOWLEDGE_IDENTITY_INVALID"
-        source_row = (
-            await session.execute(
-                select(models.KnowledgeDocument, models.KnowledgeChunk)
-                .join(
-                    models.KnowledgeChunk,
-                    (models.KnowledgeChunk.tenant_id == models.KnowledgeDocument.tenant_id)
-                    & (models.KnowledgeChunk.document_id == models.KnowledgeDocument.id),
+        if match_only_contract:
+            # Temporarily disabled for match-only testing; keep the source currentness query in
+            # the normal contract branch below for later restoration.
+            # source_row = await _load_current_published_knowledge_source(...)
+            source_row = None
+        else:
+            source_row = (
+                await session.execute(
+                    select(models.KnowledgeDocument, models.KnowledgeChunk)
+                    .join(
+                        models.KnowledgeChunk,
+                        (models.KnowledgeChunk.tenant_id == models.KnowledgeDocument.tenant_id)
+                        & (models.KnowledgeChunk.document_id == models.KnowledgeDocument.id),
+                    )
+                    .where(
+                        models.KnowledgeDocument.tenant_id == decision.tenant_id,
+                        models.KnowledgeDocument.id == decision.knowledge_document_id,
+                        models.KnowledgeChunk.id == decision.knowledge_chunk_id,
+                        models.KnowledgeChunk.content_hash == decision.knowledge_content_hash,
+                        models.KnowledgeDocument.brand_id == account.brand_id,
+                        or_(
+                            models.KnowledgeDocument.platform.is_(None),
+                            models.KnowledgeDocument.platform == account.platform,
+                        ),
+                        models.KnowledgeDocument.status == "published",
+                        models.KnowledgeDocument.source_language == "en",
+                        models.KnowledgeDocument.language_verified.is_(True),
+                    )
                 )
-                .where(
-                    models.KnowledgeDocument.tenant_id == decision.tenant_id,
-                    models.KnowledgeDocument.id == decision.knowledge_document_id,
-                    models.KnowledgeChunk.id == decision.knowledge_chunk_id,
-                    models.KnowledgeChunk.content_hash == decision.knowledge_content_hash,
-                    models.KnowledgeDocument.brand_id == account.brand_id,
-                    or_(
-                        models.KnowledgeDocument.platform.is_(None),
-                        models.KnowledgeDocument.platform == account.platform,
-                    ),
-                    models.KnowledgeDocument.status == "published",
-                    models.KnowledgeDocument.source_language == "en",
-                    models.KnowledgeDocument.language_verified.is_(True),
-                )
-            )
-        ).one_or_none()
-        if source_row is None:
-            return "MULTILINGUAL_SOURCE_REVOKED"
+            ).one_or_none()
+            if source_row is None:
+                return "MULTILINGUAL_SOURCE_REVOKED"
 
     artifact = None
     localization_identity = (
@@ -726,7 +773,7 @@ async def _public_bot_send_preflight(
         decision.knowledge_localization_text_hash,
         decision.knowledge_localization_source_hash,
     )
-    if any(value is not None for value in localization_identity):
+    if not match_only_contract and any(value is not None for value in localization_identity):
         if source_row is None or any(value is None for value in localization_identity):
             return "LOCALIZATION_PROVENANCE_INVALID"
         document, chunk = source_row
@@ -753,6 +800,12 @@ async def _public_bot_send_preflight(
             or (document.is_official_contact and not artifact.official_contact_authorized)
         ):
             return "LOCALIZATION_RELEASE_REVOKED"
+
+    if match_only_contract:
+        # Temporarily disabled for match-only testing; the normal contract below still executes:
+        # - localization provenance/currentness checks
+        # - run_hard_output_guard for facts, entities, contacts, PII, and approved wording
+        return _match_only_delivery_shape_error(account.platform, payload_text)
 
     document = source_row[0] if source_row is not None else None
     guard_source = decision.source

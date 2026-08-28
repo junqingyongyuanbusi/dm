@@ -28,6 +28,7 @@ RAG_SELECTION_METHODS = frozenset(
         "exact",
         "exact_ambiguous",
         "legacy_top1",
+        "match_only_gate",
         OFFICIAL_CONTACT_REVIEW_METHOD,
         "selector_canary_off",
         "selector_live",

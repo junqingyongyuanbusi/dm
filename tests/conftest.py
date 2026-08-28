@@ -46,6 +46,7 @@ _TEST_DEFAULTS = {
     "OPENAI_API_KEY": "",
     "OPENAI_BASE_URL": "https://api.openai.com/v1",
     "KNOWLEDGE_RETRIEVAL_ENABLED": "false",
+    "KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED": "false",
     "REQUIRE_KNOWLEDGE": "false",
     "KNOWLEDGE_VERBATIM_REPLY": "false",
 }

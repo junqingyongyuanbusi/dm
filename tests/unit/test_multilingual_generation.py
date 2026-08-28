@@ -4,6 +4,7 @@ import pytest
 
 from social_reply.application.knowledge.retrieval import KnowledgeHit
 from social_reply.application.reply_decision.multilingual_generation import (
+    KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
     generate_multilingual_reply,
 )
@@ -126,3 +127,39 @@ async def test_generation_failure_handoffs_with_contract_provenance() -> None:
     assert decision.action is ReplyAction.HANDOFF
     assert decision.reason_codes == ("MULTILINGUAL_GENERATION_FAILED",)
     assert decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION
+
+
+@pytest.mark.asyncio
+async def test_match_only_generation_uses_text_contract_without_content_guards() -> None:
+    class _MatchOnlyLLM:
+        async def decide(self, context):
+            raise AssertionError("the action decision contract must remain unused")
+
+        async def generate_knowledge_reply_text(self, context):
+            assert context.target_language == "ja"
+            return "Email support@example.com. Refunds take 99 days."
+
+        async def verify_grounding(self, **kwargs):
+            raise AssertionError("grounding must remain disabled in match-only mode")
+
+        async def detect_language_tag(self, text):
+            raise AssertionError("reply-language observation must remain disabled")
+
+    decision = await generate_multilingual_reply(
+        _snapshot(),
+        selected=_hit(),
+        target_language="ja",
+        history=(),
+        killswitch=_KillSwitch(),
+        llm=_MatchOnlyLLM(),
+        voice_preferences=DEFAULT_VOICE_PREFERENCES,
+        email_auto_reply_allowed=True,
+        knowledge_match_only_reply=True,
+    )
+
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_text == "Email support@example.com. Refunds take 99 days."
+    assert decision.reply_language == "ja"
+    assert decision.grounding_verified is None
+    assert decision.multilingual_contract_version == KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
+    assert "KNOWLEDGE_MATCH_ONLY_RUNTIME_GENERATION" in decision.reason_codes

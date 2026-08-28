@@ -7,6 +7,10 @@ from social_reply.application.reply_decision.language_resolution import (
     resolve_reply_language,
 )
 from social_reply.domain.messages.canonical import ChannelType
+from social_reply.domain.platform_accounts import (
+    PLATFORM_CAPABILITY_SPECS,
+    AccountPlatform,
+)
 from social_reply.domain.reply.business_prompt import BusinessPromptInstructions
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision, Visibility
 from social_reply.domain.reply.guard import (
@@ -19,11 +23,43 @@ from social_reply.domain.reply.guard import (
 )
 from social_reply.domain.reply.llm import APPROVED_VERBATIM_SENTINEL, LLMClient, LLMContext
 from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
-from social_reply.domain.reply.rules import apply_rules
+from social_reply.domain.reply.rules import apply_empty_input_rule, apply_rules
 from social_reply.domain.reply.voice import VoicePreferences
 
 logger = logging.getLogger(__name__)
 _GROUNDING_VERIFIER_VERSION = "grounding-v1"
+
+
+def _apply_match_only_delivery_shape(
+    decision: ReplyDecision,
+    *,
+    platform: str,
+) -> ReplyDecision:
+    """Keep only the payload shape needed for an actual platform text send."""
+    if decision.action is not ReplyAction.AUTO_REPLY:
+        return decision
+    reply_text = decision.reply_text or ""
+    if not reply_text.strip():
+        return replace(
+            decision,
+            action=ReplyAction.HANDOFF,
+            reply_text=None,
+            reason_codes=decision.reason_codes + ("GUARD_EMPTY",),
+            source="guard",
+        )
+    try:
+        maximum_text_length = PLATFORM_CAPABILITY_SPECS[AccountPlatform(platform)].max_text_length
+    except ValueError:
+        maximum_text_length = 2000
+    if len(reply_text) > maximum_text_length:
+        return replace(
+            decision,
+            action=ReplyAction.HANDOFF,
+            reply_text=None,
+            reason_codes=decision.reason_codes + ("GUARD_TOO_LONG",),
+            source="guard",
+        )
+    return decision
 
 
 @dataclass(frozen=True)
@@ -124,6 +160,7 @@ async def run_decision_pipeline(
     email_auto_reply_allowed: bool = True,
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
     language_policy: str = LANGUAGE_POLICY_REVIEW,
+    knowledge_match_only_reply: bool = False,
 ) -> ReplyDecision:
     """纯管线：状态门 → 安全规则 → 生成 → 硬闸门 → 语义验证 → 语言观察 → 草稿降级。
     不触碰数据库、不持有事务（真实 LLM 慢调用不阻塞入站与接管翻转）。
@@ -157,8 +194,14 @@ async def run_decision_pipeline(
     if disabled:
         return ReplyDecision(action=ReplyAction.DRAFT, reason_codes=("KILLSWITCH",), source="rule")
 
-    # 确定性安全规则（空消息/风险词）优先于一切
-    ruled = apply_rules(snapshot.text) if apply_legacy_rules else None
+    # 测试阶段暂时停用风险词匹配，但保留空消息路由。恢复完整规则时删除测试分支，
+    # 继续使用下面保留的 apply_rules 调用即可。
+    if knowledge_match_only_reply:
+        # Temporarily disabled for match-only testing:
+        # ruled = apply_rules(snapshot.text) if apply_legacy_rules else None
+        ruled = apply_empty_input_rule(snapshot.text)
+    else:
+        ruled = apply_rules(snapshot.text) if apply_legacy_rules else None
     if snapshot.has_unsupported_attachment:
         decision = ReplyDecision(
             action=ReplyAction.HANDOFF,
@@ -169,6 +212,60 @@ async def run_decision_pipeline(
         decision = ruled
     elif forced_decision is not None:
         decision = forced_decision
+    elif knowledge_match_only_reply and not knowledge:
+        decision = ReplyDecision(
+            action=ReplyAction.HANDOFF,
+            reason_codes=("INSUFFICIENT_KNOWLEDGE",),
+            source="rule",
+        )
+    elif knowledge_match_only_reply:
+        generator = (
+            getattr(llm, "generate_knowledge_reply_text", None) if llm is not None else None
+        )
+        if generator is None:
+            decision = ReplyDecision(
+                action=ReplyAction.HANDOFF,
+                reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
+                source="rule",
+            )
+        else:
+            try:
+                reply_text = await generator(
+                    LLMContext(
+                        text=redact_pii(snapshot.text or ""),
+                        conversation_key=snapshot.conversation_key,
+                        knowledge=knowledge,
+                        history=tuple(
+                            (role, redact_pii(text))
+                            for role, text in history
+                            if role in {"user", "assistant"} and text
+                        ),
+                        voice_preferences=voice_preferences,
+                        business_prompt=business_prompt,
+                        target_language=target_language,
+                    )
+                )
+            except Exception:
+                logger.exception("match-only reply generation failed; forcing handoff")
+                reply_text = None
+            if reply_text is None or not reply_text.strip():
+                decision = ReplyDecision(
+                    action=ReplyAction.HANDOFF,
+                    reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
+                    source="rule",
+                )
+            else:
+                decision = ReplyDecision(
+                    action=ReplyAction.AUTO_REPLY,
+                    reply_text=reply_text.strip(),
+                    intent="knowledge_match_only_reply",
+                    confidence=1.0,
+                    reply_visibility=Visibility.PUBLIC,
+                    reason_codes=("KNOWLEDGE_MATCH_ONLY_REPLY",),
+                    source="knowledge",
+                    reply_language=target_language,
+                    resolved_locale=target_language,
+                )
     elif approved_localization is not None:
         if (
             not approved_localization.auto_reply_allowed
@@ -275,27 +372,35 @@ async def run_decision_pipeline(
             reason_codes=decision.reason_codes + (reason,),
         )
 
-    # Phase 1: deterministic safety facts. Failures hand off and discard the candidate.
-    decision = run_hard_output_guard(
-        decision,
-        snapshot.platform,
-        approved_official_contact_reply=approved_official_contact_reply,
-        expected_reply_language=target_language,
-        approved_knowledge_reply=approved_knowledge_reply,
-        approved_knowledge_protected_values=approved_knowledge_protected_values,
-        approved_localization_text=(approved_localization.text if approved_localization else None),
-        approved_localization_text_hash=(
-            approved_localization.text_hash if approved_localization else None
-        ),
-        approved_localization_protected_values=(
-            approved_localization.protected_values if approved_localization else ()
-        ),
-    )
+    if knowledge_match_only_reply:
+        # Temporarily disabled for match-only testing; keep this call for later restoration:
+        # decision = run_hard_output_guard(...)
+        decision = _apply_match_only_delivery_shape(decision, platform=snapshot.platform)
+    else:
+        # Phase 1: deterministic safety facts. Failures hand off and discard the candidate.
+        decision = run_hard_output_guard(
+            decision,
+            snapshot.platform,
+            approved_official_contact_reply=approved_official_contact_reply,
+            expected_reply_language=target_language,
+            approved_knowledge_reply=approved_knowledge_reply,
+            approved_knowledge_protected_values=approved_knowledge_protected_values,
+            approved_localization_text=(
+                approved_localization.text if approved_localization else None
+            ),
+            approved_localization_text_hash=(
+                approved_localization.text_hash if approved_localization else None
+            ),
+            approved_localization_protected_values=(
+                approved_localization.protected_values if approved_localization else ()
+            ),
+        )
 
     # Phase 2: semantic fidelity/relevance. It runs only after every deterministic check passes,
     # but before language identity can turn the candidate into a review draft.
     if (
-        target_language != "und"
+        not knowledge_match_only_reply
+        and target_language != "und"
         and approved_knowledge_reply is not None
         and verbatim_after_decision is None
         and approved_localization is None
@@ -310,7 +415,11 @@ async def run_decision_pipeline(
         )
 
     observed_reply_language: str | None = None
-    if decision.action is ReplyAction.AUTO_REPLY and target_language != "und":
+    if (
+        not knowledge_match_only_reply
+        and decision.action is ReplyAction.AUTO_REPLY
+        and target_language != "und"
+    ):
         if decision.source == "knowledge_localization" and decision.reply_language != "und":
             observed_reply_language = decision.reply_language
         else:
@@ -337,21 +446,27 @@ async def run_decision_pipeline(
                     reason_codes=decision.reason_codes + ("LANGUAGE_MODEL_ATTESTED",),
                 )
 
-    # Phase 3: language identity is routing/review evidence, never a shortcut around safety.
-    decision = run_language_observation_guard(
-        decision,
-        approved_official_contact_reply=approved_official_contact_reply,
-        expected_reply_language=target_language,
-        approved_knowledge_reply=approved_knowledge_reply,
-        approved_knowledge_protected_values=approved_knowledge_protected_values,
-        approved_localization_protected_values=(
-            approved_localization.protected_values if approved_localization else ()
-        ),
-        customer_text=snapshot.text,
-        observed_reply_language=observed_reply_language,
-        language_verification=language_verification,
-        language_policy=language_policy,
-    )
+    if knowledge_match_only_reply:
+        # Temporarily disabled for match-only testing; keep these calls for later restoration:
+        # observed_reply_language = await resolve_reply_language(...)
+        # decision = run_language_observation_guard(...)
+        pass
+    else:
+        # Phase 3: language identity is routing/review evidence, never a shortcut around safety.
+        decision = run_language_observation_guard(
+            decision,
+            approved_official_contact_reply=approved_official_contact_reply,
+            expected_reply_language=target_language,
+            approved_knowledge_reply=approved_knowledge_reply,
+            approved_knowledge_protected_values=approved_knowledge_protected_values,
+            approved_localization_protected_values=(
+                approved_localization.protected_values if approved_localization else ()
+            ),
+            customer_text=snapshot.text,
+            observed_reply_language=observed_reply_language,
+            language_verification=language_verification,
+            language_policy=language_policy,
+        )
 
     # 草稿降级必须是管线的最后一步：任何把 action 改回 AUTO_REPLY 的兜底都要排在它前面，
     # 否则决策会以 auto_reply 落库——BOT_DRAFT_ONLY 下既不外发，也进不了 admin 待审队列。

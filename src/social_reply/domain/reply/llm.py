@@ -63,6 +63,10 @@ class LLMContext:
 class LLMClient(Protocol):
     async def decide(self, context: LLMContext) -> ReplyDecision: ...
 
+    async def generate_knowledge_reply_text(self, context: LLMContext) -> str | None:
+        """Generate customer-facing text without choosing a reply action."""
+        ...
+
     async def verify_grounding(
         self,
         *,
@@ -116,6 +120,9 @@ class StubLLMClient:
             reason_codes=("STUB_LLM",),
             source="llm",
         )
+
+    async def generate_knowledge_reply_text(self, context: LLMContext) -> str | None:
+        return "您好，已收到您的问题，我们会尽快为您解答。"
 
     async def verify_grounding(
         self,

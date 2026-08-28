@@ -32,6 +32,7 @@ _REQUIRED = {
     "KNOWLEDGE_VERBATIM_REPLY": "false",
     "REQUIRE_KNOWLEDGE": "false",
     "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "false",
+    "KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED": "false",
     "MULTILINGUAL_LANGUAGE_POLICY": "review",
     "RAG_SELECTOR_MODE": "off",
     "RAG_SELECTOR_CANARY_BPS": "0",
@@ -67,6 +68,20 @@ def test_validate_accepts_runtime_multilingual_generation() -> None:
         }
         for service in ("api", "worker", "scheduler")
     }
+    validate(_variables(**overrides), public_base_url="https://relay.example.com")
+
+
+def test_validate_accepts_coordinated_match_only_reply_mode() -> None:
+    overrides = {
+        service: {
+            "KNOWLEDGE_RETRIEVAL_ENABLED": "true",
+            "MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED": "true",
+            "KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED": "true",
+            "RAG_SELECTOR_MODE": "off",
+        }
+        for service in ("api", "worker", "scheduler")
+    }
+
     validate(_variables(**overrides), public_base_url="https://relay.example.com")
 
 

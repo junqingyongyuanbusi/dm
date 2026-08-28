@@ -19,6 +19,7 @@ from social_reply.domain.reply.voice import VoicePreferences
 logger = logging.getLogger(__name__)
 
 MULTILINGUAL_GENERATION_CONTRACT_VERSION = "multilingual-runtime-generation-v1"
+KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION = "knowledge-match-only-reply-v1"
 
 
 def _knowledge_evidence(hit: KnowledgeHit) -> str:
@@ -44,8 +45,14 @@ async def generate_multilingual_reply(
     language_verification: str = LANGUAGE_VERIFICATION_STRICT,
     language_policy: str = "review",
     approved_knowledge_protected_values: tuple[str, ...] = (),
+    knowledge_match_only_reply: bool = False,
 ) -> ReplyDecision:
     """Generate a guarded same-language reply from the canonical English knowledge hit."""
+    contract_version = (
+        KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
+        if knowledge_match_only_reply
+        else MULTILINGUAL_GENERATION_CONTRACT_VERSION
+    )
     try:
         decision = await run_decision_pipeline(
             snapshot,
@@ -63,6 +70,7 @@ async def generate_multilingual_reply(
             email_auto_reply_allowed=email_auto_reply_allowed,
             language_verification=language_verification,
             language_policy=language_policy,
+            knowledge_match_only_reply=knowledge_match_only_reply,
         )
     except Exception:
         logger.exception("multilingual generation failed; forcing handoff")
@@ -71,21 +79,25 @@ async def generate_multilingual_reply(
             reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
             source="rule",
             resolved_locale=target_language,
-            multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+            multilingual_contract_version=contract_version,
         )
     if decision.action is ReplyAction.HANDOFF:
         return replace(
             decision,
             resolved_locale=target_language,
-            multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+            multilingual_contract_version=contract_version,
         )
     return replace(
         decision,
         resolved_locale=target_language,
-        multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+        multilingual_contract_version=contract_version,
         reason_codes=(
             *decision.reason_codes,
             *fallback_reason_codes,
-            "MULTILINGUAL_RUNTIME_GENERATION",
+            (
+                "KNOWLEDGE_MATCH_ONLY_RUNTIME_GENERATION"
+                if knowledge_match_only_reply
+                else "MULTILINGUAL_RUNTIME_GENERATION"
+            ),
         ),
     )

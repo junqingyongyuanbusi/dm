@@ -60,6 +60,7 @@ _ENV_KEYS = [
     "ADMIN_ALLOWED_TENANTS",
     "CONVERSATION_HISTORY_LIMIT",
     "CONVERSATION_HISTORY_MAX_CHARS",
+    "KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED",
     "TESTING",
 ]
 
@@ -556,6 +557,47 @@ def test_x_mention_ingest_requires_both_activity_and_public_reply() -> None:
 def test_multilingual_runtime_requires_knowledge_retrieval() -> None:
     with pytest.raises(ValueError, match="requires KNOWLEDGE_RETRIEVAL_ENABLED"):
         _make(testing=True, multilingual_knowledge_reply_enabled=True)
+
+
+def test_match_only_reply_requires_knowledge_retrieval() -> None:
+    with pytest.raises(ValueError, match="requires KNOWLEDGE_RETRIEVAL_ENABLED"):
+        _make(
+            testing=True,
+            multilingual_knowledge_reply_enabled=True,
+            knowledge_match_only_reply_enabled=True,
+        )
+
+
+def test_match_only_reply_requires_multilingual_runtime() -> None:
+    with pytest.raises(ValueError, match="requires MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED"):
+        _make(
+            testing=True,
+            knowledge_retrieval_enabled=True,
+            knowledge_match_only_reply_enabled=True,
+        )
+
+
+def test_match_only_reply_rejects_live_selector() -> None:
+    with pytest.raises(ValueError, match="incompatible with RAG_SELECTOR_MODE=live"):
+        _make(
+            testing=True,
+            knowledge_retrieval_enabled=True,
+            multilingual_knowledge_reply_enabled=True,
+            knowledge_match_only_reply_enabled=True,
+            rag_selector_mode="live",
+        )
+
+
+def test_match_only_reply_accepts_coordinated_test_configuration() -> None:
+    settings = _make(
+        testing=True,
+        knowledge_retrieval_enabled=True,
+        multilingual_knowledge_reply_enabled=True,
+        knowledge_match_only_reply_enabled=True,
+        rag_selector_mode="off",
+    )
+
+    assert settings.knowledge_match_only_reply_enabled is True
 
 
 @pytest.mark.parametrize("policy", ["legacy_hard", "review"])

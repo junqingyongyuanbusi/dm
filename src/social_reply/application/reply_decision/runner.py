@@ -24,6 +24,7 @@ from social_reply.application.reply_decision.language_resolution import (
     resolve_customer_language,
 )
 from social_reply.application.reply_decision.multilingual_generation import (
+    KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
     generate_multilingual_reply,
 )
@@ -59,7 +60,11 @@ from social_reply.domain.reply.language import is_deterministically_verifiable
 from social_reply.domain.reply.llm import LLMClient, StubLLMClient
 from social_reply.domain.reply.localization import ApprovedLocalizationArtifact
 from social_reply.domain.reply.openai_client import OpenAILLMClient
-from social_reply.domain.reply.rules import apply_multilingual_rules, apply_rules
+from social_reply.domain.reply.rules import (
+    apply_empty_input_rule,
+    apply_multilingual_rules,
+    apply_rules,
+)
 from social_reply.domain.reply.voice import DEFAULT_PERSONA
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
@@ -748,11 +753,18 @@ async def run_and_persist_decision(
         )
     else:
         use_multilingual_path = settings.multilingual_knowledge_reply_enabled
-        deterministic_rule = (
-            apply_multilingual_rules(snapshot.text)
-            if use_multilingual_path
-            else apply_rules(snapshot.text)
-        )
+        match_only_reply = settings.knowledge_match_only_reply_enabled
+        if match_only_reply:
+            # Temporarily disabled for match-only testing; keep both rule calls for restoration:
+            # deterministic_rule = apply_multilingual_rules(snapshot.text)
+            # deterministic_rule = apply_rules(snapshot.text)
+            deterministic_rule = apply_empty_input_rule(snapshot.text)
+        else:
+            deterministic_rule = (
+                apply_multilingual_rules(snapshot.text)
+                if use_multilingual_path
+                else apply_rules(snapshot.text)
+            )
         legacy_should_retrieve = (
             not killswitch_disabled
             and snapshot.automation_state != "HUMAN_ACTIVE"
@@ -791,6 +803,9 @@ async def run_and_persist_decision(
                 and not language.is_reliable
                 and settings.multilingual_language_policy == "review"
             )
+            unresolved_language_fallback = unresolved_language_review or (
+                match_only_reply and language_should_detect and not language.is_reliable
+            )
             # 闸门严格度取决于确定性检测能否复核这个标签，而不是标签的来源。按来源
             # 判会在模型判出 en 时退到只比对文字系统——那样一句法语回复也能通过，
             # 恰好放过了「回错语言」这类唯一需要拦住的错误。
@@ -809,7 +824,7 @@ async def run_and_persist_decision(
             )
             knowledge_result, query_translation_used = (
                 await _retrieve_translation_first(snapshot, translated_query=translated_query)
-                if should_retrieve and (language.is_reliable or unresolved_language_review)
+                if should_retrieve and (language.is_reliable or unresolved_language_fallback)
                 else (KnowledgeRetrievalResult(), False)
             )
             gate_min_similarity = settings.knowledge_auto_reply_min_similarity
@@ -821,26 +836,37 @@ async def run_and_persist_decision(
             )
             gate_evaluated = (
                 should_retrieve
-                and (language.is_reliable or unresolved_language_review)
+                and (language.is_reliable or unresolved_language_fallback)
                 and not knowledge_result.error_code
             )
             selector_target_language = language.tag if language.is_reliable else "mirror-user"
-            selector_assessment = (
-                await _assess_with_rag_selector(
-                    snapshot,
-                    knowledge_result,
-                    mode=settings.rag_selector_mode,
-                    canary_bps=settings.rag_selector_canary_bps,
-                    eligible=(
-                        legacy_assessment.status == "ambiguous"
-                        and not knowledge_result.exact_ambiguous
-                    ),
+            if match_only_reply and gate_evaluated:
+                # Temporarily disabled for match-only testing:
+                # selector_assessment = await _assess_with_rag_selector(...)
+                selector_assessment = RAGSelectorAssessment(
+                    candidates=build_rag_candidates(knowledge_result),
+                    enabled=False,
+                    bucket=0,
+                    method="match_only_gate",
                 )
-                if gate_evaluated
-                else RAGSelectorAssessment(candidates=(), enabled=False, bucket=0)
-            )
+            else:
+                selector_assessment = (
+                    await _assess_with_rag_selector(
+                        snapshot,
+                        knowledge_result,
+                        mode=settings.rag_selector_mode,
+                        canary_bps=settings.rag_selector_canary_bps,
+                        eligible=(
+                            legacy_assessment.status == "ambiguous"
+                            and not knowledge_result.exact_ambiguous
+                        ),
+                    )
+                    if gate_evaluated
+                    else RAGSelectorAssessment(candidates=(), enabled=False, bucket=0)
+                )
             selector_controls_choice = (
-                settings.rag_selector_mode == "live"
+                not match_only_reply
+                and settings.rag_selector_mode == "live"
                 and selector_assessment.enabled
                 and not knowledge_result.exact_match
                 and not knowledge_result.exact_ambiguous
@@ -874,7 +900,8 @@ async def run_and_persist_decision(
             # 的译文正是人工为联系方式类事实签过字的产物，是该闸门唯一合法的放行凭据。
             approved_localization: ApprovedLocalizationArtifact | None = None
             if (
-                settings.knowledge_localization_enabled
+                not match_only_reply
+                and settings.knowledge_localization_enabled
                 and should_retrieve
                 and deterministic_rule is None
                 and language.is_reliable
@@ -896,7 +923,11 @@ async def run_and_persist_decision(
                     reason_codes=(knowledge_result.error_code,),
                     source="rule",
                 )
-            elif should_retrieve and not language.is_reliable and not unresolved_language_review:
+            elif (
+                should_retrieve
+                and not language.is_reliable
+                and not unresolved_language_fallback
+            ):
                 forced_decision = ReplyDecision(
                     action=ReplyAction.HANDOFF,
                     reason_codes=("UNKNOWN_LANGUAGE",),
@@ -913,7 +944,8 @@ async def run_and_persist_decision(
                     source="rule",
                 )
             elif (
-                should_retrieve
+                not match_only_reply
+                and should_retrieve
                 and selected is not None
                 and selected.is_official_contact
                 and not knowledge_result.exact_match
@@ -924,7 +956,8 @@ async def run_and_persist_decision(
                     source="rule",
                 )
             elif (
-                should_retrieve
+                not match_only_reply
+                and should_retrieve
                 and selected is not None
                 and selected.is_official_contact
                 and not is_english_request
@@ -941,18 +974,30 @@ async def run_and_persist_decision(
                     source="rule",
                 )
 
-            multilingual_generate = (
-                should_retrieve
-                and forced_decision is None
-                # 有审核译文就不生成：省两次 LLM 往返，且不引入改写风险。
-                and approved_localization is None
-                and selected is not None
-                and (is_english_request or not selected.is_official_contact)
-                and not (is_english_request and selected.is_official_contact)
-            )
+            if match_only_reply:
+                # Temporarily disabled for match-only testing: localization and official-contact
+                # branches above remain intact for the normal runtime policy.
+                multilingual_generate = (
+                    should_retrieve and forced_decision is None and selected is not None
+                )
+            else:
+                multilingual_generate = (
+                    should_retrieve
+                    and forced_decision is None
+                    # 有审核译文就不生成：省两次 LLM 往返，且不引入改写风险。
+                    and approved_localization is None
+                    and selected is not None
+                    and (is_english_request or not selected.is_official_contact)
+                    and not (is_english_request and selected.is_official_contact)
+                )
             generation_llm: LLMClient | None = None
             if multilingual_generate:
-                prompt_contract_suffix = f"+{MULTILINGUAL_GENERATION_CONTRACT_VERSION}"
+                generation_contract_version = (
+                    KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
+                    if match_only_reply
+                    else MULTILINGUAL_GENERATION_CONTRACT_VERSION
+                )
+                prompt_contract_suffix = f"+{generation_contract_version}"
             if multilingual_generate:
                 try:
                     async with get_session_factory()() as session:
@@ -974,7 +1019,7 @@ async def run_and_persist_decision(
                         action=ReplyAction.HANDOFF,
                         reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
                         source="rule",
-                        multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION
+                        multilingual_contract_version=generation_contract_version,
                     )
                     multilingual_generate = False
                     prompt_contract_suffix = ""
@@ -987,7 +1032,7 @@ async def run_and_persist_decision(
                         action=ReplyAction.HANDOFF,
                         reason_codes=("MULTILINGUAL_GENERATION_FAILED",),
                         source="rule",
-                        multilingual_contract_version=MULTILINGUAL_GENERATION_CONTRACT_VERSION
+                        multilingual_contract_version=generation_contract_version,
                     )
                     multilingual_generate = False
                     prompt_contract_suffix = ""
@@ -1011,11 +1056,16 @@ async def run_and_persist_decision(
                     ),
                     fallback_reason_codes=(
                         *(("QUERY_TRANSLATED",) if query_translation_used else ()),
-                        *(("UNKNOWN_LANGUAGE_REVIEW",) if unresolved_language_review else ()),
+                        *(
+                            ("UNKNOWN_LANGUAGE_REVIEW",)
+                            if unresolved_language_review and not match_only_reply
+                            else ()
+                        ),
                     ),
                     language_verification=language_verification,
                     language_policy=settings.multilingual_language_policy,
                     approved_knowledge_protected_values=selected.protected_values,
+                    knowledge_match_only_reply=match_only_reply,
                 )
             else:
                 decision = await run_decision_pipeline(
@@ -1054,7 +1104,7 @@ async def run_and_persist_decision(
                     target_language=(
                         selector_target_language
                         if should_retrieve
-                        and (language.is_reliable or unresolved_language_review)
+                        and (language.is_reliable or unresolved_language_fallback)
                         else "und"
                     ),
                     apply_legacy_rules=False,
@@ -1065,8 +1115,9 @@ async def run_and_persist_decision(
                     ),
                     language_verification=language_verification,
                     language_policy=settings.multilingual_language_policy,
+                    knowledge_match_only_reply=match_only_reply,
                 )
-            if unresolved_language_review:
+            if unresolved_language_review and not match_only_reply:
                 decision = _preserve_unresolved_language_review(decision)
             selected_candidate_id = next(
                 (
@@ -1094,7 +1145,7 @@ async def run_and_persist_decision(
             evidence = (
                 rag_evidence(
                     candidates=selector_assessment.candidates,
-                    mode=settings.rag_selector_mode,
+                    mode=("off" if match_only_reply else settings.rag_selector_mode),
                     canary_bucket=selector_assessment.bucket,
                     selection_method=selector_assessment.method,
                     selected_candidate_id=selected_candidate_id,
@@ -1120,6 +1171,11 @@ async def run_and_persist_decision(
             )
             decision = replace(
                 decision,
+                confidence=(
+                    selected.similarity
+                    if match_only_reply and selected is not None
+                    else decision.confidence
+                ),
                 request_language=(
                     language.tag if language_should_detect and language.is_reliable else "und"
                 ),
@@ -1132,7 +1188,11 @@ async def run_and_persist_decision(
                     else (
                         language.tag
                         if multilingual_generate and language.is_reliable
-                        else ("en" if is_english_request and assessment.strong else "und")
+                        else (
+                            "mirror-user"
+                            if match_only_reply and multilingual_generate
+                            else ("en" if is_english_request and assessment.strong else "und")
+                        )
                     )
                 ),
                 multilingual_contract_version=(

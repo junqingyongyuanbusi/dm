@@ -38,6 +38,71 @@ def _client(handler) -> OpenAILLMClient:
 
 
 @pytest.mark.asyncio
+async def test_match_only_generation_returns_text_without_action_fields() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _completion_response(json.dumps({"reply_text": "返金には3日かかります。"}))
+
+    reply_text = await _client(handler).generate_knowledge_reply_text(
+        LLMContext(
+            text="返金はいつですか？",
+            conversation_key="telegram:1",
+            knowledge=('{"approved_answer":"Refunds take 3 days."}',),
+            target_language="ja",
+        )
+    )
+
+    assert reply_text == "返金には3日かかります。"
+    payload = json.loads(captured[0].content)
+    schema = payload["response_format"]["json_schema"]
+    assert schema["name"] == "knowledge_match_only_reply"
+    assert set(schema["schema"]["properties"]) == {"reply_text"}
+    assert "Do not choose an action" in payload["messages"][0]["content"]
+    assert "Required reply language: ja" in payload["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_match_only_generation_retries_blank_text_then_returns_none() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _completion_response(json.dumps({"reply_text": "   "}))
+
+    reply_text = await _client(handler).generate_knowledge_reply_text(
+        LLMContext(
+            text="question",
+            conversation_key="telegram:1",
+            knowledge=("approved answer",),
+            target_language="mirror-user",
+        )
+    )
+
+    assert calls == 2
+    assert reply_text is None
+
+
+@pytest.mark.asyncio
+async def test_match_only_generation_refusal_returns_none() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _completion_response("", refusal="no")
+
+    reply_text = await _client(handler).generate_knowledge_reply_text(
+        LLMContext(
+            text="question",
+            conversation_key="telegram:1",
+            knowledge=("approved answer",),
+            target_language="en",
+        )
+    )
+
+    assert reply_text is None
+
+
+@pytest.mark.asyncio
 async def test_成功解析映射为_reply_decision():
     captured: list[httpx.Request] = []
 

@@ -265,6 +265,100 @@ async def test_risk_word_handoff_before_llm():
     assert "RISK_WORD" in d.reason_codes
 
 
+async def test_match_only_mode_bypasses_risk_and_content_guards() -> None:
+    class _MatchOnlyTextLLM:
+        async def decide(self, context):
+            raise AssertionError("match-only mode must not ask the model to choose an action")
+
+        async def generate_knowledge_reply_text(self, context):
+            assert context.target_language == "zh-Hans"
+            return "Email support@example.com. Refunds take 99 days."
+
+        async def verify_grounding(self, **kwargs):
+            raise AssertionError("match-only mode must not run grounding verification")
+
+        async def detect_language_tag(self, text):
+            raise AssertionError("match-only mode must not inspect the generated language")
+
+    decision = await run_decision_pipeline(
+        _snap(text="你们是不是诈骗，我无法提现"),
+        llm=_MatchOnlyTextLLM(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved knowledge",),
+        approved_knowledge_reply="Refunds take 3 days.",
+        target_language="zh-Hans",
+        knowledge_match_only_reply=True,
+    )
+
+    assert decision.action is ReplyAction.AUTO_REPLY
+    assert decision.reply_text == "Email support@example.com. Refunds take 99 days."
+    assert decision.reply_language == "zh-Hans"
+    assert "KNOWLEDGE_MATCH_ONLY_REPLY" in decision.reason_codes
+    assert "RISK_WORD" not in decision.reason_codes
+    assert "GUARD_PII_LEAK" not in decision.reason_codes
+    assert "GUARD_KNOWLEDGE_FACT_MISMATCH" not in decision.reason_codes
+
+
+async def test_match_only_mode_keeps_empty_input_handoff() -> None:
+    decision = await run_decision_pipeline(
+        _snap(text="   "),
+        llm=StubLLMClient(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved knowledge",),
+        knowledge_match_only_reply=True,
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert "EMPTY_OR_NON_TEXT" in decision.reason_codes
+
+
+async def test_match_only_mode_generation_failure_handoffs() -> None:
+    class _EmptyGenerator:
+        async def generate_knowledge_reply_text(self, context):
+            return None
+
+    decision = await run_decision_pipeline(
+        _snap(text="question"),
+        llm=_EmptyGenerator(),
+        killswitch=_OpenSwitch(),
+        knowledge=("approved knowledge",),
+        target_language="en",
+        knowledge_match_only_reply=True,
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reason_codes == ("MULTILINGUAL_GENERATION_FAILED",)
+
+
+async def test_match_only_mode_without_knowledge_handoffs_without_generation() -> None:
+    class _NeverGenerate:
+        async def generate_knowledge_reply_text(self, context):
+            raise AssertionError("generation requires a strong knowledge match")
+
+    decision = await run_decision_pipeline(
+        _snap(text="question"),
+        llm=_NeverGenerate(),
+        killswitch=_OpenSwitch(),
+        knowledge_match_only_reply=True,
+    )
+
+    assert decision.action is ReplyAction.HANDOFF
+    assert decision.reason_codes == ("INSUFFICIENT_KNOWLEDGE",)
+
+
+async def test_match_only_mode_still_obeys_killswitch() -> None:
+    decision = await run_decision_pipeline(
+        _snap(text="question"),
+        llm=StubLLMClient(),
+        killswitch=_ClosedSwitch(),
+        knowledge=("approved knowledge",),
+        knowledge_match_only_reply=True,
+    )
+
+    assert decision.action is ReplyAction.DRAFT
+    assert "KILLSWITCH" in decision.reason_codes
+
+
 async def test_killswitch_error_fails_closed_to_draft(caplog):
     d = await run_decision_pipeline(_snap(), llm=StubLLMClient(), killswitch=_BrokenSwitch())
     assert d.action is ReplyAction.DRAFT

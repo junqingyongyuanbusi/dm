@@ -642,6 +642,103 @@ async def test_multilingual_strong_match_generates_same_language_and_persists_ev
     assert decision.grounding_verified is True
 
 
+async def test_match_only_strong_match_bypasses_risk_and_content_rules(
+    session, knowledge_enabled
+):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("RAG_SELECTOR_MODE", "off")
+    get_settings.cache_clear()
+
+    class MatchOnlyLLM:
+        async def decide(self, context):
+            raise AssertionError("match-only mode must not use the action decision contract")
+
+        async def generate_knowledge_reply_text(self, context):
+            assert context.target_language in {"en", "mirror-user"}
+            return "Email support@example.com. Refunds take 99 days."
+
+        async def verify_rag_answer(self, **kwargs):
+            raise AssertionError("match-only mode must not run the grounding verifier")
+
+    runner._llm = MatchOnlyLLM()
+    result = _multilingual_result(similarity=0.95, second_similarity=0.80)
+
+    async def fake_fetch(snapshot, **kwargs):
+        assert kwargs["verified_english_only"] is True
+        return result
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "This broker is a scam"
+    account_id, conversation_id, message_id = await _seed_conversation(session, text)
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text),
+        conversation_id,
+        message_id,
+        account_id,
+    )
+
+    assert outbox_id is not None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "auto_reply"
+    assert decision.reply_text == "Email support@example.com. Refunds take 99 days."
+    assert decision.knowledge_match_status == "strong"
+    assert decision.knowledge_similarity == pytest.approx(0.95)
+    assert decision.knowledge_similarity_margin == pytest.approx(0.15)
+    assert decision.confidence == pytest.approx(0.95)
+    assert decision.source == "knowledge"
+    assert decision.multilingual_contract_version == "knowledge-match-only-reply-v1"
+    assert decision.grounding_verified is None
+    assert "RISK_WORD" not in decision.reason_codes
+    assert "MULTILINGUAL_RISK" not in decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        _multilingual_result(similarity=0.79),
+        _multilingual_result(similarity=0.90, second_similarity=0.83),
+        _multilingual_result(exact=False, ambiguous=True),
+    ],
+    ids=["below-similarity", "below-margin", "exact-conflict"],
+)
+async def test_match_only_weak_or_ambiguous_match_handoffs_without_generation(
+    session,
+    knowledge_enabled,
+    result,
+):
+    knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED", "true")
+    knowledge_enabled.setenv("RAG_SELECTOR_MODE", "off")
+    get_settings.cache_clear()
+
+    class NeverGenerateLLM:
+        async def generate_knowledge_reply_text(self, context):
+            raise AssertionError("weak or ambiguous matches must not generate text")
+
+    runner._llm = NeverGenerateLLM()
+
+    async def fake_fetch(snapshot, **kwargs):
+        return result
+
+    knowledge_enabled.setattr(runner, "_fetch_knowledge", fake_fetch)
+    text = "How long does this take?"
+    account_id, conversation_id, message_id = await _seed_conversation(session, text)
+
+    outbox_id = await runner.run_and_persist_decision(
+        _snapshot(account_id, text),
+        conversation_id,
+        message_id,
+        account_id,
+    )
+
+    assert outbox_id is None
+    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
+    assert decision.action == "handoff"
+    assert "NO_STRONG_KNOWLEDGE_MATCH" in decision.reason_codes
+
+
 async def test_live_selector_can_choose_non_top1_above_similarity_floor(session, knowledge_enabled):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("RAG_SELECTOR_MODE", "live")
