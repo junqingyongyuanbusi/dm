@@ -39,6 +39,7 @@ from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
 router = APIRouter(prefix="/admin", tags=["admin-web"])
+auth_router = APIRouter(prefix="/auth", tags=["auth-web"])
 _SESSION_COOKIE = "reply_admin_session"
 _CSRF_COOKIE = "reply_admin_csrf"
 _SESSION_TTL_SECONDS = 8 * 60 * 60
@@ -46,12 +47,16 @@ _SAFE_NEXT_PATHS = {"/admin/accounts", "/admin/integrations/accounts"}
 _SAFE_NEXT_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def _safe_admin_next(value: object) -> str | None:
+def _safe_auth_next(value: object) -> str | None:
     candidate = str(value or "")
-    if not candidate:
+    if not candidate or len(candidate) > 2048 or "\\" in candidate:
         return None
     parsed = urlsplit(candidate)
-    if parsed.scheme or parsed.netloc or parsed.fragment or parsed.path not in _SAFE_NEXT_PATHS:
+    if parsed.scheme or parsed.netloc or parsed.fragment:
+        return None
+    if parsed.path == "/app" or parsed.path.startswith("/app/"):
+        return parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    if parsed.path not in _SAFE_NEXT_PATHS:
         return None
     query = parse_qs(parsed.query, keep_blank_values=True)
     if set(query) - {"provider", "status", "code"}:
@@ -77,13 +82,18 @@ def _safe_admin_next(value: object) -> str | None:
 
 
 async def _web_principal(
-    request: Request, *, allow_password_change: bool = False
+    request: Request,
+    *,
+    allow_password_change: bool = False,
+    require_admin: bool = True,
 ) -> Principal | Response:
     principal = await current_principal(request)
     if principal is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse("/auth/login", status_code=status.HTTP_303_SEE_OTHER)
     if principal.must_change_password and not allow_password_change:
-        return RedirectResponse("/admin/change-password", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse("/auth/change-password", status_code=status.HTTP_303_SEE_OTHER)
+    if require_admin:
+        principal.require_admin()
     return principal
 
 
@@ -170,7 +180,7 @@ def _page(
 ) -> str:
     """Claude 风格页面外壳：暖米白底、衬线标题、赤陶橙点缀、大留白、零 JS。"""
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
-    logout = '<a class="nav-link" href="/admin/logout">退出</a>' if show_logout else ""
+    logout = '<a class="nav-link" href="/auth/logout">退出</a>' if show_logout else ""
     nav_groups = _NAV_GROUPS
     if show_users:
         nav_groups = tuple(
@@ -385,10 +395,11 @@ code{{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);paddi
 <div class="{shell_class}">{sidebar}<main id="main-content">{body}</main></div></body></html>"""
 
 
-@router.get("/login", response_class=HTMLResponse)
+@router.get("/login", response_class=HTMLResponse, include_in_schema=False)
+@auth_router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request) -> HTMLResponse:
     csrf = _csrf(request)
-    next_target = _safe_admin_next(request.query_params.get("next"))
+    next_target = _safe_auth_next(request.query_params.get("next"))
     next_field = (
         f'<input type="hidden" name="next" value="{html.escape(next_target, quote=True)}">'
         if next_target
@@ -396,10 +407,10 @@ async def login_page(request: Request) -> HTMLResponse:
     )
     response = HTMLResponse(
         _page(
-            "管理员登录",
-            f"""<div class="login-wrap"><section class="card login-card"><h1>管理员登录</h1>
-<p class="hint">生产环境建议由身份感知代理或 OIDC/MFA 保护该入口。</p>
-<form method="post" action="/admin/login"><input type="hidden" name="csrf_token" value="{csrf}">{next_field}
+            "登录",
+            f"""<div class="login-wrap"><section class="card login-card"><h1>登录 Reply Core</h1>
+<p class="hint">登录后将进入你有权访问的工作区。</p>
+<form method="post" action="/auth/login"><input type="hidden" name="csrf_token" value="{csrf}">{next_field}
 <label for="f-username">用户名</label><input id="f-username" name="username" autocomplete="username" required>
 <label for="f-password">密码</label><input id="f-password" name="password" type="password" autocomplete="current-password" required>
 <button type="submit" class="btn-block">登录</button></form></section></div>""",
@@ -417,14 +428,15 @@ async def login_page(request: Request) -> HTMLResponse:
     return response
 
 
-@router.post("/login")
+@router.post("/login", include_in_schema=False)
+@auth_router.post("/login")
 async def login(request: Request) -> Response:
     form = await _form(request)
     _require_csrf(request, form)
-    next_target = _safe_admin_next(form.get("next"))
+    next_target = _safe_auth_next(form.get("next"))
     username = (form.get("username") or "").strip()
     password = form.get("password") or ""
-    retry_target = "/admin/login"
+    retry_target = "/auth/login"
     if next_target:
         retry_target = f"{retry_target}?{urlencode({'next': next_target})}"
     retry_link = html.escape(retry_target, quote=True)
@@ -451,11 +463,11 @@ async def login(request: Request) -> Response:
         )
     principal, raw_token = result
     if principal.must_change_password:
-        target = "/admin/change-password"
+        target = "/auth/change-password"
         if next_target:
             target = f"{target}?{urlencode({'next': next_target})}"
     else:
-        target = next_target or "/admin"
+        target = next_target or ("/admin" if principal.is_admin else "/app")
     response = RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -468,9 +480,14 @@ async def login(request: Request) -> Response:
     return response
 
 
-@router.get("/logout", response_class=HTMLResponse)
+@router.get("/logout", response_class=HTMLResponse, include_in_schema=False)
+@auth_router.get("/logout", response_class=HTMLResponse)
 async def logout_page(request: Request) -> Response:
-    principal = await _web_principal(request, allow_password_change=True)
+    principal = await _web_principal(
+        request,
+        allow_password_change=True,
+        require_admin=False,
+    )
     if isinstance(principal, Response):
         return principal
     csrf = _csrf(request)
@@ -478,8 +495,8 @@ async def logout_page(request: Request) -> Response:
         _page(
             "确认退出",
             f"""<div class="login-wrap"><section class="card login-card"><h1>确认退出</h1>
-<p class="hint">退出将撤销当前后台会话。</p>
-<form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{csrf}">
+<p class="hint">退出将撤销当前会话。</p>
+<form method="post" action="/auth/logout"><input type="hidden" name="csrf_token" value="{csrf}">
 <button type="submit" class="btn-block">退出</button></form></section></div>""",
             show_logout=False,
         )
@@ -495,24 +512,36 @@ async def logout_page(request: Request) -> Response:
     return response
 
 
-@router.post("/logout")
+@router.post("/logout", include_in_schema=False)
+@auth_router.post("/logout")
 async def logout(request: Request) -> Response:
     form = await _form(request)
     _require_csrf(request, form)
     await revoke_session(request.cookies.get(_SESSION_COOKIE, ""))
-    response = RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    response = RedirectResponse("/auth/login", status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie(_SESSION_COOKIE)
     return response
 
 
-@router.get("/change-password", response_class=HTMLResponse)
+@router.get("/change-password", response_class=HTMLResponse, include_in_schema=False)
+@auth_router.get("/change-password", response_class=HTMLResponse)
 async def change_password_page(request: Request) -> Response:
-    principal = await _web_principal(request, allow_password_change=True)
+    principal = await _web_principal(
+        request,
+        allow_password_change=True,
+        require_admin=False,
+    )
     if isinstance(principal, Response):
         return principal
-    next_target = _safe_admin_next(request.query_params.get("next"))
-    if principal.is_superadmin or not principal.must_change_password:
+    next_target = _safe_auth_next(request.query_params.get("next"))
+    if principal.is_superadmin:
         return RedirectResponse(next_target or "/admin", status_code=status.HTTP_303_SEE_OTHER)
+    page_title = "首次修改密码" if principal.must_change_password else "修改密码"
+    password_hint = (
+        "为保护账号，首次登录必须设置个人密码（12–128 个字符）。"
+        if principal.must_change_password
+        else "输入当前密码，并设置一个新的个人密码（12–128 个字符）。"
+    )
     csrf = _csrf(request)
     next_field = (
         f'<input type="hidden" name="next" value="{html.escape(next_target, quote=True)}">'
@@ -521,10 +550,10 @@ async def change_password_page(request: Request) -> Response:
     )
     response = HTMLResponse(
         _page(
-            "首次修改密码",
-            f"""<div class="login-wrap"><section class="card login-card"><h1>首次修改密码</h1>
-<p class="hint">为保护账号，首次登录必须设置个人密码（12–128 个字符）。</p>
-<form method="post" action="/admin/change-password"><input type="hidden" name="csrf_token" value="{csrf}">{next_field}
+            page_title,
+            f"""<div class="login-wrap"><section class="card login-card"><h1>{page_title}</h1>
+<p class="hint">{password_hint}</p>
+<form method="post" action="/auth/change-password"><input type="hidden" name="csrf_token" value="{csrf}">{next_field}
 <label for="f-current-password">初始密码</label><input id="f-current-password" name="current_password" type="password" autocomplete="current-password" required>
 <label for="f-new-password">新密码</label><input id="f-new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required>
 <label for="f-confirm-password">确认新密码</label><input id="f-confirm-password" name="confirm_password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required>
@@ -543,16 +572,21 @@ async def change_password_page(request: Request) -> Response:
     return response
 
 
-@router.post("/change-password")
+@router.post("/change-password", include_in_schema=False)
+@auth_router.post("/change-password")
 async def change_password(request: Request) -> Response:
-    principal = await _web_principal(request, allow_password_change=True)
+    principal = await _web_principal(
+        request,
+        allow_password_change=True,
+        require_admin=False,
+    )
     if isinstance(principal, Response):
         return principal
     if principal.is_superadmin or principal.user_id is None:
         raise HTTPException(status_code=403, detail="password_change_not_available")
     form = await _form(request)
     _require_csrf(request, form)
-    next_target = _safe_admin_next(form.get("next"))
+    next_target = _safe_auth_next(form.get("next"))
     new_password = form.get("new_password") or ""
     if new_password != (form.get("confirm_password") or ""):
         raise HTTPException(status_code=422, detail="password_confirmation_mismatch")
@@ -598,11 +632,12 @@ async def change_password(request: Request) -> Response:
                 action="CHANGE_PASSWORD",
                 subject_type="admin_user",
                 subject_id=str(user.id),
-                detail={"first_login": True},
+                detail={"first_login": principal.must_change_password},
             )
         )
         await session.commit()
-    response = RedirectResponse(next_target or "/admin", status_code=status.HTTP_303_SEE_OTHER)
+    default_target = "/admin" if principal.is_admin else "/app"
+    response = RedirectResponse(next_target or default_target, status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         _SESSION_COOKIE,
         raw_token,
@@ -715,9 +750,14 @@ def _pill(status: str) -> str:
 
 
 async def _submit_form(
-    request: Request, platform: str, form: dict[str, str] | None = None
+    request: Request,
+    platform: str,
+    form: dict[str, str] | None = None,
+    *,
+    require_admin: bool = True,
+    redirect_path: str | None = None,
 ) -> Response:
-    principal = await _web_principal(request)
+    principal = await _web_principal(request, require_admin=require_admin)
     if isinstance(principal, Response):
         return principal
     form = form or await _form(request)
@@ -798,10 +838,8 @@ async def _submit_form(
         str(job_id),
         inline=lambda: process_provisioning_job(str(job_id)),
     )
-    return RedirectResponse(
-        f"/admin/integrations/provisioning-jobs/{job_id}",
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
+    target = redirect_path or f"/admin/integrations/provisioning-jobs/{job_id}"
+    return RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/connect/telegram")

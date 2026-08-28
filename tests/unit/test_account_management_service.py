@@ -48,6 +48,8 @@ async def test_connect_telegram_validates_and_configures_webhook(monkeypatch, tm
         assert kwargs["credential_bundle"] == {"bot_token": "123:token"}
         assert kwargs["automation_default"] == "BOT_DRAFT_ONLY"
         assert kwargs["preserve_existing_webhook_secret"] is False
+        assert kwargs["provider_username"] == "reply_bot"
+        assert kwargs["profile_updated_at"] is not None
         return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), "tg_public"
 
     monkeypatch.setattr(service, "provision_direct_account", fake_provision)
@@ -60,6 +62,7 @@ async def test_connect_telegram_validates_and_configures_webhook(monkeypatch, tm
     )
 
     assert result.external_account_id == "42"
+    assert result.provider_username == "reply_bot"
     assert result.webhook_url == "https://reply.example.com/webhooks/telegram/tg_public"
     assert result.pending_update_count == 3
     set_webhook = json.loads(calls[1].content)
@@ -261,6 +264,9 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
         assert kwargs["status"] == "active"
         assert kwargs["config"]["meta_health_status"] == "PROVISIONING"
         assert kwargs["capability"]["comments"] is False
+        assert kwargs["provider_username"] == "shop_account"
+        assert kwargs["avatar_url"] == "https://cdninstagram.com/shop.jpg"
+        assert kwargs["profile_updated_at"] is not None
         return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), "ig_public"
 
     async def fake_subscribe(**kwargs):
@@ -275,7 +281,15 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
             return httpx.Response(200, json={"success": True})
         assert request.headers["Authorization"] == "Bearer access-token"
         assert request.url.params["appsecret_proof"]
-        return httpx.Response(200, json={"id": "ig-1", "name": "IG Account"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "ig-1",
+                "name": "IG Account",
+                "username": "shop_account",
+                "profile_picture_url": "https://cdninstagram.com/shop.jpg",
+            },
+        )
 
     monkeypatch.setattr(service, "provision_meta_app", fake_provision_meta_app)
     monkeypatch.setattr(service, "provision_direct_account", fake_provision_account)
@@ -297,6 +311,8 @@ async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path)
     assert result.verify_token == "existing-verify-token"
     assert result.webhook_url == "https://reply.example.com/webhooks/meta/meta_public"
     assert result.platform_app_id == uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    assert result.provider_username == "shop_account"
+    assert result.avatar_url == "https://cdninstagram.com/shop.jpg"
 
 
 async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypatch, tmp_path):
@@ -346,7 +362,11 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
             pass
 
         async def get_me(self):
-            return {"id": "x-1", "username": "bot"}
+            return {
+                "id": "x-1",
+                "username": "bot",
+                "profile_image_url": "https://pbs.twimg.com/profile_images/bot.jpg",
+            }
 
         async def read_dm_events(self, *, max_results):
             assert max_results == 10
@@ -375,6 +395,8 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
         assert kwargs["config"]["xchat_key_state"] == "READY"
         assert kwargs["capability"]["dm"] is True
         assert kwargs["capability"]["x_chat"] is True
+        assert kwargs["provider_username"] == "bot"
+        assert kwargs["avatar_url"] == "https://pbs.twimg.com/profile_images/bot.jpg"
         return uuid.uuid4(), "primary"
 
     app_id = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
@@ -401,6 +423,8 @@ async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypa
     assert result.platform_app_id == app_id
     assert result.app_public_id == "x_oauth"
     assert result.webhook_url == "https://reply.example.com/webhooks/x/x_oauth"
+    assert result.provider_username == "bot"
+    assert result.avatar_url == "https://pbs.twimg.com/profile_images/bot.jpg"
 
 
 async def test_connect_x_detects_registered_xchat_that_needs_pin(monkeypatch, tmp_path):

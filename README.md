@@ -14,7 +14,9 @@ uv run alembic upgrade head
 uv run uvicorn apps.api.main:app --port 8000
 ```
 
-通过 `http://localhost:8000/admin` 连接平台账号。新账号默认 `BOT_DRAFT_ONLY`，平台事件经统一决策与 Outbox 链路处理。根模板只用于单进程 smoke/debug；验证真实 Redis/Dramatiq 三角色拓扑时，使用生产式配置（`TESTING=false`、真实强密钥和 OpenAI 凭证），再分别启动 `uv run dramatiq apps.worker.main` 与 `uv run python -m apps.scheduler.main`。
+登录入口为 `http://localhost:8000/auth/login`。管理员通过 `/admin` 管理 Tenant 与全部平台账号；普通用户通过 `/app` 绑定和处理自己拥有的账号。新账号默认 `BOT_DRAFT_ONLY`，平台事件经统一决策与 Outbox 链路处理。根模板只用于单进程 smoke/debug；验证真实 Redis/Dramatiq 三角色拓扑时，使用生产式配置（`TESTING=false`、真实强密钥和 OpenAI 凭证），再分别启动 `uv run dramatiq apps.worker.main` 与 `uv run python -m apps.scheduler.main`。
+
+普通用户的渠道中心位于 `/app/t/{tenant_id}/channels`。X、Facebook 和 Instagram 使用系统共享 App 发起一键 OAuth；Facebook Login 会在存在多个 Page/关联 Instagram 专业账号时显示一次性选择页。Telegram 和 Email 使用不回显凭证的引导式表单。首期 WhatsApp 与 Feishu 仅由管理员配置。已连接卡片只查询当前用户拥有的账号，并显示经过 HTTPS provider 域名白名单校验的头像、账号名和健康状态；个人中心只保留资料、密码和 Channels 入口。
 
 ## 可选 Chatwoot Bridge
 
@@ -66,7 +68,7 @@ PUBLIC_BASE_URL=https://reply.example.com
 PLATFORM_SECRET_KEYS=<Fernet key；轮换时逗号分隔>
 ```
 
-`ADMIN_USERNAME` / `ADMIN_PASSWORD` 是 bootstrap 超级管理员：可查看 `ADMIN_ALLOWED_TENANTS` 中全部数据，并在 `/admin/system/users`（兼容 `/admin/users`）直接创建绑定到单一 Tenant 的普通用户。普通用户首次登录必须修改初始密码，之后可在“平台账号”页自行授权和管理本 Tenant 的平台账号，但无权操作 `/admin/system/safety` 的租户总开关；系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` 是 bootstrap 超级管理员：可查看 `ADMIN_ALLOWED_TENANTS` 中全部数据，并在 `/admin/system/users`（兼容 `/admin/users`）创建绑定到单一 Tenant 的 `ADMIN` 或 `USER`。Tenant 管理员可通过 `/admin` 查看该 Tenant 的全部账号和业务数据；普通用户首次登录必须修改初始密码，之后仅能在 `/app` 授权、查看和处理归属于自己的平台账号与对话，直接访问 `/admin` 会被拒绝。系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
 
 Provisioning API 请求使用：
 
@@ -206,7 +208,7 @@ allowlist，且 DNS 解析结果全部为公共目标。会话按 thread 建立�
 以避免串人；24 小时自动回复限额按 account+sender 跨 thread 统计。轮询 RawEvent 只保存 UID、
 UIDVALIDITY、size 和可选 SHA-256，不保存 RFC822 正文。
 
-当前迁移唯一 head 为 `b9d5e2f7c314`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
+当前迁移唯一 head 为 `d4e9a2f6b710`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
 目标凭证后，必须先做 Phase 0 TLS/login/readonly 检查，再执行 draft-only real smoke。完整步骤见
 [Email operator runbook](docs/email-integration.md)。
 
@@ -292,7 +294,7 @@ DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
 REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 7 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `b9d5e2f7c314`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `d4e9a2f6b710`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
 
 ## X 贴文评论自动回复
 

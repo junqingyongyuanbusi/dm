@@ -1,3 +1,4 @@
+import uuid
 from pathlib import Path
 
 import httpx
@@ -32,6 +33,7 @@ async def connect_whatsapp_account(
     graph_base_url: str = "https://graph.facebook.com",
     api_version: str = "v23.0",
     automation_default: str = "BOT_DRAFT_ONLY",
+    owner_user_id: uuid.UUID | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AccountConnectionResult:
     """Connect one WhatsApp Cloud API phone_number_id under a shared Meta App."""
@@ -91,6 +93,7 @@ async def connect_whatsapp_account(
             "quality_rating": profile.get("quality_rating"),
         },
         automation_default=automation_default,
+        owner_user_id=owner_user_id,
         platform_app_id=platform_app_id,
     )
     resolved_name = (

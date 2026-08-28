@@ -90,7 +90,15 @@ async def test_meta_health_repairs_missing_messenger_subscription(session, monke
             assert kwargs["app_secret"] == "app-secret"
 
         async def get_account(self):
-            return {"id": "page-1", "name": "Page"}
+            return {
+                "id": "page-1",
+                "name": "Page",
+                "picture": {
+                    "data": {
+                        "url": "https://platform-lookaside.fbsbx.com/page.jpg"
+                    }
+                },
+            }
 
         async def aclose(self):
             return None
@@ -119,6 +127,8 @@ async def test_meta_health_repairs_missing_messenger_subscription(session, monke
     assert account.config["meta_subscribed_fields"] == ["messages"]
     assert account.config["meta_app_subscribed_fields"] == ["messages"]
     assert account.config["meta_health_error_code"] is None
+    assert account.avatar_url == "https://platform-lookaside.fbsbx.com/page.jpg"
+    assert account.profile_updated_at is not None
 
 
 async def test_meta_health_requires_reauthorization_when_comment_permission_drifts(
@@ -244,7 +254,13 @@ async def test_meta_health_checks_standalone_instagram_comments_and_permission_d
             assert kwargs["page_id"] is None
 
         async def get_account(self):
-            return {"id": "ig-1", "username": "shop"}
+            return {
+                "id": "ig-1",
+                "username": "shop",
+                "profile_picture_url": (
+                    "https://scontent.example.cdninstagram.com/shop.jpg"
+                ),
+            }
 
         async def require_instagram_comment_permissions(self, *, app_id):
             assert app_id == "ig-app-1"
@@ -271,6 +287,11 @@ async def test_meta_health_checks_standalone_instagram_comments_and_permission_d
     account = await session.get(models.PlatformAccount, account_id)
     assert account.config["meta_health_status"] == "READY"
     assert account.config["meta_subscribed_fields"] == ["messages", "comments"]
+    assert account.provider_username == "shop"
+    assert account.avatar_url == (
+        "https://scontent.example.cdninstagram.com/shop.jpg"
+    )
+    assert account.profile_updated_at is not None
 
     permission_missing[0] = True
     assert await meta_health.reconcile_meta_account_health(force=True) == [str(account_id)]

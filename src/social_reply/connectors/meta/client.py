@@ -265,7 +265,7 @@ class MetaGraphClient:
         if self.platform == "instagram" and self._instagram_login_mode == "instagram_login":
             response = await self._client.get(
                 "/me",
-                params={"fields": "user_id,username,name"},
+                params={"fields": "user_id,username,name,profile_picture_url"},
             )
             response.raise_for_status()
             payload = response.json()
@@ -278,9 +278,14 @@ class MetaGraphClient:
                 "id": account_id,
                 "name": payload.get("name") or payload.get("username") or account_id,
             }
+        profile_fields = (
+            "id,username,name,profile_picture_url"
+            if self.platform == "instagram"
+            else "id,name,picture.type(large)"
+        )
         response = await self._client.get(
             f"/{self._external_account_id}",
-            params={"fields": "id,name"},
+            params={"fields": profile_fields},
         )
         response.raise_for_status()
         return response.json()

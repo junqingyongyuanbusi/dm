@@ -225,7 +225,7 @@ async def test_callback_without_cookie_completes_then_login_returns_to_accounts(
         )
         assert callback.status_code == 303
         assert callback.headers["location"] == (
-            "/admin/login?next=%2Fadmin%2Faccounts%3Fprovider%3Dx%26status%3Dconnected"
+            "/auth/login?next=%2Fadmin%2Faccounts%3Fprovider%3Dx%26status%3Dconnected"
         )
         assert oauth_env["submitted"]["process_calls"] == [str(oauth_env["job_id"])]
 
@@ -494,7 +494,7 @@ async def test_start_requires_login_csrf_and_config(oauth_env, monkeypatch, migr
         anonymous = await client.post(
             "/admin/oauth/x/start", data={"tenant_id": "default", "brand_id": "b"}
         )
-        assert anonymous.headers["location"] == "/admin/login"
+        assert anonymous.headers["location"] == "/auth/login"
 
         await _login(client)
         no_csrf = await client.post(

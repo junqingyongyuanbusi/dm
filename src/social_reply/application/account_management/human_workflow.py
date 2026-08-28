@@ -100,6 +100,7 @@ async def _lock_work_context(
     *,
     work_item_id: uuid.UUID,
     allowed_tenants: frozenset[str],
+    owner_user_id: uuid.UUID | None = None,
 ) -> tuple[
     models.Conversation,
     models.PlatformAccount,
@@ -144,6 +145,8 @@ async def _lock_work_context(
     ).scalar_one_or_none()
     if account is None or account.tenant_id != conversation.tenant_id:
         raise HumanWorkflowError("conversation_account_scope_mismatch")
+    if owner_user_id is not None and account.owner_user_id != owner_user_id:
+        raise HumanWorkflowError("human_work_item_not_found")
 
     work = (
         await session.execute(
@@ -175,6 +178,7 @@ async def claim_human_work_item_in_session(
     notification_public_id: uuid.UUID | None = None,
     expected_card_revision: int | None = None,
     expected_action_nonce: uuid.UUID | None = None,
+    owner_user_id: uuid.UUID | None = None,
 ) -> tuple[
     models.Conversation,
     models.PlatformAccount,
@@ -182,7 +186,10 @@ async def claim_human_work_item_in_session(
     models.AutomationState,
 ]:
     conversation, account, work, state = await _lock_work_context(
-        session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
+        session,
+        work_item_id=work_item_id,
+        allowed_tenants=allowed_tenants,
+        owner_user_id=owner_user_id,
     )
     if notification_public_id is not None:
         if expected_card_revision is None or expected_action_nonce is None:
@@ -253,6 +260,7 @@ async def claim_human_work_item(
     actor: str,
     user_id: uuid.UUID | None,
     expected_version: int,
+    owner_user_id: uuid.UUID | None = None,
 ) -> None:
     async with get_session_factory()() as session:
         await claim_human_work_item_in_session(
@@ -262,6 +270,7 @@ async def claim_human_work_item(
             actor=actor,
             user_id=user_id,
             expected_version=expected_version,
+            owner_user_id=owner_user_id,
         )
         await session.commit()
 
@@ -286,6 +295,7 @@ async def resolve_human_work_item_in_session(
     notification_public_id: uuid.UUID | None = None,
     expected_card_revision: int | None = None,
     expected_action_nonce: uuid.UUID | None = None,
+    owner_user_id: uuid.UUID | None = None,
 ) -> tuple[
     models.Conversation,
     models.PlatformAccount,
@@ -300,7 +310,10 @@ async def resolve_human_work_item_in_session(
     }:
         raise HumanWorkflowError("resolution_evidence_invalid")
     conversation, account, work, state = await _lock_work_context(
-        session, work_item_id=work_item_id, allowed_tenants=allowed_tenants
+        session,
+        work_item_id=work_item_id,
+        allowed_tenants=allowed_tenants,
+        owner_user_id=owner_user_id,
     )
     if notification_public_id is not None:
         if expected_card_revision is None or expected_action_nonce is None:
@@ -382,6 +395,7 @@ async def resolve_human_work_item(
     allow_override: bool,
     resolution_evidence: str = "ADMIN_OPERATOR_ATTESTED",
     resolution_outbox_id: uuid.UUID | None = None,
+    owner_user_id: uuid.UUID | None = None,
 ) -> None:
     async with get_session_factory()() as session:
         await resolve_human_work_item_in_session(
@@ -393,6 +407,7 @@ async def resolve_human_work_item(
             allow_override=allow_override,
             resolution_evidence=resolution_evidence,
             resolution_outbox_id=resolution_outbox_id,
+            owner_user_id=owner_user_id,
         )
         await session.commit()
 
@@ -485,6 +500,7 @@ async def send_human_reply(
     allow_override: bool,
     work_item_id: uuid.UUID | None = None,
     expected_version: int | None = None,
+    owner_user_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     async with get_session_factory()() as session:
         await acquire_conversation_delivery_xact_lock(session, conversation_id)
@@ -499,6 +515,11 @@ async def send_human_reply(
             )
         ).scalar_one_or_none()
         if conversation is None:
+            raise HumanWorkflowError("conversation_not_found")
+        account = await session.get(models.PlatformAccount, conversation.platform_account_id)
+        if account is None or account.tenant_id != conversation.tenant_id:
+            raise HumanWorkflowError("conversation_account_scope_mismatch")
+        if owner_user_id is not None and account.owner_user_id != owner_user_id:
             raise HumanWorkflowError("conversation_not_found")
 
         existing_intent = await find_outbox_intent(

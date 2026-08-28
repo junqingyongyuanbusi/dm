@@ -45,13 +45,16 @@ class AdminUser(Base):
     __tablename__ = "admin_users"
     __table_args__ = (
         UniqueConstraint("username"),
-        UniqueConstraint("tenant_id"),
         UniqueConstraint("tenant_id", "id", name="uq_admin_users_tenant_id_id"),
+        CheckConstraint("role IN ('ADMIN', 'USER')", name="ck_admin_users_role"),
+        CheckConstraint("status IN ('active', 'disabled')", name="ck_admin_users_status"),
+        Index("ix_admin_users_tenant_role_status", "tenant_id", "role", "status"),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     username: Mapped[str] = mapped_column(String(128))
     password_hash: Mapped[str] = mapped_column(Text)
     tenant_id: Mapped[str] = mapped_column(String(64))
+    role: Mapped[str] = mapped_column(String(16), default="USER")
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(16), default="active")
     password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -128,14 +131,31 @@ class PlatformAccount(Base):
             "jsonb_typeof(capability) = 'object'",
             name="ck_platform_accounts_capability_object",
         ),
+        ForeignKeyConstraint(
+            ["tenant_id", "owner_user_id"],
+            ["admin_users.tenant_id", "admin_users.id"],
+            name="fk_platform_accounts_tenant_owner_user",
+        ),
         Index("ix_platform_accounts_tenant_status", "tenant_id", "status"),
+        Index(
+            "ix_platform_accounts_tenant_owner_status",
+            "tenant_id",
+            "owner_user_id",
+            "status",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text, default="default")
     brand_id: Mapped[str] = mapped_column(Text)
     platform: Mapped[str] = mapped_column(Text)
     platform_app_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("platform_apps.id"))
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     name: Mapped[str] = mapped_column(Text)
+    provider_username: Mapped[str | None] = mapped_column(Text)
+    avatar_url: Mapped[str | None] = mapped_column(Text)
+    profile_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     external_account_id: Mapped[str | None] = mapped_column(Text)
     public_id: Mapped[str | None] = mapped_column(Text)
     credential_ref: Mapped[str | None] = mapped_column(Text)
@@ -826,7 +846,18 @@ class ProvisioningJob(Base):
     __tablename__ = "provisioning_jobs"
     __table_args__ = (
         UniqueConstraint("tenant_id", "idempotency_key"),
+        ForeignKeyConstraint(
+            ["tenant_id", "owner_user_id"],
+            ["admin_users.tenant_id", "admin_users.id"],
+            name="fk_provisioning_jobs_tenant_owner_user",
+        ),
         Index("ix_provisioning_jobs_status_next_attempt", "status", "next_attempt_at"),
+        Index(
+            "ix_provisioning_jobs_tenant_owner_created",
+            "tenant_id",
+            "owner_user_id",
+            "created_at",
+        ),
     )
     id: Mapped[uuid.UUID] = _uuid_pk()
     tenant_id: Mapped[str] = mapped_column(Text)
@@ -834,6 +865,7 @@ class ProvisioningJob(Base):
     platform: Mapped[str] = mapped_column(Text)
     operation: Mapped[str] = mapped_column(Text, default="CONNECT_ACCOUNT")
     actor: Mapped[str] = mapped_column(Text)
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     idempotency_key: Mapped[str] = mapped_column(Text)
     request: Mapped[dict] = mapped_column(JSONB)
     staging_secret_ref: Mapped[str] = mapped_column(Text, default="")

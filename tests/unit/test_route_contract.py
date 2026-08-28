@@ -73,6 +73,11 @@ def test_control_api_v1_routes_remain_stable() -> None:
 
 def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
     routes = _route_methods()
+    auth_pages = {
+        "/auth/login": {"GET", "POST"},
+        "/auth/logout": {"GET", "POST"},
+        "/auth/change-password": {"GET", "POST"},
+    }
     tenant_pages = {
         "/app": {"GET"},
         "/app/t/{tenant_id}": {"GET"},
@@ -87,6 +92,15 @@ def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
         "/app/t/{tenant_id}/journeys": {"GET"},
         "/app/t/{tenant_id}/journeys/{journey_id}": {"GET"},
         "/app/t/{tenant_id}/settings": {"GET"},
+        "/app/t/{tenant_id}/channels": {"GET"},
+        "/app/t/{tenant_id}/channels/accounts/{platform}": {"POST"},
+        "/app/t/{tenant_id}/channels/jobs/{job_id}": {"GET"},
+        "/app/t/{tenant_id}/channels/oauth/x/start": {"POST"},
+        "/app/t/{tenant_id}/channels/oauth/meta/start": {"POST"},
+        "/app/t/{tenant_id}/channels/oauth/meta/select": {"POST"},
+        "/app/t/{tenant_id}/channels/oauth/instagram/start": {"POST"},
+        "/app/t/{tenant_id}/profile": {"GET"},
+        "/app/t/{tenant_id}/profile/accounts/{platform}": {"POST"},
     }
     system_pages = {
         "/admin/system/overview": {"GET"},
@@ -94,5 +108,5 @@ def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
         "/help": {"GET"},
     }
 
-    for path, methods in (tenant_pages | system_pages).items():
+    for path, methods in (auth_pages | tenant_pages | system_pages).items():
         assert routes[path] == methods

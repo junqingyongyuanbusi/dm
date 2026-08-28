@@ -39,14 +39,32 @@ class Principal:
     user_id: uuid.UUID | None = None
     tenant_id: str | None = None
     must_change_password: bool = False
+    role: str = "ADMIN"
 
     @property
     def is_superadmin(self) -> bool:
         return self.user_id is None
 
+    @property
+    def is_admin(self) -> bool:
+        return self.is_superadmin or self.role == "ADMIN"
+
     def require_tenant(self, tenant_id: str) -> None:
         if tenant_id not in self.allowed_tenants:
             raise HTTPException(status_code=403, detail="tenant_access_denied")
+
+    def require_admin(self) -> None:
+        if not self.is_admin:
+            raise HTTPException(status_code=403, detail="admin_required")
+
+    def can_access_account(self, account: models.PlatformAccount) -> bool:
+        if account.tenant_id not in self.allowed_tenants:
+            return False
+        return self.is_admin or account.owner_user_id == self.user_id
+
+    def require_account(self, account: models.PlatformAccount) -> None:
+        if not self.can_access_account(account):
+            raise HTTPException(status_code=404, detail="platform_account_not_found")
 
 
 def validate_password(password: str) -> None:
@@ -206,6 +224,7 @@ def _user_principal(session_id: uuid.UUID, user: models.AdminUser) -> Principal:
         tenant_id=user.tenant_id,
         allowed_tenants=frozenset({user.tenant_id}),
         must_change_password=user.must_change_password,
+        role=user.role,
     )
 
 

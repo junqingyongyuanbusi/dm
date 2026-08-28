@@ -161,7 +161,7 @@ def render_saas_page(
     navigation_groups = (
         _system_navigation_groups()
         if system_admin
-        else _tenant_navigation_groups(tenant_id or "", inbox_count)
+        else _tenant_navigation_groups(principal, tenant_id or "", inbox_count)
     )
     navigation_html = _render_navigation(navigation_groups, active_navigation)
     breadcrumb_html = _render_breadcrumbs(breadcrumbs)
@@ -176,12 +176,13 @@ def render_saas_page(
         '<a class="saas-nav-item" href="/app">进入租户工作区 <span>→</span></a>'
         if system_admin
         else (
-            '<a class="saas-nav-item" href="/admin/system/overview">'
+            '<a class="saas-nav-item" href="/admin">'
             "打开系统后台 <span>→</span></a>"
-            if principal.is_superadmin
-            else '<a class="saas-nav-item" href="/admin">兼容后台 <span>→</span></a>'
+            if principal.is_admin
+            else ""
         )
     )
+    profile_href = f"/app/t/{tenant_id}/profile" if tenant_id else "/app"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -201,8 +202,8 @@ def render_saas_page(
       <input class="saas-global-search" type="search" placeholder="搜索对话、事件或资源 ID" disabled
     </div>
     <nav class="saas-user-actions" aria-label="用户操作">
-      <a href="/help">帮助</a><span class="saas-user-name">{escape(principal.username)}</span>
-      <a href="/admin/logout">退出</a>
+      <a class="saas-user-name" href="{escape(profile_href)}">{escape(principal.username)}</a>
+      <a href="/auth/logout">退出</a>
     </nav>
   </header>
   <aside class="saas-sidebar">{admin_banner}{navigation_html}
@@ -219,16 +220,39 @@ def render_saas_page(
 </html>"""
 
 
-def _tenant_navigation_groups(tenant_id: str, inbox_count: int) -> tuple[NavigationGroup, ...]:
+def _tenant_navigation_groups(
+    principal: Principal,
+    tenant_id: str,
+    inbox_count: int,
+) -> tuple[NavigationGroup, ...]:
+    if not tenant_id:
+        return ()
     root = f"/app/t/{tenant_id}"
+    if not principal.is_admin:
+        return (
+            NavigationGroup(
+                "工作区",
+                (
+                    NavigationItem("home", root, "首页"),
+                    NavigationItem("inbox", f"{root}/inbox", "收件箱", inbox_count or None),
+                    NavigationItem("conversations", f"{root}/conversations", "对话"),
+                    NavigationItem("agents", f"{root}/agents", "Agents"),
+                    NavigationItem("knowledge-query", f"{root}/knowledge-query", "知识查询"),
+                    NavigationItem("activity", f"{root}/activity", "我的活动"),
+                    NavigationItem("channels", f"{root}/channels", "Channels"),
+                    NavigationItem("profile", f"{root}/profile", "个人中心"),
+                ),
+            ),
+        )
     return (
         NavigationGroup(
             "工作区",
             (
                 NavigationItem("home", root, "首页"),
+                NavigationItem("inbox", f"{root}/inbox", "收件箱", inbox_count or None),
+                NavigationItem("conversations", f"{root}/conversations", "对话"),
                 NavigationItem("agents", f"{root}/agents", "Agents"),
                 NavigationItem("knowledge", f"{root}/knowledge", "文档与知识"),
-                NavigationItem("inbox", f"{root}/inbox", "收件箱", inbox_count or None),
             ),
         ),
         NavigationGroup(
@@ -241,6 +265,7 @@ def _tenant_navigation_groups(tenant_id: str, inbox_count: int) -> tuple[Navigat
         NavigationGroup(
             "设置",
             (
+                NavigationItem("profile", f"{root}/profile", "个人中心"),
                 NavigationItem("settings", f"{root}/settings", "工作区设置"),
             ),
         ),

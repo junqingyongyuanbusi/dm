@@ -76,6 +76,16 @@ def test_error_explains_missing_x_direct_message_permission():
     assert retryable is False
 
 
+def test_owner_conflict_requires_action_without_disclosing_owner_identity():
+    code, message, retryable = jobs._error(
+        PermissionError("platform_account_owner_conflict")
+    )
+
+    assert code == "ACCOUNT_OWNER_CONFLICT"
+    assert "其他用户或 Tenant 共享范围" in message
+    assert retryable is False
+
+
 @pytest.mark.parametrize(
     ("platform", "settings_update"),
     [
@@ -196,6 +206,7 @@ async def test_connect_dispatches_feishu_with_staged_secrets(monkeypatch):
             "platform": "feishu",
             "tenant_id": "tenant-a",
             "brand_id": "brand-a",
+            "owner_user_id": None,
             "request": {
                 "app_id": "cli_12345678",
                 "api_base_url": "https://open.feishu.cn",
@@ -351,6 +362,7 @@ async def test_connect_dispatches_email_with_staged_secrets(monkeypatch):
             "platform": "email",
             "tenant_id": "tenant-a",
             "brand_id": "brand-a",
+            "owner_user_id": None,
             "request": {
                 "email_address": "support@example.com",
                 "imap_host": "imap.example.com",

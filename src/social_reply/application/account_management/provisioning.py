@@ -1,9 +1,10 @@
 import hashlib
 import secrets
 import uuid
+from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select, true
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from social_reply.domain.platform_accounts import (
@@ -191,6 +192,10 @@ async def provision_direct_account(
     config: dict,
     capability: dict,
     automation_default: str,
+    owner_user_id: uuid.UUID | None = None,
+    provider_username: str | None = None,
+    avatar_url: str | None = None,
+    profile_updated_at: datetime | None = None,
     platform_app_id: uuid.UUID | None = None,
     preserve_existing_webhook_secret: bool = False,
     status: str | None = None,
@@ -213,6 +218,12 @@ async def provision_direct_account(
 
     if existing is not None and public_id is not None and existing.public_id != public_id:
         raise ValueError("platform_account_public_id_is_immutable")
+    if (
+        existing is not None
+        and owner_user_id is not None
+        and existing.owner_user_id != owner_user_id
+    ):
+        raise PermissionError("platform_account_owner_conflict")
 
     account_id = existing.id if existing is not None else uuid.uuid4()
     resolved_public_id = public_id or (
@@ -234,7 +245,11 @@ async def provision_direct_account(
         "brand_id": brand_id,
         "platform": platform,
         "platform_app_id": platform_app_id,
+        "owner_user_id": existing.owner_user_id if existing is not None else owner_user_id,
         "name": name,
+        "provider_username": provider_username,
+        "avatar_url": avatar_url,
+        "profile_updated_at": profile_updated_at,
         "external_account_id": external_account_id,
         "public_id": resolved_public_id,
         "credential_bundle": encrypt_secret_bundle(credential_bundle),
@@ -285,18 +300,70 @@ async def provision_direct_account(
             models.PlatformAccount.public_id,
             statement.excluded.public_id,
         )
+        update_values["owner_user_id"] = func.coalesce(
+            models.PlatformAccount.owner_user_id,
+            statement.excluded.owner_user_id,
+        )
+        update_values["provider_username"] = func.coalesce(
+            statement.excluded.provider_username,
+            models.PlatformAccount.provider_username,
+        )
+        update_values["avatar_url"] = func.coalesce(
+            statement.excluded.avatar_url,
+            models.PlatformAccount.avatar_url,
+        )
+        update_values["profile_updated_at"] = func.coalesce(
+            statement.excluded.profile_updated_at,
+            models.PlatformAccount.profile_updated_at,
+        )
         update_values["config_version"] = models.PlatformAccount.config_version + 1
+        conflict_condition = true()
+        if owner_user_id is not None:
+            conflict_condition = and_(
+                conflict_condition,
+                models.PlatformAccount.owner_user_id == owner_user_id,
+            )
+        if public_id is not None:
+            conflict_condition = and_(
+                conflict_condition,
+                models.PlatformAccount.public_id == public_id,
+            )
         persisted = (
             await session.execute(
                 statement.on_conflict_do_update(
                     index_elements=["tenant_id", "platform", "external_account_id"],
                     set_=update_values,
+                    where=conflict_condition,
                 ).returning(
                     models.PlatformAccount.id,
                     models.PlatformAccount.public_id,
                 )
             )
-        ).one()
+        ).one_or_none()
+        if persisted is None:
+            conflicting_account = (
+                await session.execute(
+                    select(models.PlatformAccount).where(
+                        models.PlatformAccount.tenant_id == tenant_id,
+                        models.PlatformAccount.platform == platform,
+                        models.PlatformAccount.external_account_id
+                        == external_account_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if (
+                conflicting_account is not None
+                and owner_user_id is not None
+                and conflicting_account.owner_user_id != owner_user_id
+            ):
+                raise PermissionError("platform_account_owner_conflict")
+            if (
+                conflicting_account is not None
+                and public_id is not None
+                and conflicting_account.public_id != public_id
+            ):
+                raise ValueError("platform_account_public_id_is_immutable")
+            raise RuntimeError("platform_account_upsert_conflict")
         await session.commit()
     if persisted.public_id is None:
         raise RuntimeError("platform_account_public_id_missing")

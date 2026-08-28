@@ -399,7 +399,7 @@ async def test_start_requires_login_csrf_and_valid_platform(session, meta_env):
         anon = await client.post(
             "/admin/oauth/meta/start", data={"platform": "facebook", "tenant_id": "default"}
         )
-        assert anon.status_code == 303 and anon.headers["location"] == "/admin/login"
+        assert anon.status_code == 303 and anon.headers["location"] == "/auth/login"
         csrf = await _login(client)
         no_csrf = await client.post(
             "/admin/oauth/meta/start", data={"platform": "facebook", "tenant_id": "default"}

@@ -23,9 +23,32 @@ Code-only releases do not create this compatibility image. `latest` promotion an
 Railway rollout belong exclusively to `scripts/publish_railway_release.sh`; the local release path
 only inspects or retags registry manifests and never builds, pulls or runs image layers. Railway
 native image auto-update must remain disabled.
-The current Alembic graph has one head: `b9d5e2f7c314`. Database migration verifies schema state
+The current Alembic graph has one head: `d4e9a2f6b710`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
+
+## Channels account profile revision
+
+Revision `d4e9a2f6b710` is additive after ownership revision `c8f1a4d7e203`. It adds nullable
+`platform_accounts.provider_username`, `avatar_url` and timezone-aware `profile_updated_at` columns.
+No existing account owner, credential, automation mode or provider configuration is rewritten.
+Predecessor applications ignore the new columns, so application rollback keeps the additive schema;
+schema downgrade is only needed for a reviewed database rollback and simply removes advisory profile
+display metadata.
+
+Deploy this change as one coordinated API-first release because all roles must agree on the new
+Alembic head and owner-aware provisioning code. API applies the migration and must reach `SUCCESS`
+with `/healthz` healthy before Worker and Scheduler start the target image. Worker persists profile
+metadata during authorization; Scheduler may refresh Meta profile metadata during health checks.
+After rollout, verify all three roles use one digest and the same X/Meta/Instagram feature flags and
+App credentials. Existing OAuth callback URLs remain unchanged.
+
+Before enabling ordinary-user Channels against real providers, verify the shared OAuth Apps contain
+the exact production callback URLs and required scopes. Start with authorized test users/accounts,
+confirm every new account is `BOT_DRAFT_ONLY`, verify two users in one Tenant cannot see or claim one
+another's accounts/jobs, and inspect that browser/job responses contain no token, password or raw
+provider error. WhatsApp and Feishu remain administrator-managed; this release does not authorize
+Embedded Signup or Feishu marketplace installation.
 
 ## Editable reply business Prompt revision
 

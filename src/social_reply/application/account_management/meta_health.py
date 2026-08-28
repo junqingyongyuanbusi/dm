@@ -61,6 +61,20 @@ def _subscription_account_id(account: PlatformAccountRuntime) -> str:
     return account.external_account_id
 
 
+def _profile_avatar_url(profile: dict) -> str | None:
+    direct_url = profile.get("profile_picture_url")
+    if isinstance(direct_url, str) and direct_url.strip():
+        return direct_url.strip()
+    picture = profile.get("picture")
+    picture_data = picture.get("data") if isinstance(picture, dict) else None
+    picture_url = picture_data.get("url") if isinstance(picture_data, dict) else None
+    return (
+        picture_url.strip()
+        if isinstance(picture_url, str) and picture_url.strip()
+        else None
+    )
+
+
 async def _save_health(
     account_id: uuid.UUID,
     *,
@@ -68,22 +82,32 @@ async def _save_health(
     subscribed_fields: tuple[str, ...] = (),
     app_subscribed_fields: tuple[str, ...] = (),
     error_code: str | None = None,
+    provider_username: str | None = None,
+    avatar_url: str | None = None,
+    profile_checked: bool = False,
 ) -> None:
+    values: dict[str, object] = {
+        "config": models.PlatformAccount.config.op("||")(
+            {
+                "meta_health_status": status,
+                "meta_health_checked_at": datetime.now(UTC).isoformat(),
+                "meta_health_error_code": error_code,
+                "meta_subscribed_fields": list(subscribed_fields),
+                "meta_app_subscribed_fields": list(app_subscribed_fields),
+            }
+        )
+    }
+    if provider_username:
+        values["provider_username"] = provider_username
+    if avatar_url:
+        values["avatar_url"] = avatar_url
+    if profile_checked:
+        values["profile_updated_at"] = datetime.now(UTC)
     async with get_session_factory()() as session:
         await session.execute(
             models.PlatformAccount.__table__.update()
             .where(models.PlatformAccount.id == account_id)
-            .values(
-                config=models.PlatformAccount.config.op("||")(
-                    {
-                        "meta_health_status": status,
-                        "meta_health_checked_at": datetime.now(UTC).isoformat(),
-                        "meta_health_error_code": error_code,
-                        "meta_subscribed_fields": list(subscribed_fields),
-                        "meta_app_subscribed_fields": list(app_subscribed_fields),
-                    }
-                )
-            )
+            .values(**values)
         )
         await session.commit()
 
@@ -262,6 +286,12 @@ async def _check_account(account: PlatformAccountRuntime) -> str | None:
             status=status,
             subscribed_fields=observed,
             app_subscribed_fields=app_observed,
+            provider_username=(
+                str(profile.get("username") or "").strip()
+                or None
+            ),
+            avatar_url=_profile_avatar_url(profile),
+            profile_checked=True,
         )
         return str(account.id) if status != "READY" else None
     except Exception as exc:  # noqa: BLE001 - provider failures become sanitized health state

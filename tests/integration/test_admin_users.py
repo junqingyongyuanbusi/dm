@@ -50,6 +50,7 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
     user = (
         await session.execute(select(models.AdminUser).where(models.AdminUser.username == "alice"))
     ).scalar_one()
+    assert user.role == "USER"
     assert user.password_hash != initial_password
     assert await verify_password(user.password_hash, initial_password)
     assert user.must_change_password is True
@@ -59,7 +60,7 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
         assert client.cookies.get("reply_admin_session")
         dashboard = await client.get("/admin")
         assert dashboard.status_code == 303
-        assert dashboard.headers["location"] == "/admin/change-password"
+        assert dashboard.headers["location"] == "/auth/change-password"
         unchanged = await client.post(
             "/admin/change-password",
             data={
@@ -72,7 +73,7 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
         assert unchanged.status_code == 422
         still_blocked = await client.get("/admin")
         assert still_blocked.status_code == 303
-        assert still_blocked.headers["location"] == "/admin/change-password"
+        assert still_blocked.headers["location"] == "/auth/change-password"
         change = await client.post(
             "/admin/change-password",
             data={
@@ -83,9 +84,10 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
             },
         )
         assert change.status_code == 303
-        assert change.headers["location"] == "/admin"
+        assert change.headers["location"] == "/app"
         dashboard = await client.get("/admin")
-        assert dashboard.status_code == 200
+        assert dashboard.status_code == 403
+        assert dashboard.json() == {"detail": "admin_required"}
 
     audit_count = (
         await session.execute(
@@ -122,6 +124,7 @@ async def test_tenant_user_cannot_open_user_management(session, migrated_db):
             username="bob",
             password_hash=await hash_password("bob-personal-password-123"),
             tenant_id="tenant-b",
+            role="USER",
             must_change_password=False,
             status="active",
         )

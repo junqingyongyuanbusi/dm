@@ -5,7 +5,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from social_reply.application.account_management.admin import router as admin_router
+from social_reply.application.account_management.admin import (
+    auth_router,
+)
+from social_reply.application.account_management.admin import (
+    router as admin_router,
+)
 from social_reply.application.account_management.admin_console import router as admin_console_router
 from social_reply.application.account_management.feishu_handoff_admin import (
     router as feishu_handoff_admin_router,
@@ -110,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
+    app.include_router(auth_router)
     app.include_router(admin_router)
     app.include_router(admin_console_router)
     app.include_router(feishu_handoff_admin_router)

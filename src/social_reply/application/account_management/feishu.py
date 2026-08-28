@@ -1,4 +1,5 @@
 import re
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -46,6 +47,7 @@ async def connect_feishu_account(
     api_base_url: str = FEISHU_API_BASE_URL,
     group_mode: str = FEISHU_GROUP_MODE,
     automation_default: str = "BOT_DRAFT_ONLY",
+    owner_user_id: uuid.UUID | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AccountConnectionResult:
     if not get_settings().feishu_enabled:
@@ -100,6 +102,7 @@ async def connect_feishu_account(
         },
         capability={"dm": True, "mentions": True},
         automation_default=automation_default,
+        owner_user_id=owner_user_id,
         status=ACTIVE_ACCOUNT_STATUS,
     )
     callback_url = _webhook_url(

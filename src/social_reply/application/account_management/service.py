@@ -60,6 +60,9 @@ class AccountConnectionResult:
     webhook_url: str
     name: str
     automation_default: str
+    provider_username: str | None = None
+    avatar_url: str | None = None
+    profile_updated_at: datetime | None = None
     platform_app_id: uuid.UUID | None = None
     app_public_id: str | None = None
     verify_token: str | None = None
@@ -73,6 +76,20 @@ class AccountConnectionResult:
 def _validate_automation_default(value: str) -> None:
     if value not in _AUTOMATION_DEFAULTS:
         raise ValueError(f"unsupported_automation_default:{value}")
+
+
+def _profile_avatar_url(profile: dict) -> str | None:
+    direct_url = profile.get("profile_picture_url") or profile.get("profile_image_url")
+    if isinstance(direct_url, str) and direct_url.strip():
+        return direct_url.strip()
+    picture = profile.get("picture")
+    if not isinstance(picture, dict):
+        return None
+    picture_data = picture.get("data")
+    if not isinstance(picture_data, dict):
+        return None
+    picture_url = picture_data.get("url")
+    return picture_url.strip() if isinstance(picture_url, str) and picture_url.strip() else None
 
 
 def _require_secret(value: str, name: str) -> str:
@@ -129,6 +146,7 @@ async def connect_telegram_account(
     secrets_root: Path = Path(".secrets/accounts"),
     api_base_url: str = "https://api.telegram.org",
     automation_default: str = "BOT_DRAFT_ONLY",
+    owner_user_id: uuid.UUID | None = None,
     rotate_webhook_secret: bool = False,
     drop_pending_updates: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -155,6 +173,9 @@ async def connect_telegram_account(
             config={"api_base_url": api_base_url},
             capability={"dm": True, "max_text_length": 4096},
             automation_default=automation_default,
+            owner_user_id=owner_user_id,
+            provider_username=str(me.get("username") or "") or None,
+            profile_updated_at=datetime.now(UTC),
             preserve_existing_webhook_secret=not rotate_webhook_secret,
         )
         if not rotate_webhook_secret:
@@ -178,6 +199,8 @@ async def connect_telegram_account(
         webhook_url=webhook_url,
         name=name or me.get("username") or me.get("first_name") or external_account_id,
         automation_default=automation_default,
+        provider_username=str(me.get("username") or "") or None,
+        profile_updated_at=datetime.now(UTC),
         pending_update_count=webhook_info.get("pending_update_count", 0),
         last_webhook_error=webhook_info.get("last_error_message"),
     )
@@ -206,6 +229,7 @@ async def connect_meta_account(
     enable_dm: bool = True,
     enable_comments: bool = False,
     automation_default: str = "BOT_DRAFT_ONLY",
+    owner_user_id: uuid.UUID | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AccountConnectionResult:
     """连接 Facebook Page 或 Instagram 账号，并复用账号所属的 Meta App。"""
@@ -321,6 +345,12 @@ async def connect_meta_account(
             "max_text_length": 2000 if platform == "facebook" else 1000,
         },
         automation_default=automation_default,
+        owner_user_id=owner_user_id,
+        provider_username=(
+            str(profile.get("username") or "") or None
+        ),
+        avatar_url=_profile_avatar_url(profile),
+        profile_updated_at=datetime.now(UTC),
         platform_app_id=platform_app_id,
         status=ACTIVE_ACCOUNT_STATUS,
     )
@@ -400,6 +430,9 @@ async def connect_meta_account(
         webhook_url=webhook_url,
         name=name or profile.get("name") or external_account_id,
         automation_default=automation_default,
+        provider_username=str(profile.get("username") or "") or None,
+        avatar_url=_profile_avatar_url(profile),
+        profile_updated_at=datetime.now(UTC),
         platform_app_id=platform_app_id,
         app_public_id=resolved_app_public_id,
         verify_token=resolved_verify_token,
@@ -482,6 +515,7 @@ async def connect_x_account(
     secrets_root: Path = Path(".secrets/accounts"),
     api_base_url: str = "https://api.x.com",
     automation_default: str = "BOT_DRAFT_ONLY",
+    owner_user_id: uuid.UUID | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AccountConnectionResult:
     """验证 X OAuth 1.0a 凭证并登记 Account Activity webhook 路由。"""
@@ -630,6 +664,10 @@ async def connect_x_account(
             "max_text_length": 280,
         },
         automation_default=automation_default,
+        owner_user_id=owner_user_id,
+        provider_username=str(me.get("username") or "") or None,
+        avatar_url=_profile_avatar_url(me),
+        profile_updated_at=datetime.now(UTC),
         platform_app_id=platform_app_id,
     )
     return AccountConnectionResult(
@@ -640,6 +678,9 @@ async def connect_x_account(
         webhook_url=_webhook_url(public_base_url, f"/webhooks/x/{app_public_id}"),
         name=name or me.get("username") or me.get("name") or external_account_id,
         automation_default=automation_default,
+        provider_username=str(me.get("username") or "") or None,
+        avatar_url=_profile_avatar_url(me),
+        profile_updated_at=datetime.now(UTC),
         platform_app_id=platform_app_id,
         app_public_id=app_public_id,
         manual_steps=(

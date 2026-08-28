@@ -59,18 +59,18 @@ async def users_page(request: Request, notice: str = "") -> Response:
             .scalars()
             .all()
         )
-    assigned = {user.tenant_id for user in users}
-    available = sorted(principal.allowed_tenants - assigned)
+    available = sorted(principal.allowed_tenants)
     rows = (
         "".join(
             f"<tr><td>{html.escape(user.username)}</td>"
             f"<td><code>{html.escape(user.tenant_id)}</code></td>"
+            f"<td>{html.escape(user.role)}</td>"
             f"<td>{'待首次改密' if user.must_change_password else '正常'}</td>"
             f"<td>{html.escape(user.status)}</td>"
             f"<td class='muted'>{user.created_at:%Y-%m-%d %H:%M}</td></tr>"
             for user in users
         )
-        or "<tr><td colspan='5' class='muted'>暂无普通用户</td></tr>"
+        or "<tr><td colspan='6' class='muted'>暂无用户</td></tr>"
     )
     csrf = _csrf(request)
     tenant_options = "".join(
@@ -85,6 +85,10 @@ async def users_page(request: Request, notice: str = "") -> Response:
 {_field("initial_password", "初始密码（12–128 个字符）", input_type="password")}
 <label for="f-user-tenant">Tenant</label>
 <select id="f-user-tenant" name="tenant_id" required>{tenant_options}</select>
+<label for="f-user-role">角色</label>
+<select id="f-user-role" name="role" required>
+<option value="USER" selected>普通用户</option><option value="ADMIN">管理员</option>
+</select>
 <button class="btn-block">创建用户</button></form></section>"""
         if available
         else (
@@ -97,9 +101,10 @@ async def users_page(request: Request, notice: str = "") -> Response:
         if notice == "created"
         else ""
     )
-    body = f"""<h1>用户</h1><p class="lede">管理绑定到单一 Tenant 的普通后台用户。</p>{banner}
+    body = f"""<h1>用户</h1>
+<p class="lede">管理员负责配置系统，普通用户只处理自己授权账号的业务。</p>{banner}
 {create_form}<section class="card"><h2>用户列表</h2><div class="tablewrap"><table>
-<thead><tr><th>用户名</th><th>Tenant</th><th>密码状态</th><th>账号状态</th><th>创建时间</th></tr></thead>
+<thead><tr><th>用户名</th><th>Tenant</th><th>角色</th><th>密码状态</th><th>账号状态</th><th>创建时间</th></tr></thead>
 <tbody>{rows}</tbody></table></div></section>"""
     response = HTMLResponse(_page("用户", body, active="users", show_users=True))
     if not request.cookies.get(_CSRF_COOKIE):
@@ -122,12 +127,15 @@ async def create_user(request: Request) -> Response:
     _require_csrf(request, form)
     username = (form.get("username") or "").strip()
     tenant_id = (form.get("tenant_id") or "").strip()
+    role = (form.get("role") or "USER").strip().upper()
     password = form.get("initial_password") or ""
     if not username or len(username) > 128 or any(char.isspace() for char in username):
         raise HTTPException(status_code=422, detail="invalid_username")
     if secrets.compare_digest(username, get_settings().admin_username):
         raise HTTPException(status_code=409, detail="username_conflicts_with_superadmin")
     principal.require_tenant(tenant_id)
+    if role not in {"ADMIN", "USER"}:
+        raise HTTPException(status_code=422, detail="invalid_user_role")
     try:
         password_hash = await hash_password(password)
     except ValueError as exc:
@@ -137,6 +145,7 @@ async def create_user(request: Request) -> Response:
         username=username,
         password_hash=password_hash,
         tenant_id=tenant_id,
+        role=role,
         must_change_password=True,
         status="active",
     )
@@ -150,7 +159,7 @@ async def create_user(request: Request) -> Response:
                 action="CREATE_USER",
                 subject_type="admin_user",
                 subject_id=str(user.id),
-                detail={"username": username},
+                detail={"username": username, "role": role},
             )
         )
         try:
@@ -158,6 +167,6 @@ async def create_user(request: Request) -> Response:
         except IntegrityError as exc:
             await session.rollback()
             raise HTTPException(
-                status_code=409, detail="username_or_tenant_already_exists"
+                status_code=409, detail="username_already_exists"
             ) from exc
     return RedirectResponse("/admin/users?notice=created", status_code=status.HTTP_303_SEE_OTHER)

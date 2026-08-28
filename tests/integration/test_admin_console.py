@@ -138,7 +138,7 @@ async def test_console_pages_require_login():
         ):
             resp = await client.get(path)
             assert resp.status_code == 303
-            assert resp.headers["location"] == "/admin/login"
+            assert resp.headers["location"] == "/auth/login"
 
 
 async def test_console_pages_render_after_login(migrated_db):
@@ -1559,7 +1559,7 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
         )
 
     assert unauthenticated.status_code == 303
-    assert unauthenticated.headers["location"] == "/admin/login"
+    assert unauthenticated.headers["location"] == "/auth/login"
     assert bad_csrf.status_code == 403
     assert wrong_tenant.status_code == 403
     assert disabled.status_code == 503

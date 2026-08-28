@@ -76,6 +76,27 @@ Disabling a stack is not credential deletion. Recoverable sends pause and durabl
 is preserved. Legacy DM and XChat polling use PostgreSQL checkpoints, leases and resumable gaps;
 a disabled polling stack performs no provider reconciliation until it is re-enabled.
 
+## Ordinary-user Channels prerequisites
+
+`/app/t/{tenant_id}/channels` does not introduce per-user OAuth application credentials. API,
+Worker and Scheduler must share the existing deployment-level X and Meta/Instagram App settings:
+
+- X self-authorization requires `X_API_KEY` and `X_API_SECRET` plus at least one enabled X message
+  stack.
+- Facebook Login requires `FACEBOOK_APP_ID`, `FACEBOOK_APP_SECRET` and `META_VERIFY_TOKEN`, or a
+  compatible active Tenant Meta `PlatformApp` retained from an earlier deployment.
+- Standalone Instagram Login requires `INSTAGRAM_APP_ID`, `INSTAGRAM_APP_SECRET` and
+  `INSTAGRAM_VERIFY_TOKEN` (or the documented Meta verify-token fallback).
+- Telegram requires no shared App setting; the user supplies a BotFather Bot Token.
+- Email self-authorization is rendered only when `EMAIL_ENABLED=true` and remains subject to
+  `EMAIL_ALLOWED_HOSTS`, TLS and DNS public-target validation.
+- WhatsApp and Feishu are administrator-managed in the first Channels release and do not expose
+  ordinary-user credential forms.
+
+OAuth callback URLs remain the existing `/admin/oauth/*/callback` protocol endpoints even when the
+flow starts in Channels. The encrypted state controls the browser return surface; changing callback
+paths is not required. All newly self-authorized accounts remain `BOT_DRAFT_ONLY`.
+
 ## Meta and Instagram applications
 
 Code defaults keep existing deployments enabled during upgrades. Both environment templates

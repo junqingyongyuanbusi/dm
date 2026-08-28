@@ -166,6 +166,12 @@ def _error(exc: Exception) -> tuple[str, str, bool]:
             "请重新授权 Meta 账号，并允许该 Facebook Page 或 Instagram 账号的评论权限。",
             False,
         )
+    if isinstance(exc, PermissionError) and str(exc) == "platform_account_owner_conflict":
+        return (
+            "ACCOUNT_OWNER_CONFLICT",
+            "该平台账号已绑定到其他用户或 Tenant 共享范围，不能重复认领。",
+            False,
+        )
     if isinstance(exc, ValueError) and str(exc).startswith("x_direct_message_permission_missing:"):
         return (
             "X_DM_PERMISSION_REQUIRED",
@@ -209,6 +215,7 @@ async def submit_provisioning_job(
         raise ValueError("invalid_brand_id")
     key = _idempotency_key(tenant_id, platform, request)
     job_id = uuid.uuid4()
+    owner_user_id: uuid.UUID | None = None
     # Secret 内联暂存进 provisioning_jobs 行；job 完成后置 NULL（见 process_provisioning_job）
     safe_request = _safe_request(platform, request)
     async with get_session_factory()() as session:
@@ -217,6 +224,7 @@ async def submit_provisioning_job(
             if principal is None or tenant_id not in principal.allowed_tenants:
                 raise PermissionError("admin_session_invalid")
             actor = principal.actor
+            owner_user_id = None if principal.is_admin else principal.user_id
         inserted = (
             await session.execute(
                 pg_insert(models.ProvisioningJob)
@@ -227,6 +235,7 @@ async def submit_provisioning_job(
                     platform=platform,
                     operation="CONNECT_ACCOUNT",
                     actor=actor,
+                    owner_user_id=owner_user_id,
                     idempotency_key=key,
                     request=safe_request,
                     staging_secret=encrypt_secret_bundle(secrets),
@@ -251,6 +260,7 @@ async def submit_provisioning_job(
                 existing.platform != platform
                 or existing.brand_id != brand_id
                 or dict(existing.request or {}) != safe_request
+                or existing.owner_user_id != owner_user_id
             ):
                 raise ValueError("idempotency_key_payload_mismatch")
             job_id = existing.id
@@ -358,6 +368,13 @@ def _result_payload(result: AccountConnectionResult) -> dict[str, Any]:
         "public_id": result.public_id,
         "webhook_url": result.webhook_url,
         "name": result.name,
+        "provider_username": result.provider_username,
+        "avatar_url": result.avatar_url,
+        "profile_updated_at": (
+            result.profile_updated_at.isoformat()
+            if result.profile_updated_at is not None
+            else None
+        ),
         "automation_default": result.automation_default,
         "platform_app_id": str(result.platform_app_id) if result.platform_app_id else None,
         "app_public_id": result.app_public_id,
@@ -384,6 +401,7 @@ async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
         "public_id": request.get("public_id"),
         "secrets_root": Path(settings.account_secrets_root),
         "automation_default": request.get("automation_default", "BOT_DRAFT_ONLY"),
+        "owner_user_id": job.owner_user_id,
     }
     if job.platform == "telegram":
         return await connect_telegram_account(

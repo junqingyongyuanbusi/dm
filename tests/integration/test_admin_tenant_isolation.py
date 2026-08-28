@@ -41,6 +41,7 @@ async def _seed_user(session) -> None:
             username="tenant-a-user",
             password_hash=await hash_password("tenant-a-password-123"),
             tenant_id="tenant-a",
+            role="ADMIN",
             must_change_password=False,
             status="active",
         )

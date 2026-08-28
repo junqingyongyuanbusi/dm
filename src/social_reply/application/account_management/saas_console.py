@@ -1,14 +1,32 @@
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import aliased
 
+from social_reply.application.account_management.admin import (
+    _csrf,
+    _form,
+    _require_csrf,
+    _secure_cookie,
+    _submit_form,
+)
 from social_reply.application.account_management.auth import Principal, current_principal
+from social_reply.application.account_management.human_workflow import (
+    HumanWorkflowError,
+    claim_human_work_item,
+    resolve_human_work_item,
+    send_human_reply,
+)
+from social_reply.application.account_management.jobs import public_job
+from social_reply.application.account_management.meta_credentials import (
+    facebook_app_credentials,
+    instagram_app_credentials,
+)
 from social_reply.application.account_management.saas_ui import (
     definition_list,
     empty_state,
@@ -23,6 +41,7 @@ from social_reply.application.account_management.saas_ui import (
     status_badge,
     tabs,
 )
+from social_reply.application.account_management.x_app import x_app_credentials
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -70,11 +89,18 @@ class JourneyRow:
 
 async def _require_web_principal(request: Request) -> Principal | Response:
     principal = await current_principal(request)
+    return_target = request.url.path
+    if request.url.query:
+        return_target = f"{return_target}?{request.url.query}"
+    encoded_next = urlencode({"next": return_target})
     if principal is None:
-        return RedirectResponse("/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(
+            f"/auth/login?{encoded_next}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
     if principal.must_change_password:
         return RedirectResponse(
-            "/admin/change-password",
+            f"/auth/change-password?{encoded_next}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
     return principal
@@ -91,6 +117,17 @@ async def _require_tenant_principal(
     return principal
 
 
+async def _require_tenant_admin_principal(
+    request: Request,
+    tenant_id: str,
+) -> Principal | Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    principal.require_admin()
+    return principal
+
+
 def _tenant_root(tenant_id: str) -> str:
     return f"/app/t/{quote(tenant_id, safe='')}"
 
@@ -99,7 +136,21 @@ def _agent_root(tenant_id: str, agent_id: str) -> str:
     return f"{_tenant_root(tenant_id)}/agents/{quote(agent_id, safe='')}"
 
 
-async def _load_inbox_summary(session, tenant_id: str) -> InboxSummary:
+def _account_scope_condition(principal: Principal, tenant_id: str):
+    tenant_condition = models.PlatformAccount.tenant_id == tenant_id
+    if principal.is_admin:
+        return tenant_condition
+    return and_(
+        tenant_condition,
+        models.PlatformAccount.owner_user_id == principal.user_id,
+    )
+
+
+async def _load_inbox_summary(
+    session,
+    principal: Principal,
+    tenant_id: str,
+) -> InboxSummary:
     human_condition = and_(
         models.HumanWorkItem.tenant_id == tenant_id,
         models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
@@ -119,23 +170,49 @@ async def _load_inbox_summary(session, tenant_id: str) -> InboxSummary:
     )
     human_count, oldest_human_at = (
         await session.execute(
-            select(func.count(), func.min(models.HumanWorkItem.created_at)).where(
-                human_condition
+            select(func.count(), func.min(models.HumanWorkItem.created_at))
+            .join(
+                models.Conversation,
+                models.HumanWorkItem.conversation_id == models.Conversation.id,
             )
+            .join(
+                models.PlatformAccount,
+                models.Conversation.platform_account_id == models.PlatformAccount.id,
+            )
+            .where(human_condition, _account_scope_condition(principal, tenant_id))
         )
     ).one()
+    if not principal.is_admin:
+        return InboxSummary(
+            human_count=int(human_count),
+            draft_count=0,
+            delivery_count=0,
+            oldest_human_at=oldest_human_at,
+            oldest_draft_at=None,
+            oldest_delivery_at=None,
+        )
     draft_count, oldest_draft_at = (
         await session.execute(
-            select(func.count(), func.min(models.ReplyDecision.created_at)).where(
-                draft_condition
+            select(func.count(), func.min(models.ReplyDecision.created_at))
+            .join(
+                models.Conversation,
+                models.ReplyDecision.conversation_id == models.Conversation.id,
             )
+            .join(
+                models.PlatformAccount,
+                models.Conversation.platform_account_id == models.PlatformAccount.id,
+            )
+            .where(draft_condition, _account_scope_condition(principal, tenant_id))
         )
     ).one()
     delivery_count, oldest_delivery_at = (
         await session.execute(
-            select(func.count(), func.min(models.OutboxMessage.created_at)).where(
-                delivery_condition
+            select(func.count(), func.min(models.OutboxMessage.created_at))
+            .join(
+                models.PlatformAccount,
+                models.OutboxMessage.platform_account_id == models.PlatformAccount.id,
             )
+            .where(delivery_condition, _account_scope_condition(principal, tenant_id))
         )
     ).one()
     return InboxSummary(
@@ -148,12 +225,16 @@ async def _load_inbox_summary(session, tenant_id: str) -> InboxSummary:
     )
 
 
-async def _load_agent_ids(session, tenant_id: str) -> list[str]:
+async def _load_agent_ids(
+    session,
+    principal: Principal,
+    tenant_id: str,
+) -> list[str]:
     account_brands = set(
         (
             await session.execute(
                 select(models.PlatformAccount.brand_id).where(
-                    models.PlatformAccount.tenant_id == tenant_id
+                    _account_scope_condition(principal, tenant_id)
                 )
             )
         ).scalars()
@@ -257,7 +338,7 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
     now = datetime.now(UTC)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         message_count = await session.scalar(
             select(func.count())
             .select_from(models.Message)
@@ -265,17 +346,22 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
                 models.Conversation,
                 models.Message.conversation_id == models.Conversation.id,
             )
+            .join(
+                models.PlatformAccount,
+                models.Conversation.platform_account_id == models.PlatformAccount.id,
+            )
             .where(
                 models.Conversation.tenant_id == tenant_id,
+                _account_scope_condition(principal, tenant_id),
                 models.Message.created_at >= today_start,
             )
         )
         account_count = await session.scalar(
-            select(func.count()).where(models.PlatformAccount.tenant_id == tenant_id)
+            select(func.count()).where(_account_scope_condition(principal, tenant_id))
         )
         active_account_count = await session.scalar(
             select(func.count()).where(
-                models.PlatformAccount.tenant_id == tenant_id,
+                _account_scope_condition(principal, tenant_id),
                 models.PlatformAccount.status == "active",
             )
         )
@@ -289,7 +375,14 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
             (
                 await session.execute(
                     select(models.AuditLog)
-                    .where(models.AuditLog.tenant_id == tenant_id)
+                    .where(
+                        models.AuditLog.tenant_id == tenant_id,
+                        *(
+                            ()
+                            if principal.is_admin
+                            else (models.AuditLog.actor == principal.actor,)
+                        ),
+                    )
                     .order_by(models.AuditLog.created_at.desc())
                     .limit(5)
                 )
@@ -297,28 +390,56 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
             .scalars()
             .all()
         )
-        agent_ids = await _load_agent_ids(session, tenant_id)
+        agent_ids = await _load_agent_ids(session, principal, tenant_id)
 
-    next_action = _home_next_action(tenant_id, inbox_summary, int(account_count or 0))
-    attention_cards = "".join(
-        (
-            metric_card(
-                inbox_summary.human_count,
-                "待人工",
-                detail=f"最老等待 {format_age(inbox_summary.oldest_human_at)}",
-            ),
-            metric_card(
-                inbox_summary.draft_count,
-                "待审核草稿",
-                detail=f"最老等待 {format_age(inbox_summary.oldest_draft_at)}",
-            ),
-            metric_card(
-                inbox_summary.delivery_count,
-                "投递异常",
-                detail=f"最老等待 {format_age(inbox_summary.oldest_delivery_at)}",
-            ),
-        )
+    next_action = _home_next_action(
+        principal,
+        tenant_id,
+        inbox_summary,
+        int(account_count or 0),
     )
+    if principal.is_admin:
+        attention_cards = "".join(
+            (
+                metric_card(
+                    inbox_summary.human_count,
+                    "待人工",
+                    detail=f"最老等待 {format_age(inbox_summary.oldest_human_at)}",
+                ),
+                metric_card(
+                    inbox_summary.draft_count,
+                    "待审核草稿",
+                    detail=f"最老等待 {format_age(inbox_summary.oldest_draft_at)}",
+                ),
+                metric_card(
+                    inbox_summary.delivery_count,
+                    "投递异常",
+                    detail=f"最老等待 {format_age(inbox_summary.oldest_delivery_at)}",
+                ),
+            )
+        )
+        attention_description = "按人工、草稿和投递风险汇总当前工作。"
+    else:
+        attention_cards = "".join(
+            (
+                metric_card(
+                    int(account_count or 0),
+                    "我的授权账号",
+                    detail=f"{int(active_account_count or 0)} 个当前可用",
+                ),
+                metric_card(
+                    inbox_summary.human_count,
+                    "待人工",
+                    detail=f"最老等待 {format_age(inbox_summary.oldest_human_at)}",
+                ),
+                metric_card(
+                    int(message_count or 0),
+                    "今日消息",
+                    detail="仅统计我的账号",
+                ),
+            )
+        )
+        attention_description = "只汇总归属于你的账号、消息和人工工作。"
     readiness_rows = "".join(
         (
             _progress_row(True, f"已识别 {len(agent_ids)} 个 Agent 作用域"),
@@ -350,7 +471,7 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
     )
     body = f"""{next_action}
 <div class="saas-section-title"><div><h2>需要关注</h2>
-<p>按人工、草稿和投递风险汇总当前工作。</p></div></div>
+<p>{escape(attention_description)}</p></div></div>
 <div class="saas-grid three">{attention_cards}</div>
 <div class="saas-grid two">
   <section class="saas-card"><div class="saas-card-header"><div><h2>工作区就绪度</h2>
@@ -366,7 +487,7 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
 </div>
 <div class="saas-section-title"><div><h2>最近活动</h2>
 <p>配置、审核与状态变更的审计摘要。</p></div>
-{secondary_action(f'{_tenant_root(tenant_id)}/audit', '查看全部', small=True)}</div>
+{secondary_action(f'{_tenant_root(tenant_id)}/audit' if principal.is_admin else f'{_tenant_root(tenant_id)}/activity', '查看全部', small=True)}</div>
 {recent_activity}"""
     return _render_page(
         principal=principal,
@@ -380,6 +501,7 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
 
 
 def _home_next_action(
+    principal: Principal,
     tenant_id: str,
     summary: InboxSummary,
     account_count: int,
@@ -410,10 +532,18 @@ def _home_next_action(
         href = f"{inbox_href}?queue=drafts"
         action_label = "开始审核"
     elif not account_count:
-        title = "完成第一个 Agent 的渠道配置"
-        description = "当前没有平台账号。先查看 Agent 就绪度，再进入兼容接入页连接渠道。"
-        href = f"{_tenant_root(tenant_id)}/agents/default/channels"
-        action_label = "继续设置"
+        if principal.is_admin:
+            title = "完成第一个 Agent 的渠道配置"
+            description = "当前没有平台账号。连接渠道后，Agent 才能开始接收消息。"
+            href = f"{_tenant_root(tenant_id)}/agents/default/channels"
+            action_label = "继续设置"
+        else:
+            title = "授权你的第一个平台账号"
+            description = (
+                "连接 Telegram Bot 或 Email 后，你就能在工作区查看并处理该账号的对话。"
+            )
+            href = f"{_tenant_root(tenant_id)}/channels"
+            action_label = "授权新账号"
     else:
         title = "当前没有紧急工作"
         description = "建议检查 Agent 运行状态和最近配置变更。"
@@ -449,15 +579,15 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
-        agent_ids = await _load_agent_ids(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        agent_ids = await _load_agent_ids(session, principal, tenant_id)
         cards: list[str] = []
         for agent_id in agent_ids:
             accounts = (
                 (
                     await session.execute(
                         select(models.PlatformAccount).where(
-                            models.PlatformAccount.tenant_id == tenant_id,
+                            _account_scope_condition(principal, tenant_id),
                             models.PlatformAccount.brand_id == agent_id,
                         )
                     )
@@ -501,9 +631,10 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
         body=body,
         active_navigation="agents",
         inbox_count=inbox_summary.total,
-        primary_action_html=primary_action(
-            "/admin/content/reply-prompt",
-            "配置新作用域",
+        primary_action_html=(
+            primary_action("/admin/content/reply-prompt", "配置新作用域")
+            if principal.is_admin
+            else ""
         ),
     )
 
@@ -585,16 +716,16 @@ async def agent_detail(
     if section not in _AGENT_SECTIONS:
         raise HTTPException(status_code=404, detail="agent_section_not_found")
     async with get_session_factory()() as session:
-        agent_ids = await _load_agent_ids(session, tenant_id)
+        agent_ids = await _load_agent_ids(session, principal, tenant_id)
         if agent_id not in agent_ids:
             raise HTTPException(status_code=404, detail="agent_not_found")
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         accounts = (
             (
                 await session.execute(
                     select(models.PlatformAccount)
                     .where(
-                        models.PlatformAccount.tenant_id == tenant_id,
+                        _account_scope_condition(principal, tenant_id),
                         models.PlatformAccount.brand_id == agent_id,
                     )
                     .order_by(models.PlatformAccount.platform, models.PlatformAccount.name)
@@ -634,7 +765,14 @@ async def agent_detail(
             (
                 await session.execute(
                     select(models.AuditLog)
-                    .where(models.AuditLog.tenant_id == tenant_id)
+                    .where(
+                        models.AuditLog.tenant_id == tenant_id,
+                        *(
+                            ()
+                            if principal.is_admin
+                            else (models.AuditLog.actor == principal.actor,)
+                        ),
+                    )
                     .order_by(models.AuditLog.created_at.desc())
                     .limit(12)
                 )
@@ -665,6 +803,7 @@ async def agent_detail(
         prompt_version=prompt_version,
         knowledge_counts=knowledge_counts,
         recent_audits=recent_audits,
+        is_admin=principal.is_admin,
     )
     modes = {account.automation_default for account in accounts}
     agent_mode = next(iter(modes)) if len(modes) == 1 else ("mixed" if modes else "unconfigured")
@@ -679,10 +818,14 @@ async def agent_detail(
         body=f"{section_tabs}{section_body}",
         active_navigation="agents",
         inbox_count=inbox_summary.total,
-        primary_action_html=primary_action(
-            "/admin/prompt?tenant_id="
-            f"{quote(tenant_id)}&brand_id={quote(agent_id)}",
-            "运行试验",
+        primary_action_html=(
+            primary_action(
+                "/admin/prompt?tenant_id="
+                f"{quote(tenant_id)}&brand_id={quote(agent_id)}",
+                "运行试验",
+            )
+            if principal.is_admin
+            else ""
         ),
         breadcrumbs=(
             ("Agents", f"{_tenant_root(tenant_id)}/agents"),
@@ -711,6 +854,7 @@ def _render_agent_section(
     prompt_version: models.ReplyBusinessPromptVersion | None,
     knowledge_counts: dict[str, int],
     recent_audits: list[models.AuditLog],
+    is_admin: bool,
 ) -> str:
     if section == "overview":
         return _render_agent_overview(
@@ -719,6 +863,7 @@ def _render_agent_section(
             accounts=accounts,
             prompt_pointer=prompt_pointer,
             knowledge_counts=knowledge_counts,
+            is_admin=is_admin,
         )
     if section == "instructions":
         return _render_agent_instructions(
@@ -726,13 +871,23 @@ def _render_agent_section(
             agent_id=agent_id,
             prompt_pointer=prompt_pointer,
             prompt_version=prompt_version,
+            is_admin=is_admin,
         )
     if section == "model":
         return _render_agent_model()
     if section == "channels":
-        return _render_agent_channels(accounts)
+        return _render_agent_channels(
+            accounts,
+            tenant_id=tenant_id,
+            is_admin=is_admin,
+        )
     if section == "knowledge":
-        return _render_agent_knowledge(tenant_id, agent_id, knowledge_counts)
+        return _render_agent_knowledge(
+            tenant_id,
+            agent_id,
+            knowledge_counts,
+            is_admin=is_admin,
+        )
     if section == "flow":
         return _render_agent_flow()
     return _render_agent_activity(recent_audits)
@@ -745,28 +900,41 @@ def _render_agent_overview(
     accounts: list[models.PlatformAccount],
     prompt_pointer: models.ReplyBusinessPrompt | None,
     knowledge_counts: dict[str, int],
+    is_admin: bool,
 ) -> str:
     active_accounts = [account for account in accounts if account.status == "active"]
     if not accounts:
         next_title = "连接第一个渠道账号"
         next_description = "Agent 已有安全运行框架，但还不能接收或发送平台消息。"
-        next_href = "/admin/integrations/accounts"
-        action_label = "连接渠道"
+        next_href = (
+            "/admin/integrations/accounts"
+            if is_admin
+            else f"{_tenant_root(tenant_id)}/channels"
+        )
+        action_label = "连接渠道" if is_admin else "授权我的账号"
     elif len(active_accounts) != len(accounts):
         next_title = "修复不可用的渠道账号"
         next_description = f"{len(accounts) - len(active_accounts)} 个账号当前不可用。"
-        next_href = "/admin/integrations/accounts"
+        next_href = "/admin/integrations/accounts" if is_admin else f"{_tenant_root(tenant_id)}/profile"
         action_label = "查看账号"
     elif not prompt_pointer:
         next_title = "补充业务指令"
         next_description = "当前仍使用代码默认业务说明；可保存 Tenant + Brand 版本化指令。"
-        next_href = "/admin/content/reply-prompt"
-        action_label = "编辑指令"
+        next_href = "/admin/content/reply-prompt" if is_admin else f"{_agent_root(tenant_id, agent_id)}/instructions"
+        action_label = "编辑指令" if is_admin else "查看指令"
     elif not knowledge_counts.get("published", 0):
         next_title = "发布第一条批准知识"
-        next_description = "没有已发布知识时，事实类问题将更容易转人工或只生成草稿。"
-        next_href = f"{_tenant_root(tenant_id)}/knowledge"
-        action_label = "打开知识中心"
+        next_description = (
+            "没有已发布知识时，事实类问题将更容易转人工或只生成草稿。"
+            if is_admin
+            else "当前没有可查询的已发布知识，请联系管理员补充并发布内容。"
+        )
+        next_href = (
+            f"{_tenant_root(tenant_id)}/knowledge"
+            if is_admin
+            else f"{_tenant_root(tenant_id)}/knowledge-query"
+        )
+        action_label = "打开知识中心" if is_admin else "查询知识"
     else:
         next_title = "检查最近运行活动"
         next_description = "当前配置完整，建议查看最近决策和配置变更。"
@@ -802,6 +970,7 @@ def _render_agent_instructions(
     agent_id: str,
     prompt_pointer: models.ReplyBusinessPrompt | None,
     prompt_version: models.ReplyBusinessPromptVersion | None,
+    is_admin: bool,
 ) -> str:
     content = prompt_version.content if prompt_version else "当前使用代码默认业务指令。"
     metadata = definition_list(
@@ -814,6 +983,15 @@ def _render_agent_instructions(
             ("更新人", prompt_pointer.updated_by if prompt_pointer else "system"),
         )
     )
+    edit_action = (
+        secondary_action(
+            "/admin/content/reply-prompt",
+            "进入编辑器",
+            small=True,
+        )
+        if is_admin
+        else ""
+    )
     return f"""<div class="saas-grid" style="grid-template-columns:220px minmax(0,1fr) 280px;margin-top:0">
 <aside class="saas-card"><div class="saas-card-header"><div><h2>版本</h2>
 <p>不可变历史由现有 Prompt 域维护。</p></div></div><div class="saas-card-body">
@@ -821,7 +999,7 @@ def _render_agent_instructions(
 </div></aside>
 <section class="saas-card"><div class="saas-card-header"><div><h2>业务指令</h2>
 <p>低权限业务说明，不能覆盖系统安全契约。</p></div>
-{secondary_action('/admin/content/reply-prompt', '进入编辑器', small=True)}</div>
+{edit_action}</div>
 <div class="saas-card-body"><div class="saas-alert">{escape(content)}</div></div></section>
 <aside class="saas-card"><div class="saas-card-header"><div><h2>安全与元数据</h2></div></div>
 <div class="saas-card-body">{metadata}<div class="saas-alert warning" style="margin-top:16px">
@@ -845,21 +1023,35 @@ def _render_agent_model() -> str:
 <section class="saas-alert warning" style="margin-top:18px">Model Profile 管理仍处于规划阶段。当前页面只展示安全裁剪后的有效配置，不回显 API Key 或完整上游地址。</section>"""
 
 
-def _render_agent_channels(accounts: list[models.PlatformAccount]) -> str:
+def _render_agent_channels(
+    accounts: list[models.PlatformAccount],
+    *,
+    tenant_id: str,
+    is_admin: bool,
+) -> str:
+    account_href = (
+        "/admin/integrations/accounts"
+        if is_admin
+        else f"{_tenant_root(tenant_id)}/profile"
+    )
+    account_action_label = "管理账号" if is_admin else "查看我的账号"
     rows = "".join(
         f"<tr><td><strong>{escape(account.name)}</strong><br>"
         f'<span class="saas-muted">{escape(account.platform)}</span></td>'
         f"<td>{status_badge(account.status)}</td>"
         f"<td>{status_badge(account.automation_default)}</td>"
         f"<td>v{account.config_version}</td>"
-        '<td><a href="/admin/integrations/accounts">管理账号 →</a></td></tr>'
+        f'<td><a href="{account_href}">{account_action_label} →</a></td></tr>'
         for account in accounts
     )
     if not rows:
         return empty_state(
             "尚未连接渠道",
             "连接渠道后，Agent 才能接收消息；新账号仍默认仅生成草稿。",
-            action_html=primary_action("/admin/integrations/accounts", "连接第一个渠道"),
+            action_html=primary_action(
+                account_href,
+                "连接第一个渠道" if is_admin else "授权我的账号",
+            ),
         )
     return (
         '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
@@ -872,9 +1064,17 @@ def _render_agent_knowledge(
     tenant_id: str,
     agent_id: str,
     knowledge_counts: dict[str, int],
+    *,
+    is_admin: bool,
 ) -> str:
     published_count = int(knowledge_counts.get("published", 0))
     draft_count = int(knowledge_counts.get("draft", 0))
+    knowledge_href = (
+        f"{_tenant_root(tenant_id)}/knowledge?brand_id={quote(agent_id)}"
+        if is_admin
+        else f"{_tenant_root(tenant_id)}/knowledge-query"
+    )
+    knowledge_action_label = "打开知识中心" if is_admin else "查询知识"
     body = f"""<div class="saas-grid three" style="margin-top:0">
 {metric_card(published_count, '已发布知识')}
 {metric_card(draft_count, '草稿与待审核')}
@@ -882,7 +1082,7 @@ def _render_agent_knowledge(
 </div>
 <section class="saas-card" style="margin-top:18px"><div class="saas-card-header"><div>
 <h2>知识绑定</h2><p>当前 Agent 使用 Tenant + Brand + Platform 作用域检索。</p></div>
-{secondary_action(f'{_tenant_root(tenant_id)}/knowledge?brand_id={quote(agent_id)}', '打开知识中心', small=True)}</div>
+{secondary_action(knowledge_href, knowledge_action_label, small=True)}</div>
 <div class="saas-card-body"><p>来源文档、检索 Chunk 和批准答案保持分层；只有已发布并通过语言与安全检查的知识进入自动回复路径。</p></div></section>"""
     return body
 
@@ -935,6 +1135,8 @@ async def tenant_inbox(
         return principal
     if queue not in {"human", "drafts", "delivery"}:
         raise HTTPException(status_code=422, detail="invalid_inbox_queue")
+    if not principal.is_admin and queue != "human":
+        raise HTTPException(status_code=403, detail="inbox_queue_access_denied")
     selected_item_uuid: uuid.UUID | None = None
     if item_id:
         try:
@@ -942,8 +1144,8 @@ async def tenant_inbox(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_inbox_item") from exc
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
-        items = await _load_inbox_items(session, tenant_id, queue)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        items = await _load_inbox_items(session, principal, tenant_id, queue)
         selected_item = next(
             (item for item in items if item.item_id == selected_item_uuid),
             items[0] if items else None,
@@ -971,10 +1173,19 @@ async def tenant_inbox(
                 .all()
             )
             messages = list(reversed(newest_messages))
-    queue_tabs = _render_queue_tabs(tenant_id, queue, inbox_summary)
+    queue_tabs = _render_queue_tabs(
+        tenant_id,
+        queue,
+        inbox_summary,
+        include_admin_queues=principal.is_admin,
+    )
     item_list = _render_inbox_item_list(tenant_id, queue, items, selected_item)
-    thread = _render_conversation_thread(messages, selected_item)
-    action_panel = _render_inbox_action_panel(selected_item)
+    thread = _render_conversation_thread(
+        tenant_id,
+        messages,
+        selected_item,
+    )
+    action_panel = _render_inbox_action_panel(tenant_id, selected_item)
     body = f"""<section class="saas-alert" style="margin-bottom:14px">
 列表不会在阅读或编辑时自动重排。完成当前项目后，再进入下一项。</section>
 <div class="saas-inbox-layout">
@@ -987,14 +1198,23 @@ async def tenant_inbox(
         principal=principal,
         tenant_id=tenant_id,
         title="收件箱",
-        description="按最老等待优先处理人工工作、草稿审核和投递异常。",
+        description=(
+            "按最老等待优先处理人工工作、草稿审核和投递异常。"
+            if principal.is_admin
+            else "按最老等待优先处理归属于你账号的人工工作。"
+        ),
         body=body,
         active_navigation="inbox",
         inbox_count=inbox_summary.total,
     )
 
 
-async def _load_inbox_items(session, tenant_id: str, queue: str) -> list[InboxItem]:
+async def _load_inbox_items(
+    session,
+    principal: Principal,
+    tenant_id: str,
+    queue: str,
+) -> list[InboxItem]:
     if queue == "human":
         rows = (
             await session.execute(
@@ -1017,6 +1237,7 @@ async def _load_inbox_items(session, tenant_id: str, queue: str) -> list[InboxIt
                     models.HumanWorkItem.tenant_id == tenant_id,
                     models.Conversation.tenant_id == tenant_id,
                     models.PlatformAccount.tenant_id == tenant_id,
+                    _account_scope_condition(principal, tenant_id),
                     models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
                 )
                 .order_by(models.HumanWorkItem.created_at)
@@ -1061,6 +1282,7 @@ async def _load_inbox_items(session, tenant_id: str, queue: str) -> list[InboxIt
                     models.ReplyDecision.tenant_id == tenant_id,
                     models.Conversation.tenant_id == tenant_id,
                     models.PlatformAccount.tenant_id == tenant_id,
+                    _account_scope_condition(principal, tenant_id),
                     models.ReplyDecision.action == "draft",
                     or_(
                         models.ReplyDecision.review_action.is_(None),
@@ -1113,6 +1335,7 @@ async def _load_inbox_items(session, tenant_id: str, queue: str) -> list[InboxIt
                 models.OutboxMessage.tenant_id == tenant_id,
                 models.Conversation.tenant_id == tenant_id,
                 models.PlatformAccount.tenant_id == tenant_id,
+                _account_scope_condition(principal, tenant_id),
                 models.OutboxMessage.status.in_(("FAILED", "NEEDS_REVIEW")),
             )
             .order_by(models.OutboxMessage.created_at)
@@ -1140,12 +1363,18 @@ def _render_queue_tabs(
     tenant_id: str,
     active_queue: str,
     summary: InboxSummary,
+    *,
+    include_admin_queues: bool,
 ) -> str:
     root = f"{_tenant_root(tenant_id)}/inbox"
     queue_data = (
-        ("human", "人工", summary.human_count),
-        ("drafts", "草稿", summary.draft_count),
-        ("delivery", "投递", summary.delivery_count),
+        (
+            ("human", "人工", summary.human_count),
+            ("drafts", "草稿", summary.draft_count),
+            ("delivery", "投递", summary.delivery_count),
+        )
+        if include_admin_queues
+        else (("human", "人工", summary.human_count),)
     )
     links = "".join(
         f'<a class="saas-queue-tab{" active" if key == active_queue else ""}" '
@@ -1181,6 +1410,7 @@ def _render_inbox_item_list(
 
 
 def _render_conversation_thread(
+    tenant_id: str,
     messages: list[models.Message],
     selected_item: InboxItem | None,
 ) -> str:
@@ -1203,11 +1433,14 @@ def _render_conversation_thread(
 <div class="saas-composer"><textarea disabled placeholder="选择右侧操作进入受保护的处理流程"></textarea>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
 <span class="saas-muted">人工回复仍沿用现有 CSRF、目标消息和 Outbox 保护。</span>
-{secondary_action(f'/admin/conversations/{selected_item.conversation_id}', '打开完整处理页', small=True)}</div></div>
+{secondary_action(f'{_tenant_root(tenant_id)}/conversations/{selected_item.conversation_id}', '打开完整处理页', small=True)}</div></div>
 </div>"""
 
 
-def _render_inbox_action_panel(selected_item: InboxItem | None) -> str:
+def _render_inbox_action_panel(
+    tenant_id: str,
+    selected_item: InboxItem | None,
+) -> str:
     if selected_item is None:
         return '<div class="saas-action-panel"><p class="saas-muted">尚未选择工作项。</p></div>'
     if selected_item.queue == "human":
@@ -1227,8 +1460,912 @@ def _render_inbox_action_panel(selected_item: InboxItem | None) -> str:
 <p><strong>{escape(selected_item.reason)}</strong></p>
 {definition_list((('账号', selected_item.account_name), ('平台', selected_item.platform), ('等待', format_age(selected_item.created_at)), ('Item ID', str(selected_item.item_id))))}
 <div class="saas-alert warning" style="margin:16px 0">{escape(warning)}</div>
-{primary_action(f'/admin/conversations/{selected_item.conversation_id}', action_label)}
+{primary_action(f'{_tenant_root(tenant_id)}/conversations/{selected_item.conversation_id}', action_label)}
 <p class="saas-muted">完成后返回此页，继续下一项。</p></div>"""
+
+
+@router.get("/app/t/{tenant_id}/conversations", response_class=HTMLResponse)
+async def tenant_conversations(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    latest_message_at = (
+        select(func.max(models.Message.created_at))
+        .where(models.Message.conversation_id == models.Conversation.id)
+        .correlate(models.Conversation)
+        .scalar_subquery()
+    )
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        rows = (
+            await session.execute(
+                select(
+                    models.Conversation,
+                    models.Contact,
+                    models.PlatformAccount,
+                    latest_message_at.label("latest_message_at"),
+                )
+                .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+                .join(
+                    models.PlatformAccount,
+                    models.Conversation.platform_account_id == models.PlatformAccount.id,
+                )
+                .where(
+                    models.Conversation.tenant_id == tenant_id,
+                    _account_scope_condition(principal, tenant_id),
+                )
+                .order_by(latest_message_at.desc().nullslast())
+                .limit(100)
+            )
+        ).all()
+    table_rows = "".join(
+        f"<tr><td><a href='{_tenant_root(tenant_id)}/conversations/{conversation.id}'>"
+        f"<strong>{escape(contact.display_name or '匿名联系人')}</strong></a></td>"
+        f"<td>{escape(account.name)}</td><td>{escape(conversation.platform)}</td>"
+        f"<td>{escape(conversation.channel_type)}</td>"
+        f"<td>{format_datetime(latest_at)}</td>"
+        f"<td><a href='{_tenant_root(tenant_id)}/conversations/{conversation.id}'>打开 →</a></td></tr>"
+        for conversation, contact, account, latest_at in rows
+    )
+    body = (
+        '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
+        '<th>联系人</th><th>授权账号</th><th>平台</th><th>渠道</th><th>最近消息</th><th></th>'
+        f"</tr></thead><tbody>{table_rows}</tbody></table></div>"
+        if table_rows
+        else empty_state("暂无对话", "连接自己的授权账号后，新对话会显示在这里。")
+    )
+    return _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title="对话",
+        description="仅显示你有权访问的平台账号产生的客户对话。",
+        body=body,
+        active_navigation="conversations",
+        inbox_count=inbox_summary.total,
+    )
+
+
+@router.get(
+    "/app/t/{tenant_id}/conversations/{conversation_id}",
+    response_class=HTMLResponse,
+)
+async def tenant_conversation_detail(
+    request: Request,
+    tenant_id: str,
+    conversation_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        row = (
+            await session.execute(
+                select(models.Conversation, models.Contact, models.PlatformAccount)
+                .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+                .join(
+                    models.PlatformAccount,
+                    models.Conversation.platform_account_id == models.PlatformAccount.id,
+                )
+                .where(
+                    models.Conversation.id == conversation_id,
+                    models.Conversation.tenant_id == tenant_id,
+                    _account_scope_condition(principal, tenant_id),
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="conversation_not_found")
+        conversation, contact, account = row
+        newest_messages = list(
+            (
+                await session.execute(
+                    select(models.Message)
+                    .where(models.Message.conversation_id == conversation_id)
+                    .order_by(models.Message.history_seq.desc())
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        work_item = await session.scalar(
+            select(models.HumanWorkItem)
+            .where(
+                models.HumanWorkItem.conversation_id == conversation_id,
+                models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
+            )
+            .order_by(models.HumanWorkItem.created_at.desc())
+            .limit(1)
+        )
+    csrf = _csrf(request)
+    reply_target = next(
+        (
+            message
+            for message in newest_messages
+            if message.direction == "inbound"
+        ),
+        None,
+    )
+    message_rows = "".join(
+        '<article class="saas-card saas-card-body">'
+        f"<div class='saas-muted'>{escape(message.sender_type)} · "
+        f"{format_datetime(message.created_at, include_year=True)}</div>"
+        f"<p>{escape(message.text or '（非文本消息）')}</p></article>"
+        for message in reversed(newest_messages)
+    )
+    work_actions = ""
+    if work_item is not None and work_item.status == "WAITING":
+        work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/claim">
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_version" value="{work_item.version}">
+<button class="saas-button primary" type="submit">认领此对话</button></form>"""
+    elif work_item is not None and work_item.assigned_actor == principal.actor:
+        work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/resolve">
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_version" value="{work_item.version}">
+<button class="saas-button" type="submit">标记已解决</button></form>"""
+    reply_form = ""
+    if reply_target is not None:
+        work_fields = ""
+        if work_item is not None:
+            work_fields = (
+                f'<input type="hidden" name="work_item_id" value="{work_item.id}">'
+                f'<input type="hidden" name="expected_version" value="{work_item.version}">'
+            )
+        reply_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>人工回复</h2>
+<p>提交后仍进入统一 Outbox 和发送前安全复检。</p></div></div><div class="saas-card-body">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/conversations/{conversation_id}/reply">
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="reply_to_message_id" value="{reply_target.id}">
+<input type="hidden" name="idempotency_key" value="{uuid.uuid4()}">{work_fields}
+<label for="manual-reply">回复内容</label><textarea id="manual-reply" name="text" rows="5" maxlength="10000" required></textarea>
+<button class="saas-button primary" type="submit">发送人工回复</button></form></div></section>"""
+    body = (
+        '<section class="saas-card"><div class="saas-card-body">'
+        f"{definition_list((('联系人', contact.display_name or '匿名联系人'), ('账号', account.name), ('平台', conversation.platform), ('渠道', conversation.channel_type), ('Conversation ID', conversation.id)))}"
+        f"{work_actions}</div></section>"
+        f'<div class="saas-stack">{message_rows}</div>{reply_form}'
+    )
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title=contact.display_name or "对话详情",
+        description="查看该授权账号范围内的完整对话记录。",
+        body=body,
+        active_navigation="conversations",
+        inbox_count=inbox_summary.total,
+        breadcrumbs=(("对话", f"{_tenant_root(tenant_id)}/conversations"), ("详情", None)),
+    )
+    if not request.cookies.get("reply_admin_csrf"):
+        response.set_cookie(
+            "reply_admin_csrf",
+            csrf,
+            httponly=False,
+            samesite="lax",
+            secure=_secure_cookie(request),
+        )
+    return response
+
+
+@router.post("/app/t/{tenant_id}/work-items/{work_item_id}/claim")
+async def claim_tenant_work_item(
+    request: Request,
+    tenant_id: str,
+    work_item_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        expected_version = int(form.get("expected_version", ""))
+        await claim_human_work_item(
+            work_item_id=work_item_id,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            user_id=principal.user_id,
+            expected_version=expected_version,
+            owner_user_id=None if principal.is_admin else principal.user_id,
+        )
+    except (TypeError, ValueError, HumanWorkflowError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/inbox?queue=human",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/work-items/{work_item_id}/resolve")
+async def resolve_tenant_work_item(
+    request: Request,
+    tenant_id: str,
+    work_item_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        expected_version = int(form.get("expected_version", ""))
+        await resolve_human_work_item(
+            work_item_id=work_item_id,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            expected_version=expected_version,
+            allow_override=principal.is_admin,
+            owner_user_id=None if principal.is_admin else principal.user_id,
+        )
+    except (TypeError, ValueError, HumanWorkflowError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/inbox?queue=human",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/conversations/{conversation_id}/reply")
+async def reply_to_tenant_conversation(
+    request: Request,
+    tenant_id: str,
+    conversation_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    text = (form.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="reply_text_required")
+    try:
+        work_item_id = (
+            uuid.UUID(form["work_item_id"])
+            if form.get("work_item_id")
+            else None
+        )
+        expected_version = (
+            int(form["expected_version"])
+            if form.get("expected_version")
+            else None
+        )
+        await send_human_reply(
+            conversation_id=conversation_id,
+            reply_to_message_id=uuid.UUID(form.get("reply_to_message_id", "")),
+            text=text,
+            idempotency_key=str(uuid.UUID(form.get("idempotency_key", ""))),
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            user_id=principal.user_id,
+            allow_override=principal.is_admin,
+            work_item_id=work_item_id,
+            expected_version=expected_version,
+            owner_user_id=None if principal.is_admin else principal.user_id,
+        )
+    except (TypeError, ValueError, HumanWorkflowError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/conversations/{conversation_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.get("/app/t/{tenant_id}/knowledge-query", response_class=HTMLResponse)
+@router.post("/app/t/{tenant_id}/knowledge-query", response_class=HTMLResponse)
+async def tenant_knowledge_query(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    query = (request.query_params.get("q") or "").strip()
+    if request.method == "POST":
+        form = await _form(request)
+        _require_csrf(request, form)
+        query = (form.get("q") or "").strip()
+    if len(query) > 500:
+        raise HTTPException(status_code=422, detail="knowledge_query_too_long")
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        documents: list[models.KnowledgeDocument] = []
+        if query:
+            search_pattern = f"%{query}%"
+            documents = list(
+                (
+                    await session.execute(
+                        select(models.KnowledgeDocument)
+                        .where(
+                            models.KnowledgeDocument.tenant_id == tenant_id,
+                            models.KnowledgeDocument.status == "published",
+                            or_(
+                                models.KnowledgeDocument.question.ilike(search_pattern),
+                                models.KnowledgeDocument.reply.ilike(search_pattern),
+                            ),
+                        )
+                        .order_by(models.KnowledgeDocument.updated_at.desc())
+                        .limit(20)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    csrf = _csrf(request)
+    results = "".join(
+        '<article class="saas-card"><div class="saas-card-header"><div>'
+        f"<h2>{escape(document.question)}</h2>"
+        f"<p>{escape(document.brand_id)} · {escape(document.platform)}</p></div>"
+        f"{status_badge(document.status)}</div>"
+        f'<div class="saas-card-body"><p>{escape(document.reply)}</p></div></article>'
+        for document in documents
+    )
+    if query and not results:
+        results = empty_state("没有找到已发布知识", "换一个更具体的关键词再试。")
+    body = f"""<section class="saas-card"><div class="saas-card-body">
+<form class="saas-form" method="post"><input type="hidden" name="csrf_token" value="{csrf}">
+<label for="knowledge-query">输入客户问题或关键词</label>
+<div class="saas-form-row"><input id="knowledge-query" name="q" value="{escape(query)}" maxlength="500" required>
+<button class="saas-button primary" type="submit">查询已发布知识</button></div>
+<p class="saas-muted">只查询已发布内容，不会生成回复或触发外发。</p></form></div></section>
+<div class="saas-stack">{results}</div>"""
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title="知识查询",
+        description="搜索管理员已经审核并发布的标准答案。",
+        body=body,
+        active_navigation="knowledge-query",
+        inbox_count=inbox_summary.total,
+    )
+    if not request.cookies.get("reply_admin_csrf"):
+        response.set_cookie(
+            "reply_admin_csrf",
+            csrf,
+            httponly=False,
+            samesite="lax",
+            secure=_secure_cookie(request),
+        )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/app/t/{tenant_id}/activity", response_class=HTMLResponse)
+async def tenant_my_activity(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        audits = list(
+            (
+                await session.execute(
+                    select(models.AuditLog)
+                    .where(
+                        models.AuditLog.tenant_id == tenant_id,
+                        models.AuditLog.actor == principal.actor,
+                    )
+                    .order_by(models.AuditLog.created_at.desc())
+                    .limit(200)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    rows = "".join(
+        f"<tr><td>{format_datetime(audit.created_at, include_year=True)}</td>"
+        f"<td>{escape(audit.action)}</td><td>{escape(audit.subject_type)}</td>"
+        f"<td><code>{escape(audit.subject_id)}</code></td></tr>"
+        for audit in audits
+    )
+    body = (
+        '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
+        f"<th>时间</th><th>动作</th><th>资源</th><th>ID</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        if rows
+        else empty_state("暂无个人活动", "你处理会话、审核草稿或绑定账号后会显示在这里。")
+    )
+    return _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title="我的活动",
+        description="仅显示由当前账号执行的操作，不暴露其他用户或系统内部审计。",
+        body=body,
+        active_navigation="activity",
+        inbox_count=inbox_summary.total,
+    )
+
+
+_CHANNEL_AVATAR_HOST_SUFFIXES = (
+    ".fbcdn.net",
+    ".cdninstagram.com",
+)
+_CHANNEL_AVATAR_HOSTS = {
+    "abs.twimg.com",
+    "pbs.twimg.com",
+    "platform-lookaside.fbsbx.com",
+}
+
+
+def _safe_channel_avatar_url(value: object) -> str | None:
+    candidate = str(value or "").strip()
+    if not candidate or len(candidate) > 2048:
+        return None
+    parsed = urlsplit(candidate)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return None
+    if hostname in _CHANNEL_AVATAR_HOSTS:
+        return candidate
+    if any(hostname.endswith(suffix) for suffix in _CHANNEL_AVATAR_HOST_SUFFIXES):
+        return candidate
+    return None
+
+
+def _channel_icon_path(platform: str) -> str:
+    known_platform = platform if platform in {
+        "email",
+        "facebook",
+        "feishu",
+        "instagram",
+        "telegram",
+        "whatsapp",
+        "x",
+    } else "email"
+    return f"/static/channel-icons/{known_platform}.svg"
+
+
+def _channel_avatar(account: models.PlatformAccount) -> str:
+    avatar_url = _safe_channel_avatar_url(account.avatar_url)
+    if avatar_url:
+        return (
+            '<img class="saas-account-avatar" '
+            f'src="{escape(avatar_url)}" alt="" loading="lazy" '
+            'referrerpolicy="no-referrer">'
+        )
+    initial = (account.name or account.platform or "?").strip()[:1].upper()
+    return (
+        '<span class="saas-account-avatar fallback" aria-hidden="true">'
+        f"{escape(initial)}</span>"
+    )
+
+
+def _channel_account_health(account: models.PlatformAccount) -> tuple[str, str]:
+    if account.status != "active":
+        return "danger", "已禁用"
+    config = dict(account.config or {})
+    health_values = {
+        str(config.get("meta_health_status") or ""),
+        str(config.get("email_health_status") or ""),
+        str(config.get("feishu_health_status") or ""),
+    }
+    if "ERROR" in health_values:
+        return "warning", "需要重新授权"
+    if "PROVISIONING" in health_values:
+        return "info", "正在配置"
+    return "success", "已连接"
+
+
+def _channel_job_error_message(job: models.ProvisioningJob) -> str:
+    if job.status == "FAILED":
+        return "平台暂时不可用，系统会按安全退避策略自动重试。"
+    error_code = str(job.last_error_code or "")
+    if error_code == "ACCOUNT_OWNER_CONFLICT":
+        return "该平台账号已被其他归属范围绑定，不能重复认领。"
+    if error_code.startswith(("EMAIL_", "imap_", "smtp_")):
+        return "邮箱验证未完成，请检查地址、App Password 和服务器设置后重新提交。"
+    if error_code.startswith("X_"):
+        return "X 授权或权限验证未完成，请检查 App 权限后重新授权。"
+    if error_code.startswith(("META_", "PLATFORM_HTTP_")):
+        return "平台授权未完成，请确认应用权限和账号类型后重新授权。"
+    return "账号验证未完成，请重新授权；如问题持续存在，请联系管理员。"
+
+
+def _channel_job_action(job: models.ProvisioningJob) -> str:
+    if job.status not in {"NEEDS_ACTION", "FAILED"}:
+        return ""
+    if job.status == "FAILED":
+        return '<span class="saas-muted">等待自动重试</span>'
+    if job.platform in {"telegram", "email"}:
+        return (
+            '<button class="saas-button small" type="button" '
+            f'data-open-channel-dialog="{escape(job.platform)}-dialog">重新填写凭证</button>'
+        )
+    return '<a class="saas-button small" href="#add-channels">重新授权</a>'
+
+
+def _render_connected_channel(account: models.PlatformAccount) -> str:
+    health_tone, health_label = _channel_account_health(account)
+    username = (
+        f"@{account.provider_username.lstrip('@')}"
+        if account.provider_username
+        and account.platform not in {"email", "telegram"}
+        else account.provider_username
+    )
+    profile_line = username or account.external_account_id or "平台账号"
+    connected_at = account.profile_updated_at or account.created_at
+    return f"""<article class="saas-connected-channel">
+<div class="saas-connected-identity">{_channel_avatar(account)}<div>
+<h3>{escape(account.name)}</h3><p>{escape(profile_line)}</p></div></div>
+<div class="saas-connected-meta"><span class="saas-platform-label">
+<img src="{_channel_icon_path(account.platform)}" alt="">{escape(account.platform.title())}</span>
+<span class="saas-status {health_tone}">{escape(health_label)}</span>
+<span class="saas-muted">最近连接 {format_datetime(connected_at, include_year=True)}</span></div>
+</article>"""
+
+
+def _channel_oauth_form(
+    *,
+    action: str,
+    csrf: str,
+    tenant_id: str,
+    label: str,
+    platform: str | None = None,
+    available: bool,
+) -> str:
+    disabled = "" if available else " disabled aria-disabled=\"true\""
+    platform_input = (
+        f'<input type="hidden" name="platform" value="{escape(platform)}">'
+        if platform
+        else ""
+    )
+    return f"""<form method="post" action="{escape(action)}" data-channel-oauth-form>
+<input type="hidden" name="csrf_token" value="{escape(csrf)}">
+<input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="default">{platform_input}
+<button class="saas-button primary small" type="submit"{disabled}>{escape(label)}</button>
+</form>"""
+
+
+def _channel_provider_card(
+    *,
+    platform: str,
+    title: str,
+    description: str,
+    actions: str,
+    available: bool,
+    availability_label: str | None = None,
+) -> str:
+    state_label = availability_label or (
+        "可连接" if available else "联系管理员配置应用"
+    )
+    state_class = "ready" if available else "managed"
+    return f"""<article class="saas-provider-card{' disabled' if not available else ''}">
+<div class="saas-provider-heading"><span class="saas-provider-icon">
+<img src="{_channel_icon_path(platform)}" alt=""></span>
+<span class="saas-provider-state {state_class}">{escape(state_label)}</span></div>
+<div><h3>{escape(title)}</h3><p>{escape(description)}</p></div>
+<div class="saas-provider-actions">{actions}</div></article>"""
+
+
+@router.get("/app/t/{tenant_id}/channels", response_class=HTMLResponse)
+async def tenant_channels(
+    request: Request,
+    tenant_id: str,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    if principal.is_admin:
+        return RedirectResponse(
+            "/admin/integrations/accounts",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        accounts = list(
+            (
+                await session.execute(
+                    select(models.PlatformAccount)
+                    .where(_account_scope_condition(principal, tenant_id))
+                    .order_by(models.PlatformAccount.created_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        jobs = list(
+            (
+                await session.execute(
+                    select(models.ProvisioningJob)
+                    .where(
+                        models.ProvisioningJob.tenant_id == tenant_id,
+                        models.ProvisioningJob.owner_user_id == principal.user_id,
+                    )
+                    .order_by(models.ProvisioningJob.created_at.desc())
+                    .limit(12)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    settings = get_settings()
+    facebook_app = await facebook_app_credentials(tenant_id)
+    instagram_app = await instagram_app_credentials(tenant_id)
+    x_available = settings.x_integration_enabled and x_app_credentials() is not None
+    facebook_available = settings.facebook_messenger_enabled and facebook_app is not None
+    instagram_direct_available = (
+        settings.instagram_messaging_enabled and instagram_app is not None
+    )
+    instagram_meta_available = (
+        settings.instagram_messaging_enabled and facebook_app is not None
+    )
+    csrf = _csrf(request)
+    connected_channels = "".join(_render_connected_channel(account) for account in accounts)
+    if not connected_channels:
+        connected_channels = empty_state(
+            "还没有已连接账号",
+            "从下方选择一个渠道。连接成功后，账号会以名称、头像和健康状态显示在这里。",
+        )
+    job_cards = "".join(
+        f"""<article class="saas-channel-job" data-channel-job
+data-job-url="{_tenant_root(tenant_id)}/channels/jobs/{job.id}"
+data-job-status="{escape(job.status)}">
+<div><img src="{_channel_icon_path(job.platform)}" alt=""><strong>{escape(job.platform.title())}</strong>
+<span>{format_datetime(job.created_at, include_year=True)}</span></div>
+<div>{status_badge(job.status)}<span data-job-step>{escape(job.current_step)}</span>{_channel_job_action(job)}</div>
+{f'<p class="saas-job-error">{escape(_channel_job_error_message(job))}</p>' if job.last_error_code else ''}
+</article>"""
+        for job in jobs
+    ) or '<p class="saas-muted">暂无授权任务。</p>'
+    oauth_status = request.query_params.get("status", "")
+    job_id = request.query_params.get("job_id", "")
+    error_code = request.query_params.get("code", "")
+    banner = ""
+    if oauth_status in {"processing", "connected"}:
+        banner = (
+            '<div class="saas-alert success" role="status">授权已提交，正在安全验证账号。'
+            f"{f' 任务 {escape(job_id)}' if job_id else ''}</div>"
+        )
+    elif oauth_status == "error":
+        banner = (
+            '<div class="saas-alert danger" role="alert">授权未完成。'
+            f"错误代码：{escape(error_code or 'oauth_failed')}。请检查应用配置后重试。</div>"
+        )
+    x_actions = _channel_oauth_form(
+        action=f"{_tenant_root(tenant_id)}/channels/oauth/x/start",
+        csrf=csrf,
+        tenant_id=tenant_id,
+        label="使用 X 授权",
+        available=x_available,
+    )
+    facebook_actions = _channel_oauth_form(
+        action=f"{_tenant_root(tenant_id)}/channels/oauth/meta/start",
+        csrf=csrf,
+        tenant_id=tenant_id,
+        label="连接 Facebook Page",
+        platform="facebook",
+        available=facebook_available,
+    )
+    instagram_actions = (
+        _channel_oauth_form(
+            action=f"{_tenant_root(tenant_id)}/channels/oauth/instagram/start",
+            csrf=csrf,
+            tenant_id=tenant_id,
+            label="Instagram Login",
+            available=instagram_direct_available,
+        )
+        + _channel_oauth_form(
+            action=f"{_tenant_root(tenant_id)}/channels/oauth/meta/start",
+            csrf=csrf,
+            tenant_id=tenant_id,
+            label="通过 Facebook 连接",
+            platform="instagram",
+            available=instagram_meta_available,
+        )
+    )
+    email_button_attributes = (
+        "" if settings.email_enabled else ' disabled aria-disabled="true"'
+    )
+    provider_cards = "".join(
+        (
+            _channel_provider_card(
+                platform="x",
+                title="X",
+                description="授权个人或品牌 X 账号，用于私信与已启用的互动能力。",
+                actions=x_actions,
+                available=x_available,
+            ),
+            _channel_provider_card(
+                platform="facebook",
+                title="Facebook",
+                description="授权后选择一个或多个可管理的 Facebook Page。",
+                actions=facebook_actions,
+                available=facebook_available,
+            ),
+            _channel_provider_card(
+                platform="instagram",
+                title="Instagram",
+                description="支持 Instagram Login，或选择 Facebook 关联的专业账号。",
+                actions=instagram_actions,
+                available=instagram_direct_available or instagram_meta_available,
+            ),
+            _channel_provider_card(
+                platform="telegram",
+                title="Telegram Bot",
+                description="使用 BotFather 生成的 Bot Token 连接。",
+                actions=(
+                    '<button class="saas-button primary small" type="button" '
+                    'data-open-channel-dialog="telegram-dialog">填写 Bot Token</button>'
+                ),
+                available=True,
+            ),
+            _channel_provider_card(
+                platform="email",
+                title="Email",
+                description="使用 App Password 验证 IMAP 收件与 SMTP 回复。",
+                actions=(
+                    '<button class="saas-button primary small" type="button" '
+                    'data-open-channel-dialog="email-dialog"'
+                    f"{email_button_attributes}>"
+                    "填写邮箱凭证</button>"
+                ),
+                available=settings.email_enabled,
+            ),
+            _channel_provider_card(
+                platform="whatsapp",
+                title="WhatsApp",
+                description="首期由管理员配置 Meta App、WABA 与手机号。",
+                actions="",
+                available=False,
+                availability_label="由管理员配置",
+            ),
+            _channel_provider_card(
+                platform="feishu",
+                title="Feishu",
+                description="首期由管理员配置自建应用与事件回调。",
+                actions="",
+                available=False,
+                availability_label="由管理员配置",
+            ),
+        )
+    )
+    dialogs = f"""<dialog class="saas-channel-dialog" id="telegram-dialog" aria-labelledby="telegram-dialog-title">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/telegram" data-channel-credential-form>
+<div class="saas-dialog-header"><div><div class="saas-eyebrow">Telegram</div><h2 id="telegram-dialog-title">连接 Telegram Bot</h2></div>
+<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="关闭">×</button></div>
+<div class="saas-alert">Token 仅发送到服务端并加密暂存，不会在页面或任务结果中回显。</div>
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
+<label for="telegram-name">账号显示名称 <span class="saas-optional">选填</span></label><input id="telegram-name" name="name" placeholder="例如：售后 Telegram">
+<label for="telegram-token">Bot Token</label><input id="telegram-token" name="token" type="password" autocomplete="new-password" required>
+<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>取消</button>
+<button class="saas-button primary" type="submit">验证并连接</button></div></form></dialog>
+<dialog class="saas-channel-dialog wide" id="email-dialog" aria-labelledby="email-dialog-title">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/email" data-channel-credential-form>
+<div class="saas-dialog-header"><div><div class="saas-eyebrow">Email</div><h2 id="email-dialog-title">连接邮箱账号</h2></div>
+<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="关闭">×</button></div>
+<div class="saas-alert">推荐使用邮箱提供商生成的 App Password。系统以只读 IMAP 收件。</div>
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
+<div class="saas-form-grid"><div><label for="email-address">邮箱地址</label><input id="email-address" name="email_address" type="email" autocomplete="email" required></div>
+<div><label for="email-username">登录用户名</label><input id="email-username" name="username" autocomplete="username" required></div></div>
+<label for="email-password">密码或 App Password</label><input id="email-password" name="password" type="password" autocomplete="new-password" required>
+<div class="saas-form-grid"><div><label for="imap-host">IMAP Host</label><input id="imap-host" name="imap_host" required></div>
+<div><label for="smtp-host">SMTP Host</label><input id="smtp-host" name="smtp_host" required></div></div>
+<input type="hidden" name="imap_port" value="993"><input type="hidden" name="smtp_port" value="465">
+<input type="hidden" name="smtp_security" value="ssl"><input type="hidden" name="mailbox" value="INBOX">
+<input type="hidden" name="internal_domain_policy" value="ignore">
+<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>取消</button>
+<button class="saas-button primary" type="submit">验证并连接</button></div></form></dialog>"""
+    body = f"""{banner}<section><div class="saas-section-title"><div><h2>已连接账号</h2>
+<p>这里只显示属于你的账号。管理员可在系统后台查看 Tenant 全部账号。</p></div></div>
+<div class="saas-connected-grid">{connected_channels}</div></section>
+<section id="add-channels"><div class="saas-section-title"><div><h2>添加渠道</h2>
+<p>OAuth 渠道可直接授权；Telegram 与 Email 会打开安全凭证表单。</p></div></div>
+<div class="saas-provider-grid">{provider_cards}</div></section>
+<section><div class="saas-section-title"><div><h2>授权进度</h2>
+<p>页面会刷新仍在处理中的任务，不会展示 Token、密码或其他用户信息。</p></div></div>
+<div class="saas-channel-jobs">{job_cards}</div></section>{dialogs}
+<script src="/static/channels.js" defer></script>"""
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title="Channels",
+        description="连接并管理属于你的消息渠道。所有新账号默认仅生成草稿。",
+        body=body,
+        active_navigation="channels",
+        inbox_count=inbox_summary.total,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    if not request.cookies.get("reply_admin_csrf"):
+        response.set_cookie(
+            "reply_admin_csrf",
+            csrf,
+            httponly=False,
+            samesite="lax",
+            secure=_secure_cookie(request),
+        )
+    return response
+
+
+@router.get("/app/t/{tenant_id}/profile", response_class=HTMLResponse)
+async def tenant_profile(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+    body = f"""<div class="saas-grid two">
+<section class="saas-card"><div class="saas-card-header"><div><h2>账号信息</h2></div></div><div class="saas-card-body">
+{definition_list((('用户名', principal.username), ('角色', principal.role), ('Tenant', tenant_id), ('User ID', principal.user_id or 'System')))}
+<p><a class="saas-button primary" href="/auth/change-password">修改密码</a></p></div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>权限说明</h2></div></div><div class="saas-card-body">
+<p>普通用户只能查看和处理自己授权账号产生的对话、收件箱和活动。平台账号请在独立 Channels 页面管理。</p>
+{secondary_action(f'{_tenant_root(tenant_id)}/channels', '打开 Channels')}</div></section></div>"""
+    return _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title="个人中心",
+        description="管理个人资料、登录密码和权限说明。",
+        body=body,
+        active_navigation="profile",
+        inbox_count=inbox_summary.total,
+    )
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{platform}")
+async def connect_personal_account(
+    request: Request,
+    tenant_id: str,
+    platform: str,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    if principal.is_admin:
+        raise HTTPException(status_code=403, detail="use_admin_account_management")
+    if platform not in {"telegram", "email"}:
+        raise HTTPException(status_code=422, detail="unsupported_personal_account_platform")
+    form = await _form(request)
+    _require_csrf(request, form)
+    form["tenant_id"] = tenant_id
+    return await _submit_form(
+        request,
+        platform,
+        form=form,
+        require_admin=False,
+        redirect_path=f"{_tenant_root(tenant_id)}/channels?status=processing",
+    )
+
+
+@router.post("/app/t/{tenant_id}/profile/accounts/{platform}")
+async def connect_personal_account_compatibility(
+    request: Request,
+    tenant_id: str,
+    platform: str,
+) -> Response:
+    return await connect_personal_account(request, tenant_id, platform)
+
+
+@router.get("/app/t/{tenant_id}/channels/jobs/{job_id}")
+async def channel_job_status(
+    request: Request,
+    response: Response,
+    tenant_id: str,
+    job_id: uuid.UUID,
+) -> dict:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        raise HTTPException(status_code=401, detail="authentication_required")
+    if principal.is_admin:
+        raise HTTPException(status_code=403, detail="use_admin_account_management")
+    async with get_session_factory()() as session:
+        job = (
+            await session.execute(
+                select(models.ProvisioningJob).where(
+                    models.ProvisioningJob.id == job_id,
+                    models.ProvisioningJob.tenant_id == tenant_id,
+                    models.ProvisioningJob.owner_user_id == principal.user_id,
+                )
+            )
+        ).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="provisioning_job_not_found")
+    payload = public_job(job)
+    payload["last_error_message"] = (
+        _channel_job_error_message(job)
+        if job.last_error_code
+        else None
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return payload
 
 
 @router.get("/app/t/{tenant_id}/knowledge", response_class=HTMLResponse)
@@ -1238,13 +2375,13 @@ async def tenant_knowledge(
     status_filter: str = "all",
     brand_id: str = "",
 ) -> Response:
-    principal = await _require_tenant_principal(request, tenant_id)
+    principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     if status_filter not in {"all", "draft", "published", "review"}:
         raise HTTPException(status_code=422, detail="invalid_knowledge_status")
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         statement = select(models.KnowledgeDocument).where(
             models.KnowledgeDocument.tenant_id == tenant_id
         )
@@ -1372,11 +2509,11 @@ async def knowledge_document_detail(
     tenant_id: str,
     document_id: uuid.UUID,
 ) -> Response:
-    principal = await _require_tenant_principal(request, tenant_id)
+    principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         document = await session.scalar(
             select(models.KnowledgeDocument).where(
                 models.KnowledgeDocument.id == document_id,
@@ -1466,11 +2603,11 @@ async def tenant_audit(
     tenant_id: str,
     category: str = "",
 ) -> Response:
-    principal = await _require_tenant_principal(request, tenant_id)
+    principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         statement = select(models.AuditLog).where(models.AuditLog.tenant_id == tenant_id)
         if category:
             statement = statement.where(models.AuditLog.category == category)
@@ -1534,11 +2671,11 @@ async def tenant_audit_detail(
     tenant_id: str,
     audit_id: uuid.UUID,
 ) -> Response:
-    principal = await _require_tenant_principal(request, tenant_id)
+    principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         audit = await session.scalar(
             select(models.AuditLog).where(
                 models.AuditLog.id == audit_id,
@@ -1622,11 +2759,11 @@ async def _load_journey_rows(session, tenant_id: str, limit: int = 200) -> list[
 
 @router.get("/app/t/{tenant_id}/journeys", response_class=HTMLResponse)
 async def tenant_journeys(request: Request, tenant_id: str) -> Response:
-    principal = await _require_tenant_principal(request, tenant_id)
+    principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         journey_rows = await _load_journey_rows(session, tenant_id)
     rows = "".join(
         f"<tr><td>{format_datetime(row.job.created_at, include_year=True)}</td>"
@@ -1663,12 +2800,12 @@ async def tenant_journey_detail(
     tenant_id: str,
     journey_id: uuid.UUID,
 ) -> Response:
-    principal = await _require_tenant_principal(request, tenant_id)
+    principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     decision_alias = aliased(models.ReplyDecision)
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         row = (
             await session.execute(
                 select(
@@ -1866,11 +3003,11 @@ def _journey_timeline_item(
 
 @router.get("/app/t/{tenant_id}/settings", response_class=HTMLResponse)
 async def tenant_settings(request: Request, tenant_id: str) -> Response:
-    principal = await _require_tenant_principal(request, tenant_id)
+    principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, tenant_id)
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         user = await session.scalar(
             select(models.AdminUser).where(models.AdminUser.tenant_id == tenant_id)
         )

@@ -50,6 +50,28 @@ persisted conversation mapping.
 5. Webhook route identifiers are globally unambiguous within their platform namespace.
 6. Sender instances are isolated by `(platform, platform_account_id, config_version)`.
 
+## Ordinary-user Channels boundary
+
+`/app/t/{tenant_id}/channels` is a separate self-service surface, not a reduced rendering of the
+administrator account page. `USER` principals can authorize X, Facebook, Instagram, Telegram and
+Email only for their path Tenant. WhatsApp and Feishu remain administrator-managed in the first
+release. Personal Center contains profile/password controls and a Channels link; it does not accept
+provider credentials.
+
+Every user-originated `ProvisioningJob` records `owner_user_id` from the live PostgreSQL-backed
+session. Successful provisioning propagates that owner into `PlatformAccount`. Ordinary-user
+account, conversation, inbox, mutation and job-status queries all derive scope from that persisted
+owner. A sibling user in the same Tenant receives not-found semantics for another user's account or
+job. Administrators see all Tenant accounts, while bootstrap/system administrators retain their
+configured cross-Tenant scope.
+
+The `(tenant_id, platform, external_account_id)` account upsert enforces owner compatibility in the
+PostgreSQL `ON CONFLICT DO UPDATE ... WHERE` condition. Reauthorizing the same user's account is
+allowed; administrator repair preserves an existing owner; a different user or a Tenant-managed
+owner conflict becomes non-retryable `ACCOUNT_OWNER_CONFLICT/NEEDS_ACTION` without disclosing the
+other owner. This conditional update closes the first-authorization race rather than relying on a
+separate preflight query.
+
 ## Durable provisioning flow
 
 ```text

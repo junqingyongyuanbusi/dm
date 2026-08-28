@@ -14,5 +14,8 @@ from social_reply.application.account_management.oauth import instagram, meta, x
 
 router = APIRouter()
 router.include_router(x.router)
+router.include_router(x.channels_router)
 router.include_router(meta.router)
+router.include_router(meta.channels_router)
 router.include_router(instagram.router)
+router.include_router(instagram.channels_router)

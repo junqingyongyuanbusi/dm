@@ -34,6 +34,28 @@ credential envelopes can be read. Worker process and thread counts are explicitl
 All three roles, PostgreSQL, and Redis must run in one infrastructure region because every durable
 reply crosses multiple broker, transaction, and advisory-lock boundaries.
 
+## Browser surfaces and Channels ownership
+
+Browser routes are separated by authority: `/app/t/{tenant_id}` is the ordinary-user workspace,
+`/admin` is administrator-only, and `/app/t/{tenant_id}/channels` is the self-service account
+integration center. The Channels page queries `PlatformAccount.owner_user_id` and
+`ProvisioningJob.owner_user_id` using the persisted authenticated Principal; owner identity is never
+accepted from form data. Administrators continue to use `/admin/integrations/accounts` for Tenant
+shared accounts and cross-user repair.
+
+X, Facebook and both Instagram login modes use one versioned encrypted Redis OAuth context that
+binds provider, Tenant, initiating user, initiating PostgreSQL session, surface, safe return path,
+issue time and nonce. Callback completion reloads that persisted session and rejects revocation,
+expiry, Tenant loss or initiator mismatch before a durable provisioning job is created. Facebook
+multi-Page candidates and access tokens remain in a second encrypted, one-use picker context.
+Redis is still transient coordination: the durable job, account owner and encrypted final provider
+credentials remain in PostgreSQL.
+
+Connected account profile metadata (`provider_username`, `avatar_url`, `profile_updated_at`) is
+advisory display data. Provider fetches and Meta health reconciliation may refresh it. Rendering
+accepts HTTPS images only from explicit X/Meta/Instagram provider host allowlists, sends no referrer,
+and falls back to an account initial when the URL is missing or unsafe.
+
 ## State ownership
 
 ### PostgreSQL is durable truth

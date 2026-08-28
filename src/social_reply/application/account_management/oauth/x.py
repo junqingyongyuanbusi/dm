@@ -33,7 +33,9 @@ from social_reply.application.account_management.jobs import (
 )
 from social_reply.application.account_management.oauth.common import (
     admin_callback_url,
+    build_oauth_context,
     notice,
+    oauth_error_response,
     principal_from_oauth_context,
     store_oauth_state,
     take_oauth_state,
@@ -47,6 +49,7 @@ from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
+channels_router = APIRouter(tags=["channels-oauth"])
 
 _X_OAUTH_BASE = "https://api.x.com"
 _X_RETURN_TO = "/admin/accounts"
@@ -77,7 +80,11 @@ def _oauth_token_hash(token: str) -> str:
 
 def _safe_return_to(value: object) -> str:
     candidate = str(value or "")
-    return candidate if candidate in {_X_RETURN_TO} else _X_RETURN_TO
+    if candidate in {_X_RETURN_TO}:
+        return candidate
+    if re.fullmatch(r"/app/t/[A-Za-z0-9_-]{1,64}/channels", candidate):
+        return candidate
+    return _X_RETURN_TO
 
 
 def _safe_result_code(value: object, fallback: str) -> str:
@@ -137,7 +144,7 @@ async def _result_redirect(
     target = (
         result_path
         if principal is not None and not principal.must_change_password
-        else f"/admin/login?{urlencode({'next': result_path})}"
+        else f"/auth/login?{urlencode({'next': result_path})}"
     )
     return _no_store(RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER))
 
@@ -279,26 +286,72 @@ async def _access_token(
 
 @router.post("/oauth/x/start")
 async def x_oauth_start(request: Request) -> Response:
-    principal = await _web_principal(request)
+    return await _start_x_oauth(request, surface="admin")
+
+
+@channels_router.post("/app/t/{tenant_id}/channels/oauth/x/start")
+async def channels_x_oauth_start(request: Request, tenant_id: str) -> Response:
+    return await _start_x_oauth(
+        request,
+        surface="channels",
+        route_tenant_id=tenant_id,
+    )
+
+
+async def _start_x_oauth(
+    request: Request,
+    *,
+    surface: str,
+    route_tenant_id: str | None = None,
+) -> Response:
+    principal = await _web_principal(
+        request,
+        require_admin=surface == "admin",
+    )
     if isinstance(principal, Response):
         return principal
     form = await _form(request)
     _require_csrf(request, form)
-    tenant_id = (form.get("tenant_id") or "").strip()
+    tenant_id = route_tenant_id or (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
     principal.require_tenant(tenant_id)
+    return_to = (
+        f"/app/t/{tenant_id}/channels"
+        if surface == "channels"
+        else _X_RETURN_TO
+    )
     settings = get_settings()
     if not settings.x_integration_enabled:
-        return notice("X 集成已关闭", "当前环境未启用任何 X 消息栈。", status_code=503)
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="x",
+            code="x_integration_disabled",
+            title="X 集成已关闭",
+            message="当前环境未启用任何 X 消息栈。",
+            status_code=503,
+        )
     if (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
-        return notice("XChat 已关闭", "当前环境不接受 XChat PIN。", status_code=422)
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="x",
+            code="xchat_disabled",
+            title="XChat 已关闭",
+            message="当前环境不接受 XChat PIN。",
+            status_code=422,
+        )
 
     credentials = x_app_credentials()
     if credentials is None:
-        return notice(
-            "无法发起授权",
-            "请先为 API、Worker 和 Scheduler 配置 X_API_KEY 与 X_API_SECRET。",
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="x",
+            code="x_oauth_app_not_configured",
+            title="无法发起授权",
+            message="请先为 API、Worker 和 Scheduler 配置 X_API_KEY 与 X_API_SECRET。",
             status_code=422,
         )
     consumer_key, consumer_secret = credentials
@@ -312,9 +365,13 @@ async def x_oauth_start(request: Request) -> Response:
     except (httpx.HTTPError, ValueError) as exc:
         detail = _x_error_detail(exc)
         logger.warning("x oauth request token failed: %s body=%s", exc, detail)
-        return notice(
-            "发起授权失败",
-            f"X OAuth request token 失败（{exc.__class__.__name__}"
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="x",
+            code="x_request_token_failed",
+            title="发起授权失败",
+            message=f"X OAuth request token 失败（{exc.__class__.__name__}"
             f"{f': {detail}' if detail else ''}）。请检查 X App 的 Read and Write 权限、"
             f"Web App 类型及回调地址 {callback_url}。",
             status_code=502,
@@ -323,24 +380,37 @@ async def x_oauth_start(request: Request) -> Response:
         await store_oauth_state(
             "x",
             token["oauth_token"],
-            {
-                "request_token_secret": token["oauth_token_secret"],
-                "oauth_token_hash": _oauth_token_hash(token["oauth_token"]),
-                "admin_id": str(principal.user_id or principal.session_id),
-                "admin_session_id": str(principal.session_id),
-                "session_id": str(principal.session_id),
-                "organization_id": tenant_id,
-                "tenant_id": tenant_id,
-                "brand_id": (form.get("brand_id") or "default").strip() or "default",
-                "return_to": _X_RETURN_TO,
-                "created_at": datetime.now(UTC).isoformat(),
-                "status": "pending",
-                "xchat_pin": form.get("xchat_pin", ""),
-            },
+            build_oauth_context(
+                principal=principal,
+                provider="x",
+                tenant_id=tenant_id,
+                surface=surface,
+                return_to=return_to,
+                extra={
+                    "request_token_secret": token["oauth_token_secret"],
+                    "oauth_token_hash": _oauth_token_hash(token["oauth_token"]),
+                    "organization_id": tenant_id,
+                    "brand_id": (
+                        (form.get("brand_id") or "default").strip()
+                        or "default"
+                    ),
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "status": "pending",
+                    "xchat_pin": form.get("xchat_pin", ""),
+                },
+            ),
         )
     except (OSError, RedisError) as exc:
         logger.warning("x oauth state storage failed: %s", exc)
-        return notice("发起授权失败", "OAuth 临时状态存储不可用，请稍后重试。", status_code=503)
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="x",
+            code="oauth_state_unavailable",
+            title="发起授权失败",
+            message="OAuth 临时状态存储不可用，请稍后重试。",
+            status_code=503,
+        )
 
     return RedirectResponse(
         f"{_X_OAUTH_BASE}/oauth/authorize?{urlencode({'oauth_token': token['oauth_token']})}",

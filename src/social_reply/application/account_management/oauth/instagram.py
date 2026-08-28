@@ -20,7 +20,11 @@ from social_reply.application.account_management.meta_credentials import (
 )
 from social_reply.application.account_management.oauth.common import (
     admin_callback_url,
+    build_oauth_context,
     notice,
+    oauth_error_response,
+    oauth_result_response,
+    peek_oauth_state,
     principal_from_oauth_context,
     store_oauth_state,
     take_oauth_state,
@@ -32,6 +36,7 @@ from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
+channels_router = APIRouter(tags=["channels-oauth"])
 
 _API_VERSION = "v23.0"
 _BASE_SCOPES = "instagram_business_basic,instagram_business_manage_messages"
@@ -51,24 +56,58 @@ def _instagram_client(**kwargs) -> httpx.AsyncClient:
 
 @router.post("/oauth/instagram/start")
 async def instagram_oauth_start(request: Request) -> Response:
-    principal = await _web_principal(request)
+    return await _start_instagram_oauth(request, surface="admin")
+
+
+@channels_router.post("/app/t/{tenant_id}/channels/oauth/instagram/start")
+async def channels_instagram_oauth_start(
+    request: Request,
+    tenant_id: str,
+) -> Response:
+    return await _start_instagram_oauth(
+        request,
+        surface="channels",
+        route_tenant_id=tenant_id,
+    )
+
+
+async def _start_instagram_oauth(
+    request: Request,
+    *,
+    surface: str,
+    route_tenant_id: str | None = None,
+) -> Response:
+    principal = await _web_principal(
+        request,
+        require_admin=surface == "admin",
+    )
     if isinstance(principal, Response):
         return principal
     form = await _form(request)
     _require_csrf(request, form)
-    if not get_settings().instagram_messaging_enabled:
-        return notice(
-            "Instagram 集成已关闭", "当前环境未启用 Instagram Messaging。", status_code=503
-        )
-    tenant_id = (form.get("tenant_id") or "").strip()
+    tenant_id = route_tenant_id or (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
     principal.require_tenant(tenant_id)
+    if not get_settings().instagram_messaging_enabled:
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="instagram",
+            code="platform_integration_disabled",
+            title="Instagram 集成已关闭",
+            message="当前环境未启用 Instagram Messaging。",
+            status_code=503,
+        )
     app = await instagram_app_credentials(tenant_id)
     if app is None:
-        return notice(
-            "无法发起授权",
-            "请配置 INSTAGRAM_APP_ID、INSTAGRAM_APP_SECRET，以及 "
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="instagram",
+            code="instagram_app_not_configured",
+            title="无法发起授权",
+            message="请配置 INSTAGRAM_APP_ID、INSTAGRAM_APP_SECRET，以及 "
             "INSTAGRAM_VERIFY_TOKEN 或 META_VERIFY_TOKEN。",
             status_code=422,
         )
@@ -78,15 +117,35 @@ async def instagram_oauth_start(request: Request) -> Response:
         await store_oauth_state(
             "instagram",
             state_token,
-            {
-                "tenant_id": tenant_id,
-                "brand_id": (form.get("brand_id") or "default").strip() or "default",
-                "session_id": str(principal.session_id),
-            },
+            build_oauth_context(
+                principal=principal,
+                provider="instagram",
+                tenant_id=tenant_id,
+                surface=surface,
+                return_to=(
+                    f"/app/t/{tenant_id}/channels"
+                    if surface == "channels"
+                    else "/admin/accounts"
+                ),
+                extra={
+                    "brand_id": (
+                        (form.get("brand_id") or "default").strip()
+                        or "default"
+                    ),
+                },
+            ),
         )
     except (OSError, RedisError) as exc:
         logger.warning("instagram oauth state storage failed: %s", exc)
-        return notice("发起授权失败", "OAuth 临时状态存储不可用。", status_code=503)
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider="instagram",
+            code="oauth_state_unavailable",
+            title="发起授权失败",
+            message="OAuth 临时状态存储不可用。",
+            status_code=503,
+        )
 
     url = "https://www.instagram.com/oauth/authorize?" + urlencode(
         {
@@ -106,13 +165,36 @@ async def instagram_oauth_start(request: Request) -> Response:
 async def instagram_oauth_callback(request: Request) -> Response:
     state_token = request.query_params.get("state", "")
     if request.query_params.get("error"):
-        if state_token:
+        cancelled_context = (
             await take_oauth_state("instagram", state_token)
+            if state_token
+            else None
+        )
+        if cancelled_context is not None and cancelled_context.get("surface") == "channels":
+            return oauth_result_response(
+                cancelled_context,
+                provider="instagram",
+                status_value="error",
+                code="access_denied",
+            )
         return notice(
             "授权已取消",
             request.query_params.get("error_description") or "用户取消了授权。",
         )
+    pending_context = (
+        await peek_oauth_state("instagram", state_token)
+        if state_token
+        else None
+    )
     if not get_settings().instagram_messaging_enabled:
+        if pending_context is not None and pending_context.get("surface") == "channels":
+            await take_oauth_state("instagram", state_token)
+            return oauth_result_response(
+                pending_context,
+                provider="instagram",
+                status_value="error",
+                code="platform_integration_disabled",
+            )
         return notice("Instagram 集成已关闭", "授权期间 Instagram 已被关闭。", status_code=503)
     context = await take_oauth_state("instagram", state_token) if state_token else None
     if context is None:
@@ -123,6 +205,13 @@ async def instagram_oauth_callback(request: Request) -> Response:
         )
     principal = await principal_from_oauth_context(context)
     if principal is None:
+        if context.get("surface") == "channels":
+            return oauth_result_response(
+                context,
+                provider="instagram",
+                status_value="error",
+                code="initiator_session_invalid",
+            )
         return notice(
             "授权会话已失效",
             "管理员会话已退出、过期或失去 Tenant 权限，请重新登录并发起授权。",
@@ -130,9 +219,23 @@ async def instagram_oauth_callback(request: Request) -> Response:
         )
     code = request.query_params.get("code", "").removesuffix("#_")
     if not code:
+        if context.get("surface") == "channels":
+            return oauth_result_response(
+                context,
+                provider="instagram",
+                status_value="error",
+                code="oauth_callback_parameters_missing",
+            )
         return notice("授权参数不完整", "请重新发起授权。", status_code=400)
     app = await instagram_app_credentials(context["tenant_id"])
     if app is None:
+        if context.get("surface") == "channels":
+            return oauth_result_response(
+                context,
+                provider="instagram",
+                status_value="error",
+                code="instagram_app_not_configured",
+            )
         return notice("无法完成授权", "Instagram App 凭证当前不可用。", status_code=422)
 
     redirect_uri = admin_callback_url("/admin/oauth/instagram/callback")
@@ -178,6 +281,13 @@ async def instagram_oauth_callback(request: Request) -> Response:
             exc.__class__.__name__,
             status_code,
         )
+        if context.get("surface") == "channels":
+            return oauth_result_response(
+                context,
+                provider="instagram",
+                status_value="error",
+                code="token_exchange_failed",
+            )
         return notice(
             "换取凭证失败",
             f"Instagram OAuth 交换失败（{exc.__class__.__name__}）。请检查回调地址、"
@@ -187,6 +297,13 @@ async def instagram_oauth_callback(request: Request) -> Response:
 
     principal = await principal_from_oauth_context(context)
     if principal is None:
+        if context.get("surface") == "channels":
+            return oauth_result_response(
+                context,
+                provider="instagram",
+                status_value="error",
+                code="initiator_session_invalid",
+            )
         return notice(
             "授权会话已失效",
             "管理员会话在授权期间已退出、过期或失去 Tenant 权限，请重新发起。",
@@ -194,9 +311,23 @@ async def instagram_oauth_callback(request: Request) -> Response:
         )
 
     if not get_settings().instagram_messaging_enabled:
+        if context.get("surface") == "channels":
+            return oauth_result_response(
+                context,
+                provider="instagram",
+                status_value="error",
+                code="platform_integration_disabled",
+            )
         return notice("Instagram 集成已关闭", "提交接入前 Instagram 已被关闭。", status_code=503)
     external_account_id = str(profile.get("user_id") or profile.get("id") or "")
     if not external_account_id:
+        if context.get("surface") == "channels":
+            return oauth_result_response(
+                context,
+                provider="instagram",
+                status_value="error",
+                code="account_profile_missing",
+            )
         return notice("账号识别失败", "Instagram 未返回专业账号 ID。", status_code=502)
     username = str(profile.get("username") or "")
     settings = get_settings()
@@ -233,4 +364,11 @@ async def instagram_oauth_callback(request: Request) -> Response:
         str(job_id),
         inline=lambda: process_provisioning_job(str(job_id)),
     )
-    return RedirectResponse(f"/admin/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
+    if context.get("surface") == "channels":
+        target = (
+            f"{context['return_to']}?"
+            f"{urlencode({'status': 'processing', 'job_id': job_id})}"
+        )
+    else:
+        target = f"/admin/jobs/{job_id}"
+    return RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)

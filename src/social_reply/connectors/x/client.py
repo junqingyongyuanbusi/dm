@@ -97,10 +97,15 @@ class XClient:
 
     async def get_me(self) -> dict:
         """GET 无 body，OAuth1 签名头预生成即可。"""
-        url = f"{self._base_url}/2/users/me?user.fields=id,name,username"
+        url = (
+            f"{self._base_url}/2/users/me?"
+            "user.fields=id,name,username,profile_image_url"
+        )
         _, headers, _ = self._auth.prepare("GET", url, {}, None)
         response = await self._client.get(
-            "/2/users/me", params={"user.fields": "id,name,username"}, headers=headers
+            "/2/users/me",
+            params={"user.fields": "id,name,username,profile_image_url"},
+            headers=headers,
         )
         response.raise_for_status()
         return response.json()["data"]
