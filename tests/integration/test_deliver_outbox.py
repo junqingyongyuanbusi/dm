@@ -24,6 +24,7 @@ from social_reply.application.reply_decision import runner
 from social_reply.application.reply_decision.multilingual_generation import (
     KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
     KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION,
+    KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION,
 )
 from social_reply.application.reply_decision.rag_selection import (
     MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
@@ -249,6 +250,36 @@ async def _mark_match_only_reply(session, outbox_id: uuid.UUID) -> None:
             knowledge_gate_version="strong-gate-v1",
             knowledge_similarity=0.9,
             knowledge_similarity_margin=0.1,
+            knowledge_min_similarity_threshold=0.8,
+            knowledge_min_margin_threshold=0.08,
+            request_language="en",
+            reply_language="en",
+            resolved_locale="en",
+        )
+    )
+    await session.commit()
+
+
+async def _mark_similarity_floor_match_only_reply(
+    session,
+    outbox_id: uuid.UUID,
+    *,
+    top1_similarity: float = 0.9,
+) -> None:
+    await session.execute(
+        update(models.ReplyDecision)
+        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .values(
+            multilingual_contract_version="knowledge-match-only-reply-v1",
+            grounding_verified=None,
+            knowledge_match_status=(
+                "ambiguous" if top1_similarity >= 0.8 else "weak"
+            ),
+            knowledge_gate_version=KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION,
+            knowledge_similarity=top1_similarity,
+            knowledge_top2_content_hash="b" * 64,
+            knowledge_top2_similarity=0.1,
+            knowledge_similarity_margin=top1_similarity - 0.1,
             knowledge_min_similarity_threshold=0.8,
             knowledge_min_margin_threshold=0.08,
             request_language="en",
@@ -1252,6 +1283,48 @@ async def test_match_only_send_bypasses_source_currentness(session, monkeypatch)
     monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
 
     assert await _preflight_reason(session, outbox_id) is None
+
+
+async def test_match_only_similarity_floor_send_ignores_margin_and_top2_score(
+    session,
+    monkeypatch,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(session, outbox_id, approved_reply="Approved answer.")
+    await _mark_similarity_floor_match_only_reply(session, outbox_id)
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": True,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert await _preflight_reason(session, outbox_id) is None
+
+
+async def test_match_only_similarity_floor_send_rejects_top1_below_floor(
+    session,
+    monkeypatch,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    await _attach_knowledge(session, outbox_id, approved_reply="Approved answer.")
+    await _mark_similarity_floor_match_only_reply(
+        session,
+        outbox_id,
+        top1_similarity=0.79,
+    )
+    settings = get_settings().model_copy(
+        update={
+            "knowledge_retrieval_enabled": True,
+            "multilingual_knowledge_reply_enabled": True,
+            "knowledge_match_only_reply_enabled": True,
+        }
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+
+    assert await _preflight_reason(session, outbox_id) == "MULTILINGUAL_PROVENANCE_INVALID"
 
 
 @pytest.mark.parametrize("outcome", ["answer", "clarify"])

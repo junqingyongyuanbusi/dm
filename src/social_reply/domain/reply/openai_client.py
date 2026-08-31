@@ -101,10 +101,12 @@ _BUSINESS_PROMPT_HEADER = (
 )
 _MATCH_ONLY_REPLY_CONTRACT = (
     "Temporary knowledge-match-only reply contract:\n"
-    "- The application has already decided to reply from a strong knowledge match. Do not choose "
-    "an action, risk level, confidence, refusal route, or handoff route.\n"
-    "- Write one concise customer-facing reply using the approved knowledge payload as the answer "
-    "basis. Conversation history and customer text provide context only.\n"
+    "- The application's top knowledge candidate already passed the configured similarity floor. "
+    "Do not choose an action, risk level, confidence, refusal route, or handoff route.\n"
+    "- Write one concise customer-facing reply using the supplied approved knowledge blocks as "
+    "the answer basis. When multiple blocks are present, combine their explicit information as "
+    "needed for the current question. Conversation history and customer text provide context "
+    "only.\n"
     "- Follow the required reply language instruction. If it says mirror-user, use the natural "
     "language and writing system of the current customer message.\n"
     "- Return only the required reply_text field."

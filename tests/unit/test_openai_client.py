@@ -65,6 +65,8 @@ async def test_match_only_generation_returns_text_without_action_fields() -> Non
     assert schema["name"] == "knowledge_match_only_reply"
     assert set(schema["schema"]["properties"]) == {"reply_text"}
     assert "Do not choose an action" in payload["messages"][0]["content"]
+    assert "passed the configured similarity floor" in payload["messages"][0]["content"]
+    assert "When multiple blocks are present" in payload["messages"][0]["content"]
     assert "Required reply language: ja" in payload["messages"][0]["content"]
 
 

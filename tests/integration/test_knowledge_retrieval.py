@@ -15,16 +15,13 @@ from social_reply.application.knowledge.retrieval import (
 )
 from social_reply.application.reply_decision import runner
 from social_reply.application.reply_decision.multilingual_generation import (
-    KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
-    KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION,
+    KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION,
 )
 from social_reply.application.reply_decision.pipeline import DecisionSnapshot
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
 from social_reply.domain.reply.decision import ReplyAction, ReplyDecision
 from social_reply.domain.reply.llm import (
-    KnowledgeAmbiguityOutcome,
-    KnowledgeAmbiguityResolution,
     RAGSelectionResult,
     RAGVerificationResult,
 )
@@ -665,7 +662,7 @@ async def test_match_only_strong_match_bypasses_risk_and_content_rules(
 
         async def generate_knowledge_reply_text(self, context):
             assert context.target_language in {"en", "mirror-user"}
-            assert len(context.knowledge) == 1
+            assert len(context.knowledge) == 2
             return "Email support@example.com. Refunds take 99 days."
 
         async def resolve_knowledge_ambiguity(self, context, *, candidates):
@@ -702,67 +699,47 @@ async def test_match_only_strong_match_bypasses_risk_and_content_rules(
     assert decision.confidence == pytest.approx(0.95)
     assert decision.source == "knowledge"
     assert decision.multilingual_contract_version == "knowledge-match-only-reply-v1"
+    assert decision.knowledge_gate_version == (
+        KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION
+    )
     assert decision.grounding_verified is None
     assert "RISK_WORD" not in decision.reason_codes
     assert "MULTILINGUAL_RISK" not in decision.reason_codes
 
 
 @pytest.mark.parametrize(
-    ("resolution", "expected_intent", "expected_reason"),
+    "result",
     [
-        (
-            KnowledgeAmbiguityResolution(
-                outcome=KnowledgeAmbiguityOutcome.ANSWER,
-                reply_text=(
-                    "Refunds take 3–5 business days; verification takes 7 days."
-                ),
-                used_candidate_ids=("candidate-1", "candidate-2"),
-            ),
-            "knowledge_multi_candidate_reply",
-            "KNOWLEDGE_MULTI_CANDIDATE_REPLY",
-        ),
-        (
-            KnowledgeAmbiguityResolution(
-                outcome=KnowledgeAmbiguityOutcome.CLARIFY,
-                reply_text=(
-                    "Are you asking about the refund timeline or verification timeline?"
-                ),
-                used_candidate_ids=("candidate-1", "candidate-2"),
-            ),
-            "knowledge_ambiguity_clarification",
-            "KNOWLEDGE_AMBIGUITY_CLARIFICATION",
+        _multilingual_result(similarity=0.90, second_similarity=0.83),
+        _multilingual_result(similarity=0.81, second_similarity=0.79),
+        _multilingual_result(
+            similarity=1.0,
+            second_similarity=1.0,
+            exact=False,
+            ambiguous=True,
         ),
     ],
-    ids=["answer", "clarify"],
+    ids=["low-margin", "top2-below-floor", "exact-conflict"],
 )
-async def test_match_only_low_margin_resolution_persists_multi_candidate_evidence(
+async def test_match_only_top1_floor_generates_from_top_two_candidates(
     session,
     knowledge_enabled,
-    resolution,
-    expected_intent,
-    expected_reason,
+    result,
 ):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("RAG_SELECTOR_MODE", "off")
     get_settings.cache_clear()
 
-    class AmbiguityLLM:
-        knowledge_ambiguity_resolver_id = "resolver-test-v1"
-
+    class FloorOnlyLLM:
         async def generate_knowledge_reply_text(self, context):
-            raise AssertionError("low-margin matches must not use single-candidate generation")
+            assert len(context.knowledge) == 2
+            return "Combined answer from the retrieved knowledge."
 
         async def resolve_knowledge_ambiguity(self, context, *, candidates):
-            assert [candidate.candidate_id for candidate in candidates] == [
-                "candidate-1",
-                "candidate-2",
-            ]
-            assert [candidate.similarity for candidate in candidates] == [0.90, 0.83]
-            return resolution
+            raise AssertionError("similarity-floor mode must not use ambiguity resolution")
 
-    runner._llm = AmbiguityLLM()
-    result = _multilingual_result(similarity=0.90, second_similarity=0.83)
+    runner._llm = FloorOnlyLLM()
 
     async def fake_fetch(snapshot, **kwargs):
         return result
@@ -781,33 +758,19 @@ async def test_match_only_low_margin_resolution_persists_multi_candidate_evidenc
     assert outbox_id is not None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "auto_reply"
-    assert decision.intent == expected_intent
-    assert expected_reason in decision.reason_codes
-    assert decision.knowledge_match_status == "ambiguous"
-    assert decision.knowledge_similarity == pytest.approx(0.90)
-    assert decision.knowledge_top2_similarity == pytest.approx(0.83)
-    assert decision.knowledge_similarity_margin == pytest.approx(0.07)
+    assert decision.reply_text == "Combined answer from the retrieved knowledge."
+    assert decision.knowledge_similarity == pytest.approx(result.vector_hits[0].similarity)
+    assert decision.knowledge_top2_similarity == pytest.approx(
+        result.vector_hits[1].similarity
+    )
     assert decision.knowledge_min_similarity_threshold == pytest.approx(0.8)
     assert decision.knowledge_min_margin_threshold == pytest.approx(0.08)
-    assert decision.knowledge_gate_version == KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION
-    assert decision.multilingual_contract_version == (
-        KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION
+    assert decision.knowledge_gate_version == (
+        KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION
     )
-    assert decision.selector_version == "resolver-test-v1"
-    assert decision.rag_evidence["schema_version"] == "rag-evidence-v2"
-    assert decision.rag_evidence["selection_method"] == (
-        "match_only_ambiguity_resolution"
-    )
-    assert decision.rag_evidence["resolution"] == {
-        "outcome": resolution.outcome.value,
-        "used_candidate_ids": list(resolution.used_candidate_ids),
-        "version": "resolver-test-v1",
-        "latency_ms": pytest.approx(decision.rag_evidence["resolution"]["latency_ms"]),
-    }
-    assert [
-        candidate["candidate_id"]
-        for candidate in decision.rag_evidence["candidates"]
-    ] == ["candidate-1", "candidate-2"]
+    assert decision.multilingual_contract_version == "knowledge-match-only-reply-v1"
+    assert decision.rag_evidence["schema_version"] == "rag-evidence-v1"
+    assert decision.rag_evidence["selection_method"] == "match_only_gate"
     evidence_text = repr(decision.rag_evidence)
     assert "Refunds take" not in evidence_text
     assert "Verification takes" not in evidence_text
@@ -815,25 +778,16 @@ async def test_match_only_low_margin_resolution_persists_multi_candidate_evidenc
 
 
 @pytest.mark.parametrize(
-    ("result", "expected_reason"),
+    "result",
     [
-        (_multilingual_result(similarity=0.79), "NO_STRONG_KNOWLEDGE_MATCH"),
-        (
-            _multilingual_result(similarity=0.81, second_similarity=0.79),
-            "NO_STRONG_KNOWLEDGE_MATCH",
-        ),
-        (
-            _multilingual_result(exact=False, ambiguous=True),
-            "AMBIGUOUS_EXACT_KNOWLEDGE",
-        ),
+        _multilingual_result(similarity=0.79),
     ],
-    ids=["below-similarity", "top2-below-similarity", "exact-conflict"],
+    ids=["below-top1-similarity"],
 )
-async def test_match_only_weak_or_ambiguous_match_handoffs_without_generation(
+async def test_match_only_top1_below_floor_handoffs_without_generation(
     session,
     knowledge_enabled,
     result,
-    expected_reason,
 ):
     knowledge_enabled.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
     knowledge_enabled.setenv("KNOWLEDGE_MATCH_ONLY_REPLY_ENABLED", "true")
@@ -866,7 +820,7 @@ async def test_match_only_weak_or_ambiguous_match_handoffs_without_generation(
     assert outbox_id is None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "handoff"
-    assert expected_reason in decision.reason_codes
+    assert "NO_STRONG_KNOWLEDGE_MATCH" in decision.reason_codes
 
 
 async def test_live_selector_can_choose_non_top1_above_similarity_floor(session, knowledge_enabled):

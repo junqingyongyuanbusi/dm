@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 MULTILINGUAL_GENERATION_CONTRACT_VERSION = "multilingual-runtime-generation-v1"
 KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION = "knowledge-match-only-reply-v1"
+KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION = "similarity-floor-gate-v1"
 KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION = "knowledge-match-ambiguity-v1"
 KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION = "ambiguity-resolution-gate-v1"
 
@@ -192,6 +193,7 @@ async def generate_multilingual_reply(
     language_policy: str = "review",
     approved_knowledge_protected_values: tuple[str, ...] = (),
     knowledge_match_only_reply: bool = False,
+    additional_knowledge_hits: tuple[KnowledgeHit, ...] = (),
 ) -> ReplyDecision:
     """Generate a guarded same-language reply from the canonical English knowledge hit."""
     contract_version = (
@@ -200,11 +202,12 @@ async def generate_multilingual_reply(
         else MULTILINGUAL_GENERATION_CONTRACT_VERSION
     )
     try:
+        knowledge_hits = (selected, *additional_knowledge_hits)
         decision = await run_decision_pipeline(
             snapshot,
             llm=llm,
             killswitch=killswitch,
-            knowledge=(_knowledge_evidence(selected),),
+            knowledge=tuple(_knowledge_evidence(hit) for hit in knowledge_hits),
             require_knowledge=False,
             approved_knowledge_reply=selected.reply,
             approved_knowledge_protected_values=approved_knowledge_protected_values,

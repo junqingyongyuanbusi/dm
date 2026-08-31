@@ -30,6 +30,7 @@ from social_reply.application.reply_decision.multilingual_generation import (
     KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
     KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION,
     KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
+    KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION,
     MULTILINGUAL_GENERATION_CONTRACT_VERSION,
 )
 from social_reply.application.reply_decision.rag_selection import (
@@ -784,19 +785,34 @@ async def _public_bot_send_preflight(
         if not settings.multilingual_knowledge_reply_enabled:
             return "MULTILINGUAL_LIVE_DISABLED"
     if match_only_single_contract:
-        if (
-            decision.knowledge_match_status != "strong"
-            or decision.knowledge_similarity is None
-            or decision.knowledge_min_similarity_threshold is None
-            or decision.knowledge_similarity < decision.knowledge_min_similarity_threshold
-            or decision.knowledge_gate_version != "strong-gate-v1"
-            or decision.knowledge_min_margin_threshold is None
-            or (
-                decision.knowledge_similarity_margin is not None
-                and decision.knowledge_similarity_margin
-                < decision.knowledge_min_margin_threshold
+        single_candidate_provenance_is_valid = (
+            decision.knowledge_similarity is not None
+            and decision.knowledge_min_similarity_threshold is not None
+            and decision.knowledge_similarity
+            >= decision.knowledge_min_similarity_threshold
+        )
+        if decision.knowledge_gate_version == "strong-gate-v1":
+            single_candidate_provenance_is_valid = (
+                single_candidate_provenance_is_valid
+                and decision.knowledge_match_status == "strong"
+                and decision.knowledge_min_margin_threshold is not None
+                and (
+                    decision.knowledge_similarity_margin is None
+                    or decision.knowledge_similarity_margin
+                    >= decision.knowledge_min_margin_threshold
+                )
             )
+        elif (
+            decision.knowledge_gate_version
+            == KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION
         ):
+            single_candidate_provenance_is_valid = (
+                single_candidate_provenance_is_valid
+                and decision.knowledge_match_status in {"strong", "ambiguous"}
+            )
+        else:
+            single_candidate_provenance_is_valid = False
+        if not single_candidate_provenance_is_valid:
             return "MULTILINGUAL_PROVENANCE_INVALID"
     if match_only_ambiguity_contract and not _match_only_ambiguity_provenance_is_valid(
         decision

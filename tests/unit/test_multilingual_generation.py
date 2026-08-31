@@ -180,6 +180,7 @@ async def test_match_only_generation_uses_text_contract_without_content_guards()
 
         async def generate_knowledge_reply_text(self, context):
             assert context.target_language == "ja"
+            assert len(context.knowledge) == 2
             return "Email support@example.com. Refunds take 99 days."
 
         async def verify_grounding(self, **kwargs):
@@ -198,6 +199,7 @@ async def test_match_only_generation_uses_text_contract_without_content_guards()
         voice_preferences=DEFAULT_VOICE_PREFERENCES,
         email_auto_reply_allowed=True,
         knowledge_match_only_reply=True,
+        additional_knowledge_hits=(_second_hit(),),
     )
 
     assert decision.action is ReplyAction.AUTO_REPLY
