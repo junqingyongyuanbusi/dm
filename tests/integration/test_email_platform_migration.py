@@ -14,7 +14,7 @@ pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "b7e4c2d9a615"
 _EMAIL_REVISION = "e9a1c4f7b620"
-_HEAD_REVISION = "f3a7c9e1b5d2"
+_HEAD_REVISION = "a8f4d2c6e901"
 
 
 async def test_email_contract_upgrade_constraints_and_fail_closed_downgrade():

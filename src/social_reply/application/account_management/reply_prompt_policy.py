@@ -6,6 +6,9 @@ from datetime import datetime
 from sqlalchemy import distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.account_management.agent_control_plane import (
+    append_agent_version_for_business_prompt,
+)
 from social_reply.application.reply_decision.business_prompt import (
     ResolvedBusinessPrompt,
     acquire_business_prompt_xact_lock,
@@ -193,6 +196,16 @@ async def _activate_new_version(
         current.revision = next_revision
         current.content_hash = instructions.content_hash
         current.updated_by = actor
+
+    await append_agent_version_for_business_prompt(
+        session,
+        tenant_id=tenant_id,
+        brand_id=brand_id,
+        business_prompt_version_id=version_id,
+        business_prompt_revision=next_revision,
+        actor=actor,
+        change_note=change_note,
+    )
 
     detail: dict[str, object] = {
         "revision": next_revision,

@@ -10,6 +10,9 @@ from social_reply.infrastructure.database.engine import get_engine
 pytestmark = pytest.mark.integration
 
 EXPECTED_TABLES = {
+    "agents",
+    "agent_versions",
+    "agent_deployments",
     "admin_users",
     "admin_sessions",
     "platform_apps",

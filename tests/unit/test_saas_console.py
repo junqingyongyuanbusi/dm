@@ -298,7 +298,18 @@ class _ScalarResult:
         self._values = values
 
     def scalars(self):
+        return _ScalarValues(self._values)
+
+
+class _ScalarValues:
+    def __init__(self, values) -> None:
+        self._values = values
+
+    def __iter__(self):
         return iter(self._values)
+
+    def all(self):
+        return list(self._values)
 
 
 class _AgentBrandSession:
@@ -344,7 +355,9 @@ async def test_user_without_accounts_only_gets_default_onboarding_agent() -> Non
 async def test_admin_agent_ids_keep_full_tenant_brand_enumeration() -> None:
     from social_reply.application.account_management import saas_console
 
-    session = _AgentBrandSession([["account-brand"], ["prompt-brand"], ["knowledge-brand"]])
+    session = _AgentBrandSession(
+        [["account-brand"], ["prompt-brand"], ["knowledge-brand"], ["control-brand"]]
+    )
 
     agent_ids = await saas_console._load_agent_ids(
         session,
@@ -354,10 +367,66 @@ async def test_admin_agent_ids_keep_full_tenant_brand_enumeration() -> None:
 
     assert agent_ids == [
         "account-brand",
+        "control-brand",
         "default",
         "knowledge-brand",
         "prompt-brand",
     ]
+    assert len(session.statements) == 4
+
+
+async def test_agent_control_plane_view_distinguishes_latest_and_deployed_versions() -> None:
+    from types import SimpleNamespace
+
+    from social_reply.application.account_management import saas_console
+
+    agent_id = uuid.uuid4()
+    deployed_version_id = uuid.uuid4()
+    latest_version_id = uuid.uuid4()
+    session = _AgentBrandSession(
+        [
+            [
+                SimpleNamespace(
+                    id=agent_id,
+                    legacy_brand_id="support",
+                    name="Support Agent",
+                    status="active",
+                )
+            ],
+            [
+                SimpleNamespace(
+                    id=latest_version_id,
+                    agent_id=agent_id,
+                    revision=2,
+                ),
+                SimpleNamespace(
+                    id=deployed_version_id,
+                    agent_id=agent_id,
+                    revision=1,
+                ),
+            ],
+            [
+                SimpleNamespace(
+                    agent_id=agent_id,
+                    agent_version_id=deployed_version_id,
+                    revision=1,
+                )
+            ],
+        ]
+    )
+
+    views = await saas_console._load_agent_control_plane_views(
+        session,
+        "tenant-a",
+        ["support"],
+    )
+
+    assert views["support"] == saas_console.AgentControlPlaneView(
+        name="Support Agent",
+        status="active",
+        version_revision=2,
+        deployed_version_revision=1,
+    )
     assert len(session.statements) == 3
 
 

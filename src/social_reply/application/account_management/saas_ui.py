@@ -32,7 +32,7 @@ class NavigationGroup:
 
 
 PageSurface = Literal["tenant", "admin", "system", "auth"]
-_STATIC_ASSET_VERSION = "20260902-agent-workflow-1"
+_STATIC_ASSET_VERSION = "20260902-agent-control-plane-1"
 
 
 _STATUS_PRESENTATION: dict[str, tuple[str, str]] = {

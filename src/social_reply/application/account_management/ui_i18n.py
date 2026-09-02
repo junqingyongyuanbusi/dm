@@ -532,6 +532,13 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "agent.card.mode": ("自动化模式", "Automation mode"),
     "agent.card.channels": ("可用渠道", "Available channels"),
     "agent.card.knowledge": ("已发布知识", "Published knowledge"),
+    "agent.card.release": ("版本与发布", "Version & deployment"),
+    "agent.card.release_legacy": ("兼容范围 · 待建版本", "Compatibility scope · Version pending"),
+    "agent.card.release_not_deployed": ("配置 v{version} · 未发布", "Config v{version} · Not deployed"),
+    "agent.card.release_deployed": (
+        "配置 v{version} · 生产 v{deployed}",
+        "Config v{version} · Production v{deployed}",
+    ),
     "agent.card.readiness": ("配置就绪度", "Configuration readiness"),
     "agent.tab.overview": ("Overview", "Overview"),
     "agent.tab.instructions": ("Instructions", "Instructions"),

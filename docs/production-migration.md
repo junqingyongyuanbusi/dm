@@ -23,9 +23,31 @@ Code-only releases do not create this compatibility image. `latest` promotion an
 Railway rollout belong exclusively to `scripts/publish_railway_release.sh`; the local release path
 only inspects or retags registry manifests and never builds, pulls or runs image layers. Railway
 native image auto-update must remain disabled.
-The current Alembic graph has one head: `f3a7c9e1b5d2`. Database migration verifies schema state
+The current Alembic graph has one head: `a8f4d2c6e901`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
+
+## Agent control-plane foundation
+
+Revision `a8f4d2c6e901` follows `f3a7c9e1b5d2`. It adds tenant-scoped `agents`, immutable
+`agent_versions`, and append-only `agent_deployments`. The migration backfills one stable Agent and
+version for every scope already present in channel accounts, business prompts, knowledge, or tenant
+users. A production deployment record is backfilled only when the scope already has a channel
+account.
+
+This revision does not move reply selection, safety gates, decision provenance, Outbox creation, or
+delivery to the new tables. Runtime continues to resolve by the existing `tenant_id + brand_id`
+contract; `agents.legacy_brand_id` is the explicit compatibility mapping. Agent versions reference
+the existing immutable business-prompt version instead of duplicating prompt content. While prompt
+save/rollback still activates the legacy runtime pointer immediately, a channel-backed scope appends
+the matching compatibility Deployment in the same transaction. Predecessor applications therefore
+ignore the additive tables and remain compatible after the migration.
+
+The migration takes bounded SHARE locks while enumerating legacy scopes so the backfill is a
+consistent snapshot. Verify Agent counts by tenant, that only channel-backed scopes receive an
+initial deployment, and that the append-only triggers reject updates/deletes. Schema downgrade is
+safe only while the new control plane is not the runtime authority; it intentionally drops the
+derived Agent history and leaves every legacy runtime table unchanged.
 
 ## SUPERADMIN + USER role consolidation
 

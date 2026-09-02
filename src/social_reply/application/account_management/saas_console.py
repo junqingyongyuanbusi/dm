@@ -277,12 +277,22 @@ class AgentCardView:
     account_count: int
     knowledge_label: str
     published_count: int
+    release_label: str
+    release_text: str
     readiness_label: str
     readiness_percent: int
     next_step_label: str
     next_step: str
     open_href: str
     open_label: str
+
+
+@dataclass(frozen=True)
+class AgentControlPlaneView:
+    name: str
+    status: str
+    version_revision: int
+    deployed_version_revision: int | None
 
 
 @dataclass(frozen=True)
@@ -463,7 +473,105 @@ async def _load_agent_ids(
             )
         ).scalars()
     )
-    return sorted(account_brands | prompt_brands | knowledge_brands | {DEFAULT_TENANT_ID})
+    control_plane_brands = set(
+        (
+            await session.execute(
+                select(models.Agent.legacy_brand_id).where(
+                    models.Agent.tenant_id == tenant_id,
+                    models.Agent.status == "active",
+                )
+            )
+        ).scalars()
+    )
+    return sorted(
+        account_brands
+        | prompt_brands
+        | knowledge_brands
+        | control_plane_brands
+        | {DEFAULT_TENANT_ID}
+    )
+
+
+async def _load_agent_control_plane_views(
+    session,
+    tenant_id: str,
+    agent_ids: list[str],
+) -> dict[str, AgentControlPlaneView]:
+    if not agent_ids:
+        return {}
+    agents = (
+        (
+            await session.execute(
+                select(models.Agent).where(
+                    models.Agent.tenant_id == tenant_id,
+                    models.Agent.legacy_brand_id.in_(agent_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not agents:
+        return {}
+    agent_record_ids = [agent.id for agent in agents]
+    versions = (
+        (
+            await session.execute(
+                select(models.AgentVersion)
+                .where(
+                    models.AgentVersion.tenant_id == tenant_id,
+                    models.AgentVersion.agent_id.in_(agent_record_ids),
+                )
+                .order_by(models.AgentVersion.revision.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    deployments = (
+        (
+            await session.execute(
+                select(models.AgentDeployment)
+                .where(
+                    models.AgentDeployment.tenant_id == tenant_id,
+                    models.AgentDeployment.agent_id.in_(agent_record_ids),
+                    models.AgentDeployment.environment == "production",
+                )
+                .order_by(models.AgentDeployment.revision.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest_version_by_agent: dict[uuid.UUID, models.AgentVersion] = {}
+    version_by_id: dict[uuid.UUID, models.AgentVersion] = {}
+    for version in versions:
+        version_by_id[version.id] = version
+        latest_version_by_agent.setdefault(version.agent_id, version)
+    latest_deployment_by_agent: dict[uuid.UUID, models.AgentDeployment] = {}
+    for deployment in deployments:
+        latest_deployment_by_agent.setdefault(deployment.agent_id, deployment)
+
+    views: dict[str, AgentControlPlaneView] = {}
+    for agent in agents:
+        latest_version = latest_version_by_agent.get(agent.id)
+        if latest_version is None:
+            continue
+        latest_deployment = latest_deployment_by_agent.get(agent.id)
+        deployed_version = (
+            version_by_id.get(latest_deployment.agent_version_id)
+            if latest_deployment is not None
+            else None
+        )
+        views[agent.legacy_brand_id] = AgentControlPlaneView(
+            name=agent.name,
+            status=agent.status,
+            version_revision=latest_version.revision,
+            deployed_version_revision=(
+                deployed_version.revision if deployed_version is not None else None
+            ),
+        )
+    return views
 
 
 def _display_agent_name(agent_id: str) -> str:
@@ -875,6 +983,11 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         agent_ids = await _load_agent_ids(session, principal, tenant_id)
+        control_plane_views = await _load_agent_control_plane_views(
+            session,
+            tenant_id,
+            agent_ids,
+        )
         cards: list[AgentCardView] = []
         for agent_id in agent_ids:
             accounts = (
@@ -909,6 +1022,7 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
                     accounts=accounts,
                     published_count=int(published_count or 0),
                     prompt=prompt,
+                    control_plane=control_plane_views.get(agent_id),
                 )
             )
     lifecycle_agent_id = agent_ids[0] if agent_ids else DEFAULT_TENANT_ID
@@ -945,6 +1059,7 @@ def _build_agent_card_view(
     accounts: list[models.PlatformAccount],
     published_count: int,
     prompt: models.ReplyBusinessPrompt | None,
+    control_plane: AgentControlPlaneView | None = None,
 ) -> AgentCardView:
     active_accounts = [account for account in accounts if account.status == "active"]
     modes = {account.automation_default for account in accounts}
@@ -975,8 +1090,21 @@ def _build_agent_card_view(
         bool(accounts) and len(active_accounts) == len(accounts),
     )
     readiness_percent = round(sum(readiness_checks) / len(readiness_checks) * 100)
+    if control_plane is None:
+        release_text = translate("agent.card.release_legacy")
+    elif control_plane.deployed_version_revision is None:
+        release_text = translate(
+            "agent.card.release_not_deployed",
+            version=control_plane.version_revision,
+        )
+    else:
+        release_text = translate(
+            "agent.card.release_deployed",
+            version=control_plane.version_revision,
+            deployed=control_plane.deployed_version_revision,
+        )
     return AgentCardView(
-        name=_display_agent_name(agent_id),
+        name=control_plane.name if control_plane is not None else _display_agent_name(agent_id),
         agent_id=agent_id,
         scope_label=translate("agent.scope"),
         prompt_text=prompt_text,
@@ -988,6 +1116,8 @@ def _build_agent_card_view(
         account_count=len(accounts),
         knowledge_label=translate("agent.card.knowledge"),
         published_count=published_count,
+        release_label=translate("agent.card.release"),
+        release_text=release_text,
         readiness_label=translate("agent.card.readiness"),
         readiness_percent=readiness_percent,
         next_step_label=translate("agent.next_step"),
@@ -1004,6 +1134,7 @@ def _render_agent_card(
     accounts: list[models.PlatformAccount],
     published_count: int,
     prompt: models.ReplyBusinessPrompt | None,
+    control_plane: AgentControlPlaneView | None = None,
 ) -> str:
     """Render one card for compatibility with focused view tests and callers."""
     return render_template(
@@ -1014,6 +1145,7 @@ def _render_agent_card(
             accounts=accounts,
             published_count=published_count,
             prompt=prompt,
+            control_plane=control_plane,
         ),
     )
 

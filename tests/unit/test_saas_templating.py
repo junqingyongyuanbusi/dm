@@ -80,6 +80,28 @@ def test_agent_card_template_escapes_scope_data_and_shows_readiness() -> None:
     assert 'class="saas-agent-open"' in html
 
 
+def test_agent_card_shows_latest_and_production_versions_without_trusting_identity() -> None:
+    from social_reply.application.account_management import saas_console
+
+    html = saas_console._render_agent_card(
+        tenant_id="tenant-a",
+        agent_id="support",
+        accounts=[],
+        published_count=0,
+        prompt=None,
+        control_plane=saas_console.AgentControlPlaneView(
+            name='<script>alert("agent")</script>',
+            status="active",
+            version_revision=2,
+            deployed_version_revision=1,
+        ),
+    )
+
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert" in html
+    assert "配置 v2 · 生产 v1" in html
+
+
 def test_agent_lifecycle_template_uses_real_product_routes() -> None:
     from social_reply.application.account_management import saas_console
 
