@@ -16,14 +16,14 @@ async def _seed(
     """满足全部 FK 的最小种子（照抄 test_deliver_outbox 的写法）。"""
     account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     key = f"telegram:x:{uuid.uuid4().hex[:8]}"
-    # chatwoot_inbox_id 唯一约束：本套件每测多次 seed，用随机值避免撞
     await session.execute(
         insert(models.PlatformAccount).values(
             id=account_id,
             brand_id="b1",
             platform="telegram",
             name="a",
-            chatwoot_inbox_id=uuid.uuid4().int % 10**9,
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "max_text_length": 4096},
         )
     )
     await session.execute(
@@ -48,10 +48,14 @@ async def _seed(
             id=ob_id,
             conversation_id=conv_id,
             platform_account_id=account_id,
-            destination_type="chatwoot_conversation",
+            destination_type="telegram_dm",
             destination_id=key,
             message_type="text",
-            payload={"text": "hi", "visibility": "public"},
+            payload={
+                "text": "hi",
+                "visibility": "public",
+                "target": {"kind": "dm", "chat_id": "9"},
+            },
             idempotency_key=str(ob_id),
             status=status,
             next_attempt_at=next_attempt_at,

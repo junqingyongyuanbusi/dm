@@ -40,8 +40,6 @@ async def sweep_outbox() -> list[uuid.UUID]:
     now = datetime.now(UTC)
     settings = get_settings()
     recoverable_routes = []
-    if settings.chatwoot_enabled:
-        recoverable_routes.append(("chatwoot_conversation", "CHATWOOT_DISABLED", None, None))
     if settings.x_legacy_dm_enabled:
         recoverable_routes.append(_direct_recovery_route("x_dm", "X_LEGACY_DM_DISABLED"))
     if settings.xchat_enabled:

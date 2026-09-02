@@ -10,7 +10,6 @@ from social_reply.shared.config import Settings
 def _settings(**updates: object) -> Settings:
     values = {
         "testing": True,
-        "chatwoot_enabled": False,
         "platform_secret_keys": "Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
         **updates,
     }
@@ -19,11 +18,9 @@ def _settings(**updates: object) -> Settings:
 
 def test_build_specs_uses_feature_flags_and_each_settings_snapshot():
     first = _settings(
-        chatwoot_enabled=True,
         scheduler_core_interval_seconds=2.5,
         scheduler_core_warn_after_seconds=11,
         scheduler_inspection_warn_after_seconds=22,
-        chatwoot_reconcile_interval_seconds=7,
         x_dm_poll_interval_seconds=13,
         x_webhook_check_interval_seconds=17,
         xchat_poll_interval_seconds=19,
@@ -33,7 +30,6 @@ def test_build_specs_uses_feature_flags_and_each_settings_snapshot():
     second = first.model_copy(
         update={
             "scheduler_core_interval_seconds": 5,
-            "chatwoot_reconcile_interval_seconds": 31,
             "xchat_recovery_sweep_interval_seconds": 37,
         }
     )
@@ -67,8 +63,6 @@ def test_build_specs_uses_feature_flags_and_each_settings_snapshot():
     assert first_specs["sweep_xchat_recovery"].lane == "core"
     assert first_specs["sweep_xchat_recovery"].interval_seconds == 29
     assert first_specs["sweep_xchat_recovery"].warn_after_seconds == 11
-    assert first_specs["reconcile_chatwoot_messages"].interval_seconds == 7
-    assert second_specs["reconcile_chatwoot_messages"].interval_seconds == 31
     assert first_specs["poll_x_direct_messages"].interval_seconds == 13
     assert first_specs["ensure_x_webhooks_valid"].interval_seconds == 17
     assert first_specs["poll_xchat_messages"].interval_seconds == 19

@@ -14,7 +14,7 @@ def test_external_protocol_and_admin_routes_remain_stable() -> None:
     routes = _route_methods()
 
     assert routes["/healthz"] == {"GET"}
-    assert routes["/webhooks/chatwoot"] == {"POST"}
+    assert "/webhooks/chatwoot" not in routes
     assert routes["/webhooks/telegram/{public_id}"] == {"POST"}
     assert routes["/webhooks/meta/{app_public_id}"] == {"GET", "POST"}
     assert routes["/webhooks/x/{public_id}"] == {"GET", "POST"}

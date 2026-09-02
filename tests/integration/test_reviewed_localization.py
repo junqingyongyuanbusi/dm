@@ -3,7 +3,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import insert, select, text
 from sqlalchemy.exc import DBAPIError
 
 import social_reply.infrastructure.queue.broker  # noqa: F401
@@ -118,7 +118,6 @@ class _NoCallLLM:
 
 @pytest.fixture
 async def multilingual_runtime(monkeypatch):
-    monkeypatch.setenv("CHATWOOT_ENABLED", "false")
     monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
     monkeypatch.setenv("KNOWLEDGE_VERBATIM_REPLY", "false")
     monkeypatch.setenv("MULTILINGUAL_KNOWLEDGE_REPLY_ENABLED", "true")
@@ -161,7 +160,6 @@ async def _seed_conversation(session, *, text: str, tenant_id: str = "default"):
             name="localization-test",
             config={"delivery_mode": "direct"},
             capability={"dm": True, "max_text_length": 4096},
-            chatwoot_inbox_id=101,
         )
     )
     registry._senders[("telegram", account_id, 1, 0)] = _FakeTelegramSender()
@@ -194,8 +192,8 @@ async def _seed_conversation(session, *, text: str, tenant_id: str = "default"):
             direction="inbound",
             sender_type="contact",
             text=text,
-            chatwoot_message_id=55,
-            reply_target={"chat_id": "localization-user"},
+            platform_message_id="localization-inbound-1",
+            reply_target={"kind": "dm", "chat_id": "localization-user"},
             decision_generation=1,
         )
     )
@@ -645,50 +643,6 @@ async def test_query_translation_failure_keeps_original_handoff(
     assert decision.action == "handoff"
     assert "NO_STRONG_KNOWLEDGE_MATCH" in decision.reason_codes
     await _assert_handoff(session, conversation_id, "NO_STRONG_KNOWLEDGE_MATCH")
-
-
-async def test_bot_draft_private_note_survives_runtime_preflight(
-    session, multilingual_runtime, monkeypatch
-):
-    multilingual_runtime.setenv("CHATWOOT_ENABLED", "true")
-    get_settings.cache_clear()
-    await _seed_english_policy(session)
-    account_id, conversation_id, message_id = await _seed_conversation(
-        session, text=_JA_QUERY
-    )
-    await session.execute(
-        update(models.PlatformAccount)
-        .where(models.PlatformAccount.id == account_id)
-        .values(config={"delivery_mode": "chatwoot"})
-    )
-    await session.commit()
-    runner._llm = _RuntimeLLM({"ja": _JA_REPLY})
-    snapshot = _snapshot(account_id, _JA_QUERY)
-    snapshot = snapshot.__class__(
-        **{**snapshot.__dict__, "automation_state": "BOT_DRAFT_ONLY"}
-    )
-
-    outbox_id = await runner.run_and_persist_decision(
-        snapshot,
-        conversation_id,
-        message_id,
-        account_id,
-        decision_generation=1,
-    )
-
-    assert outbox_id is not None
-    decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
-    assert decision.action == "draft"
-    outbox = await session.get(models.OutboxMessage, outbox_id)
-    assert outbox.message_type == "private_note"
-    result = await outbox_module._localization_send_preflight(
-        session,
-        outbox_id=outbox_id,
-        platform_account_id=account_id,
-        payload_text=outbox.payload["text"],
-        message_type=outbox.message_type,
-    )
-    assert result is None
 
 
 # 尼泊尔语：detect_language 主动 fail-closed（_NEPALI_HINTS），确定性检测判不出。

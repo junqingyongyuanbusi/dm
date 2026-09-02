@@ -367,7 +367,6 @@ async def _record_manual_resolution(
             outcome=action,
             error_code=detail.get("previous_error_code"),
             error_message=str(detail["review_reason"]),
-            chatwoot_message_id=context.outbox.chatwoot_message_id,
         )
     )
 

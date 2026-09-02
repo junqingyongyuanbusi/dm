@@ -1,6 +1,6 @@
 # Social Reply（多租户社媒消息中台）
 
-这是一个直连 X、Telegram、Facebook、Instagram、WhatsApp、Feishu（飞书）和 Email 的模块化单体，使用 PostgreSQL 保存会话、消息、决策与 Transactional Outbox，并支持 AI 自动回复和本地人工接管。Chatwoot 是可选 Bridge，不是系统启动依赖。当前共 7 个直连账号平台；Email 已实现协议与控制面契约，但仓库测试不代表已使用真实邮箱凭证完成联网验证。
+这是一个直连 X、Telegram、Facebook、Instagram、WhatsApp、Feishu（飞书）和 Email 的模块化单体，使用 PostgreSQL 保存会话、消息、决策与 Transactional Outbox，并支持 AI 自动回复和本地人工接管。当前共 7 个直连账号平台；Email 已实现协议与控制面契约，但仓库测试不代表已使用真实邮箱凭证完成联网验证。
 
 ## 本地运行
 
@@ -18,24 +18,9 @@ uv run uvicorn apps.api.main:app --port 8000
 
 普通用户的渠道中心位于 `/app/t/{tenant_id}/channels`。X、Facebook 和 Instagram 使用系统共享 App 发起一键 OAuth；Facebook Login 会在存在多个 Page/关联 Instagram 专业账号时显示一次性选择页。Telegram 和 Email 使用不回显凭证的引导式表单。首期 WhatsApp 与 Feishu 仅由管理员配置。已连接卡片只查询当前用户拥有的账号，并显示经过 HTTPS provider 域名白名单校验的头像、账号名和健康状态；个人中心只保留资料、密码和 Channels 入口。
 
-## 可选 Chatwoot Bridge
+## C1 历史兼容边界
 
-需要保留 Chatwoot webhook、私有备注和 Messages API 投递时：
-
-1. 在 Chatwoot 建立 API/AgentBot inbox，获取 `api_access_token` 与 account id。
-2. 为 API、Worker 和 Scheduler 同时设置：
-
-   ```env
-   CHATWOOT_ENABLED=true
-   CHATWOOT_BASE_URL=https://chatwoot.example.com
-   CHATWOOT_API_TOKEN=<api_access_token>
-   CHATWOOT_WEBHOOK_SECRET=<强随机 webhook secret>
-   ```
-
-3. 确保 `platform_accounts.chatwoot_inbox_id` 与 `conversation_mappings` 已建立。
-4. 将 Chatwoot webhook 指向 `${PUBLIC_BASE_URL}/webhooks/chatwoot`。
-
-关闭开关后，Chatwoot 路由和补拉任务不会注册；历史 Chatwoot Outbox 会进入 `NEEDS_REVIEW/CHATWOOT_DISABLED`，不会使用占位凭证发送，并在重新启用后自动回到投递队列。
+当前运行时只支持上述直连平台，不读取或写入 Chatwoot，也不提供相关 webhook、投递、恢复或配置入口。数据库模型和已发布迁移中的 legacy Chatwoot 字段与表仅为应用回滚和历史审计暂留；后续 C2 将通过单独的迁移计划清理这些 schema，不得把它们视为可用集成。
 
 ## 平台账号管理控制面（推荐）
 

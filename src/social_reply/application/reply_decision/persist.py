@@ -30,12 +30,7 @@ from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
     acquire_conversation_delivery_xact_lock,
 )
-from social_reply.shared.config import get_settings
 from social_reply.shared.release import current_release_sha
-
-
-class ChatwootDecisionDeferred(RuntimeError):
-    pass
 
 
 class DecisionDeliveryConfigurationError(RuntimeError):
@@ -320,17 +315,10 @@ def _rag_evidence(value: dict | None) -> dict | None:
 def ensure_decision_delivery_available(
     *,
     account_config: dict,
-    chatwoot_inbox_id: int | None,
-    chatwoot_enabled: bool,
 ) -> bool:
-    direct_delivery = account_config.get("delivery_mode") == "direct"
-    if direct_delivery:
-        return True
-    if chatwoot_inbox_id is None:
-        raise DecisionDeliveryConfigurationError("chatwoot_inbox_id_missing")
-    if not chatwoot_enabled:
-        raise ChatwootDecisionDeferred("chatwoot_disabled")
-    return False
+    if account_config.get("delivery_mode") != "direct":
+        raise DecisionDeliveryConfigurationError("delivery_mode_unsupported")
+    return True
 
 
 def _idempotency_key(
@@ -375,14 +363,11 @@ async def persist_decision(
                 models.PlatformAccount.brand_id,
                 models.PlatformAccount.platform,
                 models.PlatformAccount.config,
-                models.PlatformAccount.chatwoot_inbox_id,
             ).where(models.PlatformAccount.id == account_id)
         )
     ).one()
     direct_delivery = ensure_decision_delivery_available(
         account_config=dict(account.config or {}),
-        chatwoot_inbox_id=account.chatwoot_inbox_id,
-        chatwoot_enabled=get_settings().chatwoot_enabled,
     )
 
     if message_id is not None:
@@ -423,10 +408,8 @@ async def persist_decision(
         ):
             message_type = "text"
     elif decision.action is ReplyAction.DRAFT:
-        # Direct platforms have no private-note channel. Retain the ReplyDecision as a
-        # draft for the admin inbox; never send it to the customer before approval.
-        if not direct_delivery and decision.reply_text:
-            message_type = "private_note"
+        # Drafts remain local until an authenticated human explicitly approves them.
+        message_type = None
     elif decision.action is ReplyAction.HANDOFF:
         await acquire_conversation_delivery_xact_lock(session, conversation_id)
         current = (

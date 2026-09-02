@@ -143,20 +143,6 @@ def _build_sweep_specs(settings: Settings) -> tuple[SweepSpec, ...]:
                 sweep_xchat_recovery,
             )
         )
-    if settings.chatwoot_enabled:
-        from social_reply.application.event_ingestion.reconcile import (
-            reconcile_chatwoot_messages,
-        )
-
-        specs.append(
-            SweepSpec(
-                "reconcile_chatwoot_messages",
-                "inspection",
-                settings.chatwoot_reconcile_interval_seconds,
-                inspection_warn_after,
-                reconcile_chatwoot_messages,
-            )
-        )
     if settings.email_enabled:
         specs.append(
             SweepSpec(

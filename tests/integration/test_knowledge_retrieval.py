@@ -234,7 +234,12 @@ async def _seed_conversation(session, text="请问几点营业"):
     account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
-            id=account_id, brand_id="b1", platform="telegram", name="acc", chatwoot_inbox_id=101
+            id=account_id,
+            brand_id="b1",
+            platform="telegram",
+            name="acc",
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "max_text_length": 4096},
         )
     )
     await session.execute(
@@ -260,7 +265,8 @@ async def _seed_conversation(session, text="请问几点营业"):
             direction="inbound",
             sender_type="contact",
             text=text,
-            chatwoot_message_id=55,
+            platform_message_id="incoming-55",
+            reply_target={"kind": "dm", "chat_id": "9"},
         )
     )
     await ensure_state(session, conv_id, "BOT_ACTIVE")
@@ -924,9 +930,9 @@ async def test_live_selector_is_not_called_for_high_margin_match(session, knowle
         _snapshot(account_id, text), conv_id, msg_id, account_id
     )
 
-    assert outbox_id is not None
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action in {"auto_reply", "draft"}
+    assert (outbox_id is not None) is (decision.action == "auto_reply")
     assert decision.knowledge_gate_version == "strong-gate-v1"
     assert decision.rag_evidence["selection_method"] == "legacy_top1"
 
@@ -1051,15 +1057,14 @@ async def test_multilingual_wrong_language_becomes_private_review_after_groundin
     outbox_id = await runner.run_and_persist_decision(
         _snapshot(account_id, text), conv_id, msg_id, account_id
     )
-    assert outbox_id is not None
+    assert outbox_id is None
     assert llm.verifier_called is True
     decision = (await session.execute(select(models.ReplyDecision))).scalar_one()
     assert decision.action == "draft"
     assert decision.reply_visibility == "private"
     assert decision.reply_text == "Refunds take 3 to 5 business days."
     assert "GUARD_LANGUAGE_MISMATCH" in decision.reason_codes
-    outbox = await session.get(models.OutboxMessage, outbox_id)
-    assert outbox.message_type == "private_note"
+    assert await session.scalar(select(func.count()).select_from(models.OutboxMessage)) == 0
 
 
 class _TranslatingLLM:

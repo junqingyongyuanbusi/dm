@@ -23,8 +23,6 @@ def test_production_settings_require_https_public_base_url():
     with pytest.raises(ValueError, match="PUBLIC_BASE_URL"):
         Settings(
             testing=False,
-            chatwoot_webhook_secret="real",
-            chatwoot_api_token="real",
             control_api_key="control",
             admin_session_secret="x" * 32,
             admin_username="admin",

@@ -24,8 +24,8 @@ same PostgreSQL schema, encryption keys, feature flags, and connector code.
 | Role | Owns | Does not own |
 | --- | --- | --- |
 | API | Admin UI, users and sessions, OAuth callbacks, Provisioning API, webhook verification, webhook `RawEvent` persistence, actor dispatch | LLM decisions, durable retries, routine platform sending |
-| Worker | Provisioning actors, direct and Chatwoot ingestion actors, XChat decryption, `DecisionJob` execution, Outbox delivery | Schema migration, periodic recovery scheduling |
-| Scheduler | Provisioning/decision/Outbox recovery, Chatwoot reconciliation when enabled, X polling/health, Email IMAP polling, Meta token/subscription reconciliation | HTTP traffic, decision business logic |
+| Worker | Provisioning actors, direct ingestion actors, XChat decryption, `DecisionJob` execution, Outbox delivery | Schema migration, periodic recovery scheduling |
+| Scheduler | Provisioning/decision/Outbox recovery, X polling/health, Email IMAP polling, Meta token/subscription reconciliation | HTTP traffic, decision business logic |
 
 The image entrypoint uses `SERVICE_ROLE=api|worker|scheduler`. API runs database preparation and
 migrations. Worker and Scheduler refuse to start until the database is at Alembic head and encrypted
@@ -98,7 +98,7 @@ PostgreSQL owns:
 - tenant-scoped `EvaluationRun` and `EvaluationDecision` rows for the trusted-local,
   synthetic-only internal evaluation foundation.
 
-New webhook and Chatwoot reconciliation `RawEvent` rows persist a versioned initial-dispatch contract before commit. Process crashes and Redis queue loss are recoverable from that row before normalization, then from `DecisionJob` and `OutboxMessage` after their transactional boundaries.
+New webhook `RawEvent` rows persist a versioned initial-dispatch contract before commit. Process crashes and Redis queue loss are recoverable from that row before normalization, then from `DecisionJob` and `OutboxMessage` after their transactional boundaries.
 
 ### Redis is transient infrastructure
 
@@ -113,9 +113,16 @@ Redis is not the source of truth for accounts, ingestion, decisions, deliveries,
 ### External systems
 
 - Platform APIs and Email IMAP/SMTP servers are the transport boundary for Telegram, Facebook, Instagram, WhatsApp, Feishu, Email and X.
-- Chatwoot is an optional bridge, not a startup dependency.
 - OpenAI-compatible chat and embedding APIs are called only from decision/knowledge code, never
   directly from webhook routers.
+
+### C1 legacy schema compatibility
+
+The current runtime neither reads nor writes Chatwoot and exposes no Chatwoot webhook, delivery,
+recovery, or configuration path. Legacy Chatwoot columns and tables remain in SQLAlchemy models and
+published migrations only for application rollback and historical audit compatibility. A separate
+C2 migration will remove that schema after the rollback window closes; retained fields do not make
+Chatwoot a supported transport.
 
 ## Synthetic evaluation foundation
 
@@ -181,7 +188,7 @@ valid. Delivery repeats the generation check immediately before provider I/O. Co
 locks serialize cancellation with delivery, but an external send that already completed cannot be
 undone.
 
-Webhook ingestion plus X and Email polling persist `RawEvent` evidence before normalization. New Telegram, Meta, Feishu, X direct, Chatwoot webhook, and Chatwoot reconciliation rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
+Webhook ingestion plus X and Email polling persist `RawEvent` evidence before normalization. New Telegram, Meta, Feishu, and X direct rows include immutable versioned dispatch metadata. Scheduler reservations and fenced worker leases recover commit-to-dispatch loss, broker loss, and worker crashes; malformed metadata or eight exhausted worker claims become `INITIAL_DISPATCH_DEAD`. Historical `PENDING` rows without the versioned contract are deliberately not guessed or replayed. Polling and XChat remain owned by their checkpoint/gap and specialized recovery paths.
 
 Polling writes one append-only evidence row per Legacy DM, XChat encrypted envelope, or XChat key-change occurrence, including account, conversation, occurrence time and page/cursor context. `PlatformCheckpoint` is the authoritative cursor, `SyncRun` records each claimed attempt, and `SyncGap` retains page-cap, pagination, or decryption gaps until a fenced backfill completes.
 
@@ -243,8 +250,8 @@ authoritative.
 
 ## Local human operations path
 
-The built-in Admin and PostgreSQL inbox are the native operations path; they do not depend on
-Chatwoot:
+The built-in Admin and PostgreSQL inbox are the native operations path for every supported direct
+platform:
 
 ```text
 HANDOFF / unsupported attachment -> HumanWorkItem(WAITING) + HANDOFF_PENDING
@@ -276,10 +283,9 @@ policy. A manual reply creates or claims work, moves the conversation to `HUMAN_
 pending or failed bot-decision Outboxes, and records `actor_id` plus `reply_to_message_id`. Bot
 decisions use `DECISION/BOT`, approved drafts use `DRAFT_APPROVAL/ADMIN_HUMAN`, and manual sends use
 `MANUAL_REPLY/ADMIN_HUMAN`, so the Outbox row is the durable provenance bridge from operator action
-to outbound history. `ReplyDecision.outbox_id` remains the private Chatwoot-note or legacy delivery
+to outbound history. `ReplyDecision.outbox_id` remains a legacy private-review or delivery
 compatibility link; `review_outbox_id` identifies the customer-facing Outbox created by Admin draft
-approval. Direct-platform delivery is independent of Chatwoot; accounts deliberately
-using a Chatwoot destination still require their persisted conversation mapping.
+approval. All new and active delivery uses an explicit direct provider destination.
 
 When Feishu handoff notifications are enabled, the HANDOFF persistence transaction also creates or
 reuses one `HandoffNotificationIntent` per work item. Missing or disabled routing does not roll back
@@ -291,20 +297,6 @@ Tenant/app-scoped operator allowlist, and persist an idempotent receipt keyed by
 `event_id`. A card resolve records `FEISHU_OPERATOR_ATTESTED`; it proves the operator declaration,
 not delivery of an external social-platform reply. A local Admin manual reply can instead retain
 Reply Core Outbox delivery evidence.
-
-## Chatwoot bridge
-
-When `CHATWOOT_ENABLED=true`, API registers the Chatwoot webhook and Scheduler runs message
-reconciliation. Chatwoot events converge on the same decision and Outbox model.
-
-When disabled:
-
-- API does not expose the Chatwoot webhook route;
-- Scheduler does not poll Chatwoot;
-- Worker retains the compatibility actor to drain already queued events;
-- decisions defer as `DEFERRED_CHATWOOT` and disabled deliveries pause as
-  `NEEDS_REVIEW/CHATWOOT_DISABLED`;
-- re-enabling the bridge returns recoverable work to the queue.
 
 ## X stack boundaries
 

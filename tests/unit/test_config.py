@@ -9,9 +9,6 @@ from social_reply.shared.config import Settings
 
 # 绕过 .env 与环境变量干扰的相关变量名
 _ENV_KEYS = [
-    "CHATWOOT_ENABLED",
-    "CHATWOOT_WEBHOOK_SECRET",
-    "CHATWOOT_API_TOKEN",
     "CONTROL_API_KEY",
     "LLM_PROVIDER",
     "OPENAI_API_KEY",
@@ -29,7 +26,6 @@ _ENV_KEYS = [
     "SCHEDULER_CORE_INTERVAL_SECONDS",
     "SCHEDULER_CORE_WARN_AFTER_SECONDS",
     "SCHEDULER_INSPECTION_WARN_AFTER_SECONDS",
-    "CHATWOOT_RECONCILE_INTERVAL_SECONDS",
     "X_DM_POLL_INTERVAL_SECONDS",
     "X_WEBHOOK_CHECK_INTERVAL_SECONDS",
     "XCHAT_POLL_INTERVAL_SECONDS",
@@ -146,8 +142,6 @@ def _migration_heads(versions_dir: Path) -> set[str]:
 
 def test_testing_true_默认值可用() -> None:
     settings = _make(testing=True)
-    assert settings.chatwoot_enabled is False
-    assert settings.chatwoot_api_token == "dev-local-token"
     assert settings.openai_api_key.get_secret_value() == ""
     assert settings.openai_base_url == "https://api.openai.com/v1"
     assert settings.openai_model == "gpt-4o-mini"
@@ -162,7 +156,6 @@ def test_testing_true_默认值可用() -> None:
     assert settings.scheduler_core_interval_seconds == 3
     assert settings.scheduler_core_warn_after_seconds == 30
     assert settings.scheduler_inspection_warn_after_seconds == 300
-    assert settings.chatwoot_reconcile_interval_seconds == 3
     assert settings.x_dm_poll_interval_seconds == 90
     assert settings.x_webhook_check_interval_seconds == 600
     assert settings.xchat_poll_interval_seconds == 900
@@ -187,44 +180,10 @@ def test_testing_true_默认值可用() -> None:
     assert settings.feishu_health_check_interval_seconds == 600
 
 
-def test_非测试环境_默认_chatwoot_api_token_拒绝() -> None:
-    with pytest.raises(ValueError, match="CHATWOOT_API_TOKEN"):
-        _make(
-            testing=False,
-            chatwoot_enabled=True,
-            chatwoot_webhook_secret="real-secret",
-        )
-
-
-def test_非测试环境_空_chatwoot_api_token_拒绝() -> None:
-    with pytest.raises(ValueError, match="CHATWOOT_API_TOKEN"):
-        _make(
-            testing=False,
-            chatwoot_enabled=True,
-            chatwoot_webhook_secret="real-secret",
-            chatwoot_api_token="",
-        )
-
-
-def test_非测试环境_禁用_chatwoot_无需其凭证() -> None:
-    settings = _make(
-        testing=False,
-        chatwoot_enabled=False,
-        chatwoot_webhook_secret="",
-        chatwoot_api_token="",
-        control_api_key="control-token",
-        llm_provider="openai",
-        openai_api_key="sk-test",
-    )
-    assert settings.chatwoot_enabled is False
-
-
 def test_非测试环境_openai_provider_空_key_拒绝() -> None:
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         _make(
             testing=False,
-            chatwoot_webhook_secret="real-secret",
-            chatwoot_api_token="real-token",
             control_api_key="control-token",
             llm_provider="openai",
         )
@@ -233,9 +192,6 @@ def test_非测试环境_openai_provider_空_key_拒绝() -> None:
 def test_非测试环境_凭证齐全通过() -> None:
     settings = _make(
         testing=False,
-        chatwoot_enabled=True,
-        chatwoot_webhook_secret="real-secret",
-        chatwoot_api_token="real-token",
         control_api_key="control-token",
         llm_provider="openai",
         openai_api_key="sk-test",
@@ -269,8 +225,6 @@ def test_conversation_history_bounds_are_validated(name: str, value: int) -> Non
         ("scheduler_core_warn_after_seconds", 3600.01),
         ("scheduler_inspection_warn_after_seconds", 0.99),
         ("scheduler_inspection_warn_after_seconds", 7200.01),
-        ("chatwoot_reconcile_interval_seconds", 0),
-        ("chatwoot_reconcile_interval_seconds", 3601),
         ("x_dm_poll_interval_seconds", -1),
         ("x_dm_poll_interval_seconds", 86401),
         ("x_webhook_check_interval_seconds", -1),
@@ -408,7 +362,6 @@ def test_local_environment_template_disables_future_platforms() -> None:
     assert assignments["SCHEDULER_CORE_INTERVAL_SECONDS"] == "3"
     assert assignments["SCHEDULER_CORE_WARN_AFTER_SECONDS"] == "30"
     assert assignments["SCHEDULER_INSPECTION_WARN_AFTER_SECONDS"] == "300"
-    assert assignments["CHATWOOT_RECONCILE_INTERVAL_SECONDS"] == "3"
     assert assignments["XCHAT_RECOVERY_SWEEP_INTERVAL_SECONDS"] == "30"
     assert assignments["XCHAT_READY_PROBE_INTERVAL_SECONDS"] == "21600"
     assert assignments["XCHAT_PENDING_PROBE_INTERVAL_SECONDS"] == "600"
@@ -457,8 +410,6 @@ def test_非测试环境_空_admin_allowed_tenants_拒绝() -> None:
     with pytest.raises(ValueError, match="ADMIN_ALLOWED_TENANTS"):
         _make(
             testing=False,
-            chatwoot_webhook_secret="real-secret",
-            chatwoot_api_token="real-token",
             control_api_key="control-token",
             admin_session_secret="x" * 32,
             admin_username="admin",
@@ -474,8 +425,6 @@ def test_非测试环境_stub_provider_拒绝() -> None:
     with pytest.raises(ValueError, match="LLM_PROVIDER=stub"):
         _make(
             testing=False,
-            chatwoot_webhook_secret="real-secret",
-            chatwoot_api_token="real-token",
             control_api_key="control-token",
             admin_session_secret="x" * 32,
             admin_username="admin",
@@ -489,8 +438,6 @@ def test_非测试环境_空_control_api_key_拒绝() -> None:
     with pytest.raises(ValueError, match="CONTROL_API_KEY"):
         _make(
             testing=False,
-            chatwoot_webhook_secret="real-secret",
-            chatwoot_api_token="real-token",
         )
 
 

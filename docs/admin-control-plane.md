@@ -16,9 +16,9 @@ new local claims, approvals or manual replies until Admin is available again.
 ## Local-first operations contract
 
 `/app/t/default`, PostgreSQL `HumanWorkItem`, and the transactional Outbox are the native operations
-control plane. `/admin` Tenant routes are compatibility adapters; Chatwoot is an optional bridge and
-does not own local claims, draft review,
-delivery exceptions, conversation automation state, or manual-reply provenance.
+control plane. `/admin` Tenant routes are compatibility adapters. Direct platform transports and
+the local operations path are the only supported runtime; local claims, draft review, delivery
+exceptions, conversation automation state, and manual-reply provenance remain PostgreSQL-owned.
 
 Every human mutation is tenant-scoped, audited and durable:
 
@@ -38,9 +38,8 @@ Every human mutation is tenant-scoped, audited and durable:
   `actor_id` and `reply_to_message_id`.
 
 Successful local manual delivery records an outbound `Message` linked through `source_outbox_id`
-and does not require a synthetic `ReplyDecision`. Direct-platform accounts do not require a
-Chatwoot conversation; accounts intentionally configured for Chatwoot delivery still require their
-persisted conversation mapping.
+and does not require a synthetic `ReplyDecision`. Direct-platform accounts reply to their explicit
+persisted provider target and do not depend on an external operations conversation mapping.
 
 ## Trust boundaries
 
@@ -140,7 +139,9 @@ Supported destination commands:
 - `x_chat_message`
 - `x_post_reply`
 
-Direct-platform drafts are never sent to customers. A `DRAFT` decision is retained in `reply_decisions` for future approval/inbox workflows and has no direct Outbox until approved. Chatwoot private notes remain supported for legacy Chatwoot-backed accounts.
+Direct-platform drafts are never sent to customers. A `DRAFT` decision is retained in
+`reply_decisions` for future approval/inbox workflows and has no direct Outbox until approved.
+Review remains entirely within the local control plane.
 
 At delivery time the system revalidates account status, tenant/account/conversation consistency, capability, target type, text length, expiration/window, and takeover state.
 

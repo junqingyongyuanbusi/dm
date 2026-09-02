@@ -21,9 +21,6 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://dev:dev@localhost:5432/social_reply"
     redis_url: str = "redis://localhost:6379/0"
-    chatwoot_enabled: bool = False
-    chatwoot_webhook_secret: str = "change-me"
-    chatwoot_signature_tolerance_seconds: int = 300
     tenant_id: str = DEFAULT_TENANT_ID
     # Literal 收紧：配错 provider 在进程启动即报错，而非每条消息决策丢失
     llm_provider: Literal["stub", "openai"] = "stub"
@@ -31,8 +28,6 @@ class Settings(BaseSettings):
     # Staged rollout gate. When disabled, Workers keep using the code-compiled legacy voice.
     # Production must set this explicitly and consistently across all three service roles.
     reply_business_prompt_enabled: bool = False
-    chatwoot_base_url: str = "http://localhost:3000"
-    chatwoot_api_token: str = "dev-local-token"
     # 控制面：CONTROL_API_KEY 仅供服务间调用；浏览器管理员使用签名会话。
     control_api_key: SecretStr = SecretStr("")
     admin_session_secret: SecretStr = SecretStr("")
@@ -51,7 +46,6 @@ class Settings(BaseSettings):
     scheduler_core_interval_seconds: float = Field(default=3, ge=0.5, le=60)
     scheduler_core_warn_after_seconds: float = Field(default=30, ge=1, le=3600)
     scheduler_inspection_warn_after_seconds: float = Field(default=300, ge=1, le=7200)
-    chatwoot_reconcile_interval_seconds: int = Field(default=3, ge=1, le=3600)
     x_dm_poll_interval_seconds: int = Field(default=90, ge=0, le=86400)
     x_webhook_check_interval_seconds: int = Field(default=600, ge=0, le=86400)
     xchat_poll_interval_seconds: int = Field(default=900, ge=0, le=86400)
@@ -172,16 +166,6 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_default_secret_in_prod(self) -> "Settings":
-        if self.chatwoot_enabled and not self.testing:
-            if self.chatwoot_webhook_secret in ("", "change-me"):
-                raise ValueError(
-                    "CHATWOOT_WEBHOOK_SECRET 未配置（CHATWOOT_ENABLED=true 时不能为空或 change-me）"
-                )
-            if self.chatwoot_api_token in ("", "dev-local-token"):
-                raise ValueError(
-                    "CHATWOOT_API_TOKEN 未配置"
-                    "（CHATWOOT_ENABLED=true 时不能为空或 dev-local-token）"
-                )
         if not self.testing and not self.control_api_key.get_secret_value():
             raise ValueError("CONTROL_API_KEY 未配置；账号管理 API 在生产环境必须鉴权")
         if not self.testing and len(self.admin_session_secret.get_secret_value()) < 32:

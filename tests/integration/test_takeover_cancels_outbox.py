@@ -18,7 +18,12 @@ async def _seed_conv_with_outbox(session, ob_status="PENDING"):
     account_id, contact_id, conv_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
-            id=account_id, brand_id="b1", platform="telegram", name="a", chatwoot_inbox_id=101
+            id=account_id,
+            brand_id="b1",
+            platform="telegram",
+            name="a",
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "max_text_length": 4096},
         )
     )
     await session.execute(
@@ -43,10 +48,10 @@ async def _seed_conv_with_outbox(session, ob_status="PENDING"):
             id=ob_id,
             conversation_id=conv_id,
             platform_account_id=account_id,
-            destination_type="chatwoot_conversation",
-            destination_id="k",
+            destination_type="telegram_dm",
+            destination_id="telegram:x:9",
             message_type="text",
-            payload={"text": "在途回复"},
+            payload={"text": "在途回复", "target": {"chat_id": "9"}},
             idempotency_key=str(ob_id),
             status=ob_status,
         )

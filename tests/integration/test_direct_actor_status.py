@@ -109,7 +109,6 @@ async def _add_job(session, raw_event_id: uuid.UUID, status: str) -> None:
     [
         ("NEEDS_REVIEW", "DECISION_PENDING", "DECISION_NEEDS_REVIEW"),
         ("FAILED", "DECISION_PENDING", "DECISION_PENDING"),
-        ("DEFERRED_CHATWOOT", "DECISION_PENDING", "DECISION_DEFERRED"),
         ("COMPLETED", "DECISION_PENDING", "PROCESSED"),
         ("SUPERSEDED", "DECISION_PENDING", "PROCESSED"),
         # A concurrent decision finalizer may commit review after this actor read
@@ -138,8 +137,7 @@ async def test_direct_actor_preserves_decision_status_priority(
     [
         (("COMPLETED", "SUPERSEDED"), "PROCESSED"),
         (("COMPLETED", "FAILED"), "DECISION_PENDING"),
-        (("FAILED", "DEFERRED_CHATWOOT"), "DECISION_DEFERRED"),
-        (("DEFERRED_CHATWOOT", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
+        (("FAILED", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
     ],
 )
 async def test_direct_actor_aggregates_mixed_job_priorities(session, statuses, expected):

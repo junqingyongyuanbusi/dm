@@ -27,7 +27,6 @@ async def test_telegram_webhook_direct_to_sent_outbox(session, monkeypatch):
             webhook_secret_bundle=encrypt_secret_bundle({"secret": "secret-1"}),
             config={"delivery_mode": "direct", "api_base_url": "https://api.telegram.test"},
             capability={"dm": True, "max_text_length": 4096},
-            chatwoot_inbox_id=None,
             automation_default="BOT_ACTIVE",
             status="active",
         )

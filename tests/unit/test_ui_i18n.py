@@ -23,7 +23,6 @@ def _settings() -> Settings:
     return Settings(
         _env_file=None,
         testing=True,
-        chatwoot_enabled=False,
         x_activity_enabled=False,
         platform_secret_keys="Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
     )

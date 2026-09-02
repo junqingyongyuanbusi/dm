@@ -26,7 +26,7 @@
 - `apps/cli/`：人工执行的维护和导入命令，不属于容器默认启动路径。
 - `src/social_reply/application/`：用例编排，包括账号管理、事件摄取、人工接管、知识库、投递与决策。
 - `src/social_reply/domain/`：领域模型、状态和不变量；不得依赖 FastAPI、Dramatiq 或具体平台 SDK。
-- `src/social_reply/connectors/`：Chatwoot、Email、Feishu、Meta、Telegram、WhatsApp、X、XChat 等外部边界。
+- `src/social_reply/connectors/`：Email、Feishu、Meta、Telegram、WhatsApp、X、XChat 等直连外部边界。
 - `src/social_reply/infrastructure/`：PostgreSQL、Redis、队列、锁和持久化实现。
 - `src/social_reply/shared/`：跨模块配置和共享基础设施。
 - `migrations/`：Alembic 迁移。迁移图必须保持唯一 head；禁止改写已发布迁移来伪造兼容。

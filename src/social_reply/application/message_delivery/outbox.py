@@ -36,7 +36,6 @@ from social_reply.application.reply_decision.multilingual_generation import (
 from social_reply.application.reply_decision.rag_selection import (
     MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD,
 )
-from social_reply.connectors.chatwoot.client import get_chatwoot_client
 from social_reply.connectors.email.contracts import email_address_identity_key
 from social_reply.connectors.errors import (
     PermanentSendError,
@@ -216,20 +215,6 @@ def _safe_error(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
-async def _resolve_target(
-    session: AsyncSession, conversation_id: uuid.UUID
-) -> tuple[int, int] | None:
-    row = (
-        await session.execute(
-            select(
-                models.ConversationMapping.chatwoot_account_id,
-                models.ConversationMapping.chatwoot_conversation_id,
-            ).where(models.ConversationMapping.conversation_id == conversation_id)
-        )
-    ).first()
-    return (row.chatwoot_account_id, row.chatwoot_conversation_id) if row else None
-
-
 async def materialize_sent_outbox(
     session: AsyncSession,
     *,
@@ -243,7 +228,6 @@ async def materialize_sent_outbox(
                 models.OutboxMessage.payload,
                 models.OutboxMessage.actor_kind,
                 models.OutboxMessage.sent_at,
-                models.OutboxMessage.chatwoot_message_id,
                 models.OutboxMessage.platform_message_id,
             ).where(
                 models.OutboxMessage.id == outbox_id,
@@ -267,7 +251,6 @@ async def materialize_sent_outbox(
                 "agent" if finalized.actor_kind == "ADMIN_HUMAN" else "bot"
             ),
             text=text,
-            chatwoot_message_id=finalized.chatwoot_message_id,
             platform_message_id=finalized.platform_message_id,
             source_outbox_id=outbox_id,
             reply_target=dict(payload.get("target") or {}),
@@ -296,7 +279,6 @@ async def _record_outcome(
     attempt_no: int,
     error_code: str | None = None,
     error_message: str | None = None,
-    chatwoot_message_id: int | None = None,
     platform_message_id: str | None = None,
     next_attempt_at: datetime | None = None,
     require_sending: bool = True,
@@ -310,8 +292,6 @@ async def _record_outcome(
     }
     if count_attempt:
         values["attempt_count"] = attempt_no
-    if chatwoot_message_id is not None:
-        values["chatwoot_message_id"] = chatwoot_message_id
     if platform_message_id is not None:
         values["platform_message_id"] = platform_message_id
     if status == "SENT":
@@ -327,7 +307,6 @@ async def _record_outcome(
                 models.OutboxMessage.payload,
                 models.OutboxMessage.actor_kind,
                 models.OutboxMessage.sent_at,
-                models.OutboxMessage.chatwoot_message_id,
                 models.OutboxMessage.platform_message_id,
             )
         )
@@ -358,7 +337,6 @@ async def _record_outcome(
                 outcome=actual_status,
                 error_code=actual_error_code,
                 error_message=actual_error_message,
-                chatwoot_message_id=chatwoot_message_id,
             )
         )
     await session.commit()
@@ -438,6 +416,14 @@ async def _validate_direct_send(
         or conversation.platform_account_id != row.platform_account_id
     ):
         return await _reject_direct_send(session, row, attempt_no, "TENANT_SCOPE_MISMATCH")
+    if (account.config or {}).get("delivery_mode") != "direct":
+        return await _reject_direct_send(
+            session,
+            row,
+            attempt_no,
+            "DELIVERY_MODE_UNSUPPORTED",
+            count_attempt=False,
+        )
     if not is_active_account_status(account.status):
         return await _reject_direct_send(session, row, attempt_no, "ACCOUNT_NOT_ACTIVE")
     settings = get_settings()
@@ -1105,7 +1091,6 @@ async def _deliver_outbox_locked(
             attempt_no,
             count_attempt=False,
         )
-    is_direct = row.destination_type != "chatwoot_conversation"
     is_public = row.message_type != "private_note"
     preflight_error = None
     if is_public:
@@ -1129,15 +1114,11 @@ async def _deliver_outbox_locked(
             count_attempt=False,
         )
 
-    if is_direct and not is_public:
+    if not is_public:
         return await _stop_before_send(
             session, oid, "CANCELLED", "DIRECT_DRAFT_BLOCKED", attempt_no
         )
     settings = get_settings()
-    if not is_direct and not settings.chatwoot_enabled:
-        return await _stop_before_send(
-            session, oid, "NEEDS_REVIEW", "CHATWOOT_DISABLED", attempt_no
-        )
     if row.destination_type == "x_dm" and not settings.x_legacy_dm_enabled:
         return await _stop_before_send(
             session,
@@ -1168,16 +1149,14 @@ async def _deliver_outbox_locked(
         return await _stop_before_send(session, oid, "CANCELLED", "TAKEOVER_AT_SEND", attempt_no)
     direct_account: models.PlatformAccount | None = None
     direct_command: TextSendCommand | None = None
-    if is_direct:
-        stopped, direct_account, direct_command = await _validate_direct_send(
-            session,
-            row,
-            payload,
-            attempt_no,
-        )
-        if stopped is not None:
-            return stopped
-    target = None if is_direct else await _resolve_target(session, row.conversation_id)
+    stopped, direct_account, direct_command = await _validate_direct_send(
+        session,
+        row,
+        payload,
+        attempt_no,
+    )
+    if stopped is not None:
+        return stopped
 
     async def dispatch() -> str:
         dispatch_claim = (
@@ -1194,16 +1173,6 @@ async def _deliver_outbox_locked(
         await session.commit()
         if dispatch_claim is None:
             return "SKIPPED_NOT_CLAIMABLE"
-
-        if not is_direct and target is None:
-            return await _record_outcome(
-                session,
-                oid,
-                "NEEDS_REVIEW",
-                attempt_no=attempt_no,
-                error_code="NO_MAPPING",
-                error_message="no chatwoot mapping",
-            )
 
         async def fail_retryable(exc: Exception) -> str:
             if attempt_no >= _MAX_ATTEMPTS:
@@ -1248,35 +1217,19 @@ async def _deliver_outbox_locked(
                 error_message=exc.message[:500],
             )
 
-        sender = None
-        if is_direct:
-            try:
-                sender = await get_platform_sender(row.platform_account_id)
-            except Exception as exc:  # noqa: BLE001 - sender resolution happens before dispatch
-                return await fail_retryable(exc)
+        try:
+            sender = await get_platform_sender(row.platform_account_id)
+        except Exception as exc:  # noqa: BLE001 - sender resolution happens before dispatch
+            return await fail_retryable(exc)
 
         try:
-            if is_direct:
-                assert direct_command is not None and sender is not None
-                platform_message_id = await _await_send(
-                    sender.send_text(
-                        target=direct_command.target,
-                        text=direct_command.text,
-                    )
+            assert direct_command is not None
+            platform_message_id = await _await_send(
+                sender.send_text(
+                    target=direct_command.target,
+                    text=direct_command.text,
                 )
-                chatwoot_message_id = None
-            else:
-                assert target is not None
-                account_id, chatwoot_conv_id = target
-                chatwoot_message_id = await _await_send(
-                    get_chatwoot_client().create_message(
-                        account_id=account_id,
-                        conversation_id=chatwoot_conv_id,
-                        content=payload["text"],
-                        private=(row.message_type == "private_note"),
-                    )
-                )
-                platform_message_id = None
+            )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             return await fail_retryable(exc)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -1299,7 +1252,6 @@ async def _deliver_outbox_locked(
             oid,
             "SENT",
             attempt_no=attempt_no,
-            chatwoot_message_id=chatwoot_message_id,
             platform_message_id=platform_message_id,
         )
 

@@ -23,7 +23,6 @@ class EvaluationAction(StrEnum):
 
 
 class EvaluationDeliverySurface(StrEnum):
-    CHATWOOT = "chatwoot"
     DIRECT = "direct"
 
 

@@ -6,7 +6,6 @@ import pytest
 from sqlalchemy import insert, select
 
 from social_reply.application.reply_decision import jobs as decision_jobs
-from social_reply.application.reply_decision import persist as persist_module
 from social_reply.application.reply_decision.jobs import (
     process_decision_job,
     snapshot_to_dict,
@@ -25,7 +24,7 @@ async def _seed_job(
     status="PENDING",
     next_attempt_at=None,
     locked_at=None,
-    chatwoot_inbox_id: int | None = None,
+    delivery_mode: str = "direct",
     attempt_count: int = 0,
 ):
     account_id, contact_id, conversation_id, message_id, raw_event_id = (
@@ -42,9 +41,8 @@ async def _seed_job(
             brand_id="b1",
             platform="telegram",
             name="a",
-            chatwoot_inbox_id=(
-                chatwoot_inbox_id if chatwoot_inbox_id is not None else uuid.uuid4().int % 10**9
-            ),
+            config={"delivery_mode": delivery_mode},
+            capability={"dm": True, "max_text_length": 4096},
         )
     )
     await session.execute(
@@ -74,13 +72,15 @@ async def _seed_job(
             direction="inbound",
             sender_type="contact",
             text="hi",
+            platform_message_id="incoming-1",
+            reply_target={"kind": "dm", "chat_id": "9"},
             decision_generation=1,
         )
     )
     await session.execute(
         insert(models.RawEvent).values(
             id=raw_event_id,
-            source="chatwoot",
+            source="telegram",
             payload={},
             processing_status="PROCESSED",
         )
@@ -199,8 +199,7 @@ async def test_concurrent_job_finalizers_commit_complete_raw_aggregate(session, 
     [
         (("COMPLETED", "SUPERSEDED"), "PROCESSED"),
         (("COMPLETED", "FAILED"), "DECISION_PENDING"),
-        (("FAILED", "DEFERRED_CHATWOOT"), "DECISION_DEFERRED"),
-        (("DEFERRED_CHATWOOT", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
+        (("FAILED", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
     ],
 )
 async def test_raw_event_aggregate_status_priority(session, statuses, expected):
@@ -222,7 +221,7 @@ async def test_jobless_raw_event_aggregate_is_noop(session):
     await session.execute(
         insert(models.RawEvent).values(
             id=raw_event_id,
-            source="chatwoot",
+            source="telegram",
             payload={},
             processing_status="DECISION_PENDING",
         )
@@ -239,77 +238,14 @@ async def test_jobless_raw_event_aggregate_is_noop(session):
     assert decision_jobs.raw_event_decision_status(set()) == "PROCESSED"
 
 
-async def test_chatwoot_decision_is_deferred_and_resumed_after_reenable(session, monkeypatch):
-    job_id = await _seed_job(session)
-
-    def disabled():
-        return type("Settings", (), {"chatwoot_enabled": False})()
-
-    def enabled():
-        return type("Settings", (), {"chatwoot_enabled": True})()
-
-    real_run_and_persist = decision_jobs.run_and_persist_decision
-
-    async def unexpected_decision_run(*_args, **_kwargs):
-        raise AssertionError("decision pipeline must not run while Chatwoot is disabled")
-
-    monkeypatch.setattr(persist_module, "get_settings", disabled)
-    monkeypatch.setattr(decision_jobs, "get_settings", disabled)
-    monkeypatch.setattr(
-        decision_jobs,
-        "run_and_persist_decision",
-        unexpected_decision_run,
-    )
-
-    assert await process_decision_job(str(job_id)) is False
-    session.expire_all()
-    job = (
-        await session.execute(select(models.DecisionJob).where(models.DecisionJob.id == job_id))
-    ).scalar_one()
-    raw_event_id = job.raw_event_id
-    raw = await session.get(models.RawEvent, raw_event_id)
-    assert job.status == "DEFERRED_CHATWOOT"
-    assert raw.processing_status == "DECISION_DEFERRED"
-    assert (await session.execute(select(models.ReplyDecision))).first() is None
-    assert (await session.execute(select(models.OutboxMessage))).first() is None
-
-    monkeypatch.setattr(persist_module, "get_settings", enabled)
-    monkeypatch.setattr(decision_jobs, "get_settings", enabled)
-    monkeypatch.setattr(
-        decision_jobs,
-        "run_and_persist_decision",
-        real_run_and_persist,
-    )
-    assert job_id in await sweep_decision_jobs()
-    assert await process_decision_job(str(job_id)) is True
-    session.expire_all()
-    resumed = await session.get(models.DecisionJob, job_id)
-    resumed_raw = await session.get(models.RawEvent, raw_event_id)
-    assert resumed.status == "COMPLETED"
-    assert resumed_raw.processing_status == "PROCESSED"
-    assert (await session.execute(select(models.OutboxMessage))).scalar_one().destination_type == (
-        "chatwoot_conversation"
-    )
-
-
-async def test_missing_delivery_route_needs_review(session):
-    job_id = await _seed_job(session, chatwoot_inbox_id=0)
-    account_id = await session.scalar(
-        select(models.DecisionJob.account_id).where(models.DecisionJob.id == job_id)
-    )
-    await session.execute(
-        models.PlatformAccount.__table__.update()
-        .where(models.PlatformAccount.id == account_id)
-        .values(chatwoot_inbox_id=None)
-    )
-    await session.commit()
-
+async def test_unsupported_delivery_mode_needs_review(session):
+    job_id = await _seed_job(session, delivery_mode="unsupported")
     assert await process_decision_job(str(job_id)) is False
     session.expire_all()
     job = await session.get(models.DecisionJob, job_id)
     raw = await session.get(models.RawEvent, job.raw_event_id)
     assert job.status == "NEEDS_REVIEW"
-    assert job.last_error == "chatwoot_inbox_id_missing"
+    assert job.last_error == "delivery_mode_unsupported"
     assert raw.processing_status == "DECISION_NEEDS_REVIEW"
 
 

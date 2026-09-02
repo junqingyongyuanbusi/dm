@@ -50,15 +50,6 @@ def direct_dispatch_context(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def chatwoot_dispatch_context() -> dict[str, Any]:
-    return {
-        _DISPATCH_CONTEXT_KEY: {
-            "version": _DISPATCH_VERSION,
-            "kind": "chatwoot",
-        }
-    }
-
-
 async def _database_now(session: AsyncSession) -> datetime:
     return (await session.execute(select(func.clock_timestamp()))).scalar_one()
 
@@ -82,12 +73,6 @@ def _dispatch_spec(row: models.RawEvent) -> tuple[str, tuple[dict[str, Any], ...
             uuid.UUID(event.platform_account_key)
             events.append(dict(value))
         return kind, tuple(events)
-    if kind == "chatwoot":
-        if row.source not in {"chatwoot", "chatwoot_reconcile"}:
-            raise ValueError("INITIAL_DISPATCH_SOURCE_INVALID")
-        if row.ingress_kind not in {"webhook", "reconcile"}:
-            raise ValueError("INITIAL_DISPATCH_SOURCE_INVALID")
-        return kind, ()
     raise ValueError("INITIAL_DISPATCH_KIND_INVALID")
 
 
@@ -202,28 +187,15 @@ async def _dispatch_reserved(raw_event_id: uuid.UUID, token: uuid.UUID) -> bool:
         except (KeyError, TypeError, ValueError):
             return False
 
-    if kind == "direct":
-        from social_reply.application.event_ingestion.direct_actors import (
-            process_initial_direct_event,
-            process_initial_direct_event_actor,
-        )
+    from social_reply.application.event_ingestion.direct_actors import (
+        process_initial_direct_event,
+        process_initial_direct_event_actor,
+    )
 
-        async def inline():
-            await process_initial_direct_event(raw_event_id, token)
+    async def inline():
+        await process_initial_direct_event(raw_event_id, token)
 
-        actor = process_initial_direct_event_actor
-    else:
-        from social_reply.application.event_ingestion.actors import (
-            process_initial_chatwoot_event_actor,
-        )
-        from social_reply.application.event_ingestion.processor import (
-            process_claimed_raw_event,
-        )
-
-        async def inline():
-            await process_claimed_raw_event(raw_event_id, token)
-
-        actor = process_initial_chatwoot_event_actor
+    actor = process_initial_direct_event_actor
 
     try:
         await dispatch_actor(
@@ -371,7 +343,7 @@ async def complete_initial_direct_claim(
         row.processing_claim_expires_at = None
         row.processing_next_attempt_at = None
         row.processing_error_code = None
-        if processing_status not in {"DECISION_PENDING", "DECISION_DEFERRED"}:
+        if processing_status != "DECISION_PENDING":
             row.processed_at = now
         await session.commit()
         return True

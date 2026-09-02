@@ -55,7 +55,6 @@ common_env=(
   -e ADMIN_USERNAME=admin
   -e ADMIN_PASSWORD=test-admin-password
   -e PUBLIC_BASE_URL=https://reply.example.com
-  -e CHATWOOT_WEBHOOK_SECRET=change-me
   -e CONTROL_API_KEY=test-control-key
   -e LLM_PROVIDER=stub
 )
@@ -90,8 +89,8 @@ compat_head="$(run_alembic "$compat_image" heads | awk '{print $1; exit}')"
   exit 1
 }
 
-# Exercise the production bridge order: the compatibility API owns the schema
-# expansion before a target Worker is allowed to assert exact-head readiness.
+# Exercise the migration-compatible rollout order: the compatibility API owns
+# schema expansion before a target Worker may assert exact-head readiness.
 run_python_module "$compat_image" scripts.prepare_database
 run_python_module "$compat_image" scripts.assert_database_ready
 

@@ -284,6 +284,28 @@ async def test_invalid_versioned_metadata_goes_to_dead_letter(session, monkeypat
     assert row.processing_error_code == "INITIAL_DISPATCH_VERSION_INVALID"
 
 
+async def test_retired_chatwoot_dispatch_metadata_goes_to_dead_letter(
+    session,
+    monkeypatch,
+):
+    raw_event_id = await _seed_raw(
+        session,
+        source="chatwoot",
+        context={"initial_dispatch": {"version": 1, "kind": "chatwoot"}},
+    )
+
+    async def unexpected_dispatch(*_args, **_kwargs):
+        raise AssertionError("retired dispatch metadata must not invoke an actor")
+
+    monkeypatch.setattr(raw_recovery, "dispatch_actor", unexpected_dispatch)
+
+    assert await raw_recovery.sweep_initial_raw_events() == []
+    session.expire_all()
+    row = await session.get(models.RawEvent, raw_event_id)
+    assert row.processing_status == "INITIAL_DISPATCH_DEAD"
+    assert row.processing_error_code == "INITIAL_DISPATCH_KIND_INVALID"
+
+
 async def test_cross_tenant_direct_metadata_fails_closed(session):
     account_id = uuid.uuid4()
     await session.execute(
@@ -508,8 +530,7 @@ async def test_direct_claim_completion_reaggregates_jobs_under_raw_lock(session)
     [
         (("COMPLETED", "SUPERSEDED"), "PROCESSED"),
         (("COMPLETED", "FAILED"), "DECISION_PENDING"),
-        (("FAILED", "DEFERRED_CHATWOOT"), "DECISION_DEFERRED"),
-        (("DEFERRED_CHATWOOT", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
+        (("FAILED", "NEEDS_REVIEW"), "DECISION_NEEDS_REVIEW"),
     ],
 )
 async def test_direct_claim_completion_aggregates_job_priorities(session, statuses, expected):
@@ -603,30 +624,3 @@ async def test_direct_ingest_rejects_non_message_canonical_events(session):
         await direct_ingestion.ingest_canonical_event(event)
     assert (await session.execute(select(models.Message))).first() is None
     assert (await session.execute(select(models.DecisionJob))).first() is None
-
-
-async def test_chatwoot_claimed_dispatch_reaches_terminal_status(session):
-    raw_event_id = await _seed_raw(
-        session,
-        source="chatwoot",
-        tenant_id=None,
-        context=raw_recovery.chatwoot_dispatch_context(),
-        payload={
-            "event": "message_created",
-            "id": 55,
-            "content": "hello",
-            "message_type": "incoming",
-            "private": False,
-            "sender": {"id": 9, "type": "contact"},
-            "conversation": {"id": 77, "inbox_id": 999, "status": "open"},
-            "account": {"id": 1},
-        },
-    )
-
-    assert await raw_recovery.dispatch_initial_raw_event(raw_event_id) is True
-    session.expire_all()
-    row = await session.get(models.RawEvent, raw_event_id)
-    assert row.processing_status == "SKIPPED_UNKNOWN_INBOX"
-    assert row.processing_attempt_count == 1
-    assert row.processing_claim_token is None
-    assert row.processed_at is not None

@@ -245,17 +245,17 @@ async def test_workload_identity_includes_scenario_and_actual_input(migrated_db)
         surface=EvaluationDeliverySurface.DIRECT,
         context={"desired_action": "draft"},
     )
-    chatwoot = _input(
+    direct_alternate = _input(
         "4",
-        scenario_id="chatwoot",
-        surface=EvaluationDeliverySurface.CHATWOOT,
-        context={"desired_action": "draft"},
+        scenario_id="direct-alternate",
+        surface=EvaluationDeliverySurface.DIRECT,
+        context={"desired_action": "handoff"},
     )
     run = await runner.create_run(
         _manifest(),
         (
             EvaluationWorkloadItem("matrix", direct),
-            EvaluationWorkloadItem("matrix", chatwoot),
+            EvaluationWorkloadItem("matrix", direct_alternate),
         ),
     )
     assert run.expected_decision_count == 2
@@ -750,9 +750,6 @@ async def test_evaluation_matrix_does_not_mutate_production_tables(session, migr
         )
         for index, (surface, action) in enumerate(
             (
-                (EvaluationDeliverySurface.CHATWOOT, EvaluationAction.AUTO_REPLY),
-                (EvaluationDeliverySurface.CHATWOOT, EvaluationAction.DRAFT),
-                (EvaluationDeliverySurface.CHATWOOT, EvaluationAction.HANDOFF),
                 (EvaluationDeliverySurface.DIRECT, EvaluationAction.AUTO_REPLY),
                 (EvaluationDeliverySurface.DIRECT, EvaluationAction.DRAFT),
                 (EvaluationDeliverySurface.DIRECT, EvaluationAction.HANDOFF),
@@ -773,7 +770,7 @@ async def test_evaluation_matrix_does_not_mutate_production_tables(session, migr
     after = await _production_snapshot(session)
     assert after == before
     assert await _count(session, models.EvaluationRun) == 1
-    assert await _count(session, models.EvaluationDecision) == 6
+    assert await _count(session, models.EvaluationDecision) == 3
 
 
 async def _seed_production_context(session) -> None:
@@ -785,7 +782,7 @@ async def _seed_production_context(session) -> None:
             brand_id="b1",
             platform="telegram",
             name="evaluation-isolation",
-            chatwoot_inbox_id=101,
+            config={"delivery_mode": "direct"},
         )
     )
     await session.execute(

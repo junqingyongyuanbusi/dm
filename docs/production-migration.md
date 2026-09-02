@@ -231,11 +231,12 @@ verifies the resulting digest immediately afterward.
 
 The compatibility image preserves the predecessor application, which does not understand
 `review_outbox_id`. During a compatibility rollback, pause Admin draft approvals and treat the draft
-review queue as degraded: the predecessor cannot surface a pending Chatwoot draft when `outbox_id`
-points to its private-note Outbox. Existing customer-facing `DRAFT_APPROVAL + ADMIN_HUMAN` Outboxes
-remain authority-driven, and persisted `review_action` prevents an already reviewed decision from
-being approved twice. Do not dual-write approval delivery into `outbox_id`; that would recreate the
-private-note/customer-delivery ambiguity removed by this migration.
+review queue as degraded: the predecessor cannot reliably surface every pending legacy private-note
+draft when `outbox_id` points to that historical review delivery. Existing customer-facing
+`DRAFT_APPROVAL + ADMIN_HUMAN` Outboxes remain authority-driven, and persisted `review_action`
+prevents an already reviewed decision from being approved twice. Do not dual-write approval
+delivery into `outbox_id`; that would recreate the private-note/customer-delivery ambiguity removed
+by this migration.
 
 Alembic downgrade restores `review_outbox_id` into the predecessor `outbox_id` only when the
 decision has no separate private-note link. If both links are populated, or any knowledge document
@@ -386,18 +387,14 @@ instances and accidental multiple API replicas serialize the full preparation se
 Worker and scheduler roles refuse to start until the database is at head and all encrypted
 envelopes can be decrypted.
 
-## Optional Chatwoot bridge
+## C1 Chatwoot runtime retirement compatibility
 
-`CHATWOOT_ENABLED` now defaults to `false`. Direct-only environments no longer need
-`CHATWOOT_WEBHOOK_SECRET` or `CHATWOOT_API_TOKEN`. Existing Chatwoot deployments must explicitly
-set `CHATWOOT_ENABLED=true` before deploying this release and keep the same value on API, Worker,
-and Scheduler.
-
-With the bridge disabled, the API route and reconcile task are absent. The Worker keeps the
-compatibility Actor long enough to drain already queued RawEvents; their delivery decisions remain
-`DEFERRED_CHATWOOT` and resume after the bridge is enabled again. Legacy pending Chatwoot
-deliveries move to `NEEDS_REVIEW/CHATWOOT_DISABLED` while disabled and are safely returned to the
-Outbox queue after re-enable. Database fields and conversation mappings remain intact.
+The current runtime does not read or write Chatwoot and has no Chatwoot webhook, actor, scheduler
+sweep, delivery branch, recovery path, or environment setting. SQLAlchemy models and published
+Alembic revisions temporarily retain legacy Chatwoot columns and tables only so the predecessor
+application can be used for rollback and historical records remain auditable. Do not repurpose or
+populate those fields. C2 will use a separately reviewed forward migration to remove the retained
+schema after the application rollback window closes.
 
 ## X stack feature flags
 
@@ -589,9 +586,9 @@ HAVING count(*) > 1;
 
 `CanonicalEvent` now persists an additive `event_kind=message` field. New readers default historical
 serialized events without the field to `message`; old readers ignore the additional key. Telegram,
-Meta, WhatsApp and Chatwoot normalization now preserves unsupported media metadata on the Message
-and creates an `UNSUPPORTED_ATTACHMENT` human work item. Receipts and reactions remain in RawEvent
-evidence without creating DecisionJobs.
+Meta and WhatsApp normalization preserves unsupported media metadata on the Message and creates an
+`UNSUPPORTED_ATTACHMENT` human work item. Receipts and reactions remain in RawEvent evidence
+without creating DecisionJobs.
 
 Direct Outbox delivery now validates nonblank text and binds the destination target to the source
 `ReplyDecision.message_id`, `Message.reply_target`, Conversation contact and account identity before
@@ -815,9 +812,23 @@ Pause old Scheduler processes before starting the new Scheduler and keep the mix
 
 ## Initial RawEvent dispatch recovery
 
-The existing `b2d8f5a3c714` RawEvent processing columns now also back generic initial-dispatch recovery; this release adds no new table or migration. New Telegram, Meta, X direct, Chatwoot webhook, and Chatwoot reconciliation rows persist a versioned actor contract in immutable `RawEvent.context`.
+The existing `b2d8f5a3c714` RawEvent processing columns also back generic initial-dispatch recovery;
+this release adds no new table or migration. New Telegram, Meta, Feishu, and X direct rows persist a
+versioned actor contract in immutable `RawEvent.context`. Retired dispatch kinds are not selected
+for execution.
 
-New recovery actors use the dedicated `initial_raw_v1` Dramatiq queue. Old workers do not declare or consume that queue, while new workers retain the old direct and Chatwoot actor signatures to drain messages produced by the previous image. This supports either API-first or Worker-first rolling replacement without interpreting a token as the old actor payload.
+Recovery actors use the dedicated `initial_raw_v1` Dramatiq queue. Mixed-version rollout must
+follow the reviewed migration-compatible rollout sequence rather than depending on removed actor
+signatures.
+
+Before deploying a release that removes an actor signature, verify the production database has no
+nonterminal RawEvent, DecisionJob, or Outbox work owned by that retired path, then inspect the Redis
+broker for messages naming the retired actor. For the C1 Chatwoot runtime retirement, both
+`process_initial_chatwoot_event_v1` and `process_chatwoot_event` must have zero queued messages. If
+the queue cannot be proven empty, keep a bounded tombstone actor for one release; it may validate
+and terminally quarantine the referenced durable row, but it must perform no external I/O. Removing
+an actor implementation while its broker messages remain is prohibited because it creates an
+unknown-actor backlog that PostgreSQL recovery cannot execute.
 
 Scheduler redispatches lost reservations and expired worker leases. Eight failed worker claims move a row to `INITIAL_DISPATCH_DEAD`; broker-send failures remain retryable without consuming a worker attempt. Historical `PENDING` rows without versioned dispatch metadata and all polling/XChat-owned rows are intentionally excluded because their actor arguments cannot be reconstructed safely.
 

@@ -539,7 +539,6 @@ _RAW_WARNING_STATUSES = (
     "INITIAL_DISPATCH_RETRY",
     "INITIAL_DISPATCHING",
     "DECISION_PENDING",
-    "DECISION_DEFERRED",
     "XCHAT_DECRYPTION_PENDING",
     "XCHAT_PROCESSING",
     "XCHAT_RETRYABLE_ERROR",
@@ -633,9 +632,7 @@ async def _load_health_metrics(
     ).one()
 
     decision_action = models.DecisionJob.status == "NEEDS_REVIEW"
-    decision_warning = models.DecisionJob.status.in_(
-        ("PENDING", "PROCESSING", "FAILED", "DEFERRED_CHATWOOT")
-    )
+    decision_warning = models.DecisionJob.status.in_(("PENDING", "PROCESSING", "FAILED"))
     decision_row = (
         await session.execute(
             select(

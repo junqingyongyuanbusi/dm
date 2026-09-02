@@ -48,7 +48,6 @@ async def _seed_x_account(session, *, dm_capable: bool = True) -> uuid.UUID:
             webhook_secret_bundle=encrypt_secret_bundle({"consumer_secret": "cs"}),
             config={"delivery_mode": "direct"},
             capability={"dm": dm_capable, "x_chat": True},
-            chatwoot_inbox_id=None,
             automation_default="BOT_ACTIVE",
             status="active",
         )

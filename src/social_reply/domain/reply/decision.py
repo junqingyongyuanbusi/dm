@@ -5,7 +5,7 @@ from enum import StrEnum
 
 class ReplyAction(StrEnum):
     AUTO_REPLY = "auto_reply"
-    DRAFT = "draft"  # 只写 Chatwoot 私有备注，不对外发
+    DRAFT = "draft"  # 保留在本地审核队列，审批前不对外发送
     HANDOFF = "handoff"  # 转人工
     IGNORE = "ignore"  # 不回复也不接管
 

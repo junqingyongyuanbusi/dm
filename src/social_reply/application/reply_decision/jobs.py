@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.message_delivery.intents import OutboxActor, OutboxOrigin
 from social_reply.application.reply_decision.persist import (
-    ChatwootDecisionDeferred,
     DecisionDeliveryConfigurationError,
     ensure_decision_delivery_available,
 )
@@ -25,7 +24,6 @@ from social_reply.infrastructure.database.advisory_locks import (
 )
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +35,7 @@ _INITIAL_DISPATCH_ACTIVE_STATUSES = (
     "INITIAL_DISPATCH_RETRY",
     "INITIAL_DISPATCHING",
 )
-_ACTIVE_JOB_STATUSES = ("PENDING", "FAILED", "PROCESSING", "DEFERRED_CHATWOOT")
+_ACTIVE_JOB_STATUSES = ("PENDING", "FAILED", "PROCESSING")
 _TERMINAL_JOB_STATUSES = {"COMPLETED", "SUPERSEDED"}
 
 
@@ -189,8 +187,6 @@ def raw_event_decision_status(statuses: set[str]) -> str:
         return "PROCESSED"
     if "NEEDS_REVIEW" in statuses:
         return "DECISION_NEEDS_REVIEW"
-    if "DEFERRED_CHATWOOT" in statuses:
-        return "DECISION_DEFERRED"
     if statuses and statuses <= _TERMINAL_JOB_STATUSES:
         return "PROCESSED"
     return "DECISION_PENDING"
@@ -229,11 +225,7 @@ async def aggregate_raw_event_decisions(session: AsyncSession, raw_event_id: uui
         return
     processing_status = raw_event_decision_status(statuses)
     raw_event.processing_status = processing_status
-    raw_event.processed_at = (
-        None
-        if processing_status in {"DECISION_PENDING", "DECISION_DEFERRED"}
-        else datetime.now(UTC)
-    )
+    raw_event.processed_at = None if processing_status == "DECISION_PENDING" else datetime.now(UTC)
 
 
 async def _finish_claim(
@@ -282,7 +274,7 @@ async def process_decision_job(job_id: str) -> bool:
             update(models.DecisionJob)
             .where(
                 models.DecisionJob.id == jid,
-                models.DecisionJob.status.in_(("PENDING", "FAILED", "DEFERRED_CHATWOOT")),
+                models.DecisionJob.status.in_(("PENDING", "FAILED")),
                 models.DecisionJob.decision_generation
                 < select(models.Conversation.decision_generation)
                 .where(models.Conversation.id == models.DecisionJob.conversation_id)
@@ -342,16 +334,13 @@ async def process_decision_job(job_id: str) -> bool:
         async with get_session_factory()() as session:
             account = (
                 await session.execute(
-                    select(
-                        models.PlatformAccount.config,
-                        models.PlatformAccount.chatwoot_inbox_id,
-                    ).where(models.PlatformAccount.id == claimed.account_id)
+                    select(models.PlatformAccount.config).where(
+                        models.PlatformAccount.id == claimed.account_id
+                    )
                 )
             ).one()
         ensure_decision_delivery_available(
             account_config=dict(account.config or {}),
-            chatwoot_inbox_id=account.chatwoot_inbox_id,
-            chatwoot_enabled=get_settings().chatwoot_enabled,
         )
         await run_and_persist_decision(
             snapshot_from_dict(claimed.snapshot),
@@ -369,13 +358,6 @@ async def process_decision_job(job_id: str) -> bool:
         updated = await _finish_claim(jid, token, status="NEEDS_REVIEW", last_error=str(exc)[:2000])
         if updated:
             logger.error("decision requires review job_id=%s error=%s", jid, exc)
-        return False
-    except ChatwootDecisionDeferred as exc:
-        updated = await _finish_claim(
-            jid, token, status="DEFERRED_CHATWOOT", last_error=str(exc)[:2000]
-        )
-        if updated:
-            logger.info("decision deferred while Chatwoot is disabled job_id=%s", jid)
         return False
     except Exception as exc:
         exhausted = claimed.attempt_count >= _MAX_ATTEMPTS
@@ -458,15 +440,6 @@ async def sweep_decision_jobs() -> list[uuid.UUID]:
                 )
             ).scalars()
         )
-        if get_settings().chatwoot_enabled:
-            await session.execute(
-                update(models.DecisionJob)
-                .where(
-                    models.DecisionJob.status == "DEFERRED_CHATWOOT",
-                    models.DecisionJob.decision_generation == current_generation,
-                )
-                .values(status="PENDING", next_attempt_at=now, last_error=None)
-            )
         exhausted = list(
             (
                 await session.execute(

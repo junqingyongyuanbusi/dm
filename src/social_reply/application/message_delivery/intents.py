@@ -111,7 +111,8 @@ async def create_or_get_outbox_intent(
     if row is None:
         raise OutboxIntentError("conversation_account_scope_mismatch")
     conversation, account = row
-    direct_delivery = (account.config or {}).get("delivery_mode") == "direct"
+    if (account.config or {}).get("delivery_mode") != "direct":
+        raise OutboxIntentError("delivery_mode_unsupported")
 
     source_message = None
     if reply_to_message_id is not None:
@@ -122,33 +123,29 @@ async def create_or_get_outbox_intent(
             or source_message.direction != "inbound"
         ):
             raise OutboxIntentError("reply_to_message_scope_mismatch")
-    if direct_delivery and source_message is None:
+    if source_message is None:
         raise OutboxIntentError("reply_to_message_required")
 
-    destination_type = "chatwoot_conversation"
-    target: dict = {}
-    valid_until = None
-    if direct_delivery:
-        limit = capability_text_limit(account.platform, dict(account.capability or {}))
-        if limit is None:
-            raise OutboxIntentError("account_capability_invalid")
-        if len(reply_text) > limit:
-            raise OutboxIntentError("reply_text_too_long")
-        try:
-            destination = build_direct_reply_destination(
-                platform=account.platform,
-                reply_target=dict(source_message.reply_target or {}),
-                visibility=visibility,
-                occurred_at=source_message.occurred_at,
-                now=datetime.now(UTC),
-            )
-        except ValueError as exc:
-            raise OutboxIntentError(str(exc)) from exc
-        destination_type = destination.destination_type
-        target = destination.target
-        valid_until = destination.valid_until
-        if valid_until is not None and valid_until <= datetime.now(UTC):
-            raise OutboxIntentError("delivery_window_expired")
+    limit = capability_text_limit(account.platform, dict(account.capability or {}))
+    if limit is None:
+        raise OutboxIntentError("account_capability_invalid")
+    if len(reply_text) > limit:
+        raise OutboxIntentError("reply_text_too_long")
+    try:
+        destination = build_direct_reply_destination(
+            platform=account.platform,
+            reply_target=dict(source_message.reply_target or {}),
+            visibility=visibility,
+            occurred_at=source_message.occurred_at,
+            now=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        raise OutboxIntentError(str(exc)) from exc
+    destination_type = destination.destination_type
+    target = destination.target
+    valid_until = destination.valid_until
+    if valid_until is not None and valid_until <= datetime.now(UTC):
+        raise OutboxIntentError("delivery_window_expired")
 
     metadata = dict(payload_metadata or {})
     if metadata.keys() & {"text", "visibility", "target"}:

@@ -202,10 +202,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(oauth_router)
     app.include_router(saas_console_router)
     app.include_router(account_management_router)
-    if settings.chatwoot_enabled:
-        from social_reply.application.event_ingestion.router import router as ingestion_router
-
-        app.include_router(ingestion_router)
     app.include_router(telegram_router)
     app.include_router(meta_router)
     app.include_router(feishu_router)

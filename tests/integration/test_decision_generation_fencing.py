@@ -16,9 +16,7 @@ from social_reply.application.account_management.human_workflow import (
 from social_reply.application.account_management.reply_prompt_policy import (
     save_reply_business_prompt,
 )
-from social_reply.application.event_ingestion import processor as chatwoot_processor
 from social_reply.application.event_ingestion.direct import ingest_canonical_event
-from social_reply.application.event_ingestion.processor import process_raw_event
 from social_reply.application.reply_decision import jobs as decision_jobs
 from social_reply.application.reply_decision import runner as decision_runner
 from social_reply.application.reply_decision.business_prompt import BusinessPromptSuperseded
@@ -49,7 +47,8 @@ async def _seed_conversation(session):
             brand_id="b1",
             platform="telegram",
             name="generation-test",
-            chatwoot_inbox_id=101,
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "max_text_length": 4096},
         )
     )
     await session.execute(
@@ -83,7 +82,7 @@ async def _seed_generation_input(
     await session.execute(
         insert(models.RawEvent).values(
             id=raw_event_id,
-            source="chatwoot",
+            source="telegram",
             payload={},
             processing_status="PROCESSED",
         )
@@ -96,6 +95,8 @@ async def _seed_generation_input(
             direction="inbound",
             sender_type="contact",
             text=text,
+            platform_message_id=f"telegram-{message_id}",
+            reply_target={"kind": "dm", "chat_id": "user-1"},
             decision_generation=decision_generation,
         )
     )
@@ -406,10 +407,10 @@ async def test_new_generation_supersedes_job_and_cancels_stale_bot_outbox(sessio
             id=outbox_id,
             conversation_id=conversation_id,
             platform_account_id=account_id,
-            destination_type="chatwoot_conversation",
-            destination_id="conversation",
+            destination_type="telegram_dm",
+            destination_id="telegram:user-1",
             message_type="text",
-            payload={"text": "stale"},
+            payload={"text": "stale", "target": {"kind": "dm", "chat_id": "user-1"}},
             reply_to_message_id=first_message_id,
             origin_kind="DECISION",
             actor_kind="BOT",
@@ -589,302 +590,6 @@ async def test_direct_ingestion_commits_new_generation_while_older_llm_is_blocke
     assert second_job.decision_generation == second_message.decision_generation == 2
     assert [decision.decision_job_id for decision in decisions] == [second_job_id]
     assert await session.scalar(select(func.count()).select_from(models.OutboxMessage)) == 0
-
-
-async def test_chatwoot_ingestion_commits_new_generation_while_older_llm_is_blocked(
-    session, monkeypatch
-):
-    account_id, _conversation_id = await _seed_conversation(session)
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
-
-    class ControlledLLM:
-        async def decide(self, context):
-            if context.text == "m1":
-                first_started.set()
-                await release_first.wait()
-            return ReplyDecision(action=ReplyAction.IGNORE, source="llm")
-
-    class EnabledKillSwitch:
-        async def is_disabled(self, *_args):
-            return False
-
-    from social_reply.application.reply_decision import runner
-
-    monkeypatch.setattr(runner, "_llm", ControlledLLM())
-    monkeypatch.setattr(runner, "_make_killswitch", lambda: EnabledKillSwitch())
-
-    def payload(message_id: int, content: str) -> dict:
-        return {
-            "event": "message_created",
-            "id": message_id,
-            "content": content,
-            "message_type": "incoming",
-            "private": False,
-            "created_at": "2026-07-31T00:00:00Z",
-            "sender": {"id": 9, "type": "contact"},
-            "conversation": {"id": 77, "inbox_id": 101, "status": "pending"},
-            "account": {"id": 1},
-        }
-
-    raw_ids = []
-    for message_id, content in ((1001, "m1"), (1002, "m2")):
-        raw_ids.append(
-            (
-                await session.execute(
-                    insert(models.RawEvent)
-                    .values(source="chatwoot", payload=payload(message_id, content))
-                    .returning(models.RawEvent.id)
-                )
-            ).scalar_one()
-        )
-    await session.commit()
-
-    first_ingestion = asyncio.create_task(process_raw_event(str(raw_ids[0])))
-    await asyncio.wait_for(first_started.wait(), timeout=2)
-    await asyncio.wait_for(process_raw_event(str(raw_ids[1])), timeout=2)
-    assert not first_ingestion.done()
-    release_first.set()
-    await asyncio.wait_for(first_ingestion, timeout=2)
-
-    session.expire_all()
-    jobs = (
-        (
-            await session.execute(
-                select(models.DecisionJob)
-                .where(models.DecisionJob.raw_event_id.in_(raw_ids))
-                .order_by(models.DecisionJob.decision_generation)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    messages = [await session.get(models.Message, job.message_id) for job in jobs]
-    assert [job.status for job in jobs] == ["SUPERSEDED", "COMPLETED"]
-    assert [job.decision_generation for job in jobs] == [1, 2]
-    assert [message.decision_generation for message in messages] == [1, 2]
-    decisions = (
-        (
-            await session.execute(
-                select(models.ReplyDecision).where(
-                    models.ReplyDecision.decision_job_id.in_([job.id for job in jobs])
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert [decision.decision_job_id for decision in decisions] == [jobs[1].id]
-
-
-@pytest.mark.parametrize("human_action", ["resume", "resolve", "reply"])
-async def test_chatwoot_ingestion_cannot_deadlock_with_human_action(
-    session, monkeypatch, human_action
-):
-    account_id, conversation_id = await _seed_conversation(session)
-    reply_to_message_id = uuid.uuid4()
-    await session.execute(
-        insert(models.ConversationMapping).values(
-            chatwoot_account_id=1,
-            chatwoot_conversation_id=77,
-            conversation_id=conversation_id,
-        )
-    )
-    await session.execute(
-        insert(models.Message).values(
-            id=reply_to_message_id,
-            conversation_id=conversation_id,
-            direction="inbound",
-            sender_type="contact",
-            text="Earlier message",
-        )
-    )
-    raw_event_id = (
-        await session.execute(
-            insert(models.RawEvent)
-            .values(
-                source="chatwoot",
-                payload={
-                    "event": "message_created",
-                    "id": 2001,
-                    "content": "Concurrent inbound",
-                    "message_type": "incoming",
-                    "private": False,
-                    "created_at": "2026-07-31T00:00:00Z",
-                    "sender": {"id": 9, "type": "contact"},
-                    "conversation": {"id": 77, "inbox_id": 101, "status": "pending"},
-                    "account": {"id": 1},
-                },
-            )
-            .returning(models.RawEvent.id)
-        )
-    ).scalar_one()
-    await session.commit()
-    await _prepare_human_action(session, conversation_id, human_action)
-
-    async def no_dispatch(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(human_workflow, "dispatch_actor", no_dispatch)
-    monkeypatch.setattr(decision_jobs, "process_decision_job", no_dispatch)
-
-    original_chatwoot_lock = chatwoot_processor.acquire_conversation_delivery_xact_lock
-    chatwoot_has_lock = asyncio.Event()
-    release_chatwoot = asyncio.Event()
-
-    async def paused_chatwoot_lock(lock_session, locked_conversation_id):
-        await original_chatwoot_lock(lock_session, locked_conversation_id)
-        chatwoot_has_lock.set()
-        await release_chatwoot.wait()
-
-    monkeypatch.setattr(
-        chatwoot_processor,
-        "acquire_conversation_delivery_xact_lock",
-        paused_chatwoot_lock,
-    )
-    original_store_message = chatwoot_processor._store_message
-
-    async def observed_store_message(*args, **kwargs):
-        assert chatwoot_has_lock.is_set()
-        return await original_store_message(*args, **kwargs)
-
-    monkeypatch.setattr(chatwoot_processor, "_store_message", observed_store_message)
-
-    original_human_lock = human_workflow.acquire_conversation_delivery_xact_lock
-    human_waiting = asyncio.Event()
-
-    async def observed_human_lock(lock_session, locked_conversation_id):
-        human_waiting.set()
-        await original_human_lock(lock_session, locked_conversation_id)
-
-    monkeypatch.setattr(
-        human_workflow, "acquire_conversation_delivery_xact_lock", observed_human_lock
-    )
-
-    chatwoot_task = asyncio.create_task(process_raw_event(str(raw_event_id)))
-    human_task = None
-    try:
-        await asyncio.wait_for(chatwoot_has_lock.wait(), timeout=2)
-        human_task = asyncio.create_task(
-            _run_human_action(human_action, conversation_id, reply_to_message_id)
-        )
-        await asyncio.wait_for(human_waiting.wait(), timeout=2)
-        release_chatwoot.set()
-        await asyncio.wait_for(asyncio.gather(chatwoot_task, human_task), timeout=4)
-    finally:
-        release_chatwoot.set()
-        for task in (chatwoot_task, human_task):
-            if task is not None and not task.done():
-                task.cancel()
-        await asyncio.gather(
-            *(task for task in (chatwoot_task, human_task) if task is not None),
-            return_exceptions=True,
-        )
-
-    session.expire_all()
-    raw_event = await session.get(models.RawEvent, raw_event_id)
-    conversation = await session.get(models.Conversation, conversation_id)
-    job = (
-        await session.execute(
-            select(models.DecisionJob).where(models.DecisionJob.raw_event_id == raw_event_id)
-        )
-    ).scalar_one()
-    stored_message = await session.get(models.Message, job.message_id)
-    assert raw_event.processing_status == "PROCESSED"
-    assert stored_message.text == "Concurrent inbound"
-    assert job.status == "PENDING"
-    assert stored_message.decision_generation == 1
-    assert job.decision_generation == conversation.decision_generation == 1
-    await _assert_human_action(session, conversation_id, human_action)
-
-
-async def test_claimed_chatwoot_ingestion_locks_conversation_before_raw_event(session, monkeypatch):
-    account_id, conversation_id = await _seed_conversation(session)
-    await session.execute(
-        insert(models.ConversationMapping).values(
-            chatwoot_account_id=1,
-            chatwoot_conversation_id=77,
-            conversation_id=conversation_id,
-        )
-    )
-    claim_token = uuid.uuid4()
-    raw_event_id = (
-        await session.execute(
-            insert(models.RawEvent)
-            .values(
-                tenant_id="default",
-                platform_account_id=account_id,
-                source="chatwoot",
-                payload={
-                    "event": "message_created",
-                    "id": 2002,
-                    "content": "Claimed inbound",
-                    "message_type": "incoming",
-                    "private": False,
-                    "created_at": "2026-07-31T00:00:00Z",
-                    "sender": {"id": 9, "type": "contact"},
-                    "conversation": {"id": 77, "inbox_id": 101, "status": "pending"},
-                    "account": {"id": 1},
-                },
-                processing_status="INITIAL_DISPATCHING",
-                processing_claim_token=claim_token,
-                processing_claim_expires_at=datetime.now(UTC) + timedelta(minutes=1),
-            )
-            .returning(models.RawEvent.id)
-        )
-    ).scalar_one()
-    await session.commit()
-
-    lock_attempted = asyncio.Event()
-    original_lock = chatwoot_processor.acquire_conversation_delivery_xact_lock
-
-    async def observed_lock(lock_session, locked_conversation_id):
-        lock_attempted.set()
-        await original_lock(lock_session, locked_conversation_id)
-
-    monkeypatch.setattr(
-        chatwoot_processor,
-        "acquire_conversation_delivery_xact_lock",
-        observed_lock,
-    )
-
-    connection = await get_engine().connect()
-    task = None
-    try:
-        await connection.begin()
-        await connection.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-            {"key": f"social-reply:conversation-delivery:{conversation_id}"},
-        )
-        task = asyncio.create_task(
-            process_raw_event(
-                str(raw_event_id),
-                raw_event_claim_token=claim_token,
-            )
-        )
-        await asyncio.wait_for(lock_attempted.wait(), timeout=2)
-        await connection.execute(text("SET LOCAL lock_timeout = '500ms'"))
-        updated = await connection.execute(
-            update(models.RawEvent)
-            .where(models.RawEvent.id == raw_event_id)
-            .values(processing_status="CLAIM_REPLACED")
-        )
-        assert updated.rowcount == 1
-        await connection.commit()
-        await asyncio.wait_for(task, timeout=4)
-    finally:
-        if connection.in_transaction():
-            await connection.rollback()
-        await connection.close()
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    session.expire_all()
-    raw_event = await session.get(models.RawEvent, raw_event_id)
-    assert raw_event.processing_status == "CLAIM_REPLACED"
-    assert await session.scalar(select(func.count()).select_from(models.Message)) == 0
-    assert await session.scalar(select(func.count()).select_from(models.DecisionJob)) == 0
 
 
 async def test_direct_ingestion_takes_conversation_lock_before_raw_event_locks(
@@ -1261,10 +966,10 @@ async def test_supersession_cancels_only_unsent_bot_decision_outboxes(session):
                 id=outbox_id,
                 conversation_id=conversation_id,
                 platform_account_id=account_id,
-                destination_type="chatwoot_conversation",
-                destination_id="conversation",
+                destination_type="telegram_dm",
+                destination_id="telegram:user-1",
                 message_type="text",
-                payload={"text": str(index)},
+                payload={"text": str(index), "target": {"kind": "dm", "chat_id": "user-1"}},
                 reply_to_message_id=first_message_id,
                 origin_kind=origin,
                 actor_kind=actor,

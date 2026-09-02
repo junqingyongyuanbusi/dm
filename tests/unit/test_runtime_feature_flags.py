@@ -15,7 +15,6 @@ from social_reply.shared.config import Settings
 
 def _settings(
     *,
-    chatwoot: bool = False,
     legacy: bool = True,
     activity: bool = True,
     xchat: bool = True,
@@ -25,7 +24,6 @@ def _settings(
     return Settings(
         _env_file=None,
         testing=True,
-        chatwoot_enabled=chatwoot,
         x_legacy_dm_enabled=legacy,
         x_activity_enabled=activity,
         xchat_enabled=xchat,
@@ -66,14 +64,11 @@ def test_x_reconciliation_modules_do_not_parse_settings_at_import_time():
     assert result.returncode == 0, result.stderr
 
 
-def test_direct_only_production_modules_import_without_chatwoot_credentials():
+def test_direct_only_production_modules_import_without_retired_bridge_configuration():
     env = os.environ.copy()
     env.update(
         {
             "TESTING": "false",
-            "CHATWOOT_ENABLED": "false",
-            "CHATWOOT_WEBHOOK_SECRET": "",
-            "CHATWOOT_API_TOKEN": "",
             "X_LEGACY_DM_ENABLED": "false",
             "X_ACTIVITY_ENABLED": "false",
             "XCHAT_ENABLED": "false",
@@ -100,7 +95,7 @@ def test_direct_only_production_modules_import_without_chatwoot_credentials():
                 "import apps.api.main; "
                 "import apps.worker.main; "
                 "import apps.scheduler.main as scheduler; "
-                "assert 'social_reply.application.event_ingestion.actors' in sys.modules; "
+                "assert 'social_reply.application.event_ingestion.actors' not in sys.modules; "
                 "assert 'social_reply.application.event_ingestion.reconcile' not in sys.modules; "
                 "assert 'social_reply.connectors.x.router' not in sys.modules; "
                 "assert 'social_reply.application.event_ingestion.xchat_actors' in sys.modules; "

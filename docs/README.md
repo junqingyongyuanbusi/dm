@@ -7,8 +7,9 @@ Instagram, WhatsApp, Feishu, X and Email. The Alembic graph has one current head
 `f3a7c9e1b5d2`. Email protocol/unit coverage does not by itself imply that a real mailbox credential
 or live provider E2E has been validated.
 
-- [Runtime architecture](architecture.md): process ownership, state boundaries, message paths and
-  reliability invariants, including the English-corpus multilingual RAG and review path.
+- [Runtime architecture](architecture.md): process ownership, state boundaries, message paths,
+  reliability invariants and the C1 legacy-schema compatibility boundary, including the
+  English-corpus multilingual RAG and review path.
 - [Configuration reference](configuration.md): application, module-level and deployment-only
   environment variables, language policy, selector canary semantics and retrieval backend choice.
 - [Multilingual English-corpus replies](multilingual-reviewed-localization.md): operator-facing

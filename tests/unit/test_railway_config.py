@@ -15,7 +15,6 @@ _REQUIRED = {
     "LLM_PROVIDER": "openai",
     "OPENAI_API_KEY": "openai-key",
     "TESTING": "false",
-    "CHATWOOT_ENABLED": "false",
     "X_LEGACY_DM_ENABLED": "true",
     "X_ACTIVITY_ENABLED": "true",
     "XCHAT_ENABLED": "false",

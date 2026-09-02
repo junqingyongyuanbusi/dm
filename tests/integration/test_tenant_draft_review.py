@@ -14,6 +14,7 @@ from social_reply.application.knowledge.publication import (
     UnpublishKnowledgeCommand,
     execute_unpublish_knowledge,
 )
+from social_reply.application.message_delivery import intents as delivery_intents
 from social_reply.application.message_delivery import outbox as outbox_module
 from social_reply.application.reply_review import service as reply_review_service
 from social_reply.application.reply_review.queries import reviewable_draft_condition
@@ -104,7 +105,6 @@ async def _seed_draft(
     message_direction: str = "inbound",
     review_action: str | None = None,
     with_review_outbox: bool = False,
-    direct_delivery: bool = True,
 ) -> DraftContext:
     account_id = uuid.uuid4()
     contact_id = uuid.uuid4()
@@ -119,7 +119,7 @@ async def _seed_draft(
         name=f"Draft account {account_id}",
         public_id=f"draft-{account_id}",
         credential_bundle=encrypt_secret_bundle({"bot_token": "provider-secret-token"}),
-        config={"delivery_mode": "direct"} if direct_delivery else {},
+        config={"delivery_mode": "direct"},
         capability={"dm": True, "max_text_length": 4096},
         automation_default="BOT_DRAFT_ONLY",
         status="active",
@@ -439,8 +439,13 @@ async def test_tenant_draft_approval_validates_reply_length_boundaries(
     reply_text: str,
     expected_status: int,
 ) -> None:
-    draft = await _seed_draft(session, direct_delivery=False)
+    draft = await _seed_draft(session)
     _install_direct_sender(monkeypatch)
+    monkeypatch.setattr(
+        delivery_intents,
+        "capability_text_limit",
+        lambda _platform, _capability: 10000,
+    )
 
     async with _client() as client:
         csrf_token = await _login(
@@ -575,10 +580,10 @@ async def test_tenant_draft_approval_rechecks_prompt_provenance(session) -> None
 async def test_tenant_draft_approval_rechecks_knowledge_document_chunk_and_hash(
     session,
 ) -> None:
-    unpublished_draft = await _seed_draft(session, direct_delivery=False)
-    mismatched_hash_draft = await _seed_draft(session, direct_delivery=False)
-    mismatched_chunk_content_draft = await _seed_draft(session, direct_delivery=False)
-    partial_provenance_draft = await _seed_draft(session, direct_delivery=False)
+    unpublished_draft = await _seed_draft(session)
+    mismatched_hash_draft = await _seed_draft(session)
+    mismatched_chunk_content_draft = await _seed_draft(session)
+    partial_provenance_draft = await _seed_draft(session)
     unpublished_document, unpublished_chunk = await _seed_published_knowledge(
         session,
         question="Unpublished approval source",
@@ -679,7 +684,7 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
 
     monkeypatch.setattr(reply_review_service, "dispatch_actor", suppress_dispatch)
 
-    unpublish_first_draft = await _seed_draft(session, direct_delivery=False)
+    unpublish_first_draft = await _seed_draft(session)
     unpublish_first_document, unpublish_first_chunk = await _seed_published_knowledge(
         session,
         question="Unpublish wins the race",
@@ -721,7 +726,7 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
         await approval_task
     assert approval_waited_for_unpublish is True
 
-    approval_first_draft = await _seed_draft(session, direct_delivery=False)
+    approval_first_draft = await _seed_draft(session)
     approval_first_document, approval_first_chunk = await _seed_published_knowledge(
         session,
         question="Approval wins the race",

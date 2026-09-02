@@ -47,15 +47,9 @@ must be public before Railway is switched so the services can pull it without re
 platform credentials unreadable. Key rotation prepends a new key and retains old keys until every
 envelope has been rewritten and backups have aged out.
 
-## Chatwoot bridge
-
-| Variable | Default | Requirement |
-| --- | --- | --- |
-| `CHATWOOT_ENABLED` | `false` | Must match across API, Worker and Scheduler |
-| `CHATWOOT_WEBHOOK_SECRET` | `change-me` | Required and non-default when bridge is enabled outside tests |
-| `CHATWOOT_SIGNATURE_TOLERANCE_SECONDS` | `300` | Signed webhook timestamp window |
-| `CHATWOOT_BASE_URL` | `http://localhost:3000` | Chatwoot API origin |
-| `CHATWOOT_API_TOKEN` | `dev-local-token` | Required and non-default when bridge is enabled outside tests |
+Chatwoot has no runtime settings or three-role configuration contract. Its legacy database fields
+remain only for the C1 application-rollback and historical-audit window and will be removed by a
+separate C2 schema migration.
 
 ## X integration
 
@@ -492,7 +486,6 @@ effects.
 | `SCHEDULER_CORE_INTERVAL_SECONDS` | `3` | 0.5-60 | Durable core recovery cadence |
 | `SCHEDULER_CORE_WARN_AFTER_SECONDS` | `30` | 1-3600 | Core slow-run warning threshold |
 | `SCHEDULER_INSPECTION_WARN_AFTER_SECONDS` | `300` | 1-7200 | Inspection slow-run warning threshold |
-| `CHATWOOT_RECONCILE_INTERVAL_SECONDS` | `3` | 1-3600 | Chatwoot reconciliation cadence |
 | `X_DM_POLL_INTERVAL_SECONDS` | `90` | 0-86400 | Legacy DM poll cadence |
 | `X_WEBHOOK_CHECK_INTERVAL_SECONDS` | `600` | 0-86400 | X webhook health cadence |
 | `XCHAT_POLL_INTERVAL_SECONDS` | `900` | 0-86400 | XChat poll cadence |

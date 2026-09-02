@@ -257,7 +257,6 @@ async def provision_direct_account(
         "config": {"delivery_mode": "direct", **config},
         "capability": capability,
         "config_version": 1,
-        "chatwoot_inbox_id": None,
         # Reauthorization must not silently change an operator-selected automation mode.
         "automation_default": (
             existing.automation_default if existing is not None else automation_default
