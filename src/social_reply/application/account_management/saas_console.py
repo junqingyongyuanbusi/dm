@@ -1252,8 +1252,8 @@ def _build_agent_card_view(
         bool(published_count),
         bool(accounts) and len(active_accounts) == len(accounts),
         (
-            control_plane is not None
-            and control_plane.deployed_version_revision
+            control_plane is None
+            or control_plane.deployed_version_revision
             == control_plane.version_revision
         ),
     )

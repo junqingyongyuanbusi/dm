@@ -341,7 +341,8 @@ async def test_canonical_admin_page_displays_complete_path_scoped_editor(
         await _login(client)
         page = await client.get("/app/t/default/agents/default/instructions")
     assert page.status_code == 200
-    assert "当前业务 Prompt" in page.text
+    assert "业务指令草稿" in page.text
+    assert "生产发布" in page.text
     assert html.escape(DEFAULT_BUSINESS_PROMPT.text) in page.text
     assert DEFAULT_BUSINESS_PROMPT.content_hash in page.text
     assert "system" in page.text
