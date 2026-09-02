@@ -883,6 +883,7 @@ def test_channel_forms_use_localized_pending_labels() -> None:
             csrf="safe-csrf",
             tenant_id="tenant-a",
             label="Authorize with X",
+            brand_id="indonesia_support",
             available=True,
         )
     finally:
@@ -890,6 +891,7 @@ def test_channel_forms_use_localized_pending_labels() -> None:
 
     assert html.count('data-pending-label="Connecting…"') == 2
     assert "safe-csrf" in html
+    assert 'name="brand_id" value="indonesia_support"' in html
     assert "正在连接" not in html
 
 
@@ -917,6 +919,7 @@ def test_ordinary_user_agent_sections_never_link_to_admin_pages() -> None:
     channels_html = saas_console._render_agent_channels(
         [account],
         tenant_id="tenant-a",
+        agent_id="default",
         is_admin=False,
     )
     instructions_html = saas_console._render_agent_instructions(
@@ -937,6 +940,20 @@ def test_ordinary_user_agent_sections_never_link_to_admin_pages() -> None:
     assert "/admin" not in combined_html
     assert "/app/t/tenant-a/channels" in channels_html
     assert "/app/t/tenant-a/knowledge-query" in knowledge_html
+
+
+def test_admin_agent_channel_link_preserves_agent_scope() -> None:
+    from social_reply.application.account_management import saas_console
+
+    html = saas_console._render_agent_channels(
+        [],
+        tenant_id="tenant-a",
+        agent_id="indonesia_support",
+        is_admin=True,
+    )
+
+    assert "/app/t/tenant-a/channels?brand_id=indonesia_support" in html
+    assert "/admin/integrations/accounts" not in html
 
 
 def test_admin_agent_knowledge_link_is_canonical_and_preserves_brand() -> None:

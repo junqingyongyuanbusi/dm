@@ -1,6 +1,10 @@
 import pytest
 from sqlalchemy import func, select
 
+from social_reply.application.account_management.agent_control_plane import (
+    AgentControlPlaneConflict,
+    create_agent,
+)
 from social_reply.application.account_management.reply_prompt_policy import (
     rollback_reply_business_prompt,
     save_reply_business_prompt,
@@ -8,6 +12,95 @@ from social_reply.application.account_management.reply_prompt_policy import (
 from social_reply.infrastructure.database import models
 
 pytestmark = pytest.mark.integration
+
+
+async def test_first_class_agent_creation_starts_undeployed_and_accepts_instructions(
+    session,
+) -> None:
+    agent = await create_agent(
+        session,
+        tenant_id="tenant-a",
+        slug="indonesia_support",
+        name="  Indonesia   Support  ",
+        description="Handles Indonesian support questions.",
+        actor="user:operator",
+    )
+    await session.commit()
+
+    initial_version = await session.scalar(
+        select(models.AgentVersion).where(
+            models.AgentVersion.tenant_id == "tenant-a",
+            models.AgentVersion.agent_id == agent.id,
+        )
+    )
+    deployment_count = await session.scalar(
+        select(func.count())
+        .select_from(models.AgentDeployment)
+        .where(models.AgentDeployment.agent_id == agent.id)
+    )
+
+    assert agent.name == "Indonesia Support"
+    assert agent.legacy_brand_id == "indonesia_support"
+    assert initial_version.revision == 1
+    assert initial_version.business_prompt_version_id is None
+    assert initial_version.configuration["source"] == "agent_creation"
+    assert deployment_count == 0
+
+    prompt = await save_reply_business_prompt(
+        session,
+        tenant_id="tenant-a",
+        brand_id="indonesia_support",
+        content="Reply in Bahasa Indonesia and escalate payment risk.",
+        expected_revision=0,
+        actor="user:operator",
+        change_note="Initial business instructions",
+    )
+    await session.commit()
+    versions = list(
+        await session.scalars(
+            select(models.AgentVersion)
+            .where(models.AgentVersion.agent_id == agent.id)
+            .order_by(models.AgentVersion.revision)
+        )
+    )
+
+    assert [version.revision for version in versions] == [1, 2]
+    assert versions[1].business_prompt_version_id == prompt.version_id
+
+
+async def test_agent_scope_is_unique_within_tenant_but_reusable_across_tenants(session) -> None:
+    await create_agent(
+        session,
+        tenant_id="tenant-a",
+        slug="support",
+        name="Tenant A Support",
+        description=None,
+        actor="user:operator",
+    )
+    await session.commit()
+
+    with pytest.raises(AgentControlPlaneConflict, match="agent_scope_already_exists"):
+        await create_agent(
+            session,
+            tenant_id="tenant-a",
+            slug="support",
+            name="Duplicate Support",
+            description=None,
+            actor="user:operator",
+        )
+    await session.rollback()
+
+    second_agent = await create_agent(
+        session,
+        tenant_id="tenant-b",
+        slug="support",
+        name="Tenant B Support",
+        description=None,
+        actor="user:operator",
+    )
+    await session.commit()
+
+    assert second_agent.tenant_id == "tenant-b"
 
 
 async def test_prompt_changes_append_agent_versions_without_implicit_deployment(session) -> None:

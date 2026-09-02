@@ -354,6 +354,7 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "common.all": ("全部", "All"),
     "common.apply_filters": ("应用筛选", "Apply filters"),
     "common.optional": ("选填", "Optional"),
+    "common.cancel": ("取消", "Cancel"),
     "common.anonymous_contact": ("匿名联系人", "Anonymous contact"),
     "common.non_text_message": ("[非文本消息]", "[Non-text message]"),
     "common.system": ("系统", "System"),
@@ -507,6 +508,82 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "Runtime activity and traces",
     ),
     "agent.configure_scope": ("配置新作用域", "Configure scope"),
+    "agent.create.action": ("创建 Agent", "Create agent"),
+    "agent.create.title": ("创建 Agent", "Create agent"),
+    "agent.create.page_description": (
+        "建立稳定的 Agent 身份，再按配置、测试、部署和分析的闭环逐步上线。",
+        "Create a stable agent identity, then move through configure, test, deploy, and analyze.",
+    ),
+    "agent.create.eyebrow": ("Agent 身份", "Agent identity"),
+    "agent.create.form_title": ("定义职责与作用域", "Define responsibility and scope"),
+    "agent.create.form_description": (
+        "名称用于团队识别；作用域 ID 将绑定指令、知识、渠道和运行记录。",
+        "The name identifies the agent to your team; the scope ID binds instructions, knowledge, channels, and runtime history.",
+    ),
+    "agent.create.name_label": ("Agent 名称", "Agent name"),
+    "agent.create.name_placeholder": (
+        "例如：Indonesia Support",
+        "For example: Indonesia Support",
+    ),
+    "agent.create.slug_label": ("作用域 ID", "Scope ID"),
+    "agent.create.slug_placeholder": (
+        "例如：indonesia_support",
+        "For example: indonesia_support",
+    ),
+    "agent.create.slug_help": (
+        "创建后不可变；仅支持字母、数字、下划线和连字符。",
+        "Immutable after creation; use letters, numbers, underscores, and hyphens only.",
+    ),
+    "agent.create.description_label": ("职责说明", "Mission description"),
+    "agent.create.description_placeholder": (
+        "说明这个 Agent 服务谁、处理什么问题，以及何时转交人工。",
+        "Describe who this agent serves, what it handles, and when it should hand off.",
+    ),
+    "agent.create.description_help": (
+        "这段说明用于团队协作；实际回复行为在下一步 Instructions 中配置。",
+        "This helps your team collaborate; configure actual reply behavior in Instructions next.",
+    ),
+    "agent.create.submit": (
+        "创建并配置 Instructions",
+        "Create and configure Instructions",
+    ),
+    "agent.create.next_title": ("创建后会发生什么", "What happens next"),
+    "agent.create.next_description": (
+        "新 Agent 先保存为未发布配置，不会自动接管任何客户消息。",
+        "A new agent starts as an undeployed configuration and does not take over customer messages.",
+    ),
+    "agent.create.step_identity": ("创建稳定身份", "Create stable identity"),
+    "agent.create.step_identity_description": (
+        "生成 Agent 与不可变配置 v1。",
+        "Create the Agent and immutable configuration v1.",
+    ),
+    "agent.create.step_instructions": ("完善 Instructions", "Configure Instructions"),
+    "agent.create.step_instructions_description": (
+        "保存业务规则会生成新的不可变版本。",
+        "Saving business rules creates a new immutable version.",
+    ),
+    "agent.create.step_deploy": ("测试后连接渠道", "Test, then connect a channel"),
+    "agent.create.step_deploy_description": (
+        "首次渠道接入会形成可审计的生产 Deployment。",
+        "The first channel connection creates an auditable production deployment.",
+    ),
+    "agent.create.safety_title": ("安全默认值", "Safe by default"),
+    "agent.create.safety_description": (
+        "创建本身不会写入 Outbox、发送消息或绕过 Final Guard。",
+        "Creation does not write to the Outbox, send messages, or bypass Final Guard.",
+    ),
+    "agent.create.error_invalid": (
+        "请检查名称、作用域 ID 和职责说明的格式。",
+        "Check the agent name, scope ID, and mission description.",
+    ),
+    "agent.create.error_conflict": (
+        "这个作用域 ID 已被使用，请选择另一个。",
+        "That scope ID is already in use. Choose another one.",
+    ),
+    "agent.create.success": (
+        "Agent 已创建。现在完善 Instructions；在连接渠道前不会接管客户消息。",
+        "Agent created. Configure Instructions next; it will not handle customer messages until a channel is connected.",
+    ),
     "agent.connect_first_channel": ("连接第一个渠道账号", "Connect the first channel account"),
     "agent.confirm_automation_mode": (
         "统一或确认账号自动化模式",
@@ -1081,6 +1158,10 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "channels.banner.error": (
         "授权未完成。错误代码：{error_code}。请检查应用配置后重试。",
         "Authorization did not complete. Error code: {error_code}. Check the app configuration and try again.",
+    ),
+    "channels.agent_scope_banner": (
+        "本页新连接将绑定到 Agent 作用域 {agent_id}。",
+        "New connections on this page will be assigned to Agent scope {agent_id}.",
     ),
     "channels.oauth.x": ("使用 X 授权", "Authorize with X"),
     "channels.oauth.facebook": ("连接 Facebook Page", "Connect Facebook Page"),

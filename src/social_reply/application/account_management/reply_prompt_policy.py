@@ -92,7 +92,16 @@ async def require_reply_prompt_brand(
         )
         .limit(1)
     )
-    if exists is None and configured is None:
+    agent = await session.scalar(
+        select(models.Agent.id)
+        .where(
+            models.Agent.tenant_id == tenant_id,
+            models.Agent.legacy_brand_id == normalized,
+            models.Agent.status == "active",
+        )
+        .limit(1)
+    )
+    if exists is None and configured is None and agent is None:
         raise ReplyBusinessPromptScopeError("reply_business_prompt_brand_not_found")
     return normalized
 

@@ -14,6 +14,7 @@ from sqlalchemy.orm import aliased
 
 from social_reply.application.account_management.admin import (
     _csrf,
+    _ensure_csrf,
     _form,
     _require_csrf,
     _secure_cookie,
@@ -23,6 +24,12 @@ from social_reply.application.account_management.admin_console import (
     _load_health_metrics,
     _raw_action_condition,
     _raw_warning_condition,
+)
+from social_reply.application.account_management.agent_control_plane import (
+    AgentControlPlaneConflict,
+    AgentControlPlaneValidationError,
+    create_agent,
+    normalize_agent_slug,
 )
 from social_reply.application.account_management.auth import Principal, current_principal
 from social_reply.application.account_management.channel_management import (
@@ -581,6 +588,21 @@ def _display_agent_name(agent_id: str) -> str:
     return f"{normalized.title()} Agent"
 
 
+async def _load_agent_display_name(session, tenant_id: str, agent_id: str) -> str:
+    identity = (
+        await session.execute(
+            select(models.Agent.name, models.Agent.created_by).where(
+                models.Agent.tenant_id == tenant_id,
+                models.Agent.legacy_brand_id == agent_id,
+                models.Agent.status == "active",
+            )
+        )
+    ).one_or_none()
+    if identity is not None and identity.created_by.startswith("user:"):
+        return identity.name
+    return _display_agent_name(agent_id)
+
+
 def _agent_lifecycle_context(
     tenant_id: str,
     agent_id: str,
@@ -1043,12 +1065,151 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
         inbox_count=inbox_summary.total,
         primary_action_html=(
             primary_action(
-                f"{_agent_root(tenant_id, DEFAULT_TENANT_ID)}/instructions",
-                translate("agent.configure_scope"),
+                f"{_tenant_root(tenant_id)}/agents/new",
+                translate("agent.create.action"),
             )
             if principal.is_admin
             else ""
         ),
+    )
+
+
+async def _agent_create_page_response(
+    request: Request,
+    principal: Principal,
+    *,
+    tenant_id: str,
+    name: str = "",
+    slug: str = "",
+    description: str = "",
+    error_key: str = "",
+    response_status: int = status.HTTP_200_OK,
+) -> Response:
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+    csrf_token = _csrf(request)
+    body = render_template(
+        "tenant/agent_create.html",
+        form_action=f"{_tenant_root(tenant_id)}/agents",
+        cancel_href=f"{_tenant_root(tenant_id)}/agents",
+        csrf_token=csrf_token,
+        name=name,
+        slug=slug,
+        description=description,
+        error_message=(translate(error_key) if error_key else ""),
+        eyebrow=translate("agent.create.eyebrow"),
+        form_title=translate("agent.create.form_title"),
+        form_description=translate("agent.create.form_description"),
+        name_label=translate("agent.create.name_label"),
+        name_placeholder=translate("agent.create.name_placeholder"),
+        slug_label=translate("agent.create.slug_label"),
+        slug_placeholder=translate("agent.create.slug_placeholder"),
+        slug_help=translate("agent.create.slug_help"),
+        description_label=translate("agent.create.description_label"),
+        description_placeholder=translate("agent.create.description_placeholder"),
+        description_help=translate("agent.create.description_help"),
+        cancel_label=translate("common.cancel"),
+        submit_label=translate("agent.create.submit"),
+        next_title=translate("agent.create.next_title"),
+        next_description=translate("agent.create.next_description"),
+        steps=(
+            {
+                "number": "01",
+                "title": translate("agent.create.step_identity"),
+                "description": translate("agent.create.step_identity_description"),
+            },
+            {
+                "number": "02",
+                "title": translate("agent.create.step_instructions"),
+                "description": translate("agent.create.step_instructions_description"),
+            },
+            {
+                "number": "03",
+                "title": translate("agent.create.step_deploy"),
+                "description": translate("agent.create.step_deploy_description"),
+            },
+        ),
+        safety_title=translate("agent.create.safety_title"),
+        safety_description=translate("agent.create.safety_description"),
+    )
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title=translate("agent.create.title"),
+        description=translate("agent.create.page_description"),
+        body=body,
+        active_navigation="agents",
+        inbox_count=inbox_summary.total,
+        breadcrumbs=(
+            (translate("nav.agents"), f"{_tenant_root(tenant_id)}/agents"),
+            (translate("agent.create.title"), None),
+        ),
+    )
+    response.status_code = response_status
+    response.headers["Cache-Control"] = "no-store"
+    return _ensure_csrf(response, request, csrf_token)
+
+
+@router.get("/app/t/{tenant_id}/agents/new", response_class=HTMLResponse)
+async def new_agent_page(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    return await _agent_create_page_response(request, principal, tenant_id=tenant_id)
+
+
+@router.post("/app/t/{tenant_id}/agents")
+async def create_tenant_agent(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    if set(form) != {"csrf_token", "name", "slug", "description"}:
+        raise HTTPException(status_code=422, detail="agent_create_fields_invalid")
+    name = form.get("name", "")
+    slug = form.get("slug", "")
+    description = form.get("description", "")
+    try:
+        async with get_session_factory()() as session:
+            agent = await create_agent(
+                session,
+                tenant_id=tenant_id,
+                slug=slug,
+                name=name,
+                description=description,
+                actor=principal.actor,
+            )
+            await session.commit()
+    except AgentControlPlaneConflict:
+        return await _agent_create_page_response(
+            request,
+            principal,
+            tenant_id=tenant_id,
+            name=name,
+            slug=slug,
+            description=description,
+            error_key="agent.create.error_conflict",
+            response_status=status.HTTP_409_CONFLICT,
+        )
+    except AgentControlPlaneValidationError:
+        return await _agent_create_page_response(
+            request,
+            principal,
+            tenant_id=tenant_id,
+            name=name,
+            slug=slug,
+            description=description,
+            error_key="agent.create.error_invalid",
+            response_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+    return RedirectResponse(
+        _prompt_canonical_location(
+            tenant_id,
+            agent.legacy_brand_id,
+            notice="agent_created",
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
@@ -1161,6 +1322,7 @@ _AGENT_SECTIONS = {
 }
 
 _PROMPT_NOTICE_KEYS = {
+    "agent_created": ("success", "agent.create.success"),
     "saved": ("success", "admin.prompt.banner.saved"),
     "rolled_back": ("success", "admin.prompt.banner.rolled_back"),
     "revision_conflict": ("danger", "admin.prompt.banner.revision_conflict"),
@@ -1382,6 +1544,7 @@ async def _agent_instructions_page_response(
         agent_ids = await _load_agent_ids(session, principal, tenant_id)
         if agent_id not in agent_ids:
             raise HTTPException(status_code=404, detail="agent_not_found")
+        agent_display_name = await _load_agent_display_name(session, tenant_id, agent_id)
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         accounts = (
             (
@@ -1435,7 +1598,7 @@ async def _agent_instructions_page_response(
     response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title=_display_agent_name(agent_id),
+        title=agent_display_name,
         description=translate(
             "agent.detail_description",
             agent_id=agent_id,
@@ -1447,7 +1610,7 @@ async def _agent_instructions_page_response(
         inbox_count=inbox_summary.total,
         breadcrumbs=(
             (translate("nav.agents"), f"{_tenant_root(tenant_id)}/agents"),
-            (_display_agent_name(agent_id), None),
+            (agent_display_name, None),
         ),
     )
     response.headers["Cache-Control"] = "no-store"
@@ -2014,6 +2177,7 @@ async def _agent_test_page_response(
     async with get_session_factory()() as session:
         if agent_id not in await _load_agent_ids(session, principal, tenant_id):
             raise HTTPException(status_code=404, detail="agent_not_found")
+        agent_display_name = await _load_agent_display_name(session, tenant_id, agent_id)
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         accounts = (
             (
@@ -2060,7 +2224,7 @@ async def _agent_test_page_response(
     response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title=_display_agent_name(agent_id),
+        title=agent_display_name,
         description=translate(
             "agent.detail_description",
             agent_id=agent_id,
@@ -2072,7 +2236,7 @@ async def _agent_test_page_response(
         inbox_count=inbox_summary.total,
         breadcrumbs=(
             (translate("nav.agents"), f"{_tenant_root(tenant_id)}/agents"),
-            (_display_agent_name(agent_id), None),
+            (agent_display_name, None),
         ),
     )
     response.status_code = status_code
@@ -2204,6 +2368,7 @@ async def agent_detail(
         agent_ids = await _load_agent_ids(session, principal, tenant_id)
         if agent_id not in agent_ids:
             raise HTTPException(status_code=404, detail="agent_not_found")
+        agent_display_name = await _load_agent_display_name(session, tenant_id, agent_id)
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         accounts = (
             (
@@ -2284,7 +2449,7 @@ async def agent_detail(
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title=_display_agent_name(agent_id),
+        title=agent_display_name,
         description=translate(
             "agent.detail_description",
             agent_id=agent_id,
@@ -2304,7 +2469,7 @@ async def agent_detail(
         ),
         breadcrumbs=(
             (translate("nav.agents"), f"{_tenant_root(tenant_id)}/agents"),
-            (_display_agent_name(agent_id), None),
+            (agent_display_name, None),
         ),
     )
 
@@ -2354,6 +2519,7 @@ def _render_agent_section(
         return _render_agent_channels(
             accounts,
             tenant_id=tenant_id,
+            agent_id=agent_id,
             is_admin=is_admin,
         )
     if section == "knowledge":
@@ -2554,10 +2720,13 @@ def _render_agent_channels(
     accounts: list[models.PlatformAccount],
     *,
     tenant_id: str,
+    agent_id: str,
     is_admin: bool,
 ) -> str:
     account_href = (
-        "/admin/integrations/accounts" if is_admin else f"{_tenant_root(tenant_id)}/channels"
+        f"{_tenant_root(tenant_id)}/channels?{urlencode({'brand_id': agent_id})}"
+        if is_admin
+        else f"{_tenant_root(tenant_id)}/channels"
     )
     account_action_label = (
         translate("agent.channels.manage_accounts")
@@ -4141,6 +4310,7 @@ def _channel_oauth_form(
     csrf: str,
     tenant_id: str,
     label: str,
+    brand_id: str = "default",
     platform: str | None = None,
     available: bool,
 ) -> str:
@@ -4152,7 +4322,7 @@ def _channel_oauth_form(
     return f"""<form method="post" action="{escape(action)}" data-channel-oauth-form data-pending-label="{pending_label}">
 <input type="hidden" name="csrf_token" value="{escape(csrf)}">
 <input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
-<input type="hidden" name="brand_id" value="default">{platform_input}
+<input type="hidden" name="brand_id" value="{escape(brand_id)}">{platform_input}
 <button class="saas-button primary small" type="submit" data-pending-label="{pending_label}"{disabled}>{escape(label)}</button>
 </form>"""
 
@@ -4186,7 +4356,26 @@ async def tenant_channels(
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
+    requested_brand_id = request.query_params.get("brand_id", "") if principal.is_admin else ""
+    try:
+        channel_brand_id = (
+            normalize_agent_slug(requested_brand_id) if requested_brand_id else "default"
+        )
+    except AgentControlPlaneValidationError as exc:
+        raise HTTPException(status_code=422, detail="invalid_agent_scope") from exc
     async with get_session_factory()() as session:
+        if requested_brand_id:
+            agent_scope_exists = await session.scalar(
+                select(models.Agent.id)
+                .where(
+                    models.Agent.tenant_id == tenant_id,
+                    models.Agent.legacy_brand_id == channel_brand_id,
+                    models.Agent.status == "active",
+                )
+                .limit(1)
+            )
+            if agent_scope_exists is None:
+                raise HTTPException(status_code=404, detail="agent_not_found")
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         accounts = list(
             (
@@ -4292,11 +4481,18 @@ data-job-status="{escape(job.status)}">
             '<div class="saas-alert danger" role="alert">'
             f"{escape(translate('channels.banner.error', error_code=error_code or 'oauth_failed'))}</div>"
         )
+    if channel_brand_id != "default":
+        banner = (
+            '<div class="saas-alert" role="status">'
+            f"{escape(translate('channels.agent_scope_banner', agent_id=channel_brand_id))}</div>"
+            f"{banner}"
+        )
     x_actions = _channel_oauth_form(
         action=f"{_tenant_root(tenant_id)}/channels/oauth/x/start",
         csrf=csrf,
         tenant_id=tenant_id,
         label=translate("channels.oauth.x"),
+        brand_id=channel_brand_id,
         available=x_available,
     )
     facebook_actions = _channel_oauth_form(
@@ -4304,6 +4500,7 @@ data-job-status="{escape(job.status)}">
         csrf=csrf,
         tenant_id=tenant_id,
         label=translate("channels.oauth.facebook"),
+        brand_id=channel_brand_id,
         platform="facebook",
         available=facebook_available,
     )
@@ -4312,12 +4509,14 @@ data-job-status="{escape(job.status)}">
         csrf=csrf,
         tenant_id=tenant_id,
         label="Instagram Login",
+        brand_id=channel_brand_id,
         available=instagram_direct_available,
     ) + _channel_oauth_form(
         action=f"{_tenant_root(tenant_id)}/channels/oauth/meta/start",
         csrf=csrf,
         tenant_id=tenant_id,
         label=translate("channels.oauth.instagram_meta"),
+        brand_id=channel_brand_id,
         platform="instagram",
         available=instagram_meta_available,
     )
@@ -4416,7 +4615,7 @@ data-job-status="{escape(job.status)}">
 <button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
 <div class="saas-alert">{escape(translate("channels.telegram_secret_notice"))}</div>
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
-<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
+<input type="hidden" name="brand_id" value="{escape(channel_brand_id)}"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
 <label for="telegram-name">{escape(translate("channels.display_name"))} <span class="saas-optional">{escape(translate("common.optional"))}</span></label><input id="telegram-name" name="name" placeholder="{escape(translate("channels.telegram_name_placeholder"))}">
 <label for="telegram-token">Bot Token</label><input id="telegram-token" name="token" type="password" autocomplete="new-password" required>
 <div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>{escape(translate("button.cancel"))}</button>
@@ -4427,7 +4626,7 @@ data-job-status="{escape(job.status)}">
 <button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
 <div class="saas-alert">{escape(translate("channels.email_secret_notice"))}</div>
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
-<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
+<input type="hidden" name="brand_id" value="{escape(channel_brand_id)}"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
 <div class="saas-form-grid"><div><label for="email-address">{escape(translate("channels.email_address"))}</label><input id="email-address" name="email_address" type="email" autocomplete="email" required></div>
 <div><label for="email-username">{escape(translate("channels.login_username"))}</label><input id="email-username" name="username" autocomplete="username" required></div></div>
 <label for="email-password">{escape(translate("channels.password"))}</label><input id="email-password" name="password" type="password" autocomplete="new-password" required>
@@ -4443,7 +4642,7 @@ data-job-status="{escape(job.status)}">
 <div class="saas-dialog-header"><div><div class="saas-eyebrow">WhatsApp</div><h2 id="whatsapp-dialog-title">{escape(translate("channels.whatsapp_dialog_title"))}</h2></div>
 <button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
-<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><input type="hidden" name="api_version" value="v23.0">
+<input type="hidden" name="brand_id" value="{escape(channel_brand_id)}"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><input type="hidden" name="api_version" value="v23.0">
 <label for="whatsapp-name">{escape(translate("channels.display_name"))}</label><input id="whatsapp-name" name="name" required>
 <label for="whatsapp-account-id">WhatsApp Business Account ID</label><input id="whatsapp-account-id" name="external_account_id" required>
 <label for="whatsapp-app-id">Meta App ID</label><input id="whatsapp-app-id" name="app_id" required>
@@ -4457,7 +4656,7 @@ data-job-status="{escape(job.status)}">
 <div class="saas-dialog-header"><div><div class="saas-eyebrow">Feishu</div><h2 id="feishu-dialog-title">{escape(translate("channels.feishu_dialog_title"))}</h2></div>
 <button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
-<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
+<input type="hidden" name="brand_id" value="{escape(channel_brand_id)}"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
 <input type="hidden" name="api_base_url" value="https://open.feishu.cn/open-apis"><input type="hidden" name="group_mode" value="mentions_only">
 <label for="feishu-name">{escape(translate("channels.display_name"))}</label><input id="feishu-name" name="name" required>
 <label for="feishu-app-id">App ID</label><input id="feishu-app-id" name="app_id" required>

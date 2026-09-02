@@ -7,6 +7,9 @@ from pathlib import Path
 from sqlalchemy import and_, func, select, true
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from social_reply.application.account_management.agent_control_plane import (
+    ensure_agent_deployment_for_channel_scope,
+)
 from social_reply.domain.platform_accounts import (
     ACTIVE_ACCOUNT_STATUS,
     account_platform,
@@ -364,6 +367,11 @@ async def provision_direct_account(
             ):
                 raise ValueError("platform_account_public_id_is_immutable")
             raise RuntimeError("platform_account_upsert_conflict")
+        await ensure_agent_deployment_for_channel_scope(
+            session,
+            tenant_id=tenant_id,
+            brand_id=brand_id,
+        )
         await session.commit()
     if persisted.public_id is None:
         raise RuntimeError("platform_account_public_id_missing")

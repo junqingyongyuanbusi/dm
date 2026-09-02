@@ -81,7 +81,8 @@ def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
     tenant_pages = {
         "/app": {"GET"},
         "/app/t/{tenant_id}": {"GET"},
-        "/app/t/{tenant_id}/agents": {"GET"},
+        "/app/t/{tenant_id}/agents": {"GET", "POST"},
+        "/app/t/{tenant_id}/agents/new": {"GET"},
         "/app/t/{tenant_id}/agents/{agent_id}": {"GET"},
         "/app/t/{tenant_id}/agents/{agent_id}/instructions": {"GET"},
         "/app/t/{tenant_id}/agents/{agent_id}/instructions/save": {"POST"},

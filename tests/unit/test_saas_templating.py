@@ -124,6 +124,47 @@ def test_agent_lifecycle_template_uses_real_product_routes() -> None:
     assert html.count('aria-current="step"') == 1
 
 
+def test_agent_create_template_autoescapes_values_and_explains_safe_lifecycle() -> None:
+    html = render_template(
+        "tenant/agent_create.html",
+        form_action="/app/t/tenant-a/agents",
+        cancel_href="/app/t/tenant-a/agents",
+        csrf_token='<script>alert("csrf")</script>',
+        name='<img src=x onerror="alert(1)">',
+        slug="support",
+        description='<script>alert("mission")</script>',
+        error_message="",
+        eyebrow="Agent identity",
+        form_title="Define scope",
+        form_description="Create a stable identity.",
+        name_label="Name",
+        name_placeholder="Support",
+        slug_label="Scope ID",
+        slug_placeholder="support",
+        slug_help="Immutable",
+        description_label="Mission",
+        description_placeholder="Describe the mission",
+        description_help="Configure behavior next",
+        cancel_label="Cancel",
+        submit_label="Create",
+        next_title="What happens next",
+        next_description="Starts undeployed",
+        steps=(
+            {"number": "01", "title": "Identity", "description": "Create v1"},
+            {"number": "02", "title": "Instructions", "description": "Save rules"},
+            {"number": "03", "title": "Deploy", "description": "Connect channel"},
+        ),
+        safety_title="Safe by default",
+        safety_description="No Outbox or outbound message.",
+    )
+
+    assert 'action="/app/t/tenant-a/agents"' in html
+    assert 'pattern="[A-Za-z0-9_-]{1,64}"' in html
+    assert "<script>" not in html
+    assert "<img src=x" not in html
+    assert "No Outbox or outbound message." in html
+
+
 def test_agent_test_workspace_is_isolated_and_autoescapes_model_output() -> None:
     from social_reply.application.account_management import saas_console
 
