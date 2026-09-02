@@ -1,0 +1,63 @@
+{% if error_message %}
+  <section class="saas-alert danger" role="alert">{{ error_message }}</section>
+{% endif %}
+
+<div class="saas-agent-create-layout">
+  <section class="saas-card saas-agent-create-card">
+    <div class="saas-card-header">
+      <div>
+        <span class="saas-eyebrow">{{ eyebrow }}</span>
+        <h2>{{ form_title }}</h2>
+        <p>{{ form_description }}</p>
+      </div>
+    </div>
+    <div class="saas-card-body">
+      <form class="saas-form" method="post" action="{{ form_action }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="saas-form-grid">
+          <label class="saas-field" for="agent-name">
+            <span>{{ name_label }}</span>
+            <input id="agent-name" name="name" value="{{ name }}" maxlength="128" placeholder="{{ name_placeholder }}" autocomplete="off" required autofocus>
+          </label>
+          <label class="saas-field" for="agent-slug">
+            <span>{{ slug_label }}</span>
+            <input id="agent-slug" name="slug" value="{{ slug }}" maxlength="64" pattern="[A-Za-z0-9_-]{1,64}" placeholder="{{ slug_placeholder }}" autocomplete="off" required aria-describedby="agent-slug-help">
+            <small class="saas-field-help" id="agent-slug-help">{{ slug_help }}</small>
+          </label>
+        </div>
+        <label class="saas-field" for="agent-description">
+          <span>{{ description_label }}</span>
+          <textarea id="agent-description" name="description" maxlength="1000" rows="5" placeholder="{{ description_placeholder }}" aria-describedby="agent-description-help">{{ description }}</textarea>
+          <small class="saas-field-help" id="agent-description-help">{{ description_help }}</small>
+        </label>
+        <div class="saas-agent-create-actions">
+          <a class="saas-button" href="{{ cancel_href }}">{{ cancel_label }}</a>
+          <button class="saas-button primary" type="submit">{{ submit_label }}</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <aside class="saas-card saas-agent-create-guide">
+    <div class="saas-card-header">
+      <div>
+        <h2>{{ next_title }}</h2>
+        <p>{{ next_description }}</p>
+      </div>
+    </div>
+    <div class="saas-card-body">
+      <ol class="saas-agent-create-steps">
+        {% for step in steps %}
+          <li>
+            <span>{{ step.number }}</span>
+            <div><strong>{{ step.title }}</strong><p>{{ step.description }}</p></div>
+          </li>
+        {% endfor %}
+      </ol>
+      <div class="saas-alert warning">
+        <strong>{{ safety_title }}</strong>
+        <p>{{ safety_description }}</p>
+      </div>
+    </div>
+  </aside>
+</div>

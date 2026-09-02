@@ -1,0 +1,12 @@
+{% include "components/agent_lifecycle.html" %}
+
+<div class="saas-filter-bar">
+  <span class="saas-status neutral">{{ list_summary }}</span>
+  <span class="saas-muted">{{ scope_description }}</span>
+</div>
+
+<div class="saas-agent-grid">
+  {% for card in cards %}
+    {% include "components/agent_card.html" %}
+  {% endfor %}
+</div>

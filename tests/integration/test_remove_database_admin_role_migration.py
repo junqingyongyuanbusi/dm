@@ -13,6 +13,7 @@ pytestmark = pytest.mark.integration
 
 _PREVIOUS_REVISION = "d4e9a2f6b710"
 _USER_ONLY_REVISION = "f3a7c9e1b5d2"
+_HEAD_REVISION = "a8f4d2c6e901"
 
 
 async def test_database_admin_roles_are_converted_to_user() -> None:
@@ -52,7 +53,7 @@ async def test_database_admin_roles_are_converted_to_user() -> None:
             ).scalars().all()
         await engine.dispose()
 
-        assert revision == _USER_ONLY_REVISION
+        assert revision == _HEAD_REVISION
         assert roles == ["USER", "USER"]
 
 

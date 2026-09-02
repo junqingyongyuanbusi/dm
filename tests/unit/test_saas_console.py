@@ -298,7 +298,18 @@ class _ScalarResult:
         self._values = values
 
     def scalars(self):
+        return _ScalarValues(self._values)
+
+
+class _ScalarValues:
+    def __init__(self, values) -> None:
+        self._values = values
+
+    def __iter__(self):
         return iter(self._values)
+
+    def all(self):
+        return list(self._values)
 
 
 class _AgentBrandSession:
@@ -344,7 +355,9 @@ async def test_user_without_accounts_only_gets_default_onboarding_agent() -> Non
 async def test_admin_agent_ids_keep_full_tenant_brand_enumeration() -> None:
     from social_reply.application.account_management import saas_console
 
-    session = _AgentBrandSession([["account-brand"], ["prompt-brand"], ["knowledge-brand"]])
+    session = _AgentBrandSession(
+        [["account-brand"], ["prompt-brand"], ["knowledge-brand"], ["control-brand"]]
+    )
 
     agent_ids = await saas_console._load_agent_ids(
         session,
@@ -354,10 +367,66 @@ async def test_admin_agent_ids_keep_full_tenant_brand_enumeration() -> None:
 
     assert agent_ids == [
         "account-brand",
+        "control-brand",
         "default",
         "knowledge-brand",
         "prompt-brand",
     ]
+    assert len(session.statements) == 4
+
+
+async def test_agent_control_plane_view_distinguishes_latest_and_deployed_versions() -> None:
+    from types import SimpleNamespace
+
+    from social_reply.application.account_management import saas_console
+
+    agent_id = uuid.uuid4()
+    deployed_version_id = uuid.uuid4()
+    latest_version_id = uuid.uuid4()
+    session = _AgentBrandSession(
+        [
+            [
+                SimpleNamespace(
+                    id=agent_id,
+                    legacy_brand_id="support",
+                    name="Support Agent",
+                    status="active",
+                )
+            ],
+            [
+                SimpleNamespace(
+                    id=latest_version_id,
+                    agent_id=agent_id,
+                    revision=2,
+                ),
+                SimpleNamespace(
+                    id=deployed_version_id,
+                    agent_id=agent_id,
+                    revision=1,
+                ),
+            ],
+            [
+                SimpleNamespace(
+                    agent_id=agent_id,
+                    agent_version_id=deployed_version_id,
+                    revision=1,
+                )
+            ],
+        ]
+    )
+
+    views = await saas_console._load_agent_control_plane_views(
+        session,
+        "tenant-a",
+        ["support"],
+    )
+
+    assert views["support"] == saas_console.AgentControlPlaneView(
+        name="Support Agent",
+        status="active",
+        version_revision=2,
+        deployed_version_revision=1,
+    )
     assert len(session.statements) == 3
 
 
@@ -508,6 +577,8 @@ def test_admin_agent_instruction_editor_is_path_scoped_and_complete() -> None:
     )
 
     version_id = uuid.uuid4()
+    agent_version_id = uuid.uuid4()
+    historical_agent_version_id = uuid.uuid4()
     updated_at = datetime(2026, 9, 1, 10, 30, tzinfo=UTC)
     editor_view = ReplyBusinessPromptEditorView(
         tenant_id="default",
@@ -528,8 +599,16 @@ def test_admin_agent_instruction_editor_is_path_scoped_and_complete() -> None:
                 created_by="user:tenant-admin",
                 created_at=updated_at - timedelta(hours=1),
                 is_active=False,
+                agent_version_id=historical_agent_version_id,
+                agent_revision=3,
             ),
         ),
+        has_channel=True,
+        latest_agent_version_id=agent_version_id,
+        latest_agent_revision=4,
+        deployed_agent_version_id=None,
+        deployed_agent_revision=None,
+        deployment_revision=0,
     )
 
     editor_html = saas_console._render_admin_reply_prompt_editor(
@@ -550,6 +629,12 @@ def test_admin_agent_instruction_editor_is_path_scoped_and_complete() -> None:
     assert f'action="{canonical_root}/save"' in editor_html
     assert f'action="{canonical_root}/trial"' in editor_html
     assert f'action="{canonical_root}/versions/{version_id}/rollback"' in editor_html
+    assert f'action="{canonical_root}/releases/{agent_version_id}/deploy"' in editor_html
+    assert (
+        f'action="{canonical_root}/releases/{historical_agent_version_id}/deploy"'
+        in editor_html
+    )
+    assert 'name="expected_deployment_revision" value="0"' in editor_html
     assert 'name="tenant_id"' not in editor_html
     assert 'name="brand_id"' not in editor_html
     assert "/admin/content/reply-prompt" not in editor_html
@@ -814,6 +899,7 @@ def test_channel_forms_use_localized_pending_labels() -> None:
             csrf="safe-csrf",
             tenant_id="tenant-a",
             label="Authorize with X",
+            brand_id="indonesia_support",
             available=True,
         )
     finally:
@@ -821,6 +907,7 @@ def test_channel_forms_use_localized_pending_labels() -> None:
 
     assert html.count('data-pending-label="Connecting…"') == 2
     assert "safe-csrf" in html
+    assert 'name="brand_id" value="indonesia_support"' in html
     assert "正在连接" not in html
 
 
@@ -848,6 +935,7 @@ def test_ordinary_user_agent_sections_never_link_to_admin_pages() -> None:
     channels_html = saas_console._render_agent_channels(
         [account],
         tenant_id="tenant-a",
+        agent_id="default",
         is_admin=False,
     )
     instructions_html = saas_console._render_agent_instructions(
@@ -868,6 +956,20 @@ def test_ordinary_user_agent_sections_never_link_to_admin_pages() -> None:
     assert "/admin" not in combined_html
     assert "/app/t/tenant-a/channels" in channels_html
     assert "/app/t/tenant-a/knowledge-query" in knowledge_html
+
+
+def test_admin_agent_channel_link_preserves_agent_scope() -> None:
+    from social_reply.application.account_management import saas_console
+
+    html = saas_console._render_agent_channels(
+        [],
+        tenant_id="tenant-a",
+        agent_id="indonesia_support",
+        is_admin=True,
+    )
+
+    assert "/app/t/tenant-a/channels?brand_id=indonesia_support" in html
+    assert "/admin/integrations/accounts" not in html
 
 
 def test_admin_agent_knowledge_link_is_canonical_and_preserves_brand() -> None:

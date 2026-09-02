@@ -6,10 +6,13 @@ from datetime import datetime
 from sqlalchemy import distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.account_management.agent_control_plane import (
+    append_agent_version_for_business_prompt,
+)
 from social_reply.application.reply_decision.business_prompt import (
     ResolvedBusinessPrompt,
     acquire_business_prompt_xact_lock,
-    load_business_prompt,
+    load_latest_business_prompt_draft,
 )
 from social_reply.domain.reply.business_prompt import (
     BusinessPromptInstructions,
@@ -38,6 +41,9 @@ class ReplyBusinessPromptVersionSummary:
     created_by: str
     created_at: datetime
     is_active: bool
+    agent_version_id: uuid.UUID | None = None
+    agent_revision: int | None = None
+    is_deployed: bool = False
 
 
 def normalize_brand_id(value: str) -> str:
@@ -89,7 +95,16 @@ async def require_reply_prompt_brand(
         )
         .limit(1)
     )
-    if exists is None and configured is None:
+    agent = await session.scalar(
+        select(models.Agent.id)
+        .where(
+            models.Agent.tenant_id == tenant_id,
+            models.Agent.legacy_brand_id == normalized,
+            models.Agent.status == "active",
+        )
+        .limit(1)
+    )
+    if exists is None and configured is None and agent is None:
         raise ReplyBusinessPromptScopeError("reply_business_prompt_brand_not_found")
     return normalized
 
@@ -194,6 +209,16 @@ async def _activate_new_version(
         current.content_hash = instructions.content_hash
         current.updated_by = actor
 
+    await append_agent_version_for_business_prompt(
+        session,
+        tenant_id=tenant_id,
+        brand_id=brand_id,
+        business_prompt_version_id=version_id,
+        business_prompt_revision=next_revision,
+        actor=actor,
+        change_note=change_note,
+    )
+
     detail: dict[str, object] = {
         "revision": next_revision,
         "content_hash": instructions.content_hash,
@@ -288,4 +313,4 @@ async def load_current_reply_business_prompt(
     brand_id: str,
 ) -> ResolvedBusinessPrompt:
     normalized_brand_id = await require_reply_prompt_brand(session, tenant_id, brand_id)
-    return await load_business_prompt(session, tenant_id, normalized_brand_id)
+    return await load_latest_business_prompt_draft(session, tenant_id, normalized_brand_id)

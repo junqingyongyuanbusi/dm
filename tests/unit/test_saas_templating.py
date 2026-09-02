@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 
 from social_reply.application.account_management.auth import Principal
 from social_reply.application.account_management.saas_ui import render_saas_page
@@ -53,3 +54,150 @@ def test_saas_renderer_marks_only_escaped_view_html_as_trusted() -> None:
     assert "&lt;unsafe-description&gt;" in html
     assert "<section data-safe-view>body</section>" in html
     assert '<aside class="saas-sidebar"' in html
+
+
+def test_agent_card_template_escapes_scope_data_and_shows_readiness() -> None:
+    from social_reply.application.account_management import saas_console
+
+    html = saas_console._render_agent_card(
+        tenant_id="default",
+        agent_id='<img src=x onerror="alert(1)">',
+        accounts=[
+            SimpleNamespace(
+                status="active",
+                automation_default="BOT_DRAFT_ONLY",
+            )
+        ],
+        published_count=2,
+        prompt=SimpleNamespace(revision='<script>alert("prompt")</script>'),
+    )
+
+    assert "<img src=x" not in html
+    assert "<script>" not in html
+    assert "&lt;Img Src=X Onerror=" in html
+    assert "&lt;script&gt;alert" in html
+    assert "100%" in html
+    assert 'class="saas-agent-open"' in html
+
+
+def test_agent_card_shows_latest_and_production_versions_without_trusting_identity() -> None:
+    from social_reply.application.account_management import saas_console
+
+    html = saas_console._render_agent_card(
+        tenant_id="tenant-a",
+        agent_id="support",
+        accounts=[],
+        published_count=0,
+        prompt=None,
+        control_plane=saas_console.AgentControlPlaneView(
+            name='<script>alert("agent")</script>',
+            status="active",
+            version_revision=2,
+            deployed_version_revision=1,
+        ),
+    )
+
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert" in html
+    assert "配置 v2 · 生产 v1" in html
+
+
+def test_agent_lifecycle_template_uses_real_product_routes() -> None:
+    from social_reply.application.account_management import saas_console
+
+    html = render_template(
+        "tenant/agent_list.html",
+        **saas_console._agent_lifecycle_context(
+            "tenant-a",
+            "support",
+            current_stage="test",
+        ),
+        list_summary="All 0",
+        scope_description="No agent yet",
+        cards=(),
+    )
+
+    assert "/app/t/tenant-a/agents/support/instructions" in html
+    assert "/app/t/tenant-a/agents/support/test" in html
+    assert "/app/t/tenant-a/agents/support/channels" in html
+    assert "/app/t/tenant-a/agents/support/activity" in html
+    assert html.count('aria-current="step"') == 1
+
+
+def test_agent_create_template_autoescapes_values_and_explains_safe_lifecycle() -> None:
+    html = render_template(
+        "tenant/agent_create.html",
+        form_action="/app/t/tenant-a/agents",
+        cancel_href="/app/t/tenant-a/agents",
+        csrf_token='<script>alert("csrf")</script>',
+        name='<img src=x onerror="alert(1)">',
+        slug="support",
+        description='<script>alert("mission")</script>',
+        error_message="",
+        eyebrow="Agent identity",
+        form_title="Define scope",
+        form_description="Create a stable identity.",
+        name_label="Name",
+        name_placeholder="Support",
+        slug_label="Scope ID",
+        slug_placeholder="support",
+        slug_help="Immutable",
+        description_label="Mission",
+        description_placeholder="Describe the mission",
+        description_help="Configure behavior next",
+        cancel_label="Cancel",
+        submit_label="Create",
+        next_title="What happens next",
+        next_description="Starts undeployed",
+        steps=(
+            {"number": "01", "title": "Identity", "description": "Create v1"},
+            {"number": "02", "title": "Instructions", "description": "Save rules"},
+            {"number": "03", "title": "Deploy", "description": "Connect channel"},
+        ),
+        safety_title="Safe by default",
+        safety_description="No Outbox or outbound message.",
+    )
+
+    assert 'action="/app/t/tenant-a/agents"' in html
+    assert 'pattern="[A-Za-z0-9_-]{1,64}"' in html
+    assert "<script>" not in html
+    assert "<img src=x" not in html
+    assert "No Outbox or outbound message." in html
+
+
+def test_agent_test_workspace_is_isolated_and_autoescapes_model_output() -> None:
+    from social_reply.application.account_management import saas_console
+
+    html, mode = saas_console._render_agent_test_workspace(
+        tenant_id="tenant-a",
+        agent_id="support",
+        can_run=True,
+        csrf_token='safe-token"><script>alert(1)</script>',
+        accounts=[
+            SimpleNamespace(
+                status="active",
+                automation_default="BOT_DRAFT_ONLY",
+            )
+        ],
+        prompt_pointer=SimpleNamespace(revision=4),
+        published_knowledge_count=8,
+        trial_result=SimpleNamespace(
+            action="draft",
+            intent="withdrawal_delay",
+            risk_level="low",
+            confidence=0.91,
+            duration_ms=248,
+            reason_codes=("KNOWLEDGE_MATCH",),
+            reply_text='<img src=x onerror="alert(2)">',
+        ),
+    )
+
+    assert mode == "BOT_DRAFT_ONLY"
+    assert 'action="/app/t/tenant-a/agents/support/test"' in html
+    assert 'aria-current="step"' in html
+    assert "不会创建生产决策、Outbox 或外发消息" in html
+    assert "KNOWLEDGE_MATCH" in html
+    assert "248 ms" in html
+    assert "<script>" not in html
+    assert "<img src=x" not in html
+    assert "&lt;img src=x" in html

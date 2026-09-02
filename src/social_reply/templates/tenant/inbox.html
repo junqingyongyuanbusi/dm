@@ -1,0 +1,27 @@
+<div class="saas-inbox-layout" data-inbox-workspace>
+  <section class="saas-inbox-column saas-list-pane" aria-label="{{ queue_label }}" data-inbox-list data-list-filter>
+    <header class="saas-inbox-column-header saas-list-pane-header">
+      <div class="saas-list-pane-title">
+        <h1>{{ title }}</h1>
+        <span class="saas-muted">{{ item_count_label }}</span>
+      </div>
+      <label for="inbox-list-search">{{ search_label }}</label>
+      <input id="inbox-list-search" type="search" autocomplete="off" data-list-search
+             placeholder="{{ search_placeholder }}">
+      {{ queue_tabs_html }}
+    </header>
+    <div data-list-items>{{ item_list_html }}</div>
+    <div class="saas-empty" data-search-empty hidden>
+      <h2>{{ search_empty_title }}</h2>
+      <p>{{ search_empty_description }}</p>
+    </div>
+  </section>
+  <section class="saas-inbox-column saas-workspace-pane" aria-label="{{ workspace_label }}" data-inbox-thread>
+    {{ thread_html }}
+    {% if action_panel_html %}
+      <aside class="saas-inbox-action" aria-label="{{ current_action_label }}" data-inbox-actions>
+        {{ action_panel_html }}
+      </aside>
+    {% endif %}
+  </section>
+</div>

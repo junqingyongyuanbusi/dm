@@ -1508,6 +1508,171 @@ class KnowledgeLocalization(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class Agent(Base):
+    """Stable tenant-owned AI agent identity.
+
+    ``legacy_brand_id`` keeps the existing runtime scope addressable while Agent deployments
+    select the immutable version used by production reply decisions.
+    """
+
+    __tablename__ = "agents"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_agents_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "legacy_brand_id",
+            name="uq_agents_tenant_id_id_legacy_brand",
+        ),
+        UniqueConstraint("tenant_id", "slug", name="uq_agents_tenant_slug"),
+        UniqueConstraint(
+            "tenant_id",
+            "legacy_brand_id",
+            name="uq_agents_tenant_legacy_brand",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'archived')",
+            name="ck_agents_status",
+        ),
+        CheckConstraint(
+            "btrim(slug) <> '' AND char_length(slug) <= 64",
+            name="ck_agents_slug",
+        ),
+        CheckConstraint(
+            "btrim(legacy_brand_id) <> '' AND char_length(legacy_brand_id) <= 64",
+            name="ck_agents_legacy_brand_id",
+        ),
+        CheckConstraint(
+            "btrim(name) <> '' AND char_length(name) <= 128",
+            name="ck_agents_name",
+        ),
+        Index("ix_agents_tenant_status", "tenant_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    slug: Mapped[str] = mapped_column(String(64))
+    legacy_brand_id: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String(16), default="active", server_default=text("'active'")
+    )
+    created_by: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AgentVersion(Base):
+    """Immutable control-plane snapshot for one agent revision."""
+
+    __tablename__ = "agent_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "agent_id",
+            "revision",
+            name="uq_agent_versions_tenant_agent_revision",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "agent_id",
+            "id",
+            name="uq_agent_versions_tenant_agent_id",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id", "legacy_brand_id"],
+            ["agents.tenant_id", "agents.id", "agents.legacy_brand_id"],
+            name="fk_agent_versions_tenant_agent_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "legacy_brand_id", "business_prompt_version_id"],
+            [
+                "reply_business_prompt_versions.tenant_id",
+                "reply_business_prompt_versions.brand_id",
+                "reply_business_prompt_versions.id",
+            ],
+            name="fk_agent_versions_tenant_prompt_version",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("revision > 0", name="ck_agent_versions_revision"),
+        CheckConstraint(
+            "jsonb_typeof(configuration) = 'object'",
+            name="ck_agent_versions_configuration_object",
+        ),
+        CheckConstraint(
+            "content_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_agent_versions_content_hash",
+        ),
+        Index("ix_agent_versions_tenant_agent_created", "tenant_id", "agent_id", "created_at"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    legacy_brand_id: Mapped[str] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer)
+    business_prompt_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    configuration: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb")
+    )
+    content_hash: Mapped[str] = mapped_column(String(64))
+    change_note: Mapped[str | None] = mapped_column(String(240))
+    created_by: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentDeployment(Base):
+    """Append-only record of an agent version deployed to an environment."""
+
+    __tablename__ = "agent_deployments"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "agent_id",
+            "environment",
+            "revision",
+            name="uq_agent_deployments_scope_revision",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id"],
+            ["agents.tenant_id", "agents.id"],
+            name="fk_agent_deployments_tenant_agent",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id", "agent_version_id"],
+            ["agent_versions.tenant_id", "agent_versions.agent_id", "agent_versions.id"],
+            name="fk_agent_deployments_tenant_agent_version",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "environment IN ('production')",
+            name="ck_agent_deployments_environment",
+        ),
+        CheckConstraint("revision > 0", name="ck_agent_deployments_revision"),
+        Index(
+            "ix_agent_deployments_tenant_agent_deployed",
+            "tenant_id",
+            "agent_id",
+            "deployed_at",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    environment: Mapped[str] = mapped_column(
+        String(16), default="production", server_default=text("'production'")
+    )
+    revision: Mapped[int] = mapped_column(Integer)
+    deployed_by: Mapped[str] = mapped_column(Text)
+    deployed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class ReplyBusinessPromptVersion(Base):
     """Immutable Tenant + Brand business-instruction revision."""
 

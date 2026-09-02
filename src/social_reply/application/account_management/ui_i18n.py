@@ -354,6 +354,7 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "common.all": ("全部", "All"),
     "common.apply_filters": ("应用筛选", "Apply filters"),
     "common.optional": ("选填", "Optional"),
+    "common.cancel": ("取消", "Cancel"),
     "common.anonymous_contact": ("匿名联系人", "Anonymous contact"),
     "common.non_text_message": ("[非文本消息]", "[Non-text message]"),
     "common.system": ("系统", "System"),
@@ -480,7 +481,109 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "集中查看每个业务 Agent 的指令、模型、渠道、知识和运行状态。",
         "Review each business agent's instructions, model, channels, knowledge, and runtime status.",
     ),
+    "agent.lifecycle.eyebrow": ("持续优化", "Continuous improvement"),
+    "agent.lifecycle.title": ("Agent 交付闭环", "Agent delivery lifecycle"),
+    "agent.lifecycle.description": (
+        "配置能力、隔离测试、连接渠道，再用真实运行记录持续改进。",
+        "Configure behavior, test in isolation, connect channels, and improve from runtime evidence.",
+    ),
+    "agent.lifecycle.train": ("配置", "Configure"),
+    "agent.lifecycle.train_description": (
+        "指令与知识",
+        "Instructions and knowledge",
+    ),
+    "agent.lifecycle.test": ("测试", "Test"),
+    "agent.lifecycle.test_description": (
+        "沙盒消息与结果",
+        "Sandbox messages and results",
+    ),
+    "agent.lifecycle.deploy": ("部署", "Deploy"),
+    "agent.lifecycle.deploy_description": (
+        "渠道与自动化模式",
+        "Channels and automation mode",
+    ),
+    "agent.lifecycle.analyze": ("分析", "Analyze"),
+    "agent.lifecycle.analyze_description": (
+        "运行活动与追踪",
+        "Runtime activity and traces",
+    ),
     "agent.configure_scope": ("配置新作用域", "Configure scope"),
+    "agent.create.action": ("创建 Agent", "Create agent"),
+    "agent.create.title": ("创建 Agent", "Create agent"),
+    "agent.create.page_description": (
+        "建立稳定的 Agent 身份，再按配置、测试、部署和分析的闭环逐步上线。",
+        "Create a stable agent identity, then move through configure, test, deploy, and analyze.",
+    ),
+    "agent.create.eyebrow": ("Agent 身份", "Agent identity"),
+    "agent.create.form_title": ("定义职责与作用域", "Define responsibility and scope"),
+    "agent.create.form_description": (
+        "名称用于团队识别；作用域 ID 将绑定指令、知识、渠道和运行记录。",
+        "The name identifies the agent to your team; the scope ID binds instructions, knowledge, channels, and runtime history.",
+    ),
+    "agent.create.name_label": ("Agent 名称", "Agent name"),
+    "agent.create.name_placeholder": (
+        "例如：Indonesia Support",
+        "For example: Indonesia Support",
+    ),
+    "agent.create.slug_label": ("作用域 ID", "Scope ID"),
+    "agent.create.slug_placeholder": (
+        "例如：indonesia_support",
+        "For example: indonesia_support",
+    ),
+    "agent.create.slug_help": (
+        "创建后不可变；仅支持字母、数字、下划线和连字符。",
+        "Immutable after creation; use letters, numbers, underscores, and hyphens only.",
+    ),
+    "agent.create.description_label": ("职责说明", "Mission description"),
+    "agent.create.description_placeholder": (
+        "说明这个 Agent 服务谁、处理什么问题，以及何时转交人工。",
+        "Describe who this agent serves, what it handles, and when it should hand off.",
+    ),
+    "agent.create.description_help": (
+        "这段说明用于团队协作；实际回复行为在下一步 Instructions 中配置。",
+        "This helps your team collaborate; configure actual reply behavior in Instructions next.",
+    ),
+    "agent.create.submit": (
+        "创建并配置 Instructions",
+        "Create and configure Instructions",
+    ),
+    "agent.create.next_title": ("创建后会发生什么", "What happens next"),
+    "agent.create.next_description": (
+        "新 Agent 先保存为未发布配置，不会自动接管任何客户消息。",
+        "A new agent starts as an undeployed configuration and does not take over customer messages.",
+    ),
+    "agent.create.step_identity": ("创建稳定身份", "Create stable identity"),
+    "agent.create.step_identity_description": (
+        "生成 Agent 与不可变配置 v1。",
+        "Create the Agent and immutable configuration v1.",
+    ),
+    "agent.create.step_instructions": ("完善 Instructions", "Configure Instructions"),
+    "agent.create.step_instructions_description": (
+        "保存业务规则会生成新的不可变版本。",
+        "Saving business rules creates a new immutable version.",
+    ),
+    "agent.create.step_deploy": ("测试后连接渠道", "Test, then connect a channel"),
+    "agent.create.step_deploy_description": (
+        "首次渠道接入会形成可审计的生产 Deployment。",
+        "The first channel connection creates an auditable production deployment.",
+    ),
+    "agent.create.safety_title": ("安全默认值", "Safe by default"),
+    "agent.create.safety_description": (
+        "创建本身不会写入 Outbox、发送消息或绕过 Final Guard。",
+        "Creation does not write to the Outbox, send messages, or bypass Final Guard.",
+    ),
+    "agent.create.error_invalid": (
+        "请检查名称、作用域 ID 和职责说明的格式。",
+        "Check the agent name, scope ID, and mission description.",
+    ),
+    "agent.create.error_conflict": (
+        "这个作用域 ID 已被使用，请选择另一个。",
+        "That scope ID is already in use. Choose another one.",
+    ),
+    "agent.create.success": (
+        "Agent 已创建。现在完善 Instructions；在连接渠道前不会接管客户消息。",
+        "Agent created. Configure Instructions next; it will not handle customer messages until a channel is connected.",
+    ),
     "agent.connect_first_channel": ("连接第一个渠道账号", "Connect the first channel account"),
     "agent.confirm_automation_mode": (
         "统一或确认账号自动化模式",
@@ -502,11 +605,24 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "agent.knowledge_published": ("知识：{count} 条已发布", "Knowledge: {count} published"),
     "agent.next_step": ("下一步：", "Next step: "),
     "agent.open": ("打开 Agent →", "Open agent →"),
+    "agent.open_short": ("打开 Agent", "Open agent"),
+    "agent.card.mode": ("自动化模式", "Automation mode"),
+    "agent.card.channels": ("可用渠道", "Available channels"),
+    "agent.card.knowledge": ("已发布知识", "Published knowledge"),
+    "agent.card.release": ("版本与发布", "Version & deployment"),
+    "agent.card.release_legacy": ("兼容范围 · 待建版本", "Compatibility scope · Version pending"),
+    "agent.card.release_not_deployed": ("配置 v{version} · 未发布", "Config v{version} · Not deployed"),
+    "agent.card.release_deployed": (
+        "配置 v{version} · 生产 v{deployed}",
+        "Config v{version} · Production v{deployed}",
+    ),
+    "agent.card.readiness": ("配置就绪度", "Configuration readiness"),
     "agent.tab.overview": ("Overview", "Overview"),
     "agent.tab.instructions": ("Instructions", "Instructions"),
     "agent.tab.model": ("Model", "Model"),
     "agent.tab.channels": ("Channels", "Channels"),
     "agent.tab.knowledge": ("Knowledge", "Knowledge"),
+    "agent.tab.test": ("Test", "Test"),
     "agent.tab.flow": ("Flow", "Flow"),
     "agent.tab.activity": ("Activity", "Activity"),
     "agent.detail_description": (
@@ -514,6 +630,52 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "Scope {agent_id} · Current mode {mode} · {count} channel accounts.",
     ),
     "agent.run_experiment": ("运行试验", "Run experiment"),
+    "agent.test.title": ("Test Playground", "Test Playground"),
+    "agent.test.description": (
+        "用当前已保存配置模拟一条客户消息，检查动作、风险、原因码和回复。",
+        "Simulate a customer message with the saved configuration and inspect the action, risk, reason codes, and reply.",
+    ),
+    "agent.test.sandbox": ("隔离沙盒", "Isolated sandbox"),
+    "agent.test.message_placeholder": (
+        "例如：我的提现从昨天开始一直没有到账。",
+        "For example: My withdrawal has been pending since yesterday.",
+    ),
+    "agent.test.isolation_notice": (
+        "不会创建生产决策、Outbox 或外发消息。",
+        "No production decision, Outbox entry, or outbound message is created.",
+    ),
+    "agent.test.run": ("运行测试", "Run test"),
+    "agent.test.read_only": (
+        "你可以查看当前测试配置；只有管理员可以调用模型运行沙盒测试。",
+        "You can inspect the test configuration; only administrators can run model-backed sandbox tests.",
+    ),
+    "agent.test.result_eyebrow": ("运行结果", "Run result"),
+    "agent.test.result_title": ("Agent 决策预览", "Agent decision preview"),
+    "agent.test.completed": ("已完成", "Completed"),
+    "agent.test.reply": ("回复预览", "Reply preview"),
+    "agent.test.context_title": ("生效配置", "Effective configuration"),
+    "agent.test.context_description": (
+        "本次测试实际读取的 Agent 作用域快照。",
+        "The effective agent scope snapshot used by this test.",
+    ),
+    "agent.test.prompt_version": ("指令版本", "Instruction version"),
+    "agent.test.guardrails_title": ("测试边界", "Test boundaries"),
+    "agent.test.guardrail.pii": (
+        "输入与输出执行 PII 脱敏",
+        "Input and output are PII-redacted",
+    ),
+    "agent.test.guardrail.isolation": (
+        "不写生产决策、人工队列或 Outbox",
+        "No production decision, human queue, or Outbox write",
+    ),
+    "agent.test.guardrail.rate_limit": (
+        "按 Tenant 与操作者限流",
+        "Rate-limited by tenant and operator",
+    ),
+    "agent.test.guardrail.active_version": (
+        "只读取当前已发布的业务指令版本",
+        "Uses only the currently deployed business-instruction version",
+    ),
     "agent.status.auto_reply": ("自动回复", "Auto reply"),
     "agent.status.draft_only": ("仅生成草稿", "Draft only"),
     "agent.status.mixed": ("混合模式", "Mixed mode"),
@@ -536,6 +698,12 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     ),
     "agent.overview.edit_instructions": ("编辑指令", "Edit instructions"),
     "agent.overview.view_instructions": ("查看指令", "View instructions"),
+    "agent.overview.deploy_agent": ("发布 Agent 变更", "Deploy Agent changes"),
+    "agent.overview.deploy_agent_description": (
+        "最新草稿尚未发布；生产运行仍保持在之前验证过的版本。",
+        "The latest draft has not been deployed. Production remains on the previously verified release.",
+    ),
+    "agent.overview.review_release": ("检查并发布", "Review and deploy"),
     "agent.overview.publish_knowledge": (
         "发布第一条批准知识",
         "Publish the first approved knowledge entry",
@@ -558,6 +726,10 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "agent.overview.instructions_ready": (
         "业务指令已版本化",
         "Business instructions are versioned",
+    ),
+    "agent.overview.release_ready": (
+        "生产版本与最新草稿一致",
+        "Production matches the latest draft",
     ),
     "agent.overview.knowledge_ready": ("已有已发布知识", "Published knowledge is available"),
     "agent.overview.channel_count": (
@@ -996,6 +1168,10 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "channels.banner.error": (
         "授权未完成。错误代码：{error_code}。请检查应用配置后重试。",
         "Authorization did not complete. Error code: {error_code}. Check the app configuration and try again.",
+    ),
+    "channels.agent_scope_banner": (
+        "本页新连接将绑定到 Agent 作用域 {agent_id}。",
+        "New connections on this page will be assigned to Agent scope {agent_id}.",
     ),
     "channels.oauth.x": ("使用 X 授权", "Authorize with X"),
     "channels.oauth.facebook": ("连接 Facebook Page", "Connect Facebook Page"),
@@ -1698,12 +1874,24 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "Edit the tenant + brand business instructions used by the primary reply model. RAG, knowledge boundaries, six-field output, language validation, safety guards, and send authorization remain code-controlled.",
     ),
     "admin.prompt.banner.saved": (
-        "业务 Prompt 已保存为新版本；启用开关时，下一次模型生成立即使用。",
-        "The business prompt was saved as a new version and will be used by the next generation when the feature is enabled.",
+        "业务 Prompt 已保存为新草稿；生产版本保持不变，直到明确发布。",
+        "The business prompt was saved as a new draft. Production remains unchanged until an explicit deployment.",
+    ),
+    "admin.prompt.banner.deployed": (
+        "所选 Agent 版本已发布到生产；新的生成会使用该版本。",
+        "The selected Agent version was deployed to production and will be used by new generations.",
     ),
     "admin.prompt.banner.rolled_back": (
-        "历史内容已复制为新的活动版本。",
-        "The historical content was copied into a new active version.",
+        "历史内容已恢复为新草稿；生产版本尚未改变。",
+        "The historical content was restored as a new draft. Production has not changed.",
+    ),
+    "admin.prompt.banner.deployment_conflict": (
+        "生产版本已被其他管理员更新，请刷新后重新选择发布版本。",
+        "Another administrator changed the production release. Refresh and select a version again.",
+    ),
+    "admin.prompt.banner.deployment_requires_channel": (
+        "请先连接至少一个 Channel，再发布 Agent 到生产。",
+        "Connect at least one channel before deploying this Agent to production.",
     ),
     "admin.prompt.banner.revision_conflict": (
         "Prompt 已被其他管理员更新，请刷新后重新编辑。",
@@ -1718,8 +1906,8 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "The brand does not exist or does not belong to the current tenant.",
     ),
     "admin.prompt.feature_enabled": (
-        "运行时开关已启用：保存提交后，新生成立即读取活动版本；旧版本待发回复会在发送前被取消。",
-        "The runtime feature is enabled. New generations use the active version immediately after save; pending replies from older versions are cancelled before sending.",
+        "运行时开关已启用：新生成只读取已发布版本；发布切换后，旧版本待发回复会在发送前被取消。",
+        "The runtime feature is enabled. New generations read only the deployed version; pending replies from older releases are cancelled before sending after a deployment change.",
     ),
     "admin.prompt.feature_disabled": (
         "运行时开关尚未启用。你可以先保存和试运行；Worker 仍使用旧的代码编译语气，直到三个服务统一设置 REPLY_BUSINESS_PROMPT_ENABLED=true。",
@@ -1729,7 +1917,7 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "admin.prompt.active_version": ("活动版本 · 第 {revision} 版", "Active version · {revision}"),
     "admin.prompt.select_scope": ("选择作用域", "Select scope"),
     "admin.prompt.switch": ("切换", "Switch"),
-    "admin.prompt.current_prompt": ("当前业务 Prompt", "Current business prompt"),
+    "admin.prompt.current_prompt": ("业务指令草稿", "Business instruction draft"),
     "admin.prompt.edit_hint": (
         "最多 {count} 字符。禁止写入联系方式、密钥、Token 或密码。保存采用乐观版本校验，并追加不可变历史。",
         "Up to {count} characters. Do not include contact information, keys, tokens, or passwords. Saves use optimistic version checks and append immutable history.",
@@ -1741,6 +1929,28 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "For example: confirm the customer need before giving concise steps",
     ),
     "admin.prompt.save_version": ("保存并创建新版本", "Save as new version"),
+    "admin.prompt.draft_revision": ("草稿内容版本", "Draft content revision"),
+    "admin.prompt.release_title": ("生产发布", "Production release"),
+    "admin.prompt.release_description": (
+        "保存只创建不可变草稿；发布才会切换运行时使用的版本。",
+        "Saving creates an immutable draft. Deploying is the only action that changes the runtime version.",
+    ),
+    "admin.prompt.release_safety": (
+        "发布采用租户作用域锁与乐观并发校验；每次切换都会追加审计和部署记录。",
+        "Deployments use a tenant-scoped lock and optimistic concurrency; every switch appends an audit and deployment record.",
+    ),
+    "admin.prompt.release_connect_channel": ("等待连接 Channel", "Waiting for a channel"),
+    "admin.prompt.release_not_deployed": ("尚未发布", "Not deployed"),
+    "admin.prompt.release_changes_pending": ("有待发布变更", "Changes pending"),
+    "admin.prompt.release_current": ("生产已是最新版本", "Production is current"),
+    "admin.prompt.release_none": ("无", "None"),
+    "admin.prompt.latest_draft": ("最新草稿", "Latest draft"),
+    "admin.prompt.production_release": ("生产版本", "Production release"),
+    "admin.prompt.deployment_revision": ("部署序号", "Deployment revision"),
+    "admin.prompt.deploy_latest": ("发布最新草稿", "Deploy latest draft"),
+    "admin.prompt.deploy_version": ("发布此版本", "Deploy this version"),
+    "admin.prompt.latest_draft_badge": ("最新草稿", "Latest draft"),
+    "admin.prompt.production_badge": ("生产中", "Production"),
     "admin.prompt.trial": ("试运行", "Run trial"),
     "admin.prompt.trial_hint": (
         "使用当前已保存的业务 Prompt 调用主回复模型；不会写决策、创建 Outbox 或发送消息。",
@@ -1766,8 +1976,8 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     ),
     "admin.prompt.version_history": ("版本历史", "Version history"),
     "admin.prompt.version_history_hint": (
-        "回滚不会改写旧版本，而是把所选内容复制成新的活动版本。",
-        "Rollback does not rewrite old versions; it copies the selected content into a new active version.",
+        "历史始终不可变。恢复会复制成新草稿；发布历史版本会追加新的生产部署记录。",
+        "History remains immutable. Restore copies content into a new draft; deploying a historical version appends a production deployment record.",
     ),
     "admin.prompt.version": ("版本", "Version"),
     "admin.prompt.note": ("说明", "Note"),

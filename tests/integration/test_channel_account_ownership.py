@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from social_reply.application.account_management.provisioning import (
     provision_direct_account,
@@ -129,11 +129,29 @@ async def test_same_user_reauthorization_preserves_owner_and_public_id(
     assert second_public_id == first_public_id
     async with get_session_factory()() as session:
         account = await session.get(models.PlatformAccount, first_account_id)
+        agent = await session.scalar(
+            select(models.Agent).where(
+                models.Agent.tenant_id == "tenant-a",
+                models.Agent.legacy_brand_id == "default",
+            )
+        )
+        version_count = await session.scalar(
+            select(func.count())
+            .select_from(models.AgentVersion)
+            .where(models.AgentVersion.agent_id == agent.id)
+        )
+        deployment_count = await session.scalar(
+            select(func.count())
+            .select_from(models.AgentDeployment)
+            .where(models.AgentDeployment.agent_id == agent.id)
+        )
     assert account is not None
     assert account.owner_user_id == first_user_id
     assert account.name == "Reauthorized account"
     assert account.provider_username == "updated_bot"
     assert account.config_version == 2
+    assert version_count == 1
+    assert deployment_count == 1
 
 
 async def test_admin_repair_preserves_existing_user_owner(migrated_db) -> None:
