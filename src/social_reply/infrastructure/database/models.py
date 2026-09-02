@@ -1511,9 +1511,8 @@ class KnowledgeLocalization(Base):
 class Agent(Base):
     """Stable tenant-owned AI agent identity.
 
-    ``legacy_brand_id`` keeps the existing runtime scope addressable while the control plane is
-    introduced. Runtime reply decisions continue to resolve by tenant + brand until an explicit
-    deployment cutover is implemented.
+    ``legacy_brand_id`` keeps the existing runtime scope addressable while Agent deployments
+    select the immutable version used by production reply decisions.
     """
 
     __tablename__ = "agents"

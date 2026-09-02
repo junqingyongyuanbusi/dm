@@ -577,6 +577,8 @@ def test_admin_agent_instruction_editor_is_path_scoped_and_complete() -> None:
     )
 
     version_id = uuid.uuid4()
+    agent_version_id = uuid.uuid4()
+    historical_agent_version_id = uuid.uuid4()
     updated_at = datetime(2026, 9, 1, 10, 30, tzinfo=UTC)
     editor_view = ReplyBusinessPromptEditorView(
         tenant_id="default",
@@ -597,8 +599,16 @@ def test_admin_agent_instruction_editor_is_path_scoped_and_complete() -> None:
                 created_by="user:tenant-admin",
                 created_at=updated_at - timedelta(hours=1),
                 is_active=False,
+                agent_version_id=historical_agent_version_id,
+                agent_revision=3,
             ),
         ),
+        has_channel=True,
+        latest_agent_version_id=agent_version_id,
+        latest_agent_revision=4,
+        deployed_agent_version_id=None,
+        deployed_agent_revision=None,
+        deployment_revision=0,
     )
 
     editor_html = saas_console._render_admin_reply_prompt_editor(
@@ -619,6 +629,12 @@ def test_admin_agent_instruction_editor_is_path_scoped_and_complete() -> None:
     assert f'action="{canonical_root}/save"' in editor_html
     assert f'action="{canonical_root}/trial"' in editor_html
     assert f'action="{canonical_root}/versions/{version_id}/rollback"' in editor_html
+    assert f'action="{canonical_root}/releases/{agent_version_id}/deploy"' in editor_html
+    assert (
+        f'action="{canonical_root}/releases/{historical_agent_version_id}/deploy"'
+        in editor_html
+    )
+    assert 'name="expected_deployment_revision" value="0"' in editor_html
     assert 'name="tenant_id"' not in editor_html
     assert 'name="brand_id"' not in editor_html
     assert "/admin/content/reply-prompt" not in editor_html

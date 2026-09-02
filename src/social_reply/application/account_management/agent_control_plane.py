@@ -240,22 +240,13 @@ async def create_agent(
             models.ReplyBusinessPrompt.brand_id == slug,
         )
     )
-    version = await _append_agent_version(
+    await _append_agent_version(
         session,
         agent=agent,
         business_prompt_version_id=(prompt.active_version_id if prompt is not None else None),
         business_prompt_revision=(prompt.revision if prompt is not None else None),
         actor=actor,
         change_note="Initial agent configuration",
-        source="agent_creation",
-    )
-    await _append_legacy_runtime_deployment(
-        session,
-        tenant_id=tenant_id,
-        brand_id=slug,
-        agent=agent,
-        agent_version=version,
-        actor=actor,
         source="agent_creation",
     )
     await session.flush()
@@ -276,9 +267,8 @@ async def append_agent_version_for_business_prompt(
 
     The caller owns the existing tenant + brand business-prompt advisory lock. This keeps the
     compatibility scope, immutable prompt version, and Agent version on one serial write path.
-    While the legacy runtime still treats a prompt save as immediately active, channel-backed
-    scopes also receive an append-only compatibility deployment. A later cutover can separate
-    draft creation from explicit production deployment without falsifying current runtime state.
+    Saving instructions creates an immutable draft snapshot only. Production continues to point
+    at the latest append-only deployment until an administrator explicitly promotes a version.
     """
     agent = await _load_agent_for_update(
         session,
@@ -298,7 +288,7 @@ async def append_agent_version_for_business_prompt(
         session.add(agent)
         await session.flush([agent])
 
-    version = await _append_agent_version(
+    return await _append_agent_version(
         session,
         agent=agent,
         business_prompt_version_id=business_prompt_version_id,
@@ -307,15 +297,77 @@ async def append_agent_version_for_business_prompt(
         change_note=change_note,
         source="business_prompt_change",
     )
-    await _append_legacy_runtime_deployment(
+
+
+async def deploy_agent_version(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    brand_id: str,
+    agent_version_id: uuid.UUID,
+    expected_deployment_revision: int,
+    actor: str,
+) -> models.AgentDeployment:
+    """Promote one immutable Agent version to production.
+
+    Deployments are append-only. Repeating the same request is idempotent, while a stale
+    expectation cannot overwrite a newer release selected by another administrator.
+    """
+    tenant_id = _normalize_tenant_id(tenant_id)
+    brand_id = normalize_agent_slug(brand_id)
+    if expected_deployment_revision < 0:
+        raise AgentControlPlaneConflict("agent_deployment_revision_conflict")
+    if not actor.strip():
+        raise AgentControlPlaneValidationError("invalid_agent_actor")
+
+    await acquire_business_prompt_xact_lock(session, tenant_id, brand_id)
+    agent = await _load_agent_for_update(
+        session,
+        tenant_id=tenant_id,
+        brand_id=brand_id,
+    )
+    if agent is None or agent.status != "active":
+        raise AgentControlPlaneValidationError("agent_scope_not_found")
+    target = await session.scalar(
+        select(models.AgentVersion).where(
+            models.AgentVersion.id == agent_version_id,
+            models.AgentVersion.tenant_id == tenant_id,
+            models.AgentVersion.agent_id == agent.id,
+            models.AgentVersion.legacy_brand_id == brand_id,
+        )
+    )
+    if target is None:
+        raise AgentControlPlaneValidationError("agent_version_not_found")
+
+    latest = await session.scalar(
+        select(models.AgentDeployment)
+        .where(
+            models.AgentDeployment.tenant_id == tenant_id,
+            models.AgentDeployment.agent_id == agent.id,
+            models.AgentDeployment.environment == "production",
+        )
+        .order_by(models.AgentDeployment.revision.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if latest is not None and latest.agent_version_id == target.id:
+        return latest
+    actual_revision = latest.revision if latest is not None else 0
+    if expected_deployment_revision != actual_revision:
+        raise AgentControlPlaneConflict("agent_deployment_revision_conflict")
+
+    deployment = await _append_legacy_runtime_deployment(
         session,
         tenant_id=tenant_id,
         brand_id=brand_id,
         agent=agent,
-        agent_version=version,
+        agent_version=target,
         actor=actor,
+        source="explicit_release",
     )
-    return version
+    if deployment is None:
+        raise AgentControlPlaneValidationError("agent_channel_scope_not_found")
+    return deployment
 
 
 async def ensure_agent_deployment_for_channel_scope(
@@ -327,9 +379,9 @@ async def ensure_agent_deployment_for_channel_scope(
 ) -> models.AgentDeployment:
     """Synchronize the compatibility Agent snapshot and production deployment.
 
-    Call this after the channel account upsert and before committing that transaction. The
-    advisory lock is shared with instruction saves, so a channel can never be committed without
-    a deployment that points at the runtime-active prompt snapshot.
+    Call this after the channel account upsert and before committing that transaction. The first
+    channel connection promotes the current draft; later reconnects preserve the existing
+    production release and therefore cannot publish unrelated draft changes implicitly.
     """
     tenant_id = _normalize_tenant_id(tenant_id)
     brand_id = normalize_agent_slug(brand_id)
@@ -385,6 +437,20 @@ async def ensure_agent_deployment_for_channel_scope(
                 },
             )
         )
+
+    existing_deployment = await session.scalar(
+        select(models.AgentDeployment)
+        .where(
+            models.AgentDeployment.tenant_id == tenant_id,
+            models.AgentDeployment.agent_id == agent.id,
+            models.AgentDeployment.environment == "production",
+        )
+        .order_by(models.AgentDeployment.revision.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if existing_deployment is not None:
+        return existing_deployment
 
     version = await _append_agent_version(
         session,

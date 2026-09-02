@@ -87,9 +87,11 @@ from social_reply.application.account_management.reply_prompt_trial import (
     run_reply_business_prompt_trial,
 )
 from social_reply.application.account_management.reply_prompt_web import (
+    DeployAgentVersionCommand,
     ReplyBusinessPromptEditorView,
     RollbackReplyBusinessPromptCommand,
     SaveReplyBusinessPromptCommand,
+    execute_deploy_agent_version,
     execute_rollback_reply_business_prompt,
     execute_save_reply_business_prompt,
     load_reply_business_prompt_editor_view,
@@ -1249,6 +1251,11 @@ def _build_agent_card_view(
         bool(prompt),
         bool(published_count),
         bool(accounts) and len(active_accounts) == len(accounts),
+        (
+            control_plane is not None
+            and control_plane.deployed_version_revision
+            == control_plane.version_revision
+        ),
     )
     readiness_percent = round(sum(readiness_checks) / len(readiness_checks) * 100)
     if control_plane is None:
@@ -1324,7 +1331,13 @@ _AGENT_SECTIONS = {
 _PROMPT_NOTICE_KEYS = {
     "agent_created": ("success", "agent.create.success"),
     "saved": ("success", "admin.prompt.banner.saved"),
+    "deployed": ("success", "admin.prompt.banner.deployed"),
     "rolled_back": ("success", "admin.prompt.banner.rolled_back"),
+    "deployment_conflict": ("danger", "admin.prompt.banner.deployment_conflict"),
+    "deployment_requires_channel": (
+        "warning",
+        "admin.prompt.banner.deployment_requires_channel",
+    ),
     "revision_conflict": ("danger", "admin.prompt.banner.revision_conflict"),
     "prompt_invalid": ("danger", "admin.prompt.banner.prompt_invalid"),
 }
@@ -1362,6 +1375,16 @@ def _prompt_expected_revision(form: dict[str, str]) -> int:
         raise ReplyBusinessPromptConflict("reply_business_prompt_revision_conflict") from exc
     if expected_revision < 0:
         raise ReplyBusinessPromptConflict("reply_business_prompt_revision_conflict")
+    return expected_revision
+
+
+def _deployment_expected_revision(form: dict[str, str]) -> int:
+    try:
+        expected_revision = int(form.get("expected_deployment_revision", ""))
+    except ValueError as exc:
+        raise AgentControlPlaneConflict("agent_deployment_revision_conflict") from exc
+    if expected_revision < 0:
+        raise AgentControlPlaneConflict("agent_deployment_revision_conflict")
     return expected_revision
 
 
@@ -1468,18 +1491,76 @@ def _render_admin_reply_prompt_editor(
         (
             ("Tenant", editor_view.tenant_id),
             ("Brand / Agent", editor_view.brand_id),
-            (translate("agent.instructions.active_version"), editor_view.current_revision),
+            (translate("admin.prompt.draft_revision"), editor_view.current_revision),
             (translate("agent.instructions.content_hash"), editor_view.content_hash),
             (translate("agent.instructions.last_updated"), format_datetime(editor_view.updated_at)),
             (translate("agent.instructions.updated_by"), editor_view.updated_by),
         )
     )
+    has_unpublished_changes = (
+        editor_view.latest_agent_version_id is not None
+        and editor_view.latest_agent_version_id != editor_view.deployed_agent_version_id
+    )
+    if not editor_view.has_channel:
+        release_tone = "degraded"
+        release_status = translate("admin.prompt.release_connect_channel")
+    elif editor_view.deployed_agent_version_id is None:
+        release_tone = "degraded"
+        release_status = translate("admin.prompt.release_not_deployed")
+    elif has_unpublished_changes:
+        release_tone = "degraded"
+        release_status = translate("admin.prompt.release_changes_pending")
+    else:
+        release_tone = "active"
+        release_status = translate("admin.prompt.release_current")
+    release_action = ""
+    if (
+        editor_view.has_channel
+        and editor_view.latest_agent_version_id is not None
+        and has_unpublished_changes
+    ):
+        release_action = f"""<form method="post" action="{escape(canonical_root)}/releases/{editor_view.latest_agent_version_id}/deploy">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<input type="hidden" name="expected_deployment_revision" value="{editor_view.deployment_revision}">
+<button class="saas-button primary" type="submit">{escape(translate("admin.prompt.deploy_latest"))}</button></form>"""
+    release_metadata = definition_list(
+        (
+            (
+                translate("admin.prompt.latest_draft"),
+                (
+                    f"Agent v{editor_view.latest_agent_revision}"
+                    if editor_view.latest_agent_revision is not None
+                    else "—"
+                ),
+            ),
+            (
+                translate("admin.prompt.production_release"),
+                (
+                    f"Agent v{editor_view.deployed_agent_revision}"
+                    if editor_view.deployed_agent_revision is not None
+                    else translate("admin.prompt.release_none")
+                ),
+            ),
+            (translate("admin.prompt.deployment_revision"), editor_view.deployment_revision),
+        )
+    )
     version_rows: list[str] = []
     for version in editor_view.versions:
-        active_badge = (
-            status_badge("active", label=translate("admin.common.current"))
-            if version.is_active
-            else ""
+        version_badges = " ".join(
+            badge
+            for badge in (
+                (
+                    status_badge("draft", label=translate("admin.prompt.latest_draft_badge"))
+                    if version.is_active
+                    else ""
+                ),
+                (
+                    status_badge("active", label=translate("admin.prompt.production_badge"))
+                    if version.is_deployed
+                    else ""
+                ),
+            )
+            if badge
         )
         rollback_form = ""
         if not version.is_active:
@@ -1487,14 +1568,26 @@ def _render_admin_reply_prompt_editor(
 <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
 <input type="hidden" name="expected_revision" value="{editor_view.current_revision}">
 <button class="saas-button small" type="submit">{escape(translate("admin.prompt.restore_version"))}</button></form>"""
+        deploy_form = ""
+        if (
+            editor_view.has_channel
+            and version.agent_version_id is not None
+            and not version.is_deployed
+        ):
+            deploy_form = f"""<form method="post" action="{escape(canonical_root)}/releases/{version.agent_version_id}/deploy">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<input type="hidden" name="expected_deployment_revision" value="{editor_view.deployment_revision}">
+<button class="saas-button small" type="submit">{escape(translate("admin.prompt.deploy_version"))}</button></form>"""
+        operations = f'<div class="saas-action-row">{deploy_form}{rollback_form}</div>'
         version_rows.append(
-            f"<tr><td>r{version.revision} {active_badge}</td>"
+            f"<tr><td>r{version.revision} {version_badges}<br>"
+            f'<span class="saas-muted">Agent v{version.agent_revision or "—"}</span></td>'
             f"<td><details><summary>{escape(translate('admin.prompt.view_content'))}</summary>"
             f"<pre>{escape(version.content)}</pre></details></td>"
             f"<td>{escape(version.change_note or '—')}</td>"
             f'<td>{escape(version.created_by)}<br><span class="saas-muted">'
             f"{escape(format_datetime(version.created_at, include_year=True))} · "
-            f"{escape(version.content_hash)}</span></td><td>{rollback_form}</td></tr>"
+            f"{escape(version.content_hash)}</span></td><td>{operations}</td></tr>"
         )
     version_history = "".join(version_rows) or (
         f'<tr><td colspan="5" class="saas-muted">'
@@ -1502,6 +1595,10 @@ def _render_admin_reply_prompt_editor(
     )
     return f"""{notice_html}
 <section class="saas-alert {"success" if feature_enabled else "warning"}">{escape(feature_status)}</section>
+<section class="saas-card" style="margin-top:18px"><div class="saas-card-header"><div><h2>{escape(translate("admin.prompt.release_title"))}</h2>
+<p>{escape(translate("admin.prompt.release_description"))}</p></div>{status_badge(release_tone, label=release_status)}</div>
+<div class="saas-card-body"><div class="saas-grid two" style="margin-top:0"><div>{release_metadata}</div>
+<div><p class="saas-muted">{escape(translate("admin.prompt.release_safety"))}</p>{release_action}</div></div></div></section>
 <div class="saas-grid two">
 <section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("admin.prompt.current_prompt"))}</h2>
 <p>{escape(translate("admin.prompt.edit_hint", count=BUSINESS_PROMPT_MAX_CHARS))}</p></div></div>
@@ -1976,6 +2073,55 @@ async def save_agent_instructions(
     )
 
 
+@router.post(
+    "/app/t/{tenant_id}/agents/{agent_id}/instructions/releases/{agent_version_id}/deploy"
+)
+async def deploy_agent_instructions(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+    agent_version_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as authorization_session:
+        if agent_id not in await _load_agent_ids(
+            authorization_session,
+            principal,
+            tenant_id,
+        ):
+            raise HTTPException(status_code=404, detail="agent_not_found")
+    form = await _form(request)
+    _require_csrf(request, form)
+    if set(form) != {"csrf_token", "expected_deployment_revision"}:
+        raise HTTPException(status_code=422, detail="agent_deployment_fields_invalid")
+    try:
+        command = DeployAgentVersionCommand(
+            tenant_id=tenant_id,
+            brand_id=agent_id,
+            agent_version_id=agent_version_id,
+            expected_deployment_revision=_deployment_expected_revision(form),
+            actor=principal.actor,
+        )
+        async with get_session_factory()() as session:
+            await execute_deploy_agent_version(session, command)
+            await session.commit()
+    except AgentControlPlaneConflict:
+        notice = "deployment_conflict"
+    except AgentControlPlaneValidationError as exc:
+        if str(exc) == "agent_channel_scope_not_found":
+            notice = "deployment_requires_channel"
+        else:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    else:
+        notice = "deployed"
+    return RedirectResponse(
+        _prompt_canonical_location(tenant_id, agent_id, notice=notice),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @router.post("/app/t/{tenant_id}/agents/{agent_id}/instructions/versions/{version_id}/rollback")
 async def rollback_agent_instructions(
     request: Request,
@@ -2399,6 +2545,9 @@ async def agent_detail(
                     models.ReplyBusinessPromptVersion.brand_id == agent_id,
                 )
             )
+        control_plane = (
+            await _load_agent_control_plane_views(session, tenant_id, [agent_id])
+        ).get(agent_id)
         knowledge_counts = dict(
             (
                 await session.execute(
@@ -2442,6 +2591,7 @@ async def agent_detail(
         prompt_version=prompt_version,
         knowledge_counts=knowledge_counts,
         recent_audits=recent_audits,
+        control_plane=control_plane,
         is_admin=principal.is_admin,
     )
     modes = {account.automation_default for account in accounts}
@@ -2494,6 +2644,7 @@ def _render_agent_section(
     prompt_version: models.ReplyBusinessPromptVersion | None,
     knowledge_counts: dict[str, int],
     recent_audits: list[models.AuditLog],
+    control_plane: AgentControlPlaneView | None,
     is_admin: bool,
 ) -> str:
     if section == "overview":
@@ -2502,6 +2653,7 @@ def _render_agent_section(
             agent_id=agent_id,
             accounts=accounts,
             prompt_pointer=prompt_pointer,
+            control_plane=control_plane,
             knowledge_counts=knowledge_counts,
             is_admin=is_admin,
         )
@@ -2540,10 +2692,18 @@ def _render_agent_overview(
     agent_id: str,
     accounts: list[models.PlatformAccount],
     prompt_pointer: models.ReplyBusinessPrompt | None,
+    control_plane: AgentControlPlaneView | None = None,
     knowledge_counts: dict[str, int],
     is_admin: bool,
 ) -> str:
     active_accounts = [account for account in accounts if account.status == "active"]
+    deployed_revision = (
+        control_plane.deployed_version_revision if control_plane is not None else None
+    )
+    latest_revision = control_plane.version_revision if control_plane is not None else None
+    release_is_current = (
+        deployed_revision is not None and deployed_revision == latest_revision
+    )
     if not accounts:
         next_title = translate("agent.connect_first_channel")
         next_description = translate("agent.overview.framework_description")
@@ -2578,6 +2738,11 @@ def _render_agent_overview(
             if is_admin
             else translate("agent.overview.view_instructions")
         )
+    elif not release_is_current:
+        next_title = translate("agent.overview.deploy_agent")
+        next_description = translate("agent.overview.deploy_agent_description")
+        next_href = f"{_agent_root(tenant_id, agent_id)}/instructions"
+        action_label = translate("agent.overview.review_release")
     elif not knowledge_counts.get("published", 0):
         next_title = translate("agent.overview.publish_knowledge")
         next_description = (
@@ -2607,6 +2772,11 @@ def _render_agent_overview(
                 translate("agent.overview.instructions_ready"),
             ),
             _progress_row(
+                release_is_current,
+                translate("agent.overview.release_ready"),
+                warning=deployed_revision is not None,
+            ),
+            _progress_row(
                 bool(knowledge_counts.get("published")),
                 translate("agent.overview.knowledge_ready"),
             ),
@@ -2628,7 +2798,7 @@ def _render_agent_overview(
 {primary_action(next_href, action_label)}</section>
 <section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.overview.runtime_summary"))}</h2>
 <p>{escape(translate("agent.overview.runtime_summary_description"))}</p></div></div><div class="saas-card-body">
-{definition_list(((translate("agent.overview.channel_accounts"), len(accounts)), (translate("home.metric.published_knowledge"), knowledge_counts.get("published", 0)), (translate("agent.overview.business_instructions"), f"v{prompt_pointer.revision}" if prompt_pointer else translate("agent.overview.code_default"))))}
+{definition_list(((translate("agent.overview.channel_accounts"), len(accounts)), (translate("home.metric.published_knowledge"), knowledge_counts.get("published", 0)), (translate("admin.prompt.latest_draft"), f"Agent v{latest_revision}" if latest_revision is not None else "—"), (translate("admin.prompt.production_release"), f"Agent v{deployed_revision}" if deployed_revision is not None else translate("admin.prompt.release_none"))))}
 </div></section></div>
 <div class="saas-section-title"><div><h2>{escape(translate("agent.overview.readiness"))}</h2><p>{escape(translate("agent.overview.readiness_description"))}</p></div></div>
 <section class="saas-card"><div class="saas-card-body"><ul class="saas-progress-list">{readiness}</ul></div></section>"""

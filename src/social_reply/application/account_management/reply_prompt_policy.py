@@ -12,7 +12,7 @@ from social_reply.application.account_management.agent_control_plane import (
 from social_reply.application.reply_decision.business_prompt import (
     ResolvedBusinessPrompt,
     acquire_business_prompt_xact_lock,
-    load_business_prompt,
+    load_latest_business_prompt_draft,
 )
 from social_reply.domain.reply.business_prompt import (
     BusinessPromptInstructions,
@@ -41,6 +41,9 @@ class ReplyBusinessPromptVersionSummary:
     created_by: str
     created_at: datetime
     is_active: bool
+    agent_version_id: uuid.UUID | None = None
+    agent_revision: int | None = None
+    is_deployed: bool = False
 
 
 def normalize_brand_id(value: str) -> str:
@@ -310,4 +313,4 @@ async def load_current_reply_business_prompt(
     brand_id: str,
 ) -> ResolvedBusinessPrompt:
     normalized_brand_id = await require_reply_prompt_brand(session, tenant_id, brand_id)
-    return await load_business_prompt(session, tenant_id, normalized_brand_id)
+    return await load_latest_business_prompt_draft(session, tenant_id, normalized_brand_id)

@@ -76,6 +76,21 @@ async def load_business_prompt(
     tenant_id: str,
     brand_id: str,
 ) -> ResolvedBusinessPrompt:
+    deployed = await _load_deployed_business_prompt(session, tenant_id, brand_id)
+    if deployed is not None:
+        return deployed
+
+    # Compatibility fallback for legacy scopes that predate the Agent control plane. Once a
+    # scope has any deployment, runtime resolution is pinned to that append-only release stream.
+    return await load_latest_business_prompt_draft(session, tenant_id, brand_id)
+
+
+async def load_latest_business_prompt_draft(
+    session: AsyncSession,
+    tenant_id: str,
+    brand_id: str,
+) -> ResolvedBusinessPrompt:
+    """Load the mutable editor pointer without changing production resolution."""
     row = (
         await session.execute(
             select(
@@ -125,6 +140,75 @@ async def load_business_prompt(
     )
 
 
+async def _load_deployed_business_prompt(
+    session: AsyncSession,
+    tenant_id: str,
+    brand_id: str,
+) -> ResolvedBusinessPrompt | None:
+    row = (
+        await session.execute(
+            select(
+                models.AgentVersion.business_prompt_version_id,
+                models.AgentVersion.configuration,
+                models.ReplyBusinessPromptVersion.content,
+                models.ReplyBusinessPromptVersion.content_hash,
+                models.ReplyBusinessPromptVersion.revision,
+            )
+            .select_from(models.AgentDeployment)
+            .join(
+                models.Agent,
+                (models.Agent.tenant_id == models.AgentDeployment.tenant_id)
+                & (models.Agent.id == models.AgentDeployment.agent_id),
+            )
+            .join(
+                models.AgentVersion,
+                (models.AgentVersion.tenant_id == models.AgentDeployment.tenant_id)
+                & (models.AgentVersion.agent_id == models.AgentDeployment.agent_id)
+                & (models.AgentVersion.id == models.AgentDeployment.agent_version_id),
+            )
+            .outerjoin(
+                models.ReplyBusinessPromptVersion,
+                (
+                    models.ReplyBusinessPromptVersion.id
+                    == models.AgentVersion.business_prompt_version_id
+                )
+                & (models.ReplyBusinessPromptVersion.tenant_id == tenant_id)
+                & (models.ReplyBusinessPromptVersion.brand_id == brand_id),
+            )
+            .where(
+                models.AgentDeployment.tenant_id == tenant_id,
+                models.AgentDeployment.environment == "production",
+                models.Agent.legacy_brand_id == brand_id,
+            )
+            .order_by(models.AgentDeployment.revision.desc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    if row.business_prompt_version_id is None:
+        return DEFAULT_RESOLVED_BUSINESS_PROMPT
+    if row.content is None or row.content_hash is None or row.revision is None:
+        raise BusinessPromptConfigurationError("deployed_business_prompt_missing")
+    try:
+        instructions = BusinessPromptInstructions(row.content)
+    except ValueError as exc:
+        raise BusinessPromptConfigurationError("deployed_business_prompt_invalid") from exc
+    configured_revision = row.configuration.get("business_prompt_revision")
+    configured_version_id = row.configuration.get("business_prompt_version_id")
+    if (
+        instructions.content_hash != row.content_hash
+        or (configured_revision is not None and configured_revision != row.revision)
+        or configured_version_id != str(row.business_prompt_version_id)
+    ):
+        raise BusinessPromptConfigurationError("deployed_business_prompt_provenance_invalid")
+    return ResolvedBusinessPrompt(
+        instructions=instructions,
+        version_id=row.business_prompt_version_id,
+        revision=row.revision,
+    )
+
+
 async def business_prompt_provenance_is_current(
     session: AsyncSession,
     *,
@@ -136,22 +220,9 @@ async def business_prompt_provenance_is_current(
 ) -> bool:
     if acquire_lock:
         await acquire_business_prompt_shared_xact_lock(session, tenant_id, brand_id)
-    current = (
-        await session.execute(
-            select(
-                models.ReplyBusinessPrompt.active_version_id,
-                models.ReplyBusinessPrompt.content_hash,
-            )
-            .where(
-                models.ReplyBusinessPrompt.tenant_id == tenant_id,
-                models.ReplyBusinessPrompt.brand_id == brand_id,
-            )
-        )
-    ).one_or_none()
-    if current is None:
-        return version_id is None and content_hash == DEFAULT_BUSINESS_PROMPT.content_hash
+    current = await load_business_prompt(session, tenant_id, brand_id)
     return (
-        version_id == current.active_version_id
+        version_id == current.version_id
         and content_hash == current.content_hash
     )
 

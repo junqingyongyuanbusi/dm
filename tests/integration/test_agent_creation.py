@@ -4,6 +4,7 @@ from sqlalchemy import func, select
 
 from apps.api.main import create_app
 from social_reply.application.account_management.auth import hash_password
+from social_reply.application.reply_decision.business_prompt import load_business_prompt
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 
@@ -159,6 +160,113 @@ async def test_agent_creation_enforces_csrf_validation_and_scope_uniqueness(
     assert first.status_code == 303
     assert duplicate.status_code == 409
     assert "已被使用" in duplicate.text
+
+
+async def test_agent_instructions_save_as_draft_then_deploy_explicitly(migrated_db) -> None:
+    async with _app_client() as client:
+        csrf = await _login_admin(client)
+        created = await client.post(
+            "/app/t/default/agents",
+            data={
+                "csrf_token": csrf,
+                "name": "Release Support",
+                "slug": "release_support",
+                "description": "Exercise explicit releases.",
+            },
+        )
+        assert created.status_code == 303
+        saved = await client.post(
+            "/app/t/default/agents/release_support/instructions/save",
+            data={
+                "csrf_token": csrf,
+                "expected_revision": "0",
+                "content": "Answer directly and escalate financial risk.",
+                "change_note": "Initial release candidate",
+            },
+        )
+        assert saved.status_code == 303
+
+        async with get_session_factory()() as session:
+            agent = await session.scalar(
+                select(models.Agent).where(
+                    models.Agent.tenant_id == "default",
+                    models.Agent.legacy_brand_id == "release_support",
+                )
+            )
+            latest_version = await session.scalar(
+                select(models.AgentVersion)
+                .where(models.AgentVersion.agent_id == agent.id)
+                .order_by(models.AgentVersion.revision.desc())
+            )
+            agent_id = agent.id
+            latest_version_id = latest_version.id
+            session.add(
+                models.PlatformAccount(
+                    tenant_id="default",
+                    brand_id="release_support",
+                    platform="telegram",
+                    name="Release Support",
+                    external_account_id="release-support-1",
+                    public_id="release-support-public",
+                    config={},
+                    capability={},
+                    automation_default="BOT_DRAFT_ONLY",
+                    status="active",
+                )
+            )
+            await session.commit()
+
+        editor = await client.get(
+            "/app/t/default/agents/release_support/instructions"
+        )
+        assert editor.status_code == 200
+        assert "尚未发布" in editor.text
+        assert (
+            f"/instructions/releases/{latest_version_id}/deploy" in editor.text
+        )
+
+        invalid_csrf = await client.post(
+            f"/app/t/default/agents/release_support/instructions/releases/"
+            f"{latest_version_id}/deploy",
+            data={
+                "csrf_token": "wrong-token",
+                "expected_deployment_revision": "0",
+            },
+        )
+        assert invalid_csrf.status_code == 403
+
+        deployed = await client.post(
+            f"/app/t/default/agents/release_support/instructions/releases/"
+            f"{latest_version_id}/deploy",
+            data={
+                "csrf_token": csrf,
+                "expected_deployment_revision": "0",
+            },
+        )
+        assert deployed.status_code == 303
+        assert deployed.headers["location"].endswith("?notice=deployed")
+        deployed_page = await client.get(deployed.headers["location"])
+        assert deployed_page.status_code == 200
+        assert "生产已是最新版本" in deployed_page.text
+        assert "生产中" in deployed_page.text
+
+    async with get_session_factory()() as session:
+        deployment = await session.scalar(
+            select(models.AgentDeployment).where(
+                models.AgentDeployment.tenant_id == "default",
+                models.AgentDeployment.agent_id == agent_id,
+            )
+        )
+        runtime_prompt = await load_business_prompt(
+            session,
+            "default",
+            "release_support",
+        )
+    assert deployment.agent_version_id == latest_version_id
+    assert deployment.revision == 1
+    assert runtime_prompt.instructions.text == (
+        "Answer directly and escalate financial risk."
+    )
 
 
 async def test_database_user_cannot_create_agents(migrated_db) -> None:

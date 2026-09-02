@@ -673,8 +673,8 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "Rate-limited by tenant and operator",
     ),
     "agent.test.guardrail.active_version": (
-        "只读取当前活动业务指令版本",
-        "Uses only the current active business-instruction version",
+        "只读取当前已发布的业务指令版本",
+        "Uses only the currently deployed business-instruction version",
     ),
     "agent.status.auto_reply": ("自动回复", "Auto reply"),
     "agent.status.draft_only": ("仅生成草稿", "Draft only"),
@@ -698,6 +698,12 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     ),
     "agent.overview.edit_instructions": ("编辑指令", "Edit instructions"),
     "agent.overview.view_instructions": ("查看指令", "View instructions"),
+    "agent.overview.deploy_agent": ("发布 Agent 变更", "Deploy Agent changes"),
+    "agent.overview.deploy_agent_description": (
+        "最新草稿尚未发布；生产运行仍保持在之前验证过的版本。",
+        "The latest draft has not been deployed. Production remains on the previously verified release.",
+    ),
+    "agent.overview.review_release": ("检查并发布", "Review and deploy"),
     "agent.overview.publish_knowledge": (
         "发布第一条批准知识",
         "Publish the first approved knowledge entry",
@@ -720,6 +726,10 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "agent.overview.instructions_ready": (
         "业务指令已版本化",
         "Business instructions are versioned",
+    ),
+    "agent.overview.release_ready": (
+        "生产版本与最新草稿一致",
+        "Production matches the latest draft",
     ),
     "agent.overview.knowledge_ready": ("已有已发布知识", "Published knowledge is available"),
     "agent.overview.channel_count": (
@@ -1864,12 +1874,24 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "Edit the tenant + brand business instructions used by the primary reply model. RAG, knowledge boundaries, six-field output, language validation, safety guards, and send authorization remain code-controlled.",
     ),
     "admin.prompt.banner.saved": (
-        "业务 Prompt 已保存为新版本；启用开关时，下一次模型生成立即使用。",
-        "The business prompt was saved as a new version and will be used by the next generation when the feature is enabled.",
+        "业务 Prompt 已保存为新草稿；生产版本保持不变，直到明确发布。",
+        "The business prompt was saved as a new draft. Production remains unchanged until an explicit deployment.",
+    ),
+    "admin.prompt.banner.deployed": (
+        "所选 Agent 版本已发布到生产；新的生成会使用该版本。",
+        "The selected Agent version was deployed to production and will be used by new generations.",
     ),
     "admin.prompt.banner.rolled_back": (
-        "历史内容已复制为新的活动版本。",
-        "The historical content was copied into a new active version.",
+        "历史内容已恢复为新草稿；生产版本尚未改变。",
+        "The historical content was restored as a new draft. Production has not changed.",
+    ),
+    "admin.prompt.banner.deployment_conflict": (
+        "生产版本已被其他管理员更新，请刷新后重新选择发布版本。",
+        "Another administrator changed the production release. Refresh and select a version again.",
+    ),
+    "admin.prompt.banner.deployment_requires_channel": (
+        "请先连接至少一个 Channel，再发布 Agent 到生产。",
+        "Connect at least one channel before deploying this Agent to production.",
     ),
     "admin.prompt.banner.revision_conflict": (
         "Prompt 已被其他管理员更新，请刷新后重新编辑。",
@@ -1884,8 +1906,8 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "The brand does not exist or does not belong to the current tenant.",
     ),
     "admin.prompt.feature_enabled": (
-        "运行时开关已启用：保存提交后，新生成立即读取活动版本；旧版本待发回复会在发送前被取消。",
-        "The runtime feature is enabled. New generations use the active version immediately after save; pending replies from older versions are cancelled before sending.",
+        "运行时开关已启用：新生成只读取已发布版本；发布切换后，旧版本待发回复会在发送前被取消。",
+        "The runtime feature is enabled. New generations read only the deployed version; pending replies from older releases are cancelled before sending after a deployment change.",
     ),
     "admin.prompt.feature_disabled": (
         "运行时开关尚未启用。你可以先保存和试运行；Worker 仍使用旧的代码编译语气，直到三个服务统一设置 REPLY_BUSINESS_PROMPT_ENABLED=true。",
@@ -1895,7 +1917,7 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     "admin.prompt.active_version": ("活动版本 · 第 {revision} 版", "Active version · {revision}"),
     "admin.prompt.select_scope": ("选择作用域", "Select scope"),
     "admin.prompt.switch": ("切换", "Switch"),
-    "admin.prompt.current_prompt": ("当前业务 Prompt", "Current business prompt"),
+    "admin.prompt.current_prompt": ("业务指令草稿", "Business instruction draft"),
     "admin.prompt.edit_hint": (
         "最多 {count} 字符。禁止写入联系方式、密钥、Token 或密码。保存采用乐观版本校验，并追加不可变历史。",
         "Up to {count} characters. Do not include contact information, keys, tokens, or passwords. Saves use optimistic version checks and append immutable history.",
@@ -1907,6 +1929,28 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
         "For example: confirm the customer need before giving concise steps",
     ),
     "admin.prompt.save_version": ("保存并创建新版本", "Save as new version"),
+    "admin.prompt.draft_revision": ("草稿内容版本", "Draft content revision"),
+    "admin.prompt.release_title": ("生产发布", "Production release"),
+    "admin.prompt.release_description": (
+        "保存只创建不可变草稿；发布才会切换运行时使用的版本。",
+        "Saving creates an immutable draft. Deploying is the only action that changes the runtime version.",
+    ),
+    "admin.prompt.release_safety": (
+        "发布采用租户作用域锁与乐观并发校验；每次切换都会追加审计和部署记录。",
+        "Deployments use a tenant-scoped lock and optimistic concurrency; every switch appends an audit and deployment record.",
+    ),
+    "admin.prompt.release_connect_channel": ("等待连接 Channel", "Waiting for a channel"),
+    "admin.prompt.release_not_deployed": ("尚未发布", "Not deployed"),
+    "admin.prompt.release_changes_pending": ("有待发布变更", "Changes pending"),
+    "admin.prompt.release_current": ("生产已是最新版本", "Production is current"),
+    "admin.prompt.release_none": ("无", "None"),
+    "admin.prompt.latest_draft": ("最新草稿", "Latest draft"),
+    "admin.prompt.production_release": ("生产版本", "Production release"),
+    "admin.prompt.deployment_revision": ("部署序号", "Deployment revision"),
+    "admin.prompt.deploy_latest": ("发布最新草稿", "Deploy latest draft"),
+    "admin.prompt.deploy_version": ("发布此版本", "Deploy this version"),
+    "admin.prompt.latest_draft_badge": ("最新草稿", "Latest draft"),
+    "admin.prompt.production_badge": ("生产中", "Production"),
     "admin.prompt.trial": ("试运行", "Run trial"),
     "admin.prompt.trial_hint": (
         "使用当前已保存的业务 Prompt 调用主回复模型；不会写决策、创建 Outbox 或发送消息。",
@@ -1932,8 +1976,8 @@ _CONSOLE_MESSAGES: Final[dict[str, tuple[str, str]]] = {
     ),
     "admin.prompt.version_history": ("版本历史", "Version history"),
     "admin.prompt.version_history_hint": (
-        "回滚不会改写旧版本，而是把所选内容复制成新的活动版本。",
-        "Rollback does not rewrite old versions; it copies the selected content into a new active version.",
+        "历史始终不可变。恢复会复制成新草稿；发布历史版本会追加新的生产部署记录。",
+        "History remains immutable. Restore copies content into a new draft; deploying a historical version appends a production deployment record.",
     ),
     "admin.prompt.version": ("版本", "Version"),
     "admin.prompt.note": ("说明", "Note"),
