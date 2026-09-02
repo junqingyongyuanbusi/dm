@@ -1,0 +1,23 @@
+<section class="saas-lifecycle" aria-labelledby="agent-lifecycle-title">
+  <div class="saas-lifecycle-heading">
+    <div>
+      <div class="saas-eyebrow">{{ lifecycle_eyebrow }}</div>
+      <h2 id="agent-lifecycle-title">{{ lifecycle_title }}</h2>
+      <p>{{ lifecycle_description }}</p>
+    </div>
+  </div>
+  <ol class="saas-lifecycle-steps">
+    {% for stage in lifecycle_stages %}
+      <li class="saas-lifecycle-step{% if stage.current %} current{% endif %}">
+        <a href="{{ stage.href }}"{% if stage.current %} aria-current="step"{% endif %}>
+          <span class="saas-lifecycle-index">{{ loop.index }}</span>
+          <span class="saas-lifecycle-copy">
+            <strong>{{ stage.label }}</strong>
+            <small>{{ stage.description }}</small>
+          </span>
+          <span class="saas-lifecycle-arrow" aria-hidden="true">→</span>
+        </a>
+      </li>
+    {% endfor %}
+  </ol>
+</section>

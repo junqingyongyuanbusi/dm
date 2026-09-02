@@ -1481,16 +1481,239 @@ a.channel-tile:hover {
   color: var(--app-warning);
 }
 
-.saas-agent-card {
+.saas-lifecycle {
+  margin-bottom: 22px;
+  overflow: hidden;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 85% 0%, var(--app-accent-soft), transparent 32%),
+    var(--app-surface);
+}
+
+.saas-lifecycle-heading {
+  padding: 17px 18px 15px;
+}
+
+.saas-lifecycle-heading h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
+}
+
+.saas-lifecycle-heading p {
+  max-width: 720px;
+  margin: 4px 0 0;
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.saas-lifecycle-steps {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 20px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--app-divider);
+  list-style: none;
+}
+
+.saas-lifecycle-step + .saas-lifecycle-step {
+  border-left: 1px solid var(--app-divider);
+}
+
+.saas-lifecycle-step a {
+  display: grid;
+  min-height: 82px;
+  grid-template-columns: 25px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 13px 14px;
+}
+
+.saas-lifecycle-step a:hover,
+.saas-lifecycle-step.current a {
+  background: var(--app-surface-muted);
+  color: var(--app-text);
+}
+
+.saas-lifecycle-step.current a {
+  box-shadow: inset 0 -2px var(--app-accent);
+}
+
+.saas-lifecycle-index {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border: 1px solid var(--app-border-strong);
+  border-radius: 999px;
+  background: var(--app-surface);
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.saas-lifecycle-step.current .saas-lifecycle-index {
+  border-color: var(--app-accent);
+  background: var(--app-accent);
+  color: #fff;
+}
+
+.saas-lifecycle-copy {
+  display: grid;
+  gap: 2px;
+}
+
+.saas-lifecycle-copy strong {
+  color: var(--app-text);
+  font-size: 13px;
+}
+
+.saas-lifecycle-copy small {
+  overflow: hidden;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.saas-lifecycle-arrow {
+  color: var(--app-text-muted);
+}
+
+.saas-agent-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.saas-agent-card {
+  display: flex;
+  min-height: 360px;
+  flex-direction: column;
+  gap: 16px;
   padding: 18px;
+  border-radius: 10px;
+}
+
+.saas-agent-card-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.saas-agent-avatar {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--app-accent) 28%, var(--app-border));
+  border-radius: 9px;
+  background: var(--app-accent-soft);
+  color: var(--app-accent);
+  font-size: 15px;
 }
 
 .saas-agent-card h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 17px;
+  letter-spacing: -0.018em;
+}
+
+.saas-agent-card-copy p {
+  margin: 4px 0 0;
+}
+
+.saas-agent-prompt {
+  color: var(--app-text-subtle);
+  font-size: 12px;
+}
+
+.saas-agent-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--app-divider);
+  border-radius: 7px;
+  background: var(--app-surface-muted);
+}
+
+.saas-agent-stats > div {
+  min-width: 0;
+  padding: 10px;
+}
+
+.saas-agent-stats > div + div {
+  border-left: 1px solid var(--app-divider);
+}
+
+.saas-agent-stats dt {
+  color: var(--app-text-muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.saas-agent-stats dd {
+  margin: 5px 0 0;
+  color: var(--app-text);
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.saas-agent-readiness > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--app-text-muted);
+  font-size: 11px;
+}
+
+.saas-agent-readiness strong {
+  color: var(--app-text-subtle);
+}
+
+.saas-agent-readiness-track {
+  display: block;
+  height: 5px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--app-surface-strong);
+}
+
+.saas-agent-readiness-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--app-accent);
+}
+
+.saas-agent-next {
+  margin: 0;
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+
+.saas-agent-next strong {
+  margin-right: 4px;
+  color: var(--app-text-subtle);
+}
+
+.saas-agent-open {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: auto;
+  padding-top: 13px;
+  border-top: 1px solid var(--app-divider);
+  color: var(--app-text-subtle);
+  font-size: 12px;
+  font-weight: 680;
 }
 
 .saas-agent-meta {
@@ -1500,6 +1723,119 @@ a.channel-tile:hover {
   margin-top: 12px;
   color: var(--app-text-muted);
   font-size: 12px;
+}
+
+.saas-test-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 14px;
+}
+
+.saas-test-console,
+.saas-test-context {
+  border-radius: 10px;
+}
+
+.saas-test-form textarea {
+  min-height: 170px;
+}
+
+.saas-test-submit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-top: 12px;
+}
+
+.saas-test-result {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--app-divider);
+}
+
+.saas-test-result-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.saas-test-result-heading h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.saas-test-result-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 14px 0 0;
+  overflow: hidden;
+  border: 1px solid var(--app-divider);
+  border-radius: 7px;
+  background: var(--app-divider);
+}
+
+.saas-test-result-grid > div {
+  min-width: 0;
+  padding: 10px 11px;
+  background: var(--app-surface-muted);
+}
+
+.saas-test-result-grid dt {
+  color: var(--app-text-muted);
+  font-size: 10px;
+}
+
+.saas-test-result-grid dd {
+  margin: 4px 0 0;
+  color: var(--app-text-subtle);
+  font-size: 12px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.saas-test-reply {
+  margin-top: 14px;
+}
+
+.saas-test-reply > span {
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.saas-test-reply p {
+  margin: 6px 0 0;
+  padding: 12px 14px;
+  border: 1px solid var(--app-border);
+  border-radius: 7px;
+  background: var(--app-surface-muted);
+  white-space: pre-wrap;
+}
+
+.saas-test-guardrails {
+  margin-top: 18px;
+  padding-top: 15px;
+  border-top: 1px solid var(--app-divider);
+  color: var(--app-text-subtle);
+  font-size: 12px;
+}
+
+.saas-test-guardrails ul {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 0;
+  color: var(--app-text-muted);
+  list-style: none;
+}
+
+.saas-test-guardrails li::before {
+  margin-right: 7px;
+  color: var(--app-success);
+  content: "✓";
 }
 
 .saas-timeline-item {
@@ -3039,6 +3375,27 @@ html[data-theme="dark"] .saas-code-details pre {
     --app-topbar-height: 48px;
   }
 
+  .saas-lifecycle-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .saas-lifecycle-step:nth-child(3) {
+    border-left: 0;
+  }
+
+  .saas-lifecycle-step:nth-child(n + 3) {
+    border-top: 1px solid var(--app-divider);
+  }
+
+  .saas-agent-grid,
+  .saas-test-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .saas-test-result-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   body {
     overflow-x: hidden;
   }
@@ -3345,6 +3702,31 @@ html[data-theme="dark"] .saas-code-details pre {
 }
 
 @media (max-width: 480px) {
+  .saas-lifecycle-steps,
+  .saas-test-result-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .saas-lifecycle-step + .saas-lifecycle-step,
+  .saas-lifecycle-step:nth-child(3) {
+    border-top: 1px solid var(--app-divider);
+    border-left: 0;
+  }
+
+  .saas-agent-stats {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .saas-agent-stats > div + div {
+    border-top: 1px solid var(--app-divider);
+    border-left: 0;
+  }
+
+  .saas-test-submit-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .saas-user-actions {
     gap: 4px;
     padding-right: 6px;

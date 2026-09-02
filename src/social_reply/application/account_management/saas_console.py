@@ -8,6 +8,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from markupsafe import Markup
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import aliased
 
@@ -99,6 +100,10 @@ from social_reply.application.account_management.saas_ui import (
     secondary_action,
     status_badge,
     tabs,
+)
+from social_reply.application.account_management.templating import (
+    render_template,
+    trusted_html,
 )
 from social_reply.application.account_management.ui_i18n import (
     reset_request_location,
@@ -256,6 +261,28 @@ class InboxItem:
     expected_status: str | None = None
     expected_attempt_count: int | None = None
     delivery_error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentCardView:
+    name: str
+    agent_id: str
+    scope_label: str
+    prompt_text: str
+    status_html: Markup
+    mode_label: str
+    mode_html: Markup
+    channels_label: str
+    active_accounts: int
+    account_count: int
+    knowledge_label: str
+    published_count: int
+    readiness_label: str
+    readiness_percent: int
+    next_step_label: str
+    next_step: str
+    open_href: str
+    open_label: str
 
 
 @dataclass(frozen=True)
@@ -444,6 +471,50 @@ def _display_agent_name(agent_id: str) -> str:
         return translate("agent.default_name")
     normalized = agent_id.replace("_", " ").replace("-", " ").strip()
     return f"{normalized.title()} Agent"
+
+
+def _agent_lifecycle_context(
+    tenant_id: str,
+    agent_id: str,
+    *,
+    current_stage: str = "",
+) -> dict[str, object]:
+    agent_root = _agent_root(tenant_id, agent_id)
+    return {
+        "lifecycle_eyebrow": translate("agent.lifecycle.eyebrow"),
+        "lifecycle_title": translate("agent.lifecycle.title"),
+        "lifecycle_description": translate("agent.lifecycle.description"),
+        "lifecycle_stages": (
+            {
+                "key": "train",
+                "label": translate("agent.lifecycle.train"),
+                "description": translate("agent.lifecycle.train_description"),
+                "href": f"{agent_root}/instructions",
+                "current": current_stage == "train",
+            },
+            {
+                "key": "test",
+                "label": translate("agent.lifecycle.test"),
+                "description": translate("agent.lifecycle.test_description"),
+                "href": f"{agent_root}/test",
+                "current": current_stage == "test",
+            },
+            {
+                "key": "deploy",
+                "label": translate("agent.lifecycle.deploy"),
+                "description": translate("agent.lifecycle.deploy_description"),
+                "href": f"{agent_root}/channels",
+                "current": current_stage == "deploy",
+            },
+            {
+                "key": "analyze",
+                "label": translate("agent.lifecycle.analyze"),
+                "description": translate("agent.lifecycle.analyze_description"),
+                "href": f"{agent_root}/activity",
+                "current": current_stage == "analyze",
+            },
+        ),
+    }
 
 
 def _render_page(
@@ -645,42 +716,67 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
             _progress_row(True, translate("home.safety_path")),
         )
     )
-    audit_rows = "".join(
-        f"<tr><td>{format_datetime(audit.created_at)}</td>"
-        f"<td>{escape(audit.actor)}</td><td>{escape(audit.action)}</td>"
-        f"<td>{escape(audit.subject_type)}</td></tr>"
-        for audit in recent_audits
+    lifecycle_agent_id = agent_ids[0] if agent_ids else DEFAULT_TENANT_ID
+    body = render_template(
+        "tenant/home.html",
+        **_agent_lifecycle_context(tenant_id, lifecycle_agent_id),
+        next_action_html=trusted_html(next_action),
+        attention_title=translate("home.attention_title"),
+        attention_description=attention_description,
+        attention_cards_html=trusted_html(attention_cards),
+        readiness_title=translate("home.readiness_title"),
+        readiness_description=translate("home.readiness_description"),
+        view_agents_action_html=trusted_html(
+            secondary_action(
+                f"{_tenant_root(tenant_id)}/agents",
+                translate("home.view_agents"),
+                small=True,
+            )
+        ),
+        readiness_rows_html=trusted_html(readiness_rows),
+        today_title=translate("home.today_overview"),
+        today_description=translate("home.today_overview_description"),
+        today_messages_html=trusted_html(
+            metric_card(int(message_count or 0), translate("home.metric.today_messages"))
+        ),
+        published_knowledge_html=trusted_html(
+            metric_card(
+                int(published_knowledge_count or 0),
+                translate("home.metric.published_knowledge"),
+            )
+        ),
+        recent_activity_title=translate("home.recent_activity"),
+        recent_activity_description=translate("home.recent_activity_description"),
+        view_all_action_html=trusted_html(
+            secondary_action(
+                (
+                    f"{_tenant_root(tenant_id)}/audit"
+                    if principal.is_admin
+                    else f"{_tenant_root(tenant_id)}/activity"
+                ),
+                translate("home.view_all"),
+                small=True,
+            )
+        ),
+        recent_activity_rows=tuple(
+            {
+                "time": format_datetime(audit.created_at),
+                "actor": audit.actor,
+                "action": audit.action,
+                "subject_type": audit.subject_type,
+            }
+            for audit in recent_audits
+        ),
+        recent_activity_empty_html=trusted_html(
+            empty_state(
+                translate("home.empty_activity_title"),
+                translate("home.empty_activity_description"),
+            )
+        ),
+        time_label=translate("common.time"),
+        action_label=translate("common.action"),
+        resource_label=translate("common.resource"),
     )
-    recent_activity = (
-        '<div class="saas-table-wrap"><table class="saas-table">'
-        f"<thead><tr><th>{escape(translate('common.time'))}</th><th>Actor</th>"
-        f"<th>{escape(translate('common.action'))}</th>"
-        f"<th>{escape(translate('common.resource'))}</th></tr></thead>"
-        f"<tbody>{audit_rows}</tbody></table></div>"
-        if audit_rows
-        else empty_state(
-            translate("home.empty_activity_title"),
-            translate("home.empty_activity_description"),
-        )
-    )
-    body = f"""{next_action}
-<div class="saas-section-title"><div><h2>{escape(translate("home.attention_title"))}</h2>
-<p>{escape(attention_description)}</p></div></div>
-<div class="saas-grid three">{attention_cards}</div>
-<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("home.readiness_title"))}</h2>
-<p>{escape(translate("home.readiness_description"))}</p></div>
-{secondary_action(f"{_tenant_root(tenant_id)}/agents", translate("home.view_agents"), small=True)}</div>
-<div class="saas-card-body"><ul class="saas-progress-list">{readiness_rows}</ul></div></section>
-<div class="saas-section-title"><div><h2>{escape(translate("home.today_overview"))}</h2>
-<p>{escape(translate("home.today_overview_description"))}</p></div></div>
-<div class="saas-grid two">
-{metric_card(int(message_count or 0), translate("home.metric.today_messages"))}
-{metric_card(int(published_knowledge_count or 0), translate("home.metric.published_knowledge"))}
-</div>
-<div class="saas-section-title"><div><h2>{escape(translate("home.recent_activity"))}</h2>
-<p>{escape(translate("home.recent_activity_description"))}</p></div>
-{secondary_action(f"{_tenant_root(tenant_id)}/audit" if principal.is_admin else f"{_tenant_root(tenant_id)}/activity", translate("home.view_all"), small=True)}</div>
-{recent_activity}"""
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
@@ -779,7 +875,7 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         agent_ids = await _load_agent_ids(session, principal, tenant_id)
-        cards: list[str] = []
+        cards: list[AgentCardView] = []
         for agent_id in agent_ids:
             accounts = (
                 (
@@ -807,7 +903,7 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
                 )
             )
             cards.append(
-                _render_agent_card(
+                _build_agent_card_view(
                     tenant_id=tenant_id,
                     agent_id=agent_id,
                     accounts=accounts,
@@ -815,11 +911,13 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
                     prompt=prompt,
                 )
             )
-    body = (
-        '<div class="saas-filter-bar"><span class="saas-status neutral">'
-        f"{escape(translate('agent.list_summary', count=len(agent_ids)))}</span>"
-        f'<span class="saas-muted">{escape(translate("agent.list_scope_description"))}</span></div>'
-        f'<div class="saas-grid">{"".join(cards)}</div>'
+    lifecycle_agent_id = agent_ids[0] if agent_ids else DEFAULT_TENANT_ID
+    body = render_template(
+        "tenant/agent_list.html",
+        **_agent_lifecycle_context(tenant_id, lifecycle_agent_id),
+        list_summary=translate("agent.list_summary", count=len(agent_ids)),
+        scope_description=translate("agent.list_scope_description"),
+        cards=cards,
     )
     return _render_page(
         principal=principal,
@@ -840,14 +938,14 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
     )
 
 
-def _render_agent_card(
+def _build_agent_card_view(
     *,
     tenant_id: str,
     agent_id: str,
     accounts: list[models.PlatformAccount],
     published_count: int,
     prompt: models.ReplyBusinessPrompt | None,
-) -> str:
+) -> AgentCardView:
     active_accounts = [account for account in accounts if account.status == "active"]
     modes = {account.automation_default for account in accounts}
     if not accounts:
@@ -871,16 +969,53 @@ def _render_agent_card(
         if prompt
         else translate("agent.default_prompt")
     )
-    return f"""<section class="saas-card saas-agent-card">
-<div><div style="display:flex;align-items:center;gap:10px"><h2>{escape(_display_agent_name(agent_id))}</h2>
-{status_badge(status)}</div>
-<p class="saas-muted">{escape(translate("agent.scope"))} <span class="saas-mono">{escape(agent_id)}</span> · {escape(prompt_text)}</p>
-<div class="saas-agent-meta"><span>{escape(translate("agent.mode"))}{status_badge(automation_mode)}</span>
-<span>{escape(translate("agent.channels_available", active=len(active_accounts), total=len(accounts)))}</span>
-<span>{escape(translate("agent.knowledge_published", count=published_count))}</span></div>
-<p><strong>{escape(translate("agent.next_step"))}</strong>{escape(next_step)}</p></div>
-<div>{secondary_action(f"{_agent_root(tenant_id, agent_id)}/overview", translate("agent.open"))}</div>
-</section>"""
+    readiness_checks = (
+        bool(prompt),
+        bool(published_count),
+        bool(accounts) and len(active_accounts) == len(accounts),
+    )
+    readiness_percent = round(sum(readiness_checks) / len(readiness_checks) * 100)
+    return AgentCardView(
+        name=_display_agent_name(agent_id),
+        agent_id=agent_id,
+        scope_label=translate("agent.scope"),
+        prompt_text=prompt_text,
+        status_html=trusted_html(status_badge(status)),
+        mode_label=translate("agent.card.mode"),
+        mode_html=trusted_html(status_badge(automation_mode)),
+        channels_label=translate("agent.card.channels"),
+        active_accounts=len(active_accounts),
+        account_count=len(accounts),
+        knowledge_label=translate("agent.card.knowledge"),
+        published_count=published_count,
+        readiness_label=translate("agent.card.readiness"),
+        readiness_percent=readiness_percent,
+        next_step_label=translate("agent.next_step"),
+        next_step=next_step,
+        open_href=f"{_agent_root(tenant_id, agent_id)}/overview",
+        open_label=translate("agent.open_short"),
+    )
+
+
+def _render_agent_card(
+    *,
+    tenant_id: str,
+    agent_id: str,
+    accounts: list[models.PlatformAccount],
+    published_count: int,
+    prompt: models.ReplyBusinessPrompt | None,
+) -> str:
+    """Render one card for compatibility with focused view tests and callers."""
+    return render_template(
+        "components/agent_card.html",
+        card=_build_agent_card_view(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            accounts=accounts,
+            published_count=published_count,
+            prompt=prompt,
+        ),
+    )
 
 
 _AGENT_SECTIONS = {
@@ -918,6 +1053,7 @@ def _agent_section_tabs(tenant_id: str, agent_id: str, section: str) -> str:
                 f"{agent_base}/knowledge",
                 translate("agent.tab.knowledge"),
             ),
+            ("test", f"{agent_base}/test", translate("agent.tab.test")),
             ("flow", f"{agent_base}/flow", translate("agent.tab.flow")),
             ("activity", f"{agent_base}/activity", translate("agent.tab.activity")),
         ),
@@ -1658,6 +1794,247 @@ async def trial_agent_instructions(
     )
 
 
+def _render_agent_test_workspace(
+    *,
+    tenant_id: str,
+    agent_id: str,
+    can_run: bool,
+    csrf_token: str,
+    accounts: list[models.PlatformAccount],
+    prompt_pointer: models.ReplyBusinessPrompt | None,
+    published_knowledge_count: int,
+    trial_result: ReplyBusinessPromptTrialResult | None = None,
+    error_message_key: str = "",
+) -> tuple[str, str]:
+    active_account_count = sum(account.status == "active" for account in accounts)
+    automation_modes = {account.automation_default for account in accounts}
+    agent_mode = (
+        next(iter(automation_modes))
+        if len(automation_modes) == 1
+        else ("mixed" if automation_modes else "unconfigured")
+    )
+    return (
+        render_template(
+            "tenant/agent_test.html",
+            **_agent_lifecycle_context(tenant_id, agent_id, current_stage="test"),
+            playground_title=translate("agent.test.title"),
+            playground_description=translate("agent.test.description"),
+            sandbox_label=translate("agent.test.sandbox"),
+            can_run=can_run,
+            test_action=f"{_agent_root(tenant_id, agent_id)}/test",
+            csrf_token=csrf_token,
+            message_label=translate("admin.prompt.test_message"),
+            message_placeholder=translate("agent.test.message_placeholder"),
+            input_text="",
+            isolation_notice=translate("agent.test.isolation_notice"),
+            run_label=translate("agent.test.run"),
+            read_only_notice=translate("agent.test.read_only"),
+            error_message=(translate(error_message_key) if error_message_key else ""),
+            result=trial_result,
+            result_eyebrow=translate("agent.test.result_eyebrow"),
+            result_title=translate("agent.test.result_title"),
+            completed_label=translate("agent.test.completed"),
+            action_label=translate("common.action"),
+            intent_label=translate("admin.overview.intent"),
+            risk_label=translate("admin.prompt.risk"),
+            confidence_label=translate("admin.conversation.confidence"),
+            duration_label=translate("agent.instructions.trial.duration"),
+            reason_codes_label=translate("admin.prompt.reason_codes"),
+            reply_label=translate("agent.test.reply"),
+            no_reply_label=translate("admin.prompt.trial_no_reply"),
+            context_title=translate("agent.test.context_title"),
+            context_description=translate("agent.test.context_description"),
+            prompt_label=translate("agent.test.prompt_version"),
+            prompt_version=(
+                f"v{prompt_pointer.revision}"
+                if prompt_pointer
+                else translate("agent.overview.code_default")
+            ),
+            knowledge_label=translate("agent.card.knowledge"),
+            published_knowledge_count=published_knowledge_count,
+            channels_label=translate("agent.card.channels"),
+            active_account_count=active_account_count,
+            account_count=len(accounts),
+            mode_label=translate("agent.card.mode"),
+            mode=_plain_status_label(agent_mode),
+            guardrails_title=translate("agent.test.guardrails_title"),
+            guardrails=(
+                translate("agent.test.guardrail.pii"),
+                translate("agent.test.guardrail.isolation"),
+                translate("agent.test.guardrail.rate_limit"),
+                translate("agent.test.guardrail.active_version"),
+            ),
+        ),
+        agent_mode,
+    )
+
+
+async def _agent_test_page_response(
+    request: Request,
+    principal: Principal,
+    *,
+    tenant_id: str,
+    agent_id: str,
+    trial_result: ReplyBusinessPromptTrialResult | None = None,
+    error_message_key: str = "",
+    status_code: int = status.HTTP_200_OK,
+) -> Response:
+    async with get_session_factory()() as session:
+        if agent_id not in await _load_agent_ids(session, principal, tenant_id):
+            raise HTTPException(status_code=404, detail="agent_not_found")
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        accounts = (
+            (
+                await session.execute(
+                    select(models.PlatformAccount)
+                    .where(
+                        _account_scope_condition(principal, tenant_id),
+                        models.PlatformAccount.brand_id == agent_id,
+                    )
+                    .order_by(models.PlatformAccount.platform, models.PlatformAccount.name)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        prompt_pointer = await session.scalar(
+            select(models.ReplyBusinessPrompt).where(
+                models.ReplyBusinessPrompt.tenant_id == tenant_id,
+                models.ReplyBusinessPrompt.brand_id == agent_id,
+            )
+        )
+        published_knowledge_count = int(
+            await session.scalar(
+                select(func.count()).where(
+                    models.KnowledgeDocument.tenant_id == tenant_id,
+                    models.KnowledgeDocument.brand_id == agent_id,
+                    models.KnowledgeDocument.status == "published",
+                )
+            )
+            or 0
+        )
+
+    test_body, agent_mode = _render_agent_test_workspace(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        can_run=principal.is_admin,
+        csrf_token=_csrf(request),
+        accounts=accounts,
+        prompt_pointer=prompt_pointer,
+        published_knowledge_count=published_knowledge_count,
+        trial_result=trial_result,
+        error_message_key=error_message_key,
+    )
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title=_display_agent_name(agent_id),
+        description=translate(
+            "agent.detail_description",
+            agent_id=agent_id,
+            mode=_plain_status_label(agent_mode),
+            count=len(accounts),
+        ),
+        body=f"{_agent_section_tabs(tenant_id, agent_id, 'test')}{test_body}",
+        active_navigation="agents",
+        inbox_count=inbox_summary.total,
+        breadcrumbs=(
+            (translate("nav.agents"), f"{_tenant_root(tenant_id)}/agents"),
+            (_display_agent_name(agent_id), None),
+        ),
+    )
+    response.status_code = status_code
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get(
+    "/app/t/{tenant_id}/agents/{agent_id}/test",
+    response_class=HTMLResponse,
+)
+async def agent_test_page(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    return await _agent_test_page_response(
+        request,
+        principal,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+    )
+
+
+@router.post("/app/t/{tenant_id}/agents/{agent_id}/test")
+async def run_agent_test(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as authorization_session:
+        if agent_id not in await _load_agent_ids(
+            authorization_session,
+            principal,
+            tenant_id,
+        ):
+            raise HTTPException(status_code=404, detail="agent_not_found")
+    form = await _form(request)
+    _require_csrf(request, form)
+    if set(form) != {"csrf_token", "text"}:
+        raise HTTPException(status_code=422, detail="agent_test_fields_invalid")
+    try:
+        trial_result = await run_reply_business_prompt_trial(
+            tenant_id=tenant_id,
+            brand_id=agent_id,
+            input_text=form.get("text", ""),
+            actor=principal.actor,
+        )
+    except ReplyBusinessPromptTrialValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except ReplyBusinessPromptTrialRateLimited:
+        return await _agent_test_page_response(
+            request,
+            principal,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            error_message_key="agent.instructions.trial.rate_limited",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+    except ReplyBusinessPromptTrialUnavailable:
+        return await _agent_test_page_response(
+            request,
+            principal,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            error_message_key="agent.instructions.trial.unavailable",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    except ReplyBusinessPromptScopeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ReplyBusinessPromptTrialExecutionError:
+        return await _agent_test_page_response(
+            request,
+            principal,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            error_message_key="admin.prompt.trial_failed",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+    return await _agent_test_page_response(
+        request,
+        principal,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        trial_result=trial_result,
+    )
+
+
 @router.get(
     "/app/t/{tenant_id}/agents/{agent_id}",
     response_class=HTMLResponse,
@@ -1787,7 +2164,7 @@ async def agent_detail(
         inbox_count=inbox_summary.total,
         primary_action_html=(
             primary_action(
-                f"{agent_base}/instructions#prompt-trial",
+                f"{agent_base}/test",
                 translate("agent.run_experiment"),
             )
             if principal.is_admin
@@ -2173,32 +2550,22 @@ def _render_inbox_workspace(
     action_panel: str,
     item_count: int = 0,
 ) -> str:
-    action_panel_html = (
-        f'<aside class="saas-inbox-action" aria-label="{escape(translate("inbox.current_action"))}" '
-        f"data-inbox-actions>{action_panel}</aside>"
-        if action_panel
-        else ""
+    return render_template(
+        "tenant/inbox.html",
+        queue_label=translate("inbox.queue_label"),
+        title=translate("inbox.title"),
+        item_count_label=translate("inbox.item_count", count=item_count),
+        search_label=translate("inbox.search_label"),
+        search_placeholder=translate("inbox.search_placeholder"),
+        queue_tabs_html=trusted_html(queue_tabs),
+        item_list_html=trusted_html(item_list),
+        search_empty_title=translate("inbox.search_empty_title"),
+        search_empty_description=translate("inbox.search_empty_description"),
+        workspace_label=translate("conversations.workspace_label"),
+        thread_html=trusted_html(thread),
+        current_action_label=translate("inbox.current_action"),
+        action_panel_html=trusted_html(action_panel) if action_panel else "",
     )
-    return f"""<div class="saas-inbox-layout" data-inbox-workspace>
-  <section class="saas-inbox-column saas-list-pane" aria-label="{escape(translate("inbox.queue_label"))}" data-inbox-list data-list-filter>
-    <header class="saas-inbox-column-header saas-list-pane-header">
-      <div class="saas-list-pane-title"><h1>{escape(translate("inbox.title"))}</h1>
-      <span class="saas-muted">{escape(translate("inbox.item_count", count=item_count))}</span></div>
-      <label for="inbox-list-search">{escape(translate("inbox.search_label"))}</label>
-      <input id="inbox-list-search" type="search" autocomplete="off" data-list-search
-             placeholder="{escape(translate("inbox.search_placeholder"))}">
-      {queue_tabs}
-    </header>
-    <div data-list-items>{item_list}</div>
-    <div class="saas-empty" data-search-empty hidden>
-      <h2>{escape(translate("inbox.search_empty_title"))}</h2>
-      <p>{escape(translate("inbox.search_empty_description"))}</p>
-    </div>
-  </section>
-  <section class="saas-inbox-column saas-workspace-pane" aria-label="{escape(translate("conversations.workspace_label"))}" data-inbox-thread>
-    {thread}{action_panel_html}
-  </section>
-</div>"""
 
 
 @router.get("/app/t/{tenant_id}/inbox", response_class=HTMLResponse)
@@ -2611,8 +2978,7 @@ async def _load_inbox_items(
                 and_(
                     models.Conversation.contact_id == models.Contact.id,
                     models.Contact.tenant_id == tenant_id,
-                    models.Contact.platform_account_id
-                    == models.Conversation.platform_account_id,
+                    models.Contact.platform_account_id == models.Conversation.platform_account_id,
                 ),
             )
             .join(
@@ -3096,8 +3462,7 @@ async def tenant_conversation_detail(
                 .join(
                     models.PlatformAccount,
                     and_(
-                        models.Conversation.platform_account_id
-                        == models.PlatformAccount.id,
+                        models.Conversation.platform_account_id == models.PlatformAccount.id,
                         models.PlatformAccount.tenant_id == tenant_id,
                     ),
                 )
@@ -3139,8 +3504,7 @@ async def tenant_conversation_detail(
                     models.OutboxMessage.id.is_(None),
                     models.OutboxMessage.tenant_id != tenant_id,
                     models.OutboxMessage.conversation_id != conversation_id,
-                    models.OutboxMessage.platform_account_id
-                    != conversation.platform_account_id,
+                    models.OutboxMessage.platform_account_id != conversation.platform_account_id,
                 ),
             )
             .limit(1)
@@ -5550,7 +5914,7 @@ async def tenant_health(request: Request, tenant_id: str) -> Response:
         f"<td>{status_badge(metric.level)}</td>"
         f"<td>{escape(translate('admin.health.backlog_summary', action_count=metric.action_count, warning_count=metric.warning_count))}</td>"
         f"<td>{escape(_health_age(current_time, metric.oldest_at))}</td>"
-        f'<td>{secondary_action(metric.href, translate("admin.common.view"), small=True)}</td></tr>'
+        f"<td>{secondary_action(metric.href, translate('admin.common.view'), small=True)}</td></tr>"
         for metric in health_metrics
     )
     delivery_rows = (

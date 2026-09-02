@@ -1,0 +1,69 @@
+{{ next_action_html }}
+
+{% include "components/agent_lifecycle.html" %}
+
+<div class="saas-section-title">
+  <div>
+    <h2>{{ attention_title }}</h2>
+    <p>{{ attention_description }}</p>
+  </div>
+</div>
+<div class="saas-grid three">{{ attention_cards_html }}</div>
+
+<section class="saas-card">
+  <div class="saas-card-header">
+    <div>
+      <h2>{{ readiness_title }}</h2>
+      <p>{{ readiness_description }}</p>
+    </div>
+    {{ view_agents_action_html }}
+  </div>
+  <div class="saas-card-body">
+    <ul class="saas-progress-list">{{ readiness_rows_html }}</ul>
+  </div>
+</section>
+
+<div class="saas-section-title">
+  <div>
+    <h2>{{ today_title }}</h2>
+    <p>{{ today_description }}</p>
+  </div>
+</div>
+<div class="saas-grid two">
+  {{ today_messages_html }}
+  {{ published_knowledge_html }}
+</div>
+
+<div class="saas-section-title">
+  <div>
+    <h2>{{ recent_activity_title }}</h2>
+    <p>{{ recent_activity_description }}</p>
+  </div>
+  {{ view_all_action_html }}
+</div>
+{% if recent_activity_rows %}
+  <div class="saas-table-wrap">
+    <table class="saas-table">
+      <thead>
+        <tr>
+          <th>{{ time_label }}</th>
+          <th>Actor</th>
+          <th>{{ action_label }}</th>
+          <th>{{ resource_label }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in recent_activity_rows %}
+          <tr>
+            <td>{{ row.time }}</td>
+            <td>{{ row.actor }}</td>
+            <td>{{ row.action }}</td>
+            <td>{{ row.subject_type }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  {{ recent_activity_empty_html }}
+{% endif %}

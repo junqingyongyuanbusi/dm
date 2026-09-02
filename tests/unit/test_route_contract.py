@@ -86,6 +86,7 @@ def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
         "/app/t/{tenant_id}/agents/{agent_id}/instructions": {"GET"},
         "/app/t/{tenant_id}/agents/{agent_id}/instructions/save": {"POST"},
         "/app/t/{tenant_id}/agents/{agent_id}/instructions/trial": {"POST"},
+        "/app/t/{tenant_id}/agents/{agent_id}/test": {"GET", "POST"},
         "/app/t/{tenant_id}/agents/{agent_id}/instructions/versions/{version_id}/rollback": {
             "POST"
         },
