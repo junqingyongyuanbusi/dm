@@ -57,7 +57,8 @@ remain intact through this phase so an application rollback remains possible.
    retry, and outbound message materialization remain unchanged.
 5. API, Worker, and Scheduler can start without any `CHATWOOT_*` variables.
 6. Current documentation no longer presents Chatwoot as a supported optional integration.
-7. The Alembic head remains `f3a7c9e1b5d2`; C1 introduces no migration.
+7. C1 introduces no migration. After synchronizing the concurrent Agent control-plane work, the
+   combined branch retains its single Alembic head `a8f4d2c6e901`.
 8. Production keeps `CHATWOOT_ENABLED=false` throughout rollout, then obsolete URL/token/secret
    variables are removed or revoked after verification.
 

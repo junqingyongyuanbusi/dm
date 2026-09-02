@@ -70,11 +70,17 @@ def test_agent_card_template_escapes_scope_data_and_shows_readiness() -> None:
         ],
         published_count=2,
         prompt=SimpleNamespace(revision='<script>alert("prompt")</script>'),
+        control_plane=saas_console.AgentControlPlaneView(
+            name="Support",
+            status="active",
+            version_revision=2,
+            deployed_version_revision=2,
+        ),
     )
 
     assert "<img src=x" not in html
     assert "<script>" not in html
-    assert "&lt;Img Src=X Onerror=" in html
+    assert "&lt;img src=x onerror=" in html
     assert "&lt;script&gt;alert" in html
     assert "100%" in html
     assert 'class="saas-agent-open"' in html
