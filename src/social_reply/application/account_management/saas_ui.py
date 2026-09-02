@@ -6,6 +6,10 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.templating import (
+    render_template,
+    trusted_html,
+)
 from social_reply.application.account_management.ui_i18n import (
     get_locale,
     locale_switch_url,
@@ -180,9 +184,6 @@ def render_shared_page(
 ) -> str:
     """Render the shared tenant, admin, system, or authentication page shell."""
     has_sidebar = surface != "auth" and bool(navigation_groups)
-    refresh_html = (
-        f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
-    )
     navigation_html = _render_navigation(
         navigation_groups,
         active_navigation,
@@ -211,28 +212,23 @@ def render_shared_page(
         legacy_content=legacy_content,
         workbench=workbench,
     )
-    page_title = f"{escape(title)} · {escape(translate('shell.product_name'))}"
     layout_mode = "workbench" if workbench else "page"
-    return f"""<!doctype html>
-<html lang="{escape(get_locale())}">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
-  {refresh_html}
-  <title>{page_title}</title>
-  <script src="/static/theme.js?v={_STATIC_ASSET_VERSION}"></script>
-  <link rel="stylesheet" href="/static/saas.css?v={_STATIC_ASSET_VERSION}">
-  <script src="/static/app.js?v={_STATIC_ASSET_VERSION}" defer></script>
-</head>
-<body class="saas-surface saas-surface-{escape(surface)} saas-layout-{layout_mode}"
-      data-page-layout="{layout_mode}"
-      data-sidebar-backdrop-label="{escape(translate('shell.close_navigation'))}">
-  <a class="skip-link" href="#main-content">{escape(translate('shell.skip_to_content'))}</a>
-  {header_html}
-  {_render_page_layout(sidebar_html, main_html, has_sidebar, legacy_content)}
-</body>
-</html>"""
+    return render_template(
+        "shared/page.html",
+        locale=get_locale(),
+        title=title,
+        product_name=translate("shell.product_name"),
+        asset_version=_STATIC_ASSET_VERSION,
+        refresh_seconds=refresh_seconds,
+        surface=surface,
+        layout_mode=layout_mode,
+        close_navigation_label=translate("shell.close_navigation"),
+        skip_to_content_label=translate("shell.skip_to_content"),
+        header_html=trusted_html(header_html),
+        page_layout_html=trusted_html(
+            _render_page_layout(sidebar_html, main_html, has_sidebar, legacy_content)
+        ),
+    )
 
 
 def render_saas_page(
@@ -348,6 +344,7 @@ def _tenant_navigation_groups(
         NavigationGroup(
             translate("nav.group.settings"),
             (
+                NavigationItem("channels", f"{root}/channels", translate("nav.channels")),
                 NavigationItem("profile", f"{root}/profile", translate("nav.profile")),
                 NavigationItem(
                     "settings", f"{root}/settings", translate("nav.workspace_settings")

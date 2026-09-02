@@ -213,7 +213,7 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
 
     assert "/app/t/tenant-a/agents" in tenant_html
     assert "跨租户审计" not in tenant_html
-    for group_label in ("工作", "配置", "可观测性", "设置"):
+    for group_label in ("工作区", "AI Studio", "洞察", "管理"):
         assert f">{group_label}<" in tenant_html
     assert "href=\"/app/t/tenant-a\" aria-current='page'" in tenant_html
     assert '<script src="/static/theme.js?v=' in tenant_html
@@ -259,6 +259,7 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
     assert "进入租户工作区" in system_html
     assert "/app/t/tenant-a/agents" not in system_html
     assert 'href="/admin/system/overview"' in tenant_html
+    assert 'href="/app/t/tenant-a/channels"' in tenant_html
 
 
 def test_tenant_topbar_uses_neutral_workspace_context_without_selector() -> None:
@@ -424,7 +425,7 @@ def test_saas_shell_uses_request_locale_without_translating_identity_data() -> N
         reset_locale(locale_token)
 
     assert '<html lang="en">' in html
-    for group_label in ("Work", "Configuration", "Observability", "Settings"):
+    for group_label in ("Workspace", "AI Studio", "Insights", "Manage"):
         assert f">{group_label}<" in html
     assert 'href="?ui_lang=zh-CN"' in html
     assert "system-admin" in html

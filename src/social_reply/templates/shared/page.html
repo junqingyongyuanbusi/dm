@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  {% if refresh_seconds %}<meta http-equiv="refresh" content="{{ refresh_seconds }}">{% endif %}
+  <title>{{ title }} · {{ product_name }}</title>
+  <script src="/static/theme.js?v={{ asset_version }}"></script>
+  <link rel="stylesheet" href="/static/saas.css?v={{ asset_version }}">
+  <script src="/static/app.js?v={{ asset_version }}" defer></script>
+</head>
+<body class="saas-surface saas-surface-{{ surface }} saas-layout-{{ layout_mode }}"
+      data-page-layout="{{ layout_mode }}"
+      data-sidebar-backdrop-label="{{ close_navigation_label }}">
+  <a class="skip-link" href="#main-content">{{ skip_to_content_label }}</a>
+  {{ header_html }}
+  {{ page_layout_html }}
+</body>
+</html>
