@@ -1201,7 +1201,7 @@ async def create_tenant_agent(request: Request, tenant_id: str) -> Response:
             slug=slug,
             description=description,
             error_key="agent.create.error_invalid",
-            response_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            response_status=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
     return RedirectResponse(
         _prompt_canonical_location(

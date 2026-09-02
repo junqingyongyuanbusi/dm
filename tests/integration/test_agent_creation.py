@@ -158,7 +158,7 @@ async def test_agent_creation_enforces_csrf_validation_and_scope_uniqueness(
 
     assert first.status_code == 303
     assert duplicate.status_code == 409
-    assert "已经被使用" in duplicate.text
+    assert "已被使用" in duplicate.text
 
 
 async def test_database_user_cannot_create_agents(migrated_db) -> None:
