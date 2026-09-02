@@ -13,7 +13,7 @@ from social_reply.domain.reply.voice import VoicePreferences, compile_voice_pref
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "a7c3e9d1b624"
-_HEAD_REVISION = "d4e9a2f6b710"
+_HEAD_REVISION = "f3a7c9e1b5d2"
 
 
 async def test_migration_backfills_current_compiled_prompt_and_decision_provenance() -> None:

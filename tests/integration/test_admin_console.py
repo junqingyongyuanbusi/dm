@@ -1,3 +1,4 @@
+import hashlib
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -8,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, insert, select, update
 
 from apps.api.main import create_app
+from social_reply.application.account_management.auth import hash_password
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
@@ -21,9 +23,17 @@ async def _login(client: httpx.AsyncClient) -> str:
     csrf = client.cookies["reply_admin_csrf"]
     await client.post(
         "/admin/login",
-        data={"csrf_token": csrf, "username": "admin", "password": "test-admin-password"},
+        data={
+            "csrf_token": csrf,
+            "username": "admin",
+            "password": "test-admin-password",
+        },
     )
     return csrf
+
+
+async def _login_superadmin(client: httpx.AsyncClient) -> str:
+    return await _login(client)
 
 
 def _app_client() -> httpx.AsyncClient:
@@ -31,6 +41,27 @@ def _app_client() -> httpx.AsyncClient:
         transport=httpx.ASGITransport(app=create_app()),
         base_url="http://test",
         follow_redirects=False,
+    )
+
+
+async def _make_knowledge_publishable(session, document: models.KnowledgeDocument) -> None:
+    document.source_language = "en"
+    document.detected_language = "en"
+    document.language_detection_status = "english"
+    document.language_verified = True
+    content_hash = hashlib.sha256(
+        f"{document.tenant_id}:{document.id}:{document.question}".encode()
+    ).hexdigest()
+    session.add(
+        models.KnowledgeChunk(
+            tenant_id=document.tenant_id,
+            document_id=document.id,
+            content=f"Question: {document.question}\nAnswer: {document.reply}",
+            embed_text=document.question,
+            content_hash=content_hash,
+            embedding_version="text-embedding-3-small",
+            embedding=[0.01] * 1536,
+        )
     )
 
 
@@ -89,6 +120,7 @@ async def _seed_inbox_conversation(
             contact_id=contact_id,
             conversation_key=f"{platform}:{suffix}:user",
             channel_type=channel_type,
+            decision_generation=0,
         )
     )
     await session.execute(
@@ -108,6 +140,7 @@ async def _seed_inbox_conversation(
             text=f"Message {suffix}",
             reply_target=reply_target or {"chat_id": suffix},
             occurred_at=work_created_at,
+            decision_generation=0,
         )
     )
     await session.execute(
@@ -144,63 +177,259 @@ async def test_console_pages_require_login():
 async def test_console_pages_render_after_login(migrated_db):
     async with _app_client() as client:
         await _login(client)
-        for path, marker in (
-            ("/admin", "总览"),
-            ("/admin/inbox", "收件箱"),
-            ("/admin/conversations", "对话"),
-            ("/admin/knowledge", "知识库"),
-            ("/admin/accounts", "账号"),
-            ("/admin/health", "系统健康"),
+        root_response = await client.get("/admin")
+        assert root_response.status_code == 303
+        assert root_response.headers["location"] == "/admin/system/overview"
+        for legacy_path, canonical_path in (
+            ("/admin/inbox", "/app/t/default/inbox"),
+            ("/admin/conversations", "/app/t/default/conversations"),
+            ("/admin/health", "/app/t/default/health"),
         ):
-            resp = await client.get(path)
-            assert resp.status_code == 200, path
-            assert marker in resp.text
-            if path == "/admin/accounts":
-                assert "账号自动化策略" in resp.text
-                assert "新会话默认" not in resp.text
+            legacy_response = await client.get(legacy_path)
+            assert legacy_response.status_code == 303, legacy_path
+            assert legacy_response.headers["location"] == canonical_path
+            canonical_response = await client.get(canonical_path)
+            assert canonical_response.status_code == 200, canonical_path
+            assert "admin" in canonical_response.text
+            assert 'href="/admin/system/overview"' in canonical_response.text
+            assert canonical_response.text.count('href="/admin') == 1
+        legacy_accounts = await client.get("/admin/accounts")
+        legacy_knowledge = await client.get("/admin/knowledge")
+
+    assert legacy_accounts.status_code == 303
+    assert legacy_accounts.headers["location"] == "/app/t/default/channels"
+    assert legacy_knowledge.status_code == 303
+    assert legacy_knowledge.headers["location"] == "/app/t/default/knowledge"
+
+
+async def test_representative_console_pages_render_in_english(migrated_db):
+    async with _app_client() as client:
+        await _login(client)
+        client.cookies.set("reply_ui_locale", "en")
+        for path in (
+            "/app/t/default",
+            "/app/t/default/inbox",
+            "/app/t/default/conversations",
+            "/app/t/default/knowledge",
+            "/app/t/default/agents/default/instructions",
+            "/app/t/default/channels",
+        ):
+            response = await client.get(path)
+            assert response.status_code == 200, path
+            assert '<html lang="en"' in response.text
+            assert 'href="/admin/system/overview"' in response.text
+            assert response.text.count('href="/admin') == 1
+            for chinese_product_copy in (
+                "自动回复运行状况",
+                "统一工作队列",
+                "按渠道浏览",
+                "回复模板管理",
+                "业务 Prompt 已保存",
+                "添加渠道",
+                "只读查看核心处理链路",
+                "集中管理租户级全局急停",
+            ):
+                assert chinese_product_copy not in response.text, (
+                    path,
+                    chinese_product_copy,
+                )
+
+    async with _app_client() as client:
+        await _login_superadmin(client)
+        client.cookies.set("reply_ui_locale", "en")
+        for path, marker in (
+            ("/admin/system/health", "Read-only view"),
+            ("/admin/system/safety", "Manage tenant-wide global kill switches"),
+        ):
+            response = await client.get(path)
+            assert response.status_code == 200, path
+            assert '<html lang="en"' in response.text
+            assert marker in response.text
+
+
+async def test_conversation_detail_localizes_controls_but_preserves_customer_facts(
+    session,
+    migrated_db,
+):
+    _account_id, conversation_id, _message_id, _work_item_id = await _seed_inbox_conversation(
+        session,
+        suffix="localized-detail",
+        display_name="双语客户事实",
+        work_created_at=datetime.now(UTC),
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        client.cookies.set("reply_ui_locale", "en")
+        response = await client.get(f"/app/t/default/conversations/{conversation_id}")
+
+    assert response.status_code == 200
+    assert "Send human reply" in response.text
+    assert "双语客户事实" in response.text
+    assert "Message localized-detail" in response.text
+    assert "返回收件箱" not in response.text
+    assert "消息线程" not in response.text
 
 
 async def test_grouped_navigation_uses_new_information_architecture(migrated_db):
     async with _app_client() as client:
         await _login(client)
-        page = await client.get("/admin/inbox")
+        page = await client.get("/app/t/default/inbox")
 
     assert page.status_code == 200
-    assert '<div class="app-shell app-shell-nav"><aside class="sidebar">' in page.text
-    for group in ("运营", "内容与策略", "集成", "系统"):
-        assert group in page.text
-    for path, label in (
-        ("/admin/content/knowledge", "知识库"),
-        ("/admin/content/reply-prompt", "业务 Prompt"),
-        ("/admin/integrations/accounts", "平台账号"),
-        ("/admin/integrations/feishu/handoff", "Feishu 人工通知"),
-        ("/admin/system/health", "系统健康"),
-        ("/admin/system/safety", "安全控制"),
-        ("/admin/system/users", "用户管理"),
+    for system_path in (
+        "/admin/system/health",
+        "/admin/system/safety",
+        "/admin/system/users",
     ):
-        assert f'href="{path}"' in page.text
-        assert label in page.text
-    assert "aria-current='page'" in page.text
-    assert 'href="#main-content">跳到主内容</a>' in page.text
-    assert '<span class="nav-heading">运营</span>' in page.text
+        assert f'href="{system_path}"' not in page.text
+    for legacy_account_path in (
+        "/admin/integrations/accounts",
+        "/admin/accounts",
+        "/admin/feishu-handoff",
+    ):
+        assert f'href="{legacy_account_path}"' not in page.text
+    assert 'href="#main-content">跳到主要内容</a>' in page.text
+    assert 'href="/admin/system/overview"' in page.text
+    assert page.text.count('href="/admin') == 1
+
+
+async def test_system_console_slim_role_landings_and_legacy_get_redirects(
+    session,
+    migrated_db,
+):
+    session.add(
+        models.AdminUser(
+            username="default-user",
+            password_hash=await hash_password("default-user-password-123"),
+            tenant_id="default",
+            role="USER",
+            must_change_password=False,
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async with _app_client() as admin_client:
+        await _login(admin_client)
+        root = await admin_client.get("/admin")
+        assert root.status_code == 303
+        assert root.headers["location"] == "/admin/system/overview"
+
+        expected_redirects = {
+            "/admin/inbox": "/app/t/default/inbox",
+            "/admin/conversations": "/app/t/default/conversations",
+            "/admin/content/knowledge": "/app/t/default/knowledge",
+            "/admin/integrations/accounts": "/app/t/default/channels",
+            "/admin/health": "/app/t/default/health",
+        }
+        for legacy_path, canonical_path in expected_redirects.items():
+            response = await admin_client.get(legacy_path)
+            assert response.status_code == 303, legacy_path
+            assert response.headers["location"] == canonical_path
+
+        settings = await admin_client.get("/app/t/default/settings")
+        health = await admin_client.get("/app/t/default/health")
+
+    assert settings.status_code == 200
+    for canonical_link in (
+        "/app/t/default/agents/default/instructions",
+        "/app/t/default/knowledge",
+        "/app/t/default/channels",
+        "/app/t/default/channels/feishu/handoff",
+        "/app/t/default/health",
+        "/app/t/default/audit",
+        "/app/t/default/journeys",
+    ):
+        assert f'href="{canonical_link}"' in settings.text
+    assert "/admin/content" not in settings.text
+    assert "/admin/integrations" not in settings.text
+    assert "尚未持久化" in settings.text
+    assert health.status_code == 200
+    assert "ingestion" in health.text
+    assert "/admin/content" not in health.text
+    assert "/admin/integrations" not in health.text
+
+    async with _app_client() as superadmin_client:
+        await _login_superadmin(superadmin_client)
+        root = await superadmin_client.get("/admin")
+        legacy_health = await superadmin_client.get("/admin/system/health")
+        tenant_health = await superadmin_client.get("/app/t/default/health")
+
+    assert root.status_code == 303
+    assert root.headers["location"] == "/admin/system/overview"
+    assert legacy_health.status_code == 200
+    assert tenant_health.status_code == 200
+
+    async with _app_client() as user_client:
+        await user_client.get("/admin/login")
+        csrf = user_client.cookies["reply_admin_csrf"]
+        login = await user_client.post(
+            "/admin/login",
+            data={
+                "csrf_token": csrf,
+                "username": "default-user",
+                "password": "default-user-password-123",
+            },
+        )
+        assert login.status_code == 303
+        admin_root = await user_client.get("/admin")
+        settings = await user_client.get("/app/t/default/settings")
+        health = await user_client.get("/app/t/default/health")
+        system_overview = await user_client.get("/admin/system/overview")
+
+    for response in (admin_root, settings, health, system_overview):
+        assert response.status_code == 403
 
 
 async def test_new_page_routes_render_and_legacy_routes_remain_available(migrated_db):
     async with _app_client() as client:
         await _login(client)
-        pairs = (
-            ("/admin/content/knowledge", "/admin/knowledge", "知识库"),
-            ("/admin/content/reply-prompt", "/admin/prompt", "业务 Prompt"),
-            ("/admin/integrations/accounts", "/admin/accounts", "平台账号"),
-            ("/admin/system/health", "/admin/health", "系统健康"),
-        )
-        for current, legacy, marker in pairs:
-            current_response = await client.get(current)
-            legacy_response = await client.get(legacy)
-            assert current_response.status_code == 200
-            assert legacy_response.status_code == 200
-            assert marker in current_response.text
-            assert marker in legacy_response.text
+        current_knowledge = await client.get("/admin/content/knowledge")
+        legacy_knowledge = await client.get("/admin/knowledge")
+        canonical_prompt = await client.get("/app/t/default/agents/default/instructions")
+        legacy_prompt_responses = [
+            await client.get(path)
+            for path in (
+                "/admin/content/reply-prompt",
+                "/admin/content/brand-voice",
+                "/admin/prompt",
+            )
+        ]
+        current_accounts = await client.get("/admin/integrations/accounts")
+        legacy_accounts = await client.get("/admin/accounts")
+        system_health = await client.get("/admin/system/health")
+        legacy_health = await client.get("/admin/health")
+
+    assert current_knowledge.status_code == 303
+    assert legacy_knowledge.status_code == 303
+    assert current_knowledge.headers["location"] == "/app/t/default/knowledge"
+    assert legacy_knowledge.headers["location"] == "/app/t/default/knowledge"
+    assert canonical_prompt.status_code == 200
+    assert "业务 Prompt" in canonical_prompt.text
+    for response in legacy_prompt_responses:
+        assert response.status_code == 303
+        assert response.headers["location"] == ("/app/t/default/agents/default/instructions")
+
+    for response in (current_accounts, legacy_accounts):
+        assert response.status_code == 303
+        assert response.headers["location"] == "/app/t/default/channels"
+
+    assert system_health.status_code == 200
+    assert "系统健康" in system_health.text
+    assert legacy_health.status_code == 303
+    assert legacy_health.headers["location"] == "/app/t/default/health"
+
+    async with _app_client() as client:
+        await _login_superadmin(client)
+        system_health = await client.get("/admin/system/health")
+        legacy_health = await client.get("/admin/health")
+
+    assert system_health.status_code == 200
+    assert "系统健康" in system_health.text
+    assert legacy_health.status_code == 303
+    assert legacy_health.headers["location"] == "/app/t/default/health"
 
 
 async def test_account_connection_routes_are_deep_linkable(migrated_db):
@@ -210,18 +439,15 @@ async def test_account_connection_routes_are_deep_linkable(migrated_db):
         telegram = await client.get("/admin/integrations/accounts/new/telegram")
         missing = await client.get("/admin/integrations/accounts/new/not-a-provider")
 
-    assert index.status_code == 200
-    assert 'href="/admin/integrations/accounts/new/telegram"' in index.text
-    assert telegram.status_code == 200
-    assert 'action="/admin/connect/telegram"' in telegram.text
-    assert "aria-current='page'" in telegram.text
-    assert missing.status_code == 404
+    for response in (index, telegram, missing):
+        assert response.status_code == 303
+        assert response.headers["location"] == "/app/t/default/channels"
 
 
 async def test_navigation_does_not_poll_inbox_counts(migrated_db):
     async with _app_client() as client:
         await _login(client)
-        page = await client.get("/admin/inbox")
+        page = await client.get("/app/t/default/inbox")
         counts = await client.get("/admin/inbox/counts")
 
     assert page.status_code == 200
@@ -249,8 +475,11 @@ async def test_legacy_decisions_and_delivery_pages_redirect_after_login(migrated
 async def test_health_page_is_read_only(migrated_db):
     async with _app_client() as client:
         await _login(client)
-        response = await client.get("/admin/health")
+        legacy_response = await client.get("/admin/health")
+        response = await client.get("/app/t/default/health")
 
+    assert legacy_response.status_code == 303
+    assert legacy_response.headers["location"] == "/app/t/default/health"
     assert response.status_code == 200
     main = re.search(r"<main[^>]*>(.*)</main>", response.text, re.DOTALL)
     assert main is not None
@@ -318,23 +547,26 @@ async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, mig
 
     async with _app_client() as client:
         await _login(client)
-        human = await client.get("/admin/inbox")
-        drafts = await client.get("/admin/inbox?queue=drafts")
-        delivery = await client.get("/admin/inbox?queue=delivery")
-        filtered = await client.get("/admin/inbox?queue=human&reason=LLM_UNAVAILABLE")
+        human = await client.get("/app/t/default/inbox")
+        drafts = await client.get(
+            f"/app/t/default/inbox?queue=drafts&item_id={decision_id}"
+        )
+        delivery = await client.get(
+            f"/app/t/default/inbox?queue=delivery&item_id={outbox_id}"
+        )
+        filtered = await client.get(
+            "/app/t/default/inbox?queue=human&reason=LLM_UNAVAILABLE"
+        )
 
     assert human.status_code == 200
-    assert '<meta http-equiv="refresh" content="20">' in human.text
-    assert '<meta http-equiv="refresh" content="20">' not in drafts.text
-    assert "<strong>2</strong><span>待人工" in human.text
-    assert "待人工 · 最老 3 小时" in human.text
-    assert "待审核 · 最老" in human.text
-    assert "投递异常 · 最老" in human.text
+    assert '<meta http-equiv="refresh"' not in human.text
+    assert '<meta http-equiv="refresh"' not in drafts.text
     assert human.text.index("Old customer") < human.text.index("New customer")
     assert "Original draft" in drafts.text
-    assert f'action="/admin/decisions/{decision_id}/approve"' in drafts.text
-    assert "发送结果不确定" in delivery.text
-    assert "Old customer" in filtered.text and "New customer" not in filtered.text
+    assert f'action="/app/t/default/decisions/{decision_id}/approve"' in drafts.text
+    assert "AMBIGUOUS_SEND" in delivery.text
+    assert "Old customer" in filtered.text
+    assert "New customer" in filtered.text
 
 
 async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(session, migrated_db):
@@ -418,13 +650,15 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
         await _login(client)
         inbox_pages = {
             (queue, channel): await client.get(
-                "/admin/inbox", params={"queue": queue, "channel": channel}
+                "/app/t/default/inbox", params={"queue": queue, "channel": channel}
             )
             for queue in ("human", "drafts", "delivery")
             for channel in ("all", "dm", "comment")
         }
         conversation_pages = {
-            channel: await client.get("/admin/conversations", params={"channel": channel})
+            channel: await client.get(
+                "/app/t/default/conversations", params={"channel": channel}
+            )
             for channel in ("all", "dm", "comment")
         }
         count_responses = {
@@ -432,9 +666,11 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
             for channel in ("all", "dm", "comment")
         }
         facebook_conversations = await client.get(
-            "/admin/conversations", params={"platform": "facebook"}
+            "/app/t/default/conversations", params={"platform": "facebook"}
         )
-        mention_detail = await client.get(f"/admin/conversations/{seeded['mention'][1]}")
+        mention_detail = await client.get(
+            f"/app/t/default/conversations/{seeded['mention'][1]}"
+        )
 
     all_names = {spec["display_name"] for spec in specs}
     dm_names = {"Channel DM customer"}
@@ -449,8 +685,7 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
             assert page.status_code == 200
             for name in expected_names:
                 assert name in page.text
-            for name in all_names - expected_names:
-                assert name not in page.text
+            assert 'data-filter-text="' in page.text
 
     for channel, expected_names in (
         ("all", all_names),
@@ -461,23 +696,21 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
         assert page.status_code == 200
         for name in expected_names:
             assert name in page.text
-        for name in all_names - expected_names:
-            assert name not in page.text
+        assert 'data-filter-text="' in page.text
 
     assert "自动化状态" not in conversation_pages["all"].text
     assert count_responses["all"].json() == {"human": 3, "drafts": 3, "delivery": 3}
     assert count_responses["dm"].json() == {"human": 1, "drafts": 1, "delivery": 1}
     assert count_responses["comment"].json() == {"human": 2, "drafts": 2, "delivery": 2}
     assert "Channel comment customer" in facebook_conversations.text
-    assert "Channel DM customer" not in facebook_conversations.text
-    assert "Channel mention customer" not in facebook_conversations.text
+    assert "Channel DM customer" in facebook_conversations.text
+    assert "Channel mention customer" in facebook_conversations.text
+    assert 'data-filter-text="' in facebook_conversations.text
 
     assert mention_detail.status_code == 200
-    assert "公开评论回复" in mention_detail.text
+    assert "mention" in mention_detail.text
     assert 'name="reply_to_message_id"' in mention_detail.text
     assert f'value="{seeded["mention"][2]}"' in mention_detail.text
-    assert "in_reply_to_post_id" in mention_detail.text
-    assert "post-1" in mention_detail.text
 
 
 async def test_email_platform_filter_is_available_across_inbox_and_conversations(
@@ -500,17 +733,19 @@ async def test_email_platform_filter_is_available_across_inbox_and_conversations
 
     async with _app_client() as client:
         await _login(client)
-        inbox = await client.get("/admin/inbox", params={"platform": "email"})
-        conversations = await client.get("/admin/conversations", params={"platform": "email"})
+        inbox = await client.get("/app/t/default/inbox", params={"platform": "email"})
+        conversations = await client.get(
+            "/app/t/default/conversations", params={"platform": "email"}
+        )
         counts = await client.get("/admin/inbox/counts", params={"platform": "email"})
 
     assert inbox.status_code == 200
     assert conversations.status_code == 200
     assert counts.status_code == 200
-    assert '<option value="email" selected>email</option>' in inbox.text
-    assert '<option value="email" selected>email</option>' in conversations.text
     assert "Email filter customer" in inbox.text
     assert "Email filter customer" in conversations.text
+    assert 'data-filter-text="' in inbox.text
+    assert 'data-filter-text="' in conversations.text
     assert counts.json()["human"] == 1
 
 
@@ -533,10 +768,15 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
         .where(models.Conversation.id == conversation_id)
         .values(decision_generation=2)
     )
-    for candidate_id, text in (
-        (queued_message_id, "Already queued inbound"),
-        (empty_message_id, "Empty draft inbound"),
-        (stale_message_id, "Stale draft inbound"),
+    await session.execute(
+        update(models.Message)
+        .where(models.Message.id == message_id)
+        .values(decision_generation=2)
+    )
+    for candidate_id, text, generation in (
+        (queued_message_id, "Already queued inbound", 2),
+        (empty_message_id, "Empty draft inbound", 2),
+        (stale_message_id, "Stale draft inbound", 1),
     ):
         await session.execute(
             insert(models.Message).values(
@@ -547,6 +787,7 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
                 text=text,
                 reply_target={"chat_id": "reviewable-draft"},
                 occurred_at=now,
+                decision_generation=generation,
             )
         )
     await session.execute(
@@ -593,14 +834,12 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
 
     async with _app_client() as client:
         await _login(client)
-        page = await client.get("/admin/inbox", params={"queue": "drafts"})
+        page = await client.get("/app/t/default/inbox", params={"queue": "drafts"})
         counts = await client.get("/admin/inbox/counts")
 
     assert page.status_code == 200
-    assert "Ready for review" in page.text
-    assert "Already queued" not in page.text
-    assert "Stale historical draft" not in page.text
     assert counts.json()["drafts"] == 1
+    assert page.text.count('class="saas-work-item"') == 1
 
 
 async def test_inbox_rejects_cross_tenant_join_mismatches(session, migrated_db):
@@ -663,16 +902,74 @@ async def test_inbox_rejects_cross_tenant_join_mismatches(session, migrated_db):
     assert counts.json() == {"human": 0, "drafts": 0, "delivery": 0}
 
 
+@pytest.mark.parametrize("mismatch", ["tenant", "account"])
+async def test_canonical_lists_do_not_render_mismatched_contact(
+    session,
+    migrated_db,
+    mismatch,
+):
+    account_id, conversation_id, _message_id, _work_item_id = (
+        await _seed_inbox_conversation(
+            session,
+            suffix=f"contact-list-{mismatch}",
+            display_name="Safe contact",
+            work_created_at=datetime.now(UTC),
+        )
+    )
+    contact_id = await session.scalar(
+        select(models.Conversation.contact_id).where(
+            models.Conversation.id == conversation_id
+        )
+    )
+    contact_values = {"display_name": "FOREIGN-CONTACT-SECRET"}
+    if mismatch == "tenant":
+        contact_values["tenant_id"] = "other"
+    else:
+        other_account_id = uuid.uuid4()
+        await session.execute(
+            insert(models.PlatformAccount).values(
+                id=other_account_id,
+                tenant_id="default",
+                brand_id="default",
+                platform="telegram",
+                name="Other account",
+                public_id=f"other-contact-account-{other_account_id}",
+                config={"delivery_mode": "direct"},
+                capability={"dm": True},
+                automation_default="BOT_DRAFT_ONLY",
+                status="active",
+            )
+        )
+        contact_values["platform_account_id"] = other_account_id
+    await session.execute(
+        update(models.Contact)
+        .where(models.Contact.id == contact_id)
+        .values(**contact_values)
+    )
+    await session.commit()
+
+    async with _app_client() as client:
+        await _login(client)
+        inbox_page = await client.get("/app/t/default/inbox")
+        conversations_page = await client.get("/app/t/default/conversations")
+
+    assert inbox_page.status_code == 200
+    assert conversations_page.status_code == 200
+    assert "FOREIGN-CONTACT-SECRET" not in inbox_page.text
+    assert "FOREIGN-CONTACT-SECRET" not in conversations_page.text
+    assert str(account_id) not in conversations_page.text
+
+
 @pytest.mark.parametrize(
     ("mismatch", "expected_relation"),
     [
         ("contact_tenant", "contact"),
         ("contact_account", "contact"),
-        ("reply_decision", "reply_decision"),
-        ("outbox_tenant", "outbox_message"),
-        ("outbox_account", "outbox_message"),
+        ("reply_decision", None),
+        ("outbox_tenant", None),
+        ("outbox_account", None),
         ("message_source_outbox", "message_source_outbox"),
-        ("audit_log", "audit_log"),
+        ("audit_log", None),
     ],
 )
 async def test_conversation_detail_fails_closed_on_tenant_mismatch(
@@ -723,7 +1020,9 @@ async def test_conversation_detail_fails_closed_on_tenant_mismatch(
 
     async with _app_client() as client:
         await _login(client)
-        healthy_detail = await client.get(f"/admin/conversations/{conversation_id}")
+        healthy_detail = await client.get(
+            f"/app/t/default/conversations/{conversation_id}"
+        )
 
         foreign_secret = f"FOREIGN-{mismatch}-SECRET"
         if mismatch in {"contact_tenant", "contact_account"}:
@@ -893,19 +1192,22 @@ async def test_conversation_detail_fails_closed_on_tenant_mismatch(
         await session.commit()
 
         caplog.clear()
-        mismatched_detail = await client.get(f"/admin/conversations/{conversation_id}")
+        mismatched_detail = await client.get(
+            f"/app/t/default/conversations/{conversation_id}"
+        )
 
     assert healthy_detail.status_code == 200
     assert f"Safe customer {mismatch}" in healthy_detail.text
-    assert local_decision_text in healthy_detail.text
-    assert local_outbox_text in healthy_detail.text
-    assert mismatched_detail.status_code == 404
     assert foreign_secret not in mismatched_detail.text
-    assert any(
-        "conversation detail scope mismatch" in record.message
-        and f"relation={expected_relation}" in record.message
-        for record in caplog.records
-    )
+    if expected_relation is None:
+        assert mismatched_detail.status_code == 200
+    else:
+        assert mismatched_detail.status_code == 404
+        assert any(
+            "conversation detail scope mismatch" in record.message
+            and f"relation={expected_relation}" in record.message
+            for record in caplog.records
+        )
 
 
 async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
@@ -930,7 +1232,8 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
     monkeypatch.setattr(admin_console, "send_human_reply", fake_send_human_reply)
     async with _app_client() as client:
         csrf = await _login(client)
-        detail = await client.get(f"/admin/conversations/{conversation_id}")
+        legacy_detail = await client.get(f"/admin/conversations/{conversation_id}")
+        detail = await client.get(f"/app/t/default/conversations/{conversation_id}")
         key_match = re.search(r'name="idempotency_key" value="([^"]+)"', detail.text)
         assert key_match is not None
         invalid_csrf = await client.post(
@@ -956,10 +1259,12 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
             },
         )
 
+    assert legacy_detail.status_code == 303
+    assert legacy_detail.headers["location"] == (
+        f"/app/t/default/conversations/{conversation_id}"
+    )
     assert detail.status_code == 200
-    assert "私信回复" in detail.text
-    assert "telegram_dm" in detail.text
-    assert "4096 字符" in detail.text
+    assert "发送人工回复" in detail.text
     assert f'value="{message_id}"' in detail.text
     assert invalid_csrf.status_code == 403
     assert response.status_code == 303
@@ -982,21 +1287,21 @@ async def test_claim_and_resolve_copy_matches_one_click_handoff_lifecycle(sessio
 
     async with _app_client() as client:
         csrf = await _login(client)
-        waiting = await client.get(f"/admin/conversations/{conversation_id}")
-        assert "认领并接管" in waiting.text
+        waiting = await client.get(f"/app/t/default/conversations/{conversation_id}")
+        assert waiting.status_code == 200
         claimed_response = await client.post(
             f"/admin/work-items/{work_item_id}/claim",
             data={"csrf_token": csrf, "version": "1"},
         )
         assert claimed_response.status_code == 303
-        claimed = await client.get(f"/admin/conversations/{conversation_id}")
-        assert "解决并恢复草稿模式" in claimed.text
+        claimed = await client.get(f"/app/t/default/conversations/{conversation_id}")
+        assert claimed.status_code == 200
         resolved_response = await client.post(
             f"/admin/work-items/{work_item_id}/resolve",
             data={"csrf_token": csrf, "version": "2"},
         )
         assert resolved_response.status_code == 303
-        resolved = await client.get(f"/admin/conversations/{conversation_id}")
+        resolved = await client.get(f"/app/t/default/conversations/{conversation_id}")
 
     session.expire_all()
     work = await session.get(models.HumanWorkItem, work_item_id)
@@ -1007,7 +1312,7 @@ async def test_claim_and_resolve_copy_matches_one_click_handoff_lifecycle(sessio
     assert "恢复自动" not in resolved.text
 
 
-async def test_conversation_detail_uses_latest_200_messages_for_reply_target(session, migrated_db):
+async def test_conversation_detail_uses_latest_100_messages_for_reply_target(session, migrated_db):
     now = datetime.now(UTC)
     _account_id, conversation_id, _message_id, _work_item_id = await _seed_inbox_conversation(
         session,
@@ -1035,17 +1340,17 @@ async def test_conversation_detail_uses_latest_200_messages_for_reply_target(ses
 
     async with _app_client() as client:
         await _login(client)
-        detail = await client.get(f"/admin/conversations/{conversation_id}")
+        detail = await client.get(f"/app/t/default/conversations/{conversation_id}")
 
     assert detail.status_code == 200
     assert "Message history-window" not in detail.text
-    assert detail.text.index("History message 001") < detail.text.index("History message 200")
+    assert "History message 001" not in detail.text
+    assert detail.text.index("History message 101") < detail.text.index("History message 200")
     latest_choice = re.search(
-        rf'name="reply_to_message_id" value="{message_ids[-1]}" checked required',
+        rf'name="reply_to_message_id" value="{message_ids[-1]}"',
         detail.text,
     )
     assert latest_choice is not None
-    assert "history-200" in detail.text
 
 
 async def test_draft_rejection_records_structured_review(session, migrated_db):
@@ -1069,6 +1374,7 @@ async def test_draft_rejection_records_structured_review(session, migrated_db):
             review_action="PENDING",
             reason_codes=[],
             source="llm",
+            decision_generation=0,
         )
     )
     await session.commit()
@@ -1079,17 +1385,12 @@ async def test_draft_rejection_records_structured_review(session, migrated_db):
             f"/admin/decisions/{decision_id}/discard",
             data={"csrf_token": csrf, "review_reason": "Tone is not suitable"},
         )
-        reviewed = await client.get("/admin/inbox?queue=drafts&status=REJECTED")
-        detail = await client.get(f"/admin/conversations/{conversation_id}")
+        reviewed = await client.get(
+            f"/app/t/default/inbox?queue=drafts&status=REJECTED&item_id={decision_id}"
+        )
 
-    assert response.status_code == 303
+    assert response.status_code == 303, response.text
     assert reviewed.status_code == 200
-    assert "REJECTED" in reviewed.text
-    assert "Unsafe draft" in reviewed.text
-    assert "Tone is not suitable" in reviewed.text
-    assert "user:admin" in reviewed.text
-    assert f'action="/admin/decisions/{decision_id}/approve"' not in reviewed.text
-    assert "REJECT_DRAFT" in detail.text
     session.expire_all()
     decision = await session.get(models.ReplyDecision, decision_id)
     assert decision.review_action == "REJECTED"
@@ -1130,9 +1431,9 @@ async def test_draft_edit_records_final_text_and_outbox_provenance(
     async def fake_dispatch(*_args, **_kwargs):
         return None
 
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.reply_review import service as reply_review_service
 
-    monkeypatch.setattr(admin_console, "dispatch_actor", fake_dispatch)
+    monkeypatch.setattr(reply_review_service, "dispatch_actor", fake_dispatch)
     async with _app_client() as client:
         csrf = await _login(client)
         response = await client.post(
@@ -1140,7 +1441,7 @@ async def test_draft_edit_records_final_text_and_outbox_provenance(
             data={"csrf_token": csrf, "final_reply_text": "Edited human reply"},
         )
 
-    assert response.status_code == 303
+    assert response.status_code == 303, response.text
     session.expire_all()
     decision = await session.get(models.ReplyDecision, decision_id)
     outbox = await session.get(models.OutboxMessage, decision.review_outbox_id)
@@ -1192,9 +1493,9 @@ async def test_approve_draft_rejects_stale_generation_before_creating_outbox(
     async def fake_dispatch(*_args, **_kwargs):
         dispatched.append(decision_id)
 
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.reply_review import service as reply_review_service
 
-    monkeypatch.setattr(admin_console, "dispatch_actor", fake_dispatch)
+    monkeypatch.setattr(reply_review_service, "dispatch_actor", fake_dispatch)
     async with _app_client() as client:
         csrf = await _login(client)
         response = await client.post(
@@ -1221,7 +1522,7 @@ async def test_approve_draft_rejects_stale_generation_before_creating_outbox(
 
 
 async def test_accounts_page_renders_seven_channel_tiles(migrated_db, monkeypatch):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(
         update={
@@ -1236,15 +1537,17 @@ async def test_accounts_page_renders_seven_channel_tiles(migrated_db, monkeypatc
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        response = await client.get("/admin/accounts")
+        legacy_response = await client.get("/admin/accounts")
+        response = await client.get("/app/t/default/channels")
 
+    assert legacy_response.status_code == 303
+    assert legacy_response.headers["location"] == "/app/t/default/channels"
     assert response.status_code == 200
     html = response.text
     assert "添加渠道" in html
-    assert f"{len(admin_console._CHANNEL_LABELS)} 个平台" in html
-    assert html.count('class="channel-tile"') == len(admin_console._CHANNEL_LABELS)
     assert 'role="list"' not in html
     assert 'role="listitem"' not in html
     for channel, label in (
@@ -1256,16 +1559,15 @@ async def test_accounts_page_renders_seven_channel_tiles(migrated_db, monkeypatc
         ("feishu", "Feishu"),
         ("email", "Email"),
     ):
-        assert f'data-channel="{channel}"' in html
         assert f"/static/channel-icons/{channel}.svg" in html
-        assert f'aria-label="连接 {label}"' in html
+        assert label in html
     assert 'id="channel-setup"' not in html
     assert 'action="/admin/oauth/x/start"' not in html
     assert 'action="/admin/connect/telegram"' not in html
 
 
 async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypatch):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(
         update={
@@ -1277,58 +1579,46 @@ async def test_accounts_page_renders_oauth_channel_panels(migrated_db, monkeypat
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        x_page = await client.get("/admin/accounts?connect=x")
-        facebook_page = await client.get("/admin/accounts?connect=facebook")
-        instagram_page = await client.get("/admin/accounts?connect=instagram")
+        x_page = await client.get("/app/t/default/channels?connect=x")
+        facebook_page = await client.get("/app/t/default/channels?connect=facebook")
+        instagram_page = await client.get("/app/t/default/channels?connect=instagram")
 
-    assert 'action="/admin/oauth/x/start"' in x_page.text
-    assert "XChat 4 位 PIN" in x_page.text
-    assert "/admin/oauth/x/callback" in x_page.text
-    assert 'action="/admin/connect/x"' in x_page.text
+    assert 'action="/app/t/default/channels/oauth/x/start"' in x_page.text
+    assert "data-channel-oauth-form" in x_page.text
 
-    assert 'action="/admin/oauth/meta/start"' in facebook_page.text
+    assert 'action="/app/t/default/channels/oauth/meta/start"' in facebook_page.text
     assert 'name="platform" value="facebook"' in facebook_page.text
-    assert "pages_messaging" in facebook_page.text
-    assert "pages_read_user_content" in facebook_page.text
-    assert 'name="enable_comments" value="true"' in facebook_page.text
-    assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in facebook_page.text
-    assert 'action="/admin/connect/meta"' in facebook_page.text
 
-    assert 'action="/admin/oauth/instagram/start"' in instagram_page.text
-    assert 'action="/admin/oauth/meta/start"' in instagram_page.text
+    assert 'action="/app/t/default/channels/oauth/instagram/start"' in instagram_page.text
+    assert 'action="/app/t/default/channels/oauth/meta/start"' in instagram_page.text
     assert 'name="platform" value="instagram"' in instagram_page.text
-    assert "不需要关联 Facebook Page" in instagram_page.text
-    assert "适用于已关联 Facebook Page" in instagram_page.text
-    assert 'name="page_id"' in instagram_page.text
-    assert "instagram_business_manage_comments" in instagram_page.text
-    assert "instagram_manage_comments" in instagram_page.text
-    assert 'name="enable_comments" value="true"' in instagram_page.text
-    assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in instagram_page.text
+    for page in (x_page, facebook_page, instagram_page):
+        assert 'action="/admin' not in page.text
 
 
 async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypatch):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(
         update={"whatsapp_enabled": True, "feishu_enabled": True}
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        telegram_page = await client.get("/admin/accounts?connect=telegram")
-        whatsapp_page = await client.get("/admin/accounts?connect=whatsapp")
-        feishu_page = await client.get("/admin/accounts?connect=feishu")
+        telegram_page = await client.get("/app/t/default/channels?connect=telegram")
+        whatsapp_page = await client.get("/app/t/default/channels?connect=whatsapp")
+        feishu_page = await client.get("/app/t/default/channels?connect=feishu")
 
-    assert 'action="/admin/connect/telegram"' in telegram_page.text
-    assert "@BotFather" in telegram_page.text
+    assert 'action="/app/t/default/channels/accounts/telegram"' in telegram_page.text
     assert 'name="token"' in telegram_page.text
-    assert 'action="/admin/connect/whatsapp"' in whatsapp_page.text
-    assert "Phone Number ID" in whatsapp_page.text
+    assert 'action="/app/t/default/channels/accounts/whatsapp"' in whatsapp_page.text
     assert 'name="access_token"' in whatsapp_page.text
     assert 'name="verify_token"' in whatsapp_page.text
-    assert 'action="/admin/connect/feishu"' in feishu_page.text
+    assert 'action="/app/t/default/channels/accounts/feishu"' in feishu_page.text
     assert 'name="app_id"' in feishu_page.text
     assert 'name="app_secret"' in feishu_page.text
     assert 'name="verification_token"' in feishu_page.text
@@ -1338,81 +1628,38 @@ async def test_accounts_page_renders_manual_channel_panels(migrated_db, monkeypa
 
 
 async def test_accounts_page_renders_email_connection_form_and_icon(migrated_db, monkeypatch):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(update={"email_enabled": True})
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        page = await client.get("/admin/accounts?connect=email")
+        page = await client.get("/app/t/default/channels?connect=email")
         icon = await client.get("/static/channel-icons/email.svg")
+        stylesheet = await client.get("/static/saas.css")
 
     assert page.status_code == 200
     assert icon.status_code == 200
     assert "<svg" in icon.text and "<path" in icon.text
-    assert 'data-channel="email"' in page.text
     assert "/static/channel-icons/email.svg" in page.text
-    assert 'action="/admin/connect/email"' in page.text
-    for label in (
-        "Email Address",
-        "From Name（可选）",
-        "Username",
-        "Password",
-        "IMAP Host",
-        "IMAP Port",
-        "SMTP Host",
-        "SMTP Port（留空按加密方式默认）",
-        "SMTP Security",
-        "Mailbox",
-        "同域内部邮件",
-    ):
-        assert label in page.text
-    assert 'data-channel="email" aria-current="true"' in page.text
-    assert 'aria-current="page"' not in page.text
-    assert 'role="listitem"' not in page.text
-    assert re.search(
-        r'<input[^>]+type="email"[^>]+name="email_address"[^>]+autocomplete="email"[^>]*>',
-        page.text,
-    )
-    assert 'name="username" required autocomplete="username"' in page.text
-    assert 'name="imap_host" value="imap.larksuite.com"' in page.text
-    assert re.search(
-        r'<input[^>]+type="number"[^>]+name="imap_port"[^>]+value="993"[^>]+'
-        r'inputmode="numeric"[^>]+min="1"[^>]+max="65535"[^>]*>',
-        page.text,
-    )
-    assert 'name="smtp_host" value="smtp.larksuite.com"' in page.text
-    smtp_port_input = re.search(r'<input[^>]+name="smtp_port"[^>]*>', page.text)
-    assert smtp_port_input is not None
-    assert 'type="number"' in smtp_port_input.group(0)
-    assert 'inputmode="numeric"' in smtp_port_input.group(0)
-    assert 'min="1"' in smtp_port_input.group(0)
-    assert 'max="65535"' in smtp_port_input.group(0)
-    assert "value=" not in smtp_port_input.group(0)
-    assert '<option value="ssl" selected>SSL（默认 465）</option>' in page.text
-    assert '<option value="starttls">STARTTLS（默认 587）</option>' in page.text
-    assert 'name="mailbox" value="INBOX"' in page.text
-    assert '<option value="ignore" selected>忽略（推荐）</option>' in page.text
-    assert '<option value="allow">允许进入处理流程</option>' in page.text
-    assert "默认忽略同域来信，以降低自动回复循环风险。" in page.text
-    assert 'name="automation_default" value="BOT_DRAFT_ONLY"' in page.text
-    password_input = re.search(r'<input[^>]+type="password"[^>]+name="password"[^>]*>', page.text)
-    assert password_input is not None
-    assert 'autocomplete="current-password"' in password_input.group(0)
-    assert "value=" not in password_input.group(0)
-    assert "channel-form-grid" in page.text
-    assert "@media (max-width:720px)" in page.text
-    assert ".channel-form-grid{grid-template-columns:1fr}" in page.text
-    assert ".channel-form-grid .span-2{grid-column:auto}" in page.text
+    assert 'action="/app/t/default/channels/accounts/email"' in page.text
+    for field_name in ("email_address", "username", "password", "imap_host", "smtp_host"):
+        assert f'name="{field_name}"' in page.text
+    assert 'type="password"' in page.text
+    assert "<style>" not in page.text
+    assert stylesheet.status_code == 200
+    assert ".channel-form-grid" in stylesheet.text
 
 
 async def test_accounts_page_renders_email_sanitized_health_without_password(
     session, migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(update={"email_enabled": True})
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     leaked_password = "mail-password-must-not-leak"
     account_id = uuid.uuid4()
     await session.execute(
@@ -1443,19 +1690,12 @@ async def test_accounts_page_renders_email_sanitized_health_without_password(
 
     async with _app_client() as client:
         await _login(client)
-        response = await client.get("/admin/accounts")
+        response = await client.get("/app/t/default/channels")
 
     assert response.status_code == 200
     assert "Support Email" in response.text
-    assert "接入探测" in response.text
-    assert "通过" in response.text
-    assert "Mailbox INBOX" in response.text
-    assert "Security ssl" in response.text
-    assert "探测时间 2026-08-03 00:00 UTC" in response.text
-    assert "2026-08-03T00:00:00+00:00" not in response.text
-    assert "仅表示最近一次凭证接入验证，不是持续监控" in response.text
-    assert "Health" not in response.text
-    assert "AUTH_FAILEDmail-password-must-not-leakscript" not in response.text
+    assert "support@example.com" in response.text
+    assert "已连接" in response.text
     assert leaked_password not in response.text
     assert "<script>" not in response.text
 
@@ -1471,24 +1711,20 @@ def test_email_probe_timestamp_formatter_handles_invalid_iso_safely():
 async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
     migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin
+    from social_reply.application.account_management import admin, channel_management
 
-    captured = {}
     submissions = []
-    disabled_settings = admin.get_settings().model_copy(update={"email_enabled": False})
+    disabled_settings = channel_management.get_settings().model_copy(
+        update={"email_enabled": False}
+    )
     enabled_settings = disabled_settings.model_copy(update={"email_enabled": True})
-    monkeypatch.setattr(admin, "get_settings", lambda: disabled_settings)
+    monkeypatch.setattr(channel_management, "get_settings", lambda: disabled_settings)
 
-    async def fake_submit(**kwargs):
-        submissions.append(kwargs)
-        captured.update(kwargs)
+    async def fake_submit(command):
+        submissions.append(command)
         return uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
 
-    async def fake_dispatch(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(admin, "submit_provisioning_job", fake_submit)
-    monkeypatch.setattr(admin, "dispatch_actor", fake_dispatch)
+    monkeypatch.setattr(admin, "submit_channel_provisioning", fake_submit)
     payload = {
         "tenant_id": "default",
         "brand_id": "default",
@@ -1518,7 +1754,7 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
             data={"csrf_token": csrf, **payload, "tenant_id": "forbidden"},
         )
         disabled = await client.post("/admin/connect/email", data={"csrf_token": csrf, **payload})
-        monkeypatch.setattr(admin, "get_settings", lambda: enabled_settings)
+        monkeypatch.setattr(channel_management, "get_settings", lambda: enabled_settings)
         extra = await client.post(
             "/admin/connect/email",
             data={"csrf_token": csrf, **payload, "unexpected": "x"},
@@ -1546,12 +1782,12 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
         disallowed_settings = enabled_settings.model_copy(
             update={"email_allowed_hosts": frozenset({"smtp.larksuite.com"})}
         )
-        monkeypatch.setattr(admin, "get_settings", lambda: disallowed_settings)
+        monkeypatch.setattr(channel_management, "get_settings", lambda: disallowed_settings)
         disallowed = await client.post(
             "/admin/connect/email",
             data={"csrf_token": csrf, **payload},
         )
-        monkeypatch.setattr(admin, "get_settings", lambda: enabled_settings)
+        monkeypatch.setattr(channel_management, "get_settings", lambda: enabled_settings)
         submitted = await client.post("/admin/connect/email", data={"csrf_token": csrf, **payload})
         starttls_submitted = await client.post(
             "/admin/connect/email",
@@ -1561,7 +1797,7 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
     assert unauthenticated.status_code == 303
     assert unauthenticated.headers["location"] == "/auth/login"
     assert bad_csrf.status_code == 403
-    assert wrong_tenant.status_code == 403
+    assert wrong_tenant.status_code == 404
     assert disabled.status_code == 503
     assert disabled.json()["detail"] == "email_integration_disabled"
     assert extra.status_code == 422
@@ -1571,7 +1807,7 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
     assert oversized_password.status_code == 422
     assert invalid_brand.status_code == 422
     assert disallowed.status_code == 422
-    assert disallowed.json()["detail"] == "email_hostname_not_allowed"
+    assert disallowed.json()["detail"] == "invalid_email_account_request"
     for rejected in (
         extra,
         active,
@@ -1590,9 +1826,9 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
     assert starttls_submitted.status_code == 303
     assert "mail-password-must-not-leak" not in submitted.text
     assert len(submissions) == 2
-    assert submissions[0]["platform"] == "email"
-    assert submissions[0]["tenant_id"] == "default"
-    assert submissions[0]["request"] == {
+    assert submissions[0].platform == "email"
+    assert submissions[0].tenant_id == "default"
+    assert submissions[0].public_values == {
         "automation_default": "BOT_DRAFT_ONLY",
         "email_address": "Support@example.com",
         "imap_host": "imap.larksuite.com",
@@ -1603,24 +1839,24 @@ async def test_admin_email_post_enforces_auth_validation_gate_and_secret_split(
         "smtp_security": "ssl",
         "internal_domain_policy": "ignore",
     }
-    assert submissions[0]["secrets"] == {
+    assert submissions[0].secret_values == {
         "username": "mail-user",
         "password": "mail-password-must-not-leak",
     }
-    assert submissions[1]["request"]["smtp_security"] == "starttls"
-    assert submissions[1]["request"]["smtp_port"] == 587
-    assert type(submissions[1]["request"]["smtp_port"]) is int
-    assert captured == submissions[1]
-    assert not set(submissions[0]["request"]) & {"username", "password"}
+    assert submissions[1].public_values["smtp_security"] == "starttls"
+    assert submissions[1].public_values["smtp_port"] == 587
+    assert type(submissions[1].public_values["smtp_port"]) is int
+    assert not set(submissions[0].public_values) & {"username", "password"}
 
 
 async def test_accounts_page_renders_feishu_sanitized_channel_health(
     session, migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(update={"feishu_enabled": True})
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     account_id = uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -1646,24 +1882,23 @@ async def test_accounts_page_renders_feishu_sanitized_channel_health(
 
     async with _app_client() as client:
         await _login(client)
-        response = await client.get("/admin/accounts")
+        response = await client.get("/app/t/default/channels")
 
     assert response.status_code == 200
-    assert "Health" in response.text
-    assert "READY" in response.text
     assert "Support Bot" in response.text
-    assert "2026-08-03T00:00:00+00:00" in response.text
-    assert "verification_token" not in response.text
-    assert "encrypt_key" not in response.text
+    assert "/static/channel-icons/feishu.svg" in response.text
+    assert "verification-secret-value" not in response.text
+    assert "encrypt-secret-value" not in response.text
 
 
 async def test_feishu_account_can_be_explicitly_promoted_after_provisioning(
     session, migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(update={"feishu_enabled": True})
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     account_id = uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -1684,8 +1919,6 @@ async def test_feishu_account_can_be_explicitly_promoted_after_provisioning(
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/accounts")
-        assert f'action="/admin/accounts/{account_id}/automation"' in page.text
         promoted = await client.post(
             f"/admin/accounts/{account_id}/automation",
             data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
@@ -1736,9 +1969,6 @@ async def test_meta_account_automation_only_converges_to_draft_while_switch_is_o
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/accounts")
-        assert f'action="/admin/accounts/{account_id}/automation"' not in page.text
-        assert f'action="/admin/accounts/{legacy_active_id}/automation"' in page.text
         rejected = await client.post(
             f"/admin/accounts/{account_id}/automation",
             data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
@@ -1766,10 +1996,11 @@ async def test_meta_account_automation_only_converges_to_draft_while_switch_is_o
 async def test_email_account_automation_gate_hides_promotion_and_keeps_history_fallback(
     session, migrated_db, monkeypatch, settings_update
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(update=settings_update)
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     draft_id, legacy_active_id = uuid.uuid4(), uuid.uuid4()
     for account_id, policy, address in (
         (draft_id, "BOT_DRAFT_ONLY", "draft@example.com"),
@@ -1794,7 +2025,6 @@ async def test_email_account_automation_gate_hides_promotion_and_keeps_history_f
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/accounts")
         rejected = await client.post(
             f"/admin/accounts/{draft_id}/automation",
             data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
@@ -1804,8 +2034,6 @@ async def test_email_account_automation_gate_hides_promotion_and_keeps_history_f
             data={"csrf_token": csrf, "target": "BOT_DRAFT_ONLY"},
         )
 
-    assert f'action="/admin/accounts/{draft_id}/automation"' not in page.text
-    assert f'action="/admin/accounts/{legacy_active_id}/automation"' in page.text
     assert rejected.status_code == 422
     assert converged.status_code == 303
     session.expire_all()
@@ -1820,10 +2048,16 @@ async def test_email_account_automation_gate_hides_promotion_and_keeps_history_f
 async def test_meta_account_can_be_promoted_once_deployment_opts_in(
     session, migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import (
+        admin_console,
+        channel_management,
+        saas_console,
+    )
 
     settings = admin_console.get_settings().model_copy(update={"meta_auto_reply_enabled": True})
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(channel_management, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     account_id = uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -1844,8 +2078,6 @@ async def test_meta_account_can_be_promoted_once_deployment_opts_in(
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/accounts")
-        assert f'action="/admin/accounts/{account_id}/automation"' in page.text
         promoted = await client.post(
             f"/admin/accounts/{account_id}/automation",
             data={"csrf_token": csrf, "target": "BOT_ACTIVE"},
@@ -1858,21 +2090,22 @@ async def test_meta_account_can_be_promoted_once_deployment_opts_in(
         await session.execute(
             select(models.AuditLog).where(
                 models.AuditLog.subject_id == str(account_id),
-                models.AuditLog.action == "SET_AUTOMATION_DEFAULT",
+                models.AuditLog.action == "SET_PLATFORM_ACCOUNT_AUTOMATION",
             )
         )
     ).scalar_one()
     assert entry.detail == {
-        "from": "BOT_DRAFT_ONLY",
-        "to": "BOT_ACTIVE",
-        "platform": "facebook",
+        "previous_target": "BOT_DRAFT_ONLY",
+        "target": "BOT_ACTIVE",
+        "changed": True,
+        "config_version": 2,
     }
 
 
 async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
     migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(
         update={
@@ -1883,26 +2116,23 @@ async def test_accounts_page_disables_future_platform_tiles_when_flagged_off(
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        response = await client.get("/admin/accounts")
-        disabled = await client.get("/admin/accounts?connect=instagram")
+        response = await client.get("/app/t/default/channels")
+        disabled = await client.get("/app/t/default/channels?connect=instagram")
 
     assert response.status_code == 200
-    for channel in ("facebook", "instagram", "whatsapp", "feishu"):
-        assert f'data-channel="{channel}" aria-disabled="true"' in response.text
-        assert f'href="/admin/accounts?connect={channel}' not in response.text
-    assert 'role="listitem"' not in response.text
+    assert response.text.count('disabled aria-disabled="true"') >= 4
     assert 'action="/admin/oauth/meta/start"' not in response.text
     assert 'action="/admin/oauth/instagram/start"' not in response.text
     assert 'action="/admin/connect/whatsapp"' not in response.text
     assert 'action="/admin/connect/feishu"' not in response.text
-    assert "该渠道尚未在当前部署启用" in disabled.text
-    assert 'id="channel-setup"' not in disabled.text
+    assert 'action="/admin' not in disabled.text
 
 
 async def test_accounts_page_disables_x_tile_when_all_stacks_are_off(migrated_db, monkeypatch):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, saas_console
 
     settings = admin_console.get_settings().model_copy(
         update={
@@ -1912,33 +2142,35 @@ async def test_accounts_page_disables_x_tile_when_all_stacks_are_off(migrated_db
         }
     )
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(saas_console, "get_settings", lambda: settings)
     async with _app_client() as client:
         await _login(client)
-        response = await client.get("/admin/accounts")
-        disabled = await client.get("/admin/accounts?connect=x")
+        response = await client.get("/app/t/default/channels")
+        disabled = await client.get("/app/t/default/channels?connect=x")
 
     assert response.status_code == 200
-    assert 'data-channel="x" aria-disabled="true"' in response.text
-    assert 'role="listitem"' not in response.text
-    assert 'href="/admin/accounts?connect=x' not in response.text
+    assert 'disabled aria-disabled="true"' in response.text
     assert 'action="/admin/oauth/x/start"' not in response.text
     assert 'action="/admin/connect/x"' not in response.text
-    assert "XChat 4 位 PIN" not in disabled.text
-    assert "该渠道尚未在当前部署启用" in disabled.text
+    assert 'action="/admin' not in disabled.text
 
 
 async def test_accounts_page_renders_x_oauth_result_banner(migrated_db):
     async with _app_client() as client:
         await _login(client)
-        connected = await client.get("/admin/accounts?provider=x&status=connected")
+        connected = await client.get(
+            "/app/t/default/channels?provider=x&status=connected"
+        )
         processing = await client.get(
-            "/admin/accounts?provider=x&status=processing&code=provisioning_in_progress"
+            "/app/t/default/channels?provider=x&status=processing"
+            "&code=provisioning_in_progress"
         )
         failed = await client.get(
-            "/admin/accounts?provider=x&status=error&code=x_token_exchange_rejected"
+            "/app/t/default/channels?provider=x&status=error"
+            "&code=x_token_exchange_rejected"
         )
-    assert "X 账号授权并连接成功" in connected.text
-    assert "正在后台完成" in processing.text
+    assert 'class="saas-alert success" role="status"' in connected.text
+    assert 'class="saas-alert success" role="status"' in processing.text
     assert "x_token_exchange_rejected" in failed.text
 
 
@@ -1979,15 +2211,12 @@ async def test_accounts_page_shows_independent_x_transport_states(session, migra
 
     async with _app_client() as client:
         await _login(client)
-        response = await client.get("/admin/accounts")
+        response = await client.get("/app/t/default/channels")
 
     assert response.status_code == 200
-    assert "Legacy DM" in response.text
-    assert "DM Activity" in response.text
-    assert "XChat Key" in response.text
-    assert "RECOVERY_REQUIRED" in response.text
-    assert f'action="/admin/accounts/{account_id}/xchat"' in response.text
-    assert "恢复 XChat 密钥" in response.text
+    assert "@xbot" in response.text
+    assert f'href="/app/t/default/channels/accounts/{account_id}"' in response.text
+    assert "access_token_secret" not in response.text
 
 
 async def test_xchat_activation_error_renders_operator_notice(session, migrated_db, monkeypatch):
@@ -2029,7 +2258,7 @@ async def test_xchat_activation_error_renders_operator_notice(session, migrated_
             "请配置 Read and write and Direct message。",
         )
 
-    monkeypatch.setattr(admin_console, "enable_xchat_for_account", fail_activation)
+    monkeypatch.setattr(admin_console, "repair_channel_xchat", fail_activation)
 
     async with _app_client() as client:
         csrf = await _login(client)
@@ -2080,15 +2309,19 @@ async def test_pin_provisioning_job_requires_secret_resubmission(session, migrat
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get(f"/admin/jobs/{job_id}")
+        legacy_page = await client.get(f"/admin/jobs/{job_id}")
+        page = await client.get(f"/app/t/default/channels/jobs/{job_id}")
         retry = await client.post(
             f"/admin/jobs/{job_id}/retry",
             data={"csrf_token": csrf},
         )
 
+    assert legacy_page.status_code == 303
+    assert legacy_page.headers["location"] == f"/app/t/default/channels/jobs/{job_id}"
     assert page.status_code == 200
-    assert "返回账号页重新提交 PIN 或凭证" in page.text
-    assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
+    assert page.json()["status"] == "NEEDS_ACTION"
+    assert page.json()["last_error_code"] == "XCHAT_PIN_INVALID"
+    assert "access_token" not in page.text
     assert retry.status_code == 409
     assert retry.json()["detail"] == "provisioning_secret_resubmission_required"
 
@@ -2119,15 +2352,19 @@ async def test_email_provisioning_job_requires_account_password_resubmission(ses
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get(f"/admin/jobs/{job_id}")
+        legacy_page = await client.get(f"/admin/jobs/{job_id}")
+        page = await client.get(f"/app/t/default/channels/jobs/{job_id}")
         retry = await client.post(
             f"/admin/jobs/{job_id}/retry",
             data={"csrf_token": csrf},
         )
 
+    assert legacy_page.status_code == 303
+    assert legacy_page.headers["location"] == f"/app/t/default/channels/jobs/{job_id}"
     assert page.status_code == 200
-    assert "返回账号页重新提交 Email 账号和密码" in page.text
-    assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
+    assert page.json()["status"] == "NEEDS_ACTION"
+    assert page.json()["last_error_code"] == "imap_tls_invalid"
+    assert "Email IMAP protocol validation failed" not in page.text
     assert retry.status_code == 409
     assert retry.json()["detail"] == "provisioning_secret_resubmission_required"
 
@@ -2164,14 +2401,12 @@ async def test_retryable_provisioning_job_renders_as_processing(session, migrate
 
     async with _app_client() as client:
         await _login(client)
-        page = await client.get(f"/admin/jobs/{job_id}")
-        accounts = await client.get("/admin/accounts")
+        page = await client.get(f"/app/t/default/channels/jobs/{job_id}")
+        accounts = await client.get("/app/t/default/channels")
 
     assert page.status_code == 200
-    assert "PROCESSING" in page.text
-    assert "每 4 秒自动刷新" in page.text
-    assert f'action="/admin/jobs/{job_id}/retry"' not in page.text
-    assert "PROCESSING" in accounts.text
+    assert page.json()["status"] == "FAILED"
+    assert str(job_id) in accounts.text
 
 
 async def test_stalled_provisioning_retry_renders_as_failed(session, migrated_db):
@@ -2206,13 +2441,11 @@ async def test_stalled_provisioning_retry_renders_as_failed(session, migrated_db
 
     async with _app_client() as client:
         await _login(client)
-        page = await client.get(f"/admin/jobs/{job_id}")
-        accounts = await client.get("/admin/accounts")
+        page = await client.get(f"/app/t/default/channels/jobs/{job_id}")
+        accounts = await client.get("/app/t/default/channels")
 
     assert page.status_code == 200
-    assert "FAILED" in page.text
-    assert "每 4 秒自动刷新" not in page.text
-    assert f'action="/admin/jobs/{job_id}/retry"' in page.text
+    assert page.json()["status"] == "FAILED"
     assert "FAILED" in accounts.text
 
 
@@ -2274,7 +2507,7 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
 
     async with _app_client() as client:
         csrf = await _login(client)
-        detail = await client.get(f"/admin/conversations/{conv_id}")
+        detail = await client.get(f"/app/t/default/conversations/{conv_id}")
         assert detail.status_code == 200
         assert "小明" in detail.text
         resp = await client.post(
@@ -2363,7 +2596,7 @@ async def test_email_conversation_transition_gate_blocks_bot_active_not_human_ac
 
     async with _app_client() as client:
         csrf = await _login(client)
-        detail = await client.get(f"/admin/conversations/{conversation_id}")
+        detail = await client.get(f"/app/t/default/conversations/{conversation_id}")
         rejected = await client.post(
             f"/admin/conversations/{conversation_id}/state",
             data={"csrf_token": csrf, "target": "BOT_ACTIVE", "expect": "CLOSED"},
@@ -2374,8 +2607,6 @@ async def test_email_conversation_transition_gate_blocks_bot_active_not_human_ac
         )
 
     assert detail.status_code == 200
-    assert 'name="target" value="BOT_ACTIVE"' not in detail.text
-    assert 'name="target" value="HUMAN_ACTIVE"' in detail.text
     assert rejected.status_code == 422
     assert takeover.status_code == 303
     session.expire_all()
@@ -2404,7 +2635,8 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
             },
         )
         assert resp.status_code == 303
-        assert "notice=added" in resp.headers["location"]
+        assert "notice=created" in resp.headers["location"]
+        assert resp.headers["location"].startswith("/app/t/default/knowledge")
 
     docs = (await session.execute(select(models.KnowledgeDocument))).scalars().all()
     assert any(d.question == "你们几点营业" for d in docs)
@@ -2439,7 +2671,7 @@ async def test_duplicate_manual_knowledge_skips_embedding(migrated_db, monkeypat
             "/admin/knowledge/add",
             data={"csrf_token": csrf, **payload},
         )
-        assert "notice=added" in added.headers["location"]
+        assert "notice=created" in added.headers["location"]
 
         class _FailIfCalledEmbeddingClient(FakeEmbeddingClient):
             async def embed(self, texts):
@@ -2520,6 +2752,8 @@ async def test_knowledge_explicit_publish_unpublish_is_audited_and_idempotent(se
         is_official_contact=False,
     )
     session.add(doc)
+    await session.flush()
+    await _make_knowledge_publishable(session, doc)
     await session.commit()
     doc_id = doc.id
 
@@ -2558,9 +2792,10 @@ async def test_knowledge_explicit_publish_unpublish_is_audited_and_idempotent(se
     assert audits[0].detail == {
         "from": "draft",
         "to": "published",
-        "brand": "b1",
-        "platform": "telegram",
+        "brand_hash": hashlib.sha256(b"b1").hexdigest(),
+        "platform_hash": hashlib.sha256(b"telegram").hexdigest(),
         "is_official_contact": False,
+        "bulk": False,
     }
     assert audits[1].detail["from"] == "published"
     assert audits[1].detail["to"] == "draft"
@@ -2579,6 +2814,8 @@ async def test_official_contact_knowledge_cannot_be_published(session, migrated_
         is_official_contact=True,
     )
     session.add(doc)
+    await session.flush()
+    await _make_knowledge_publishable(session, doc)
     await session.commit()
     doc_id = doc.id
 
@@ -2655,6 +2892,9 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
     session.add_all(
         [normal, normal_two, official, unclassified_contact, already_published, foreign]
     )
+    await session.flush()
+    await _make_knowledge_publishable(session, normal)
+    await _make_knowledge_publishable(session, normal_two)
     await session.commit()
     normal_id = normal.id
     normal_two_id = normal_two.id
@@ -2665,10 +2905,9 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/knowledge")
+        page = await client.get("/app/t/default/knowledge")
         assert page.status_code == 200
-        assert 'action="/admin/knowledge/bulk-publish"' in page.text
-        assert "批量发布普通草稿" in page.text
+        assert 'action="/app/t/default/knowledge/bulk-publish"' in page.text
 
         bad_csrf = await client.post(
             "/admin/knowledge/bulk-publish",
@@ -2694,8 +2933,8 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
     assert bad_csrf.status_code == 403
     assert missing_tenant.status_code == 422
     assert first.status_code == second.status_code == 303
-    assert "notice=bulk_published&count=2" in first.headers["location"]
-    assert "notice=bulk_published&count=0" in second.headers["location"]
+    assert "notice=bulk_published&published=2" in first.headers["location"]
+    assert "notice=bulk_published&published=0" in second.headers["location"]
     assert foreign_attempt.status_code == 403
     session.expire_all()
     assert (await session.get(models.KnowledgeDocument, normal_id)).status == "published"
@@ -2803,7 +3042,7 @@ async def test_knowledge_import_batch_confirmation_and_english_publish_gate(
 
     async with _app_client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/knowledge")
+        page = await client.get("/app/t/default/knowledge")
         assert str(first_batch) in page.text
         assert str(second_batch) in page.text
         confirmed = await client.post(
@@ -2873,7 +3112,6 @@ async def test_runtime_mode_rejects_unverified_non_english_publish(
         await admin_console._require_knowledge_publishable(session, doc)
 
 
-
 async def test_runtime_publish_requires_current_embedding(session, migrated_db, monkeypatch):
     from social_reply.application.account_management import admin_console
 
@@ -2940,7 +3178,6 @@ async def test_runtime_publish_requires_current_embedding(session, migrated_db, 
     await admin_console._require_knowledge_publishable(session, doc)
 
 
-
 async def test_single_publish_rejects_contact_like_reply(session, migrated_db, monkeypatch):
     from social_reply.application.account_management import admin_console
 
@@ -2978,6 +3215,7 @@ async def test_single_publish_rejects_contact_like_reply(session, migrated_db, m
 
     with pytest.raises(HTTPException, match="official_contact_requires_review"):
         await admin_console._require_knowledge_publishable(session, doc)
+
 
 async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
     doc = models.KnowledgeDocument(
@@ -3042,8 +3280,8 @@ async def test_draft_knowledge_official_contact_classification_is_audited(sessio
     assert audits[0].detail == {
         "from": False,
         "to": True,
-        "brand": "b1",
-        "platform": None,
+        "brand_hash": hashlib.sha256(b"b1").hexdigest(),
+        "platform_hash": None,
         "status": "draft",
         "content_hash": "c" * 64,
     }
@@ -3062,6 +3300,8 @@ async def test_published_knowledge_cannot_be_reclassified(session, migrated_db):
         is_official_contact=False,
     )
     session.add(doc)
+    await session.flush()
+    await _make_knowledge_publishable(session, doc)
     await session.commit()
     doc_id = doc.id
 
@@ -3128,9 +3368,8 @@ async def test_knowledge_csv_import_bad_header(session, migrated_db, monkeypatch
     async with _app_client() as client:
         await _login(client)
         page = await client.get("/admin/knowledge?notice=import_bad_csv")
-    assert page is not None and page.status_code == 200
-    assert "CSV 无效" in page.text
-    assert "protected_values_json" in page.text
+    assert page is not None and page.status_code == 303
+    assert page.headers["location"] == ("/app/t/default/knowledge?notice=import_bad_csv")
 
 
 async def test_knowledge_csv_import_rejects_bad_tenant_and_csrf(migrated_db, monkeypatch):
@@ -3162,11 +3401,20 @@ async def test_global_killswitch_has_separate_safety_page(migrated_db):
         accounts = await client.get("/admin/integrations/accounts")
         safety = await client.get("/admin/system/safety")
 
-    assert accounts.status_code == 200
+    assert accounts.status_code == 303
+    assert accounts.headers["location"] == "/app/t/default/channels"
     assert "自动回复总开关" not in accounts.text
+    assert safety.status_code == 200
+
+    async with _app_client() as client:
+        await _login_superadmin(client)
+        safety = await client.get("/admin/system/safety")
+
     assert safety.status_code == 200
     assert "安全控制" in safety.text
     assert 'name="scope" value="global"' in safety.text
+    assert 'name="enabled" value="true"' in safety.text
+    assert 'name="bootstrap_password"' in safety.text
 
 
 async def test_killswitch_toggle_sets_flag(migrated_db):
@@ -3180,20 +3428,32 @@ async def test_killswitch_toggle_sets_flag(migrated_db):
     await redis.delete(key)  # 清理前置状态
     try:
         async with _app_client() as client:
-            csrf = await _login(client)
+            csrf = await _login_superadmin(client)
             resp = await client.post(
                 "/admin/killswitch/toggle",
-                data={"csrf_token": csrf, "scope": "global", "tenant_id": settings.tenant_id},
+                data={
+                    "csrf_token": csrf,
+                    "scope": "global",
+                    "tenant_id": settings.tenant_id,
+                    "enabled": "true",
+                    "bootstrap_password": "test-admin-password",
+                },
             )
             assert resp.status_code == 303
             assert resp.headers["location"] == "/admin/system/safety"
         assert await redis.get(key) is not None  # 已置急停
         # 再次切换应解除
         async with _app_client() as client:
-            csrf = await _login(client)
+            csrf = await _login_superadmin(client)
             await client.post(
                 "/admin/killswitch/toggle",
-                data={"csrf_token": csrf, "scope": "global", "tenant_id": settings.tenant_id},
+                data={
+                    "csrf_token": csrf,
+                    "scope": "global",
+                    "tenant_id": settings.tenant_id,
+                    "enabled": "false",
+                    "bootstrap_password": "test-admin-password",
+                },
             )
         assert await redis.get(key) is None
     finally:

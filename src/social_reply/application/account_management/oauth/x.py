@@ -41,11 +41,12 @@ from social_reply.application.account_management.oauth.common import (
     take_oauth_state,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.application.account_management.ui_i18n import translate
 from social_reply.application.account_management.x_app import x_app_credentials
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
@@ -315,12 +316,10 @@ async def _start_x_oauth(
     tenant_id = route_tenant_id or (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
+    if tenant_id != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
-    return_to = (
-        f"/app/t/{tenant_id}/channels"
-        if surface == "channels"
-        else _X_RETURN_TO
-    )
+    return_to = f"/app/t/{tenant_id}/channels" if surface == "channels" else _X_RETURN_TO
     settings = get_settings()
     if not settings.x_integration_enabled:
         return oauth_error_response(
@@ -328,8 +327,8 @@ async def _start_x_oauth(
             tenant_id=tenant_id,
             provider="x",
             code="x_integration_disabled",
-            title="X 集成已关闭",
-            message="当前环境未启用任何 X 消息栈。",
+            title=translate("oauth.x.disabled_title"),
+            message=translate("oauth.x.current_disabled"),
             status_code=503,
         )
     if (form.get("xchat_pin") or "").strip() and not settings.xchat_enabled:
@@ -338,8 +337,8 @@ async def _start_x_oauth(
             tenant_id=tenant_id,
             provider="x",
             code="xchat_disabled",
-            title="XChat 已关闭",
-            message="当前环境不接受 XChat PIN。",
+            title=translate("oauth.xchat.disabled_title"),
+            message=translate("oauth.xchat.pin_disabled"),
             status_code=422,
         )
 
@@ -350,8 +349,8 @@ async def _start_x_oauth(
             tenant_id=tenant_id,
             provider="x",
             code="x_oauth_app_not_configured",
-            title="无法发起授权",
-            message="请先为 API、Worker 和 Scheduler 配置 X_API_KEY 与 X_API_SECRET。",
+            title=translate("oauth.cannot_start.title"),
+            message=translate("oauth.x.credentials_missing"),
             status_code=422,
         )
     consumer_key, consumer_secret = credentials
@@ -370,10 +369,13 @@ async def _start_x_oauth(
             tenant_id=tenant_id,
             provider="x",
             code="x_request_token_failed",
-            title="发起授权失败",
-            message=f"X OAuth request token 失败（{exc.__class__.__name__}"
-            f"{f': {detail}' if detail else ''}）。请检查 X App 的 Read and Write 权限、"
-            f"Web App 类型及回调地址 {callback_url}。",
+            title=translate("oauth.start_failed.title"),
+            message=translate(
+                "oauth.x.request_token_failed",
+                error_type=exc.__class__.__name__,
+                detail=f": {detail}" if detail else "",
+                callback_url=callback_url,
+            ),
             status_code=502,
         )
     try:
@@ -390,10 +392,7 @@ async def _start_x_oauth(
                     "request_token_secret": token["oauth_token_secret"],
                     "oauth_token_hash": _oauth_token_hash(token["oauth_token"]),
                     "organization_id": tenant_id,
-                    "brand_id": (
-                        (form.get("brand_id") or "default").strip()
-                        or "default"
-                    ),
+                    "brand_id": ((form.get("brand_id") or "default").strip() or "default"),
                     "created_at": datetime.now(UTC).isoformat(),
                     "status": "pending",
                     "xchat_pin": form.get("xchat_pin", ""),
@@ -407,8 +406,8 @@ async def _start_x_oauth(
             tenant_id=tenant_id,
             provider="x",
             code="oauth_state_unavailable",
-            title="发起授权失败",
-            message="OAuth 临时状态存储不可用，请稍后重试。",
+            title=translate("oauth.start_failed.title"),
+            message=translate("oauth.start_unavailable"),
             status_code=503,
         )
 
@@ -454,8 +453,8 @@ async def x_oauth_callback(request: Request) -> Response:
         )
         return _no_store(
             notice(
-                "授权参数不完整",
-                "回调缺少必要参数，请从后台账号页重新发起授权。",
+                translate("oauth.parameters_missing.title"),
+                translate("oauth.parameters_missing.x"),
                 status_code=400,
             )
         )

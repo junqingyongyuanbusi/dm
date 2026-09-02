@@ -47,6 +47,7 @@ def test_build_specs_uses_feature_flags_and_each_settings_snapshot():
     )
     assert all(spec.lane == "core" for spec in first_spec_list[:first_inspection_index])
     assert {name for name, spec in first_specs.items() if spec.lane == "core"} == {
+        "sweep_account_kill_switch_commands",
         "sweep_provisioning_jobs",
         "sweep_initial_raw_events",
         "sweep_decision_jobs",
@@ -54,6 +55,7 @@ def test_build_specs_uses_feature_flags_and_each_settings_snapshot():
         "sweep_xchat_recovery",
     }
     for name in (
+        "sweep_account_kill_switch_commands",
         "sweep_provisioning_jobs",
         "sweep_initial_raw_events",
         "sweep_decision_jobs",
@@ -143,6 +145,7 @@ def test_build_specs_omits_disabled_integrations():
     }
 
     assert specs == {
+        "sweep_account_kill_switch_commands",
         "sweep_provisioning_jobs",
         "sweep_initial_raw_events",
         "sweep_decision_jobs",

@@ -24,15 +24,15 @@ from social_reply.application.account_management.oauth.common import (
     notice,
     oauth_error_response,
     oauth_result_response,
-    peek_oauth_state,
     principal_from_oauth_context,
     store_oauth_state,
     take_oauth_state,
 )
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.application.account_management.ui_i18n import translate
 from social_reply.connectors.meta.client import appsecret_proof
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
@@ -52,6 +52,13 @@ def _oauth_scopes() -> str:
 
 def _instagram_client(**kwargs) -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=15, **kwargs)
+
+
+def _no_store(response: Response) -> Response:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @router.post("/oauth/instagram/start")
@@ -88,6 +95,8 @@ async def _start_instagram_oauth(
     tenant_id = route_tenant_id or (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
+    if tenant_id != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
     if not get_settings().instagram_messaging_enabled:
         return oauth_error_response(
@@ -95,8 +104,8 @@ async def _start_instagram_oauth(
             tenant_id=tenant_id,
             provider="instagram",
             code="platform_integration_disabled",
-            title="Instagram 集成已关闭",
-            message="当前环境未启用 Instagram Messaging。",
+            title=translate("oauth.instagram.disabled_title"),
+            message=translate("oauth.instagram.current_disabled"),
             status_code=503,
         )
     app = await instagram_app_credentials(tenant_id)
@@ -106,9 +115,8 @@ async def _start_instagram_oauth(
             tenant_id=tenant_id,
             provider="instagram",
             code="instagram_app_not_configured",
-            title="无法发起授权",
-            message="请配置 INSTAGRAM_APP_ID、INSTAGRAM_APP_SECRET，以及 "
-            "INSTAGRAM_VERIFY_TOKEN 或 META_VERIFY_TOKEN。",
+            title=translate("oauth.cannot_start.title"),
+            message=translate("oauth.instagram.credentials_missing"),
             status_code=422,
         )
 
@@ -123,15 +131,10 @@ async def _start_instagram_oauth(
                 tenant_id=tenant_id,
                 surface=surface,
                 return_to=(
-                    f"/app/t/{tenant_id}/channels"
-                    if surface == "channels"
-                    else "/admin/accounts"
+                    f"/app/t/{tenant_id}/channels" if surface == "channels" else "/admin/accounts"
                 ),
                 extra={
-                    "brand_id": (
-                        (form.get("brand_id") or "default").strip()
-                        or "default"
-                    ),
+                    "brand_id": ((form.get("brand_id") or "default").strip() or "default"),
                 },
             ),
         )
@@ -142,8 +145,8 @@ async def _start_instagram_oauth(
             tenant_id=tenant_id,
             provider="instagram",
             code="oauth_state_unavailable",
-            title="发起授权失败",
-            message="OAuth 临时状态存储不可用。",
+            title=translate("oauth.start_failed.title"),
+            message=translate("oauth.start_unavailable_short"),
             status_code=503,
         )
 
@@ -163,12 +166,14 @@ async def _start_instagram_oauth(
 
 @router.get("/oauth/instagram/callback")
 async def instagram_oauth_callback(request: Request) -> Response:
+    return _no_store(await _handle_instagram_oauth_callback(request))
+
+
+async def _handle_instagram_oauth_callback(request: Request) -> Response:
     state_token = request.query_params.get("state", "")
     if request.query_params.get("error"):
         cancelled_context = (
-            await take_oauth_state("instagram", state_token)
-            if state_token
-            else None
+            await take_oauth_state("instagram", state_token) if state_token else None
         )
         if cancelled_context is not None and cancelled_context.get("surface") == "channels":
             return oauth_result_response(
@@ -178,30 +183,29 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 code="access_denied",
             )
         return notice(
-            "授权已取消",
-            request.query_params.get("error_description") or "用户取消了授权。",
+            translate("oauth.cancelled.title"),
+            request.query_params.get("error_description")
+            or translate("oauth.cancelled.default_detail"),
         )
-    pending_context = (
-        await peek_oauth_state("instagram", state_token)
-        if state_token
-        else None
-    )
+    context = await take_oauth_state("instagram", state_token) if state_token else None
+    if context is None:
+        return notice(
+            translate("oauth.session_invalid.title"),
+            translate("oauth.session_missing"),
+            status_code=400,
+        )
     if not get_settings().instagram_messaging_enabled:
-        if pending_context is not None and pending_context.get("surface") == "channels":
-            await take_oauth_state("instagram", state_token)
+        if context.get("surface") == "channels":
             return oauth_result_response(
-                pending_context,
+                context,
                 provider="instagram",
                 status_value="error",
                 code="platform_integration_disabled",
             )
-        return notice("Instagram 集成已关闭", "授权期间 Instagram 已被关闭。", status_code=503)
-    context = await take_oauth_state("instagram", state_token) if state_token else None
-    if context is None:
         return notice(
-            "授权会话无效",
-            "发起记录缺失、已使用或已过期，请重新发起。",
-            status_code=400,
+            translate("oauth.instagram.disabled_title"),
+            translate("oauth.instagram.disabled_during_flow"),
+            status_code=503,
         )
     principal = await principal_from_oauth_context(context)
     if principal is None:
@@ -213,8 +217,8 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 code="initiator_session_invalid",
             )
         return notice(
-            "授权会话已失效",
-            "管理员会话已退出、过期或失去 Tenant 权限，请重新登录并发起授权。",
+            translate("oauth.session_expired.title"),
+            translate("oauth.session_expired.admin"),
             status_code=403,
         )
     code = request.query_params.get("code", "").removesuffix("#_")
@@ -226,7 +230,11 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 status_value="error",
                 code="oauth_callback_parameters_missing",
             )
-        return notice("授权参数不完整", "请重新发起授权。", status_code=400)
+        return notice(
+            translate("oauth.parameters_missing.title"),
+            translate("oauth.parameters_missing.retry"),
+            status_code=400,
+        )
     app = await instagram_app_credentials(context["tenant_id"])
     if app is None:
         if context.get("surface") == "channels":
@@ -236,7 +244,11 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 status_value="error",
                 code="instagram_app_not_configured",
             )
-        return notice("无法完成授权", "Instagram App 凭证当前不可用。", status_code=422)
+        return notice(
+            translate("oauth.cannot_complete.title"),
+            translate("oauth.instagram.app_unavailable"),
+            status_code=422,
+        )
 
     redirect_uri = admin_callback_url("/admin/oauth/instagram/callback")
     try:
@@ -289,9 +301,11 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 code="token_exchange_failed",
             )
         return notice(
-            "换取凭证失败",
-            f"Instagram OAuth 交换失败（{exc.__class__.__name__}）。请检查回调地址、"
-            "专业账号类型和 App 权限。",
+            translate("oauth.exchange_failed.title"),
+            translate(
+                "oauth.instagram.exchange_failed",
+                error_type=exc.__class__.__name__,
+            ),
             status_code=502,
         )
 
@@ -305,8 +319,8 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 code="initiator_session_invalid",
             )
         return notice(
-            "授权会话已失效",
-            "管理员会话在授权期间已退出、过期或失去 Tenant 权限，请重新发起。",
+            translate("oauth.session_expired.title"),
+            translate("oauth.session_expired.during_flow"),
             status_code=403,
         )
 
@@ -318,7 +332,11 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 status_value="error",
                 code="platform_integration_disabled",
             )
-        return notice("Instagram 集成已关闭", "提交接入前 Instagram 已被关闭。", status_code=503)
+        return notice(
+            translate("oauth.instagram.disabled_title"),
+            translate("oauth.instagram.disabled_before_submit"),
+            status_code=503,
+        )
     external_account_id = str(profile.get("user_id") or profile.get("id") or "")
     if not external_account_id:
         if context.get("surface") == "channels":
@@ -328,7 +346,11 @@ async def instagram_oauth_callback(request: Request) -> Response:
                 status_value="error",
                 code="account_profile_missing",
             )
-        return notice("账号识别失败", "Instagram 未返回专业账号 ID。", status_code=502)
+        return notice(
+            translate("oauth.instagram.account_missing_title"),
+            translate("oauth.instagram.account_missing"),
+            status_code=502,
+        )
     username = str(profile.get("username") or "")
     settings = get_settings()
     enable_comments = settings.meta_comment_reply_enabled
@@ -365,10 +387,7 @@ async def instagram_oauth_callback(request: Request) -> Response:
         inline=lambda: process_provisioning_job(str(job_id)),
     )
     if context.get("surface") == "channels":
-        target = (
-            f"{context['return_to']}?"
-            f"{urlencode({'status': 'processing', 'job_id': job_id})}"
-        )
+        target = f"{context['return_to']}?{urlencode({'status': 'processing', 'job_id': job_id})}"
     else:
         target = f"/admin/jobs/{job_id}"
     return RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)

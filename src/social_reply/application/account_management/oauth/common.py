@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from social_reply.application.account_management.admin import _page, html
 from social_reply.application.account_management.auth import Principal, principal_from_session_id
+from social_reply.application.account_management.ui_i18n import translate
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
@@ -67,9 +68,7 @@ def build_oauth_context(
         "context_version": OAUTH_CONTEXT_VERSION,
         "provider": provider,
         "tenant_id": tenant_id,
-        "initiator_user_id": (
-            str(principal.user_id) if principal.user_id is not None else None
-        ),
+        "initiator_user_id": (str(principal.user_id) if principal.user_id is not None else None),
         "initiator_session_id": str(principal.session_id),
         "surface": surface,
         "return_to": safe_oauth_return_to(
@@ -243,6 +242,9 @@ async def principal_from_oauth_context(context: Mapping[str, Any]) -> Principal 
     tenant_id = context.get("tenant_id")
     if not isinstance(tenant_id, str) or tenant_id not in principal.allowed_tenants:
         return None
+    surface = context.get("surface", "admin")
+    if surface == "admin" and not principal.is_superadmin:
+        return None
     if context.get("context_version") is not None:
         if context.get("context_version") != OAUTH_CONTEXT_VERSION:
             return None
@@ -258,12 +260,10 @@ async def principal_from_oauth_context(context: Mapping[str, Any]) -> Principal 
         age = datetime.now(UTC) - issued
         if not timedelta(seconds=-60) <= age <= _CONTEXT_MAX_AGE:
             return None
-        expected_user_id = (
-            str(principal.user_id) if principal.user_id is not None else None
-        )
+        expected_user_id = str(principal.user_id) if principal.user_id is not None else None
         if context.get("initiator_user_id") != expected_user_id:
             return None
-        if context.get("surface") not in {"admin", "channels"}:
+        if surface not in {"admin", "channels"}:
             return None
         if context.get("provider") not in {"x", "facebook", "instagram"}:
             return None
@@ -271,7 +271,8 @@ async def principal_from_oauth_context(context: Mapping[str, Any]) -> Principal 
 
 
 def notice(title: str, message: str, *, status_code: int = 200) -> HTMLResponse:
-    body = f"""<a class="back" href="/admin/integrations/accounts">← 返回平台账号</a>
-<section class="card"><h1 style="font-size:24px">{html.escape(title)}</h1>
-<p>{html.escape(message)}</p></section>"""
+    back_label = translate("oauth.back_to_accounts")
+    body = f"""<a class="back" href="/admin/integrations/accounts">← {back_label}</a>
+<header><h1>{html.escape(title)}</h1></header>
+<section class="card"><p>{html.escape(message)}</p></section>"""
     return HTMLResponse(_page(title, body, active="accounts"), status_code=status_code)

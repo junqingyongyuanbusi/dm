@@ -13,6 +13,7 @@ from social_reply.connectors.email.network import (
 from social_reply.domain.reply.localization import canonicalize_locale
 
 _META_PLATFORMS = {"facebook", "instagram"}
+DEFAULT_TENANT_ID = "default"
 
 
 class Settings(BaseSettings):
@@ -23,7 +24,7 @@ class Settings(BaseSettings):
     chatwoot_enabled: bool = False
     chatwoot_webhook_secret: str = "change-me"
     chatwoot_signature_tolerance_seconds: int = 300
-    tenant_id: str = "default"
+    tenant_id: str = DEFAULT_TENANT_ID
     # Literal 收紧：配错 provider 在进程启动即报错，而非每条消息决策丢失
     llm_provider: Literal["stub", "openai"] = "stub"
     prompt_version: str = "v2-editable-business-prompt"
@@ -38,7 +39,7 @@ class Settings(BaseSettings):
     admin_username: str = ""
     admin_password: SecretStr = SecretStr("")
     public_base_url: str = "http://localhost:8000"
-    admin_allowed_tenants: str = "default"
+    admin_allowed_tenants: str = DEFAULT_TENANT_ID
     # X App-level OAuth 1.0a credentials. Like Postiz, these belong to the
     # deployment, while each authorized account stores only its user token pair.
     x_api_key: SecretStr = SecretStr("")

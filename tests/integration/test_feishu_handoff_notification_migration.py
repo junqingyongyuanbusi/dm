@@ -9,7 +9,7 @@ from tests.integration.migration_support import (
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "d3f6a1b8c904"
-_HEAD_REVISION = "d4e9a2f6b710"
+_HEAD_REVISION = "f3a7c9e1b5d2"
 
 
 async def test_upgrade_downgrade_and_reupgrade_feishu_handoff_notifications():

@@ -36,13 +36,28 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
         page = await client.get("/admin/system/users")
         assert page.status_code == 200
         assert "创建普通用户" in page.text
+        assert 'value="ADMIN"' not in page.text
+        assert "/role" not in page.text
+        rejected_admin = await client.post(
+            "/admin/system/users",
+            data={
+                "csrf_token": csrf,
+                "username": "forbidden-admin",
+                "initial_password": initial_password,
+                "role": "ADMIN",
+                "bootstrap_password": "test-admin-password",
+            },
+        )
+        assert rejected_admin.status_code == 422
+        assert rejected_admin.json() == {"detail": "invalid_user_role"}
         response = await client.post(
             "/admin/users",
             data={
                 "csrf_token": csrf,
                 "username": "alice",
                 "initial_password": initial_password,
-                "tenant_id": "tenant-a",
+                "role": "USER",
+                "bootstrap_password": "test-admin-password",
             },
         )
         assert response.status_code == 303
@@ -51,6 +66,7 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
         await session.execute(select(models.AdminUser).where(models.AdminUser.username == "alice"))
     ).scalar_one()
     assert user.role == "USER"
+    assert user.tenant_id == "default"
     assert user.password_hash != initial_password
     assert await verify_password(user.password_hash, initial_password)
     assert user.must_change_password is True
@@ -87,7 +103,7 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
         assert change.headers["location"] == "/app"
         dashboard = await client.get("/admin")
         assert dashboard.status_code == 403
-        assert dashboard.json() == {"detail": "admin_required"}
+        assert dashboard.json() == {"detail": "tenant_admin_required"}
 
     audit_count = (
         await session.execute(
@@ -136,3 +152,159 @@ async def test_tenant_user_cannot_open_user_management(session, migrated_db):
         response = await client.get("/admin/system/users")
     assert legacy.status_code == 403
     assert response.status_code == 403
+
+
+async def test_user_management_current_and_legacy_routes_are_bilingual(migrated_db):
+    async with _client() as client:
+        await _login(client, "admin", "test-admin-password")
+        current_chinese = await client.get("/admin/system/users")
+        legacy_chinese_redirect = await client.get("/admin/users")
+        client.cookies.set("reply_ui_locale", "en")
+        current_english = await client.get("/admin/system/users")
+        legacy_english_redirect = await client.get("/admin/users")
+
+    for response in (current_chinese, current_english):
+        assert response.status_code == 200
+        assert '<div class="app-shell app-shell-nav"><aside class="sidebar">' in response.text
+        assert "aria-current='page'" in response.text
+
+    for response in (legacy_chinese_redirect, legacy_english_redirect):
+        assert response.status_code == 303
+        assert response.headers["location"] == "/admin/system/users"
+
+    assert "创建普通用户" in current_chinese.text
+    assert "Create user" in current_english.text
+    assert "创建普通用户" not in current_english.text
+
+
+async def test_system_user_lifecycle_requires_csrf_and_bootstrap_reauthentication(
+    session,
+    migrated_db,
+):
+    initial_password = "system-user-initial-password-123"
+    reset_password = "system-user-reset-password-456"
+    async with _client() as client:
+        csrf = await _login(client, "admin", "test-admin-password")
+        page = await client.get("/admin/system/users")
+        assert page.status_code == 200
+        assert 'name="tenant_id"' not in page.text
+        assert "default" in page.text
+
+        missing_csrf = await client.post(
+            "/admin/system/users",
+            data={
+                "username": "system-operator",
+                "initial_password": initial_password,
+                "role": "USER",
+                "bootstrap_password": "test-admin-password",
+            },
+        )
+        assert missing_csrf.status_code == 403
+
+        wrong_password = await client.post(
+            "/admin/system/users",
+            data={
+                "csrf_token": csrf,
+                "username": "system-operator",
+                "initial_password": initial_password,
+                "role": "USER",
+                "bootstrap_password": "wrong-bootstrap-password",
+            },
+        )
+        assert wrong_password.status_code == 401
+
+        created = await client.post(
+            "/admin/system/users",
+            data={
+                "csrf_token": csrf,
+                "username": "system-operator",
+                "initial_password": initial_password,
+                "role": "USER",
+                "bootstrap_password": "test-admin-password",
+            },
+        )
+        assert created.status_code == 303
+        assert created.headers["location"].startswith("/admin/system/users")
+
+    user = await session.scalar(
+        select(models.AdminUser).where(models.AdminUser.username == "system-operator")
+    )
+    assert user is not None
+    assert user.tenant_id == "default"
+    assert user.role == "USER"
+    assert user.status == "active"
+    assert user.must_change_password is True
+    assert await verify_password(user.password_hash, initial_password)
+    user_id = user.id
+
+    async with _client() as user_client:
+        await _login(user_client, "system-operator", initial_password)
+        existing_session_id = await session.scalar(
+            select(models.AdminSession.id).where(models.AdminSession.user_id == user_id)
+        )
+        assert existing_session_id is not None
+
+    async with _client() as client:
+        csrf = await _login(client, "admin", "test-admin-password")
+        reset = await client.post(
+            f"/admin/system/users/{user_id}/password-reset",
+            data={
+                "csrf_token": csrf,
+                "initial_password": reset_password,
+                "bootstrap_password": "test-admin-password",
+            },
+        )
+        assert reset.status_code == 303
+
+        revoked = await client.post(
+            f"/admin/system/users/{user_id}/sessions/revoke",
+            data={
+                "csrf_token": csrf,
+                "bootstrap_password": "test-admin-password",
+            },
+        )
+        assert revoked.status_code == 303
+
+        disabled = await client.post(
+            f"/admin/system/users/{user_id}/status",
+            data={
+                "csrf_token": csrf,
+                "status": "disabled",
+                "bootstrap_password": "test-admin-password",
+            },
+        )
+        assert disabled.status_code == 303
+
+    session.expire_all()
+    updated_user = await session.get(models.AdminUser, user_id)
+    assert updated_user is not None
+    assert updated_user.role == "USER"
+    assert updated_user.status == "disabled"
+    assert updated_user.must_change_password is True
+    assert await verify_password(updated_user.password_hash, reset_password)
+    assert (
+        await session.scalar(
+            select(func.count())
+            .select_from(models.AdminSession)
+            .where(models.AdminSession.user_id == user_id)
+        )
+        == 0
+    )
+
+    audit_rows = list(
+        (
+            await session.execute(
+                select(models.AuditLog).where(models.AuditLog.subject_id == str(user_id))
+            )
+        ).scalars()
+    )
+    assert {audit.action for audit in audit_rows} >= {
+        "CREATE_USER",
+        "FORCE_PASSWORD_RESET",
+        "REVOKE_USER_SESSIONS",
+        "SET_USER_STATUS",
+    }
+    serialized_details = " ".join(str(audit.detail) for audit in audit_rows)
+    assert initial_password not in serialized_details
+    assert reset_password not in serialized_details
+    assert "password_hash" not in serialized_details

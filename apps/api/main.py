@@ -1,12 +1,15 @@
 import logging
 from importlib.resources import files
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from social_reply.application.account_management.admin import (
     auth_router,
+    reset_web_principal_context,
+    set_web_principal_context,
 )
 from social_reply.application.account_management.admin import (
     router as admin_router,
@@ -18,6 +21,15 @@ from social_reply.application.account_management.feishu_handoff_admin import (
 from social_reply.application.account_management.oauth import router as oauth_router
 from social_reply.application.account_management.router import router as account_management_router
 from social_reply.application.account_management.saas_console import router as saas_console_router
+from social_reply.application.account_management.ui_i18n import (
+    LOCALE_COOKIE_NAME,
+    SUPPORTED_LOCALES,
+    normalize_locale,
+    reset_locale,
+    reset_request_location,
+    set_locale,
+    set_request_location,
+)
 from social_reply.application.account_management.users import router as admin_users_router
 from social_reply.connectors.feishu.router import router as feishu_router
 from social_reply.connectors.meta.router import router as meta_router
@@ -31,7 +43,21 @@ _OAUTH_CALLBACK_PATHS = {
     "/admin/oauth/meta/callback",
     "/admin/oauth/instagram/callback",
 }
-_X_OAUTH_CALLBACK_PATHS = {_X_OAUTH_CALLBACK_PATH, f"{_X_OAUTH_CALLBACK_PATH}/"}
+_OAUTH_CALLBACK_REQUEST_PATHS = frozenset(
+    callback_request_path
+    for callback_path in _OAUTH_CALLBACK_PATHS
+    for callback_request_path in (callback_path, f"{callback_path}/")
+)
+_SUPPORTED_LOCALE_INPUTS = frozenset(locale.casefold() for locale in SUPPORTED_LOCALES)
+
+
+def _same_origin_redirect_path(request: Request) -> str:
+    redirect_path = quote(request.url.path, safe="/:@-._~!$&'()*+,;=")
+    if not redirect_path.startswith("/"):
+        redirect_path = f"/{redirect_path}"
+    if redirect_path.startswith("//"):
+        redirect_path = f"/%2F{redirect_path[2:]}"
+    return redirect_path
 
 
 class OAuthCallbackAccessLogFilter(logging.Filter):
@@ -88,26 +114,79 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         name="static",
     )
 
+    # Register this first so OAuth callback security remains the outermost middleware.
     @app.middleware("http")
-    async def x_oauth_callback_security(request: Request, call_next):
-        if request.url.path not in _X_OAUTH_CALLBACK_PATHS:
+    async def ui_locale(request: Request, call_next):
+        locale_token = set_locale(request.cookies.get(LOCALE_COOKIE_NAME, ""))
+        request_location_token = set_request_location(
+            _same_origin_redirect_path(request),
+            tuple(request.query_params.multi_items()),
+        )
+        principal_token = set_web_principal_context(None)
+        try:
+            requested_locales = request.query_params.getlist("ui_lang")
+            should_redirect = request.method in {"GET", "HEAD"} and bool(requested_locales)
+            if should_redirect:
+                remaining_query_items = [
+                    (key, value)
+                    for key, value in request.query_params.multi_items()
+                    if key != "ui_lang"
+                ]
+                redirect_path = _same_origin_redirect_path(request)
+                redirect_query = urlencode(remaining_query_items)
+                redirect_target = (
+                    f"{redirect_path}?{redirect_query}" if redirect_query else redirect_path
+                )
+                response = RedirectResponse(redirect_target, status_code=303)
+
+                requested_locale = requested_locales[-1].strip()
+                normalized_locale = normalize_locale(requested_locale)
+                if requested_locale.casefold() in _SUPPORTED_LOCALE_INPUTS:
+                    response.set_cookie(
+                        LOCALE_COOKIE_NAME,
+                        normalized_locale,
+                        httponly=True,
+                        samesite="lax",
+                        path="/",
+                        secure=request.url.scheme == "https",
+                    )
+                return response
+
             return await call_next(request)
-        if request.url.path != _X_OAUTH_CALLBACK_PATH:
+        finally:
+            reset_web_principal_context(principal_token)
+            reset_request_location(request_location_token)
+            reset_locale(locale_token)
+
+    @app.middleware("http")
+    async def oauth_callback_security(request: Request, call_next):
+        if request.url.path not in _OAUTH_CALLBACK_REQUEST_PATHS:
+            return await call_next(request)
+        is_x_callback = request.url.path in {
+            _X_OAUTH_CALLBACK_PATH,
+            f"{_X_OAUTH_CALLBACK_PATH}/",
+        }
+        if is_x_callback and request.url.path != _X_OAUTH_CALLBACK_PATH:
             response = PlainTextResponse("Invalid OAuth callback path", status_code=400)
         else:
             try:
                 response = await call_next(request)
-            except Exception:  # noqa: BLE001 - never expose callback internals
+            except Exception:  # noqa: BLE001 - never expose OAuth callback internals
                 request_id = (
                     request.headers.get("x-request-id")
                     or request.headers.get("x-railway-request-id")
                     or request.headers.get("cf-ray")
                     or "-"
                 )
-                logging.getLogger("social_reply.application.account_management.oauth.x").error(
-                    "x oauth callback request_id=%s stage=unhandled provider=x http_status=500 "
-                    "code=callback_internal_error token_hash=-",
+                callback_provider = {
+                    "/admin/oauth/meta/callback": "meta",
+                    "/admin/oauth/instagram/callback": "instagram",
+                }.get(request.url.path.rstrip("/"), "x")
+                logging.getLogger("social_reply.application.account_management.oauth").error(
+                    "oauth callback request_id=%s stage=unhandled provider=%s http_status=500 "
+                    "code=callback_internal_error",
                     request_id,
+                    callback_provider,
                 )
                 response = PlainTextResponse("OAuth callback failed", status_code=500)
         response.headers["Cache-Control"] = "no-store"

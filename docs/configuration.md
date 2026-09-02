@@ -32,14 +32,14 @@ must be public before Railway is switched so the services can pull it without re
 | --- | --- | --- |
 | `DATABASE_URL` | local `social_reply` asyncpg URL | PostgreSQL durable store; `postgres://` and `postgresql://` are normalized to asyncpg |
 | `REDIS_URL` | `redis://localhost:6379/0` | Dramatiq, kill switches and OAuth transient state |
-| `TENANT_ID` | `default` | Legacy/default tenant input; request and Principal scope remain authoritative |
+| `TENANT_ID` | `default` | Single-organization Tenant identifier; production browser and compatibility routes accept only `default` |
 | `TESTING` | `false` | Enables test-only stubs and relaxed production validation; never true in production |
 | `PLATFORM_SECRET_KEYS` | empty | Always required; comma-separated Fernet keys, first encrypts and all decrypt |
 | `CONTROL_API_KEY` | empty | Required outside tests; server-to-server Provisioning API only |
 | `ADMIN_SESSION_SECRET` | empty | Required outside tests, at least 32 characters, identical on all API instances |
 | `ADMIN_USERNAME` | empty | Required outside tests; bootstrap superadmin |
 | `ADMIN_PASSWORD` | empty | Required outside tests; bootstrap superadmin |
-| `ADMIN_ALLOWED_TENANTS` | `default` | Required outside tests; comma-separated bootstrap-superadmin scope |
+| `ADMIN_ALLOWED_TENANTS` | `default` | Tenant allowlist for the bootstrap SUPERADMIN; production currently exposes only `default`, and SUPERADMIN can read and mutate all business data in every listed Tenant |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | Must be HTTPS outside tests; source for callback/webhook URLs |
 | `ACCOUNT_SECRETS_ROOT` | `.secrets/accounts` | Legacy `file://` credential migration only |
 
@@ -76,9 +76,30 @@ Disabling a stack is not credential deletion. Recoverable sends pause and durabl
 is preserved. Legacy DM and XChat polling use PostgreSQL checkpoints, leases and resumable gaps;
 a disabled polling stack performs no provider reconciliation until it is re-enabled.
 
+## Browser role and route contract
+
+Production is single-organization and uses `default` as the only browser Tenant. Database users
+persist only `role="USER"` and remain owner-scoped. Bootstrap `SUPERADMIN` comes exclusively from
+`ADMIN_USERNAME` / `ADMIN_PASSWORD`, has `user_id=None`, and can use both `/admin/system/*` and the
+canonical Tenant workspace with Tenant-wide authority. Do not configure a non-default browser
+Tenant as a way to create another organization; canonical `/app/t/<non-default>` requests fail
+closed with 404.
+
+This intentionally makes the environment credential a direct entry point to customer business
+data: anyone who can read `.env` or Railway service variables can access all configured Tenant
+data. SUPERADMIN audit records keep a stable actor string but have no database `user_id`, so
+individual attribution is coarser than for database users. Protect and rotate these variables as
+production data-access credentials.
+
+The canonical browser surface is `/app/t/default`. Legacy Tenant GET routes under `/admin` redirect
+to canonical pages only after role/default-Tenant validation. Legacy POST routes are temporary
+compatibility adapters and keep CSRF, authorization, idempotency, audit, kill-switch and final-send
+guards. OAuth callback URLs stay under `/admin/oauth/*/callback`; only the encrypted OAuth context
+selects whether the result returns through legacy or Channels navigation.
+
 ## Ordinary-user Channels prerequisites
 
-`/app/t/{tenant_id}/channels` does not introduce per-user OAuth application credentials. API,
+`/app/t/default/channels` does not introduce per-user OAuth application credentials. API,
 Worker and Scheduler must share the existing deployment-level X and Meta/Instagram App settings:
 
 - X self-authorization requires `X_API_KEY` and `X_API_SECRET` plus at least one enabled X message

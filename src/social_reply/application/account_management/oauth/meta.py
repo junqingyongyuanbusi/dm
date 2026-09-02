@@ -40,8 +40,9 @@ from social_reply.application.account_management.oauth.common import (
 )
 from social_reply.application.account_management.saas_ui import render_saas_page
 from social_reply.application.account_management.submissions import split_submission
+from social_reply.application.account_management.ui_i18n import translate
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-oauth"])
@@ -84,6 +85,13 @@ def _graph_client(**kwargs) -> httpx.AsyncClient:
 
 def _proof(token: str, app_secret: str) -> str:
     return hmac.new(app_secret.encode(), token.encode(), hashlib.sha256).hexdigest()
+
+
+def _no_store(response: Response) -> Response:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 async def _exchange_code(*, app: MetaAppCredentials, code: str, redirect_uri: str) -> list[dict]:
@@ -168,20 +176,22 @@ async def _start_meta_oauth(
     platform = form.get("platform", "")
     if platform not in _SCOPES:
         raise HTTPException(status_code=422, detail="platform_must_be_facebook_or_instagram")
-    if not get_settings().platform_integration_enabled(platform):
-        return oauth_error_response(
-            surface=surface,
-            tenant_id=route_tenant_id or "",
-            provider=platform,
-            code="platform_integration_disabled",
-            title="平台集成已关闭",
-            message=f"当前环境未启用 {platform}。",
-            status_code=503,
-        )
     tenant_id = route_tenant_id or (form.get("tenant_id") or "").strip()
     if not tenant_id:
         raise HTTPException(status_code=422, detail="tenant_id_required")
+    if tenant_id != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
+    if not get_settings().platform_integration_enabled(platform):
+        return oauth_error_response(
+            surface=surface,
+            tenant_id=tenant_id,
+            provider=platform,
+            code="platform_integration_disabled",
+            title=translate("oauth.integration_disabled.title"),
+            message=translate("oauth.integration_disabled.current", provider=platform),
+            status_code=503,
+        )
 
     app = await facebook_app_credentials(tenant_id)
     if app is None:
@@ -190,9 +200,8 @@ async def _start_meta_oauth(
             tenant_id=tenant_id,
             provider=platform,
             code="meta_app_not_configured",
-            title="无法发起授权",
-            message="未找到 Meta App 凭证。请配置 FACEBOOK_APP_ID、FACEBOOK_APP_SECRET 和 "
-            "META_VERIFY_TOKEN，或保留一个旧版 Meta PlatformApp。",
+            title=translate("oauth.cannot_start.title"),
+            message=translate("oauth.meta.credentials_missing"),
             status_code=422,
         )
     state_token = secrets.token_urlsafe(32)
@@ -206,16 +215,11 @@ async def _start_meta_oauth(
                 tenant_id=tenant_id,
                 surface=surface,
                 return_to=(
-                    f"/app/t/{tenant_id}/channels"
-                    if surface == "channels"
-                    else "/admin/accounts"
+                    f"/app/t/{tenant_id}/channels" if surface == "channels" else "/admin/accounts"
                 ),
                 extra={
                     "platform": platform,
-                    "brand_id": (
-                        (form.get("brand_id") or "default").strip()
-                        or "default"
-                    ),
+                    "brand_id": ((form.get("brand_id") or "default").strip() or "default"),
                 },
             ),
         )
@@ -226,8 +230,8 @@ async def _start_meta_oauth(
             tenant_id=tenant_id,
             provider=platform,
             code="oauth_state_unavailable",
-            title="发起授权失败",
-            message="OAuth 临时状态存储不可用，请稍后重试。",
+            title=translate("oauth.start_failed.title"),
+            message=translate("oauth.start_unavailable"),
             status_code=503,
         )
 
@@ -251,13 +255,13 @@ async def _start_meta_oauth(
 
 @router.get("/oauth/meta/callback")
 async def meta_oauth_callback(request: Request) -> Response:
+    return _no_store(await _handle_meta_oauth_callback(request))
+
+
+async def _handle_meta_oauth_callback(request: Request) -> Response:
     state_token = request.query_params.get("state", "")
     if request.query_params.get("error"):
-        cancelled_state = (
-            await take_oauth_state("meta", state_token)
-            if state_token
-            else None
-        )
+        cancelled_state = await take_oauth_state("meta", state_token) if state_token else None
         if cancelled_state is not None and cancelled_state.get("surface") == "channels":
             return oauth_result_response(
                 cancelled_state,
@@ -266,32 +270,33 @@ async def meta_oauth_callback(request: Request) -> Response:
                 code="access_denied",
             )
         return notice(
-            "授权已取消",
-            f"Meta 返回：{request.query_params.get('error_description') or '用户取消了授权'}。",
+            translate("oauth.cancelled.title"),
+            translate(
+                "oauth.cancelled.provider_detail",
+                provider="Meta",
+                detail=request.query_params.get("error_description")
+                or translate("oauth.cancelled.default_detail"),
+            ),
         )
-    pending_state = await peek_oauth_state("meta", state_token) if state_token else None
-    if pending_state is None:
+    state = await take_oauth_state("meta", state_token) if state_token else None
+    if state is None:
         return notice(
-            "授权会话无效",
-            "发起记录缺失、已使用或已过期，请回到账号页重新发起。",
+            translate("oauth.session_invalid.title"),
+            translate("oauth.session_missing"),
             status_code=400,
         )
-    if not get_settings().platform_integration_enabled(str(pending_state.get("platform") or "")):
-        if pending_state.get("surface") == "channels":
-            await take_oauth_state("meta", state_token)
+    if not get_settings().platform_integration_enabled(str(state.get("platform") or "")):
+        if state.get("surface") == "channels":
             return oauth_result_response(
-                pending_state,
-                provider=str(pending_state.get("platform") or "facebook"),
+                state,
+                provider=str(state.get("platform") or "facebook"),
                 status_value="error",
                 code="platform_integration_disabled",
             )
-        return notice("平台集成已关闭", "授权期间该平台已被关闭，请稍后重试。", status_code=503)
-    state = await take_oauth_state("meta", state_token)
-    if state is None:
         return notice(
-            "授权会话无效",
-            "发起记录已由另一请求使用，请回到账号页重新发起。",
-            status_code=400,
+            translate("oauth.integration_disabled.title"),
+            translate("oauth.integration_disabled.during_flow"),
+            status_code=503,
         )
     principal = await principal_from_oauth_context(state)
     if principal is None:
@@ -303,8 +308,8 @@ async def meta_oauth_callback(request: Request) -> Response:
                 code="initiator_session_invalid",
             )
         return notice(
-            "授权会话已失效",
-            "管理员会话已退出、过期或失去 Tenant 权限，请重新登录并发起授权。",
+            translate("oauth.session_expired.title"),
+            translate("oauth.session_expired.admin"),
             status_code=403,
         )
     code = request.query_params.get("code", "")
@@ -316,7 +321,11 @@ async def meta_oauth_callback(request: Request) -> Response:
                 status_value="error",
                 code="oauth_callback_parameters_missing",
             )
-        return notice("授权参数不完整", "请重新发起授权。", status_code=400)
+        return notice(
+            translate("oauth.parameters_missing.title"),
+            translate("oauth.parameters_missing.retry"),
+            status_code=400,
+        )
     app = await facebook_app_credentials(state["tenant_id"])
     if app is None:
         if state.get("surface") == "channels":
@@ -326,7 +335,11 @@ async def meta_oauth_callback(request: Request) -> Response:
                 status_value="error",
                 code="meta_app_not_configured",
             )
-        return notice("无法完成授权", "Facebook App 凭证当前不可用。", status_code=422)
+        return notice(
+            translate("oauth.cannot_complete.title"),
+            translate("oauth.meta.app_unavailable"),
+            status_code=422,
+        )
 
     redirect_uri = admin_callback_url("/admin/oauth/meta/callback")
     try:
@@ -350,9 +363,11 @@ async def meta_oauth_callback(request: Request) -> Response:
                 code="token_exchange_failed",
             )
         return notice(
-            "换取凭证失败",
-            f"与 Meta 交换 Token 失败（{exc.__class__.__name__}）。请检查回调地址、"
-            "权限和 App Review 状态。",
+            translate("oauth.exchange_failed.title"),
+            translate(
+                "oauth.meta.exchange_failed",
+                error_type=exc.__class__.__name__,
+            ),
             status_code=502,
         )
 
@@ -366,8 +381,8 @@ async def meta_oauth_callback(request: Request) -> Response:
                 code="initiator_session_invalid",
             )
         return notice(
-            "授权会话已失效",
-            "管理员会话在授权期间已退出、过期或失去 Tenant 权限，请重新发起。",
+            translate("oauth.session_expired.title"),
+            translate("oauth.session_expired.during_flow"),
             status_code=403,
         )
 
@@ -381,11 +396,11 @@ async def meta_oauth_callback(request: Request) -> Response:
                 code="no_authorized_accounts",
             )
         return notice(
-            "没有可接入的目标",
+            translate("oauth.no_targets.title"),
             (
-                "没有找到关联 Facebook Page 的 Instagram 专业账号。"
+                translate("oauth.no_targets.instagram")
                 if state["platform"] == "instagram"
-                else "没有找到当前用户可管理的 Facebook Page。"
+                else translate("oauth.no_targets.facebook")
             ),
             status_code=422,
         )
@@ -408,10 +423,7 @@ def _candidates(pages: list[dict], platform: str) -> list[dict[str, str]]:
                 (page.get("instagram_business_account") or {}).get("username") or ""
             ),
             "ig_avatar_url": str(
-                (page.get("instagram_business_account") or {}).get(
-                    "profile_picture_url"
-                )
-                or ""
+                (page.get("instagram_business_account") or {}).get("profile_picture_url") or ""
             ),
         }
         for page in pages
@@ -442,8 +454,8 @@ async def _picker(
             tenant_id=str(context.get("tenant_id") or ""),
             provider=str(context.get("platform") or "facebook"),
             code="oauth_state_unavailable",
-            title="无法显示账号列表",
-            message="OAuth 临时状态存储不可用。",
+            title=translate("oauth.picker.unavailable_title"),
+            message=translate("oauth.start_unavailable_short"),
             status_code=503,
         )
 
@@ -456,7 +468,11 @@ async def _picker(
         + ")</span></label>"
         for index, candidate in enumerate(candidates)
     )
-    label = "Instagram 账号" if context["platform"] == "instagram" else "Facebook Page"
+    label = (
+        translate("oauth.picker.target.instagram")
+        if context["platform"] == "instagram"
+        else translate("oauth.picker.target.facebook")
+    )
     channels_surface = context.get("surface") == "channels"
     return_to = str(context.get("return_to") or "/admin/integrations/accounts")
     select_action = (
@@ -464,27 +480,40 @@ async def _picker(
         if channels_surface
         else "/admin/oauth/meta/select"
     )
-    back_label = "返回 Channels" if channels_surface else "返回平台账号"
+    back_label = (
+        translate("oauth.picker.back_channels")
+        if channels_surface
+        else translate("oauth.back_to_accounts")
+    )
     card_class = "saas-card" if channels_surface else "card"
     form_class = "saas-form" if channels_surface else ""
     button_class = "saas-button primary" if channels_surface else "btn-block"
+    card_body_start = '<div class="saas-card-body">' if channels_surface else ""
+    card_body_end = "</div>" if channels_surface else ""
+    picker_heading = translate("oauth.picker.select_target", target=label)
+    connect_selected_label = translate("oauth.picker.connect_selected")
     body = f"""<a class="back" href="{html.escape(return_to)}">← {back_label}</a>
-<section class="{card_class}"><div class="saas-card-body"><h2>选择要接入的 {label}</h2>
+<section class="{card_class}">{card_body_start}<h2>{picker_heading}</h2>
 <form class="{form_class}" method="post" action="{html.escape(select_action)}">
 <input type="hidden" name="csrf_token" value="{csrf}">
 <input type="hidden" name="pick_token" value="{pick_token}">{rows}
-<button class="{button_class}">接入所选</button></form></div></section>"""
+<button class="{button_class}">{connect_selected_label}</button></form>{card_body_end}</section>"""
     if channels_surface:
         page_html = render_saas_page(
             principal=principal,
-            title="选择接入目标",
-            description="只会创建属于当前用户的账号；候选凭证保存在加密的一次性会话中。",
+            title=translate("oauth.picker.title"),
+            description=translate("oauth.picker.description"),
             body=body,
             active_navigation="channels",
             tenant_id=str(context["tenant_id"]),
         )
     else:
-        page_html = _page("选择接入目标", body, active="accounts")
+        page_html = _page(
+            translate("oauth.picker.title"),
+            body,
+            active="accounts",
+            principal=principal,
+        )
     response = HTMLResponse(page_html)
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -536,6 +565,8 @@ async def _select_meta_account(
     )
     if isinstance(principal, Response):
         return principal
+    if route_tenant_id is not None and route_tenant_id != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     form = await _form(request)
     _require_csrf(request, form)
     pick_token = form.get("pick_token", "") or request.cookies.get(_PICK_COOKIE, "")
@@ -546,8 +577,8 @@ async def _select_meta_account(
             tenant_id=route_tenant_id or "",
             provider="facebook",
             code="oauth_picker_expired",
-            title="选择会话无效",
-            message="候选记录已使用或过期，请重新授权。",
+            title=translate("oauth.picker.invalid_title"),
+            message=translate("oauth.picker.expired"),
             status_code=400,
         )
     if pending_pick.get("surface", "admin") != surface:
@@ -559,21 +590,24 @@ async def _select_meta_account(
             tenant_id=str(pending_pick.get("tenant_id") or route_tenant_id or ""),
             provider=str(pending_pick.get("platform") or "facebook"),
             code="initiator_session_invalid",
-            title="选择会话无效",
-            message="请使用发起授权的同一登录会话完成选择。",
+            title=translate("oauth.picker.invalid_title"),
+            message=translate("oauth.picker.same_session"),
             status_code=403,
         )
     if route_tenant_id is not None and pending_pick.get("tenant_id") != route_tenant_id:
         raise HTTPException(status_code=403, detail="tenant_access_denied")
-    principal.require_tenant(str(pending_pick.get("tenant_id") or ""))
+    pending_tenant_id = str(pending_pick.get("tenant_id") or "")
+    if pending_tenant_id != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
+    principal.require_tenant(pending_tenant_id)
     if not get_settings().platform_integration_enabled(str(pending_pick.get("platform") or "")):
         return oauth_error_response(
             surface=surface,
             tenant_id=str(pending_pick.get("tenant_id") or ""),
             provider=str(pending_pick.get("platform") or "facebook"),
             code="platform_integration_disabled",
-            title="平台集成已关闭",
-            message="选择期间该平台已被关闭，请稍后重试。",
+            title=translate("oauth.integration_disabled.title"),
+            message=translate("oauth.picker.platform_disabled"),
             status_code=503,
         )
     try:
@@ -585,8 +619,8 @@ async def _select_meta_account(
             tenant_id=str(pending_pick.get("tenant_id") or ""),
             provider=str(pending_pick.get("platform") or "facebook"),
             code="oauth_picker_choice_invalid",
-            title="选择无效",
-            message="所选目标不存在，请重新选择。",
+            title=translate("oauth.picker.choice_invalid_title"),
+            message=translate("oauth.picker.choice_invalid"),
             status_code=400,
         )
     app = await facebook_app_credentials(pending_pick["tenant_id"])
@@ -596,8 +630,8 @@ async def _select_meta_account(
             tenant_id=str(pending_pick.get("tenant_id") or ""),
             provider=str(pending_pick.get("platform") or "facebook"),
             code="meta_app_not_configured",
-            title="无法完成接入",
-            message="Facebook App 凭证当前不可用。",
+            title=translate("oauth.cannot_complete.title"),
+            message=translate("oauth.meta.app_unavailable"),
             status_code=422,
         )
     pick = await take_oauth_state("meta-pick", pick_token)
@@ -607,8 +641,8 @@ async def _select_meta_account(
             tenant_id=str(pending_pick.get("tenant_id") or ""),
             provider=str(pending_pick.get("platform") or "facebook"),
             code="oauth_picker_consumed",
-            title="选择会话无效",
-            message="候选记录已由另一请求使用，请重新授权。",
+            title=translate("oauth.picker.invalid_title"),
+            message=translate("oauth.picker.consumed"),
             status_code=400,
         )
     try:
@@ -619,8 +653,8 @@ async def _select_meta_account(
             tenant_id=str(pick.get("tenant_id") or ""),
             provider=str(pick.get("platform") or "facebook"),
             code="oauth_picker_payload_invalid",
-            title="选择会话无效",
-            message="候选记录发生变化，请重新授权。",
+            title=translate("oauth.picker.invalid_title"),
+            message=translate("oauth.picker.changed"),
             status_code=400,
         )
     response = await _finalize(candidate, pick, app, principal)
@@ -642,8 +676,8 @@ async def _finalize(
             tenant_id=str(context.get("tenant_id") or ""),
             provider=platform,
             code="platform_integration_disabled",
-            title="平台集成已关闭",
-            message="提交接入前该平台已被关闭。",
+            title=translate("oauth.integration_disabled.title"),
+            message=translate("oauth.integration_disabled.before_submit"),
             status_code=503,
         )
     if platform == "instagram":

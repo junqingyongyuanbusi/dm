@@ -68,7 +68,7 @@ PUBLIC_BASE_URL=https://reply.example.com
 PLATFORM_SECRET_KEYS=<Fernet key；轮换时逗号分隔>
 ```
 
-`ADMIN_USERNAME` / `ADMIN_PASSWORD` 是 bootstrap 超级管理员：可查看 `ADMIN_ALLOWED_TENANTS` 中全部数据，并在 `/admin/system/users`（兼容 `/admin/users`）创建绑定到单一 Tenant 的 `ADMIN` 或 `USER`。Tenant 管理员可通过 `/admin` 查看该 Tenant 的全部账号和业务数据；普通用户首次登录必须修改初始密码，之后仅能在 `/app` 授权、查看和处理归属于自己的平台账号与对话，直接访问 `/admin` 会被拒绝。系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` 是唯一的 bootstrap `SUPERADMIN`：它没有数据库用户行，可查看和管理 `ADMIN_ALLOWED_TENANTS` 中全部业务数据，并在 `/admin/system/users`（兼容 `/admin/users`）创建绑定到单一 Tenant 的 `USER`。数据库 `ADMIN` 角色已移除。普通用户首次登录必须修改初始密码，之后仅能在 `/app` 授权、查看和处理归属于自己的平台账号与对话，直接访问 `/admin` 会被拒绝。环境凭证因此也是客户业务数据的直接入口，必须按生产数据访问凭证保护和轮换；其审计 actor 没有数据库 `user_id`，追责粒度低于数据库用户。系统不发送邀请或邮件。生产建议在 `/admin` 前部署 OIDC/MFA 身份感知代理。完整设计见 `docs/admin-control-plane.md`。
 
 Provisioning API 请求使用：
 
@@ -208,7 +208,7 @@ allowlist，且 DNS 解析结果全部为公共目标。会话按 thread 建立�
 以避免串人；24 小时自动回复限额按 account+sender 跨 thread 统计。轮询 RawEvent 只保存 UID、
 UIDVALIDITY、size 和可选 SHA-256，不保存 RFC822 正文。
 
-当前迁移唯一 head 为 `d4e9a2f6b710`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
+当前迁移唯一 head 为 `f3a7c9e1b5d2`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
 目标凭证后，必须先做 Phase 0 TLS/login/readonly 检查，再执行 draft-only real smoke。完整步骤见
 [Email operator runbook](docs/email-integration.md)。
 
@@ -294,7 +294,7 @@ DATABASE_URL=postgresql+asyncpg://dev:dev@localhost:5432/social_reply_test \
 REDIS_URL=redis://localhost:6379/0 uv run pytest -q   # 7 个直连账号平台的全量门禁
 ```
 
-GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `d4e9a2f6b710`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
+GitHub Actions 在 `main` / `dev` 的 push 和 pull request 上运行三道门禁：`Ruff`、使用 pgvector PostgreSQL 17 + Redis 8 的完整 pytest，以及实际 `linux/amd64` 生产 Dockerfile 构建与镜像入口契约检查。测试 Job 会先从空库执行 `alembic upgrade head`、`alembic check`，并确认 current revision 等于唯一 head `f3a7c9e1b5d2`。平台专用测试文件的精确收集数以 `pytest --collect-only` 为准；跨平台断言会提供额外覆盖，但测试 stub/fake 不代表已使用生产凭证完成真实 Feishu 或 Email E2E。
 
 ## X 贴文评论自动回复
 

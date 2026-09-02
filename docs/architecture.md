@@ -36,12 +36,32 @@ reply crosses multiple broker, transaction, and advisory-lock boundaries.
 
 ## Browser surfaces and Channels ownership
 
-Browser routes are separated by authority: `/app/t/{tenant_id}` is the ordinary-user workspace,
-`/admin` is administrator-only, and `/app/t/{tenant_id}/channels` is the self-service account
-integration center. The Channels page queries `PlatformAccount.owner_user_id` and
+The deployed product is a single-organization installation. `default` is the only canonical
+Tenant exposed by browser routes; an authenticated request for `/app/t/{tenant_id}` with any other
+Tenant returns not-found before a business query runs. Browser authority is role-separated:
+
+- `USER` uses `/app/t/default` and sees only owned platform accounts and account-derived Agent/Brand
+  scopes;
+- bootstrap `SUPERADMIN` comes from `ADMIN_USERNAME` / `ADMIN_PASSWORD`, has no database user row,
+  and uses both `/admin/system/*` and the canonical Tenant workspace with Tenant-wide visibility
+  and mutations;
+- database users persist only `USER`. The database `ADMIN` role has been removed. Compatibility
+  names such as `is_admin`, `admin_required`, and internal `ChannelActor(role="ADMIN")` describe
+  Tenant-wide SUPERADMIN capability rather than a third login role.
+
+Canonical Tenant pages include inbox/draft/delivery work, conversations, Channels and provisioning
+jobs, business Prompt, Knowledge, health, audit, journeys, settings, and profile. Historical
+`/admin` Tenant GET pages are compatibility redirects to `/app/t/default/...` after authentication
+and role/default-Tenant checks but before business queries. Historical POST routes remain thin
+adapters over the same command services during the compatibility window. OAuth callbacks remain
+stable at `/admin/oauth/x/callback`, `/admin/oauth/meta/callback`, and
+`/admin/oauth/instagram/callback`.
+
+The Channels page queries `PlatformAccount.owner_user_id` and
 `ProvisioningJob.owner_user_id` using the persisted authenticated Principal; owner identity is never
-accepted from form data. Administrators continue to use `/admin/integrations/accounts` for Tenant
-shared accounts and cross-user repair.
+accepted from form data. SUPERADMIN continues to use `/admin/integrations/accounts` for Tenant
+shared accounts only as a compatibility redirect; canonical repair and control live under
+`/app/t/default/channels`.
 
 X, Facebook and both Instagram login modes use one versioned encrypted Redis OAuth context that
 binds provider, Tenant, initiating user, initiating PostgreSQL session, surface, safe return path,

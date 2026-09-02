@@ -46,7 +46,7 @@ class AdminUser(Base):
     __table_args__ = (
         UniqueConstraint("username"),
         UniqueConstraint("tenant_id", "id", name="uq_admin_users_tenant_id_id"),
-        CheckConstraint("role IN ('ADMIN', 'USER')", name="ck_admin_users_role"),
+        CheckConstraint("role = 'USER'", name="ck_admin_users_role"),
         CheckConstraint("status IN ('active', 'disabled')", name="ck_admin_users_status"),
         Index("ix_admin_users_tenant_role_status", "tenant_id", "role", "status"),
     )

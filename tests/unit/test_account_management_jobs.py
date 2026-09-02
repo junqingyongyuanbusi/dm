@@ -4,7 +4,7 @@ import ssl
 import httpx
 import pytest
 
-from social_reply.application.account_management import jobs
+from social_reply.application.account_management import channel_management, jobs
 from social_reply.application.account_management.service import AccountConnectionResult
 from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.connectors.email.imap_client import ImapClientError
@@ -110,6 +110,36 @@ async def test_provisioning_execution_rechecks_platform_flag_before_decrypting_s
         await jobs._connect(job)
 
 
+@pytest.mark.parametrize(
+    ("platform", "request_values"),
+    [
+        ("telegram", {"automation_default": "BOT_ACTIVE"}),
+        ("whatsapp", {"automation_default": "BOT_DRAFT_ONLY"}),
+    ],
+)
+async def test_provisioning_execution_rejects_historical_user_policy_before_decrypting(
+    monkeypatch,
+    platform,
+    request_values,
+):
+    def unexpected_decrypt(_value):
+        raise AssertionError("retired user job must fail before decrypting credentials")
+
+    monkeypatch.setattr(jobs, "decrypt_secret_bundle", unexpected_decrypt)
+    job = type(
+        "Job",
+        (),
+        {
+            "platform": platform,
+            "owner_user_id": __import__("uuid").uuid4(),
+            "request": request_values,
+        },
+    )()
+
+    with pytest.raises(ValueError, match="user_provisioning_policy_rejected"):
+        await jobs._connect(job)
+
+
 def test_result_payload_does_not_expose_verify_token():
     result = AccountConnectionResult(
         account_id=__import__("uuid").uuid4(),
@@ -150,6 +180,58 @@ def test_public_job_defensively_redacts_nested_credentials():
         },
     )()
     assert jobs.public_job(job)["result"] == {"nested": {}}
+
+
+@pytest.mark.parametrize(
+    ("service_error", "expected_error_type", "expected_code"),
+    [
+        (
+            ValueError("idempotency_key_payload_mismatch"),
+            channel_management.ChannelConflictError,
+            "idempotency_key_payload_mismatch",
+        ),
+        (
+            ValueError("provisioning_secret_resubmission_required"),
+            channel_management.ChannelConflictError,
+            "provisioning_secret_resubmission_required",
+        ),
+        (
+            PermissionError("admin_session_invalid"),
+            channel_management.ChannelPermissionError,
+            "admin_session_invalid",
+        ),
+    ],
+)
+async def test_submit_channel_provisioning_normalizes_expected_service_errors(
+    monkeypatch,
+    service_error,
+    expected_error_type,
+    expected_code,
+):
+    async def fail_submission(**_kwargs):
+        raise service_error
+
+    monkeypatch.setattr(
+        channel_management,
+        "submit_provisioning_job",
+        fail_submission,
+    )
+    command = channel_management.ProvisioningCommand(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        actor=channel_management.ChannelActor(
+            actor="user:test",
+            role="USER",
+            user_id=__import__("uuid").uuid4(),
+            session_id=__import__("uuid").uuid4(),
+        ),
+        public_values={"name": "Test"},
+        secret_values={"token": "not-rendered"},
+    )
+
+    with pytest.raises(expected_error_type, match=expected_code):
+        await channel_management.submit_channel_provisioning(command)
 
 
 def test_feishu_safe_request_and_public_result_redact_all_secrets():

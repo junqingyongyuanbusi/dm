@@ -14,7 +14,7 @@ pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "c2f4a6d8e901"
 _FEISHU_REVISION = "e4b7c2d9a610"
-_HEAD_REVISION = "d4e9a2f6b710"
+_HEAD_REVISION = "f3a7c9e1b5d2"
 _FEISHU_ACCOUNT_ID = "00000000-0000-0000-0000-00000000fe15"
 
 

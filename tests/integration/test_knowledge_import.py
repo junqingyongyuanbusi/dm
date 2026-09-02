@@ -10,6 +10,10 @@ from social_reply.application.knowledge.importer import (
     import_knowledge_csv,
     import_knowledge_rows,
 )
+from social_reply.application.knowledge.upload import (
+    MAX_KNOWLEDGE_UPLOAD_BYTES,
+    decode_knowledge_csv_upload,
+)
 from social_reply.domain.knowledge.embeddings import FakeEmbeddingClient
 from social_reply.infrastructure.database.models import AuditLog, KnowledgeChunk, KnowledgeDocument
 
@@ -102,11 +106,18 @@ async def test_官方联系方式布尔列严格解析(migrated_db, session, val
     assert doc.status == "draft"
     assert doc.is_official_contact is expected
     audits = (await session.execute(select(AuditLog))).scalars().all()
-    assert len(audits) == int(expected)
+    assert {audit.action for audit in audits} >= {
+        "CREATE_KNOWLEDGE_DOCUMENT",
+        "IMPORT_KNOWLEDGE_BATCH",
+    }
     if expected:
-        assert audits[0].actor == "knowledge-import"
-        assert audits[0].action == "SET_KNOWLEDGE_OFFICIAL_CONTACT"
-        assert audits[0].detail["content_hash"]
+        official_audit = next(
+            audit for audit in audits if audit.action == "SET_KNOWLEDGE_OFFICIAL_CONTACT"
+        )
+        assert official_audit.actor == "knowledge-import"
+        assert official_audit.detail["content_hash"]
+    else:
+        assert "SET_KNOWLEDGE_OFFICIAL_CONTACT" not in {audit.action for audit in audits}
 
 
 async def test_官方联系方式无效布尔值报错(migrated_db):
@@ -120,7 +131,7 @@ async def test_官方联系方式无效布尔值报错(migrated_db):
 
 async def test_protected_values_are_tenant_knowledge_metadata(migrated_db, session):
     csv_text = (
-        'question,reply,protected_values_json\n'
+        "question,reply,protected_values_json\n"
         'platform,Use Acme Portal with MT4.,"[""Acme Portal"", ""MT4""]"\n'
     )
     await import_knowledge_rows(
@@ -135,12 +146,11 @@ async def test_protected_values_are_tenant_knowledge_metadata(migrated_db, sessi
 
 async def test_protected_value_revision_is_not_skipped_as_duplicate(migrated_db, session):
     first = (
-        'question,reply,protected_values_json\n'
+        "question,reply,protected_values_json\n"
         'platform,Use Acme Portal with MT4.,"[""Acme Portal""]"\n'
     )
     second = (
-        'question,reply,protected_values_json\n'
-        'platform,Use Acme Portal with MT4.,"[""MT4""]"\n'
+        'question,reply,protected_values_json\nplatform,Use Acme Portal with MT4.,"[""MT4""]"\n'
     )
 
     first_report = await import_knowledge_rows(
@@ -167,7 +177,7 @@ async def test_protected_value_revision_is_not_skipped_as_duplicate(migrated_db,
 
 @pytest.mark.parametrize(
     "value",
-    ['{"not":"an-array"}', '["missing"]', '[1]'],
+    ['{"not":"an-array"}', '["missing"]', "[1]"],
 )
 async def test_invalid_protected_values_are_rejected(migrated_db, value):
     escaped_value = value.replace('"', '""')
@@ -195,3 +205,57 @@ async def test_超行数上限报错(migrated_db):
             source_name="too-many.csv",
             embedder=FakeEmbeddingClient(),
         )
+
+
+async def test_csv_unknown_columns_fail_closed(migrated_db):
+    with pytest.raises(ValueError, match="unexpected CSV columns"):
+        await import_knowledge_rows(
+            io.StringIO("question,reply,secret_field\nq,r,do-not-accept\n"),
+            source_name="unexpected.csv",
+            embedder=FakeEmbeddingClient(),
+        )
+
+
+async def test_csv_extra_data_columns_fail_closed(migrated_db):
+    with pytest.raises(ValueError, match="unexpected extra columns"):
+        await import_knowledge_rows(
+            io.StringIO("question,reply\nq,r,hidden\n"),
+            source_name="extra-values.csv",
+            embedder=FakeEmbeddingClient(),
+        )
+
+
+async def test_csv_manual_symmetric_scope_fields_are_persisted(migrated_db, session):
+    csv_text = (
+        "question,reply,brand_id,platform,category,is_official_contact,"
+        "protected_values_json\n"
+        'How to sign in?,Use Acme Portal.,retail,telegram,account,false,"[""Acme Portal""]"\n'
+    )
+    report = await import_knowledge_rows(
+        io.StringIO(csv_text),
+        source_name="symmetric.csv",
+        embedder=FakeEmbeddingClient(),
+        actor="user:knowledge-admin",
+    )
+    assert report.inserted == 1
+    document = (await session.execute(select(KnowledgeDocument))).scalar_one()
+    assert document.brand_id == "retail"
+    assert document.platform == "telegram"
+    assert document.category == "account"
+    assert document.protected_values == ["Acme Portal"]
+    audits = (await session.execute(select(AuditLog))).scalars().all()
+    assert {audit.action for audit in audits} >= {
+        "CREATE_KNOWLEDGE_DOCUMENT",
+        "IMPORT_KNOWLEDGE_BATCH",
+    }
+    assert all("How to sign in?" not in str(audit.detail) for audit in audits)
+    assert all("Use Acme Portal." not in str(audit.detail) for audit in audits)
+    assert all("Acme Portal" not in str(audit.detail) for audit in audits)
+
+
+def test_csv_upload_boundary_requires_utf8_and_two_mib_limit() -> None:
+    assert decode_knowledge_csv_upload(b"question,reply\nq,r\n") == "question,reply\nq,r\n"
+    with pytest.raises(ValueError, match="UTF-8"):
+        decode_knowledge_csv_upload(b"\xff")
+    with pytest.raises(ValueError, match="2 MiB"):
+        decode_knowledge_csv_upload(b"x" * (MAX_KNOWLEDGE_UPLOAD_BYTES + 1))

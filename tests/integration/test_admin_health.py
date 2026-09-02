@@ -44,10 +44,10 @@ def _health_row(page: str, key: str) -> str:
 async def test_health_center_renders_healthy_empty_state(migrated_db):
     async with _client() as client:
         await _login(client)
-        response = await client.get("/admin")
+        response = await client.get("/app/t/default/health")
 
     assert response.status_code == 200
-    assert "运行健康" in response.text
+    assert "系统健康" in response.text
     for key in (
         "ingestion",
         "decisions",
@@ -348,8 +348,8 @@ async def test_health_center_surfaces_actionable_postgres_state(session):
 
     async with _client() as client:
         await _login(client)
-        response = await client.get("/admin")
-        health = await client.get("/admin/health")
+        response = await client.get("/app/t/default/health")
+        health = response
 
     for key in (
         "ingestion",
@@ -363,10 +363,10 @@ async def test_health_center_surfaces_actionable_postgres_state(session):
         assert "ACTION" in row
         assert "1 需处理" in row
         assert "3 小时" in row
-    assert "/admin/health#ingress" in _health_row(response.text, "ingestion")
-    assert "/admin/health#decisions" in _health_row(response.text, "decisions")
-    assert "/admin/inbox?queue=delivery" in _health_row(response.text, "delivery")
-    assert "/admin/accounts" in _health_row(response.text, "sync")
+    assert "/app/t/default/health#ingress" in _health_row(response.text, "ingestion")
+    assert "/app/t/default/inbox?queue=drafts" in _health_row(response.text, "decisions")
+    assert "/app/t/default/inbox?queue=delivery" in _health_row(response.text, "delivery")
+    assert "/app/t/default/channels" in _health_row(response.text, "sync")
     assert "INITIAL_DISPATCH_DEAD" in health.text
 
 
@@ -383,7 +383,7 @@ async def test_health_center_flags_permanent_xchat_public_key_failure(session):
 
     async with _client() as client:
         await _login(client)
-        response = await client.get("/admin")
+        response = await client.get("/app/t/default/health")
 
     row = _health_row(response.text, "ingestion")
     assert "ACTION" in row

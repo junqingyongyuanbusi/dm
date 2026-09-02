@@ -15,8 +15,9 @@ new local claims, approvals or manual replies until Admin is available again.
 
 ## Local-first operations contract
 
-`/admin`, PostgreSQL `HumanWorkItem`, and the transactional Outbox are the native operations control
-plane. Chatwoot is an optional compatibility bridge; it does not own local claims, draft review,
+`/app/t/default`, PostgreSQL `HumanWorkItem`, and the transactional Outbox are the native operations
+control plane. `/admin` Tenant routes are compatibility adapters; Chatwoot is an optional bridge and
+does not own local claims, draft review,
 delivery exceptions, conversation automation state, or manual-reply provenance.
 
 Every human mutation is tenant-scoped, audited and durable:
@@ -46,24 +47,37 @@ persisted conversation mapping.
 1. Browser administrators authenticate through PostgreSQL-backed server-side sessions. The browser receives only an opaque, HTTP-only session token; PostgreSQL stores its HMAC digest, never the raw token. The browser never receives `CONTROL_API_KEY`.
 2. `CONTROL_API_KEY` remains a server-to-server credential for automation and future external admin services.
 3. Platform credentials are accepted only over TLS and stored as application-encrypted Fernet envelopes in PostgreSQL. Encryption keys remain outside PostgreSQL in `PLATFORM_SECRET_KEYS`; job request/result JSON never contains credentials.
-4. `ADMIN_USERNAME` / `ADMIN_PASSWORD` remain the bootstrap superadmin and may access every tenant in `ADMIN_ALLOWED_TENANTS`. Database users are bound to exactly one tenant; every read and mutation is scoped to the current Principal and audited with the human or service actor.
+4. `ADMIN_USERNAME` / `ADMIN_PASSWORD` are the bootstrap `SUPERADMIN` for both system routes and Tenant-wide operations. It has no database user row. Database users persist only `USER`, are bound to the single `default` Tenant, and every read and mutation is scoped to the current Principal and audited with the human or service actor.
 5. Webhook route identifiers are globally unambiguous within their platform namespace.
 6. Sender instances are isolated by `(platform, platform_account_id, config_version)`.
 
+### Accepted SUPERADMIN tradeoffs
+
+- The environment credential is now a direct entry point to customer business data. Anyone who can
+  read a local `.env` or Railway service variables can read and mutate all configured Tenant data;
+  those values must be protected, access-controlled, monitored, and rotated as production data
+  credentials.
+- SUPERADMIN audit actors have a stable username string but no database `user_id`, so attribution is
+  intentionally coarser than for database users.
+- Compatibility names including `is_admin`, `role="ADMIN"`, `admin_required`, and
+  `tenant_admin_required` remain in selected code and HTTP contracts. They denote Tenant-wide
+  SUPERADMIN capability or historical audit vocabulary; they do not imply that a database ADMIN
+  login role still exists.
+
 ## Ordinary-user Channels boundary
 
-`/app/t/{tenant_id}/channels` is a separate self-service surface, not a reduced rendering of the
-administrator account page. `USER` principals can authorize X, Facebook, Instagram, Telegram and
-Email only for their path Tenant. WhatsApp and Feishu remain administrator-managed in the first
-release. Personal Center contains profile/password controls and a Channels link; it does not accept
-provider credentials.
+`/app/t/default/channels` is a separate self-service surface, not a reduced rendering of the retired
+Tenant Admin HTML page. The production installation is single-organization: non-default canonical
+Tenant paths return 404. `USER` principals can authorize X, Facebook, Instagram, Telegram and Email
+only as the persisted owner; bootstrap `SUPERADMIN` can see and manage all default-Tenant accounts.
+WhatsApp and Feishu remain administrator-managed. Personal Center contains profile/password
+controls and a Channels link; it does not accept provider credentials.
 
 Every user-originated `ProvisioningJob` records `owner_user_id` from the live PostgreSQL-backed
 session. Successful provisioning propagates that owner into `PlatformAccount`. Ordinary-user
 account, conversation, inbox, mutation and job-status queries all derive scope from that persisted
 owner. A sibling user in the same Tenant receives not-found semantics for another user's account or
-job. Administrators see all Tenant accounts, while bootstrap/system administrators retain their
-configured cross-Tenant scope.
+job. Bootstrap `SUPERADMIN` sees all default-Tenant accounts and can open the Tenant workspace.
 
 The `(tenant_id, platform, external_account_id)` account upsert enforces owner compatibility in the
 PostgreSQL `ON CONFLICT DO UPDATE ... WHERE` condition. Reauthorizing the same user's account is
@@ -130,22 +144,34 @@ Direct-platform drafts are never sent to customers. A `DRAFT` decision is retain
 
 At delivery time the system revalidates account status, tenant/account/conversation consistency, capability, target type, text length, expiration/window, and takeover state.
 
-## Admin Web first slice
+## Canonical browser control plane
 
-The built-in administration surface provides:
+The built-in browser surface provides:
 
 - bootstrap-superadmin and tenant-user login/logout with opaque HTTP-only cookies, server-side revocation, and CSRF checks;
-- grouped navigation under `/admin`: operations (`/admin/inbox`, `/admin/conversations`), content and policy (`/admin/content/*`), integrations (`/admin/integrations/*`), and system administration (`/admin/system/*`);
+- canonical default-Tenant navigation under `/app/t/default` for inbox/drafts/delivery,
+  conversations, Channels/jobs, business Prompt, Knowledge, health, audit, journeys, settings and
+  profile;
+- system navigation under `/admin/system/*` is SUPERADMIN-only, while the same SUPERADMIN can follow
+  the visible workspace link into `/app/t/default`;
+- historical Tenant GET routes under `/admin` as role-aware 303 redirects and historical POST
+  routes as compatibility adapters over the same command services; redirect handlers perform no
+  business query before returning;
 - superadmin-only direct user creation at `/admin/system/users`, with `/admin/users` retained as a compatibility route and no email/invitation flow;
 - mandatory first-login password change for newly created tenant users;
-- tenant-user self-service account authorization for the user's assigned tenant, including OAuth starts and tenant-scoped provisioning jobs;
+- owner-scoped `USER` account authorization and Tenant-wide `SUPERADMIN` account management,
+  including OAuth starts and provisioning jobs;
 - superadmin-only tenant-wide automation kill switch at `/admin/system/safety`; tenant users retain account-level controls for their own accounts;
-- PostgreSQL-backed runtime health summary on `/admin`, covering ingestion recovery, decision jobs, Outbox, provisioning, active X sync gaps, and disabled accounts with oldest backlog age;
-- an operations inbox at `/admin/inbox` for human handoff, draft review, and delivery exceptions, with direct-message versus public-interaction filtering and oldest-wait ordering;
+- PostgreSQL-backed runtime health on `/app/t/default/health` and an operations inbox at
+  `/app/t/default/inbox`; legacy `/admin/health` and `/admin/inbox` redirect during the compatibility
+  window;
 - Feishu handoff routing at `/admin/integrations/feishu/handoff`, with `/admin/feishu-handoff` retained for compatibility, including one support-chat route per Tenant, an explicit app-scoped operator allowlist, a non-customer-data test card, and read-only notification failure visibility;
 - a conversation archive at `/admin/conversations`, where direct messages and public comments/mentions are separated while every reply remains bound to an explicit inbound message target;
-- read-only runtime diagnostics at `/admin/system/health`, with `/admin/health` retained for compatibility; draft approval and delivery retry remain inbox workflows instead of being duplicated across diagnostic pages;
-- platform account and provisioning-job overview at `/admin/integrations/accounts`, with provider-specific deep links under `/admin/integrations/accounts/new/{provider}` and `/admin/accounts` retained for compatibility;
+- read-only system diagnostics at `/admin/system/health`; draft approval and delivery retry remain
+  canonical inbox workflows instead of being duplicated across diagnostic pages;
+- platform account and provisioning-job overview at `/app/t/default/channels`, with
+  `/admin/integrations/accounts`, provider deep links, `/admin/accounts`, and `/admin/jobs/{job_id}`
+  retained as compatibility redirects;
 - Telegram, Facebook, Instagram, WhatsApp, Feishu, Email, and X connection forms;
 - asynchronous job status and retry, with current job pages under `/admin/integrations/provisioning-jobs/{job_id}` and legacy `/admin/jobs/{job_id}` still accepted;
 - account enable/disable and health checks, including separate Messaging/Comments status plus app-level and account-level subscription state; Meta accounts can only use `BOT_ACTIVE` when the deployment sets `META_AUTO_REPLY_ENABLED=true`, and every change is written to `audit_logs` as `SET_AUTOMATION_DEFAULT`; when `META_COMMENT_REPLY_ENABLED=true` too, newly authorized Facebook and Instagram accounts enable comments, still start as `BOT_DRAFT_ONLY`, validate account-targeted comment permissions, and install the required App/account webhook fields;

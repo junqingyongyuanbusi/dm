@@ -230,6 +230,64 @@ async def _resolve_target(
     return (row.chatwoot_account_id, row.chatwoot_conversation_id) if row else None
 
 
+async def materialize_sent_outbox(
+    session: AsyncSession,
+    *,
+    outbox_id: uuid.UUID,
+) -> None:
+    finalized = (
+        await session.execute(
+            select(
+                models.OutboxMessage.conversation_id,
+                models.OutboxMessage.message_type,
+                models.OutboxMessage.payload,
+                models.OutboxMessage.actor_kind,
+                models.OutboxMessage.sent_at,
+                models.OutboxMessage.chatwoot_message_id,
+                models.OutboxMessage.platform_message_id,
+            ).where(
+                models.OutboxMessage.id == outbox_id,
+                models.OutboxMessage.status == "SENT",
+            )
+        )
+    ).one_or_none()
+    if finalized is None or finalized.message_type != "text":
+        return
+    payload = dict(finalized.payload or {})
+    text = payload.get("text")
+    if not isinstance(text, str) or not text:
+        return
+    await session.execute(
+        pg_insert(models.Message)
+        .values(
+            id=uuid.uuid4(),
+            conversation_id=finalized.conversation_id,
+            direction="outbound",
+            sender_type=(
+                "agent" if finalized.actor_kind == "ADMIN_HUMAN" else "bot"
+            ),
+            text=text,
+            chatwoot_message_id=finalized.chatwoot_message_id,
+            platform_message_id=finalized.platform_message_id,
+            source_outbox_id=outbox_id,
+            reply_target=dict(payload.get("target") or {}),
+            private=False,
+            occurred_at=finalized.sent_at,
+        )
+        .on_conflict_do_nothing(index_elements=["source_outbox_id"])
+    )
+    sent_column = (
+        "last_human_message_at"
+        if finalized.actor_kind == "ADMIN_HUMAN"
+        else "last_bot_message_at"
+    )
+    await session.execute(
+        update(models.AutomationState)
+        .where(models.AutomationState.conversation_id == finalized.conversation_id)
+        .values({sent_column: finalized.sent_at})
+    )
+
+
 async def _record_outcome(
     session: AsyncSession,
     outbox_id: uuid.UUID,
@@ -290,37 +348,8 @@ async def _record_outcome(
         actual_status = "STALE_FINALIZE"
         actual_error_code = "STALE_FINALIZE"
         actual_error_message = f"requested={status}; current={current_status}"
-    elif status == "SENT" and finalized.message_type == "text":
-        payload = dict(finalized.payload or {})
-        text = payload.get("text")
-        if isinstance(text, str) and text:
-            await session.execute(
-                pg_insert(models.Message)
-                .values(
-                    id=uuid.uuid4(),
-                    conversation_id=finalized.conversation_id,
-                    direction="outbound",
-                    sender_type=("agent" if finalized.actor_kind == "ADMIN_HUMAN" else "bot"),
-                    text=text,
-                    chatwoot_message_id=finalized.chatwoot_message_id,
-                    platform_message_id=finalized.platform_message_id,
-                    source_outbox_id=outbox_id,
-                    reply_target=dict(payload.get("target") or {}),
-                    private=False,
-                    occurred_at=finalized.sent_at,
-                )
-                .on_conflict_do_nothing(index_elements=["source_outbox_id"])
-            )
-            sent_column = (
-                "last_human_message_at"
-                if finalized.actor_kind == "ADMIN_HUMAN"
-                else "last_bot_message_at"
-            )
-            await session.execute(
-                update(models.AutomationState)
-                .where(models.AutomationState.conversation_id == finalized.conversation_id)
-                .values({sent_column: finalized.sent_at})
-            )
+    elif status == "SENT":
+        await materialize_sent_outbox(session, outbox_id=outbox_id)
     if count_attempt:
         await session.execute(
             insert(models.DeliveryAttempt).values(

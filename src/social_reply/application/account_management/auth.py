@@ -13,7 +13,7 @@ from sqlalchemy import delete, select
 
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
 _SESSION_TTL = timedelta(hours=8)
 _PASSWORD_MIN_LENGTH = 12
@@ -39,15 +39,19 @@ class Principal:
     user_id: uuid.UUID | None = None
     tenant_id: str | None = None
     must_change_password: bool = False
-    role: str = "ADMIN"
+    role: str = "USER"
 
     @property
     def is_superadmin(self) -> bool:
-        return self.user_id is None
+        # SUPERADMIN is exclusively the environment-backed bootstrap identity;
+        # a database user must never gain this authority from a role string.
+        return self.user_id is None and self.role == "SUPERADMIN"
 
     @property
     def is_admin(self) -> bool:
-        return self.is_superadmin or self.role == "ADMIN"
+        # The database ADMIN role no longer exists. This compatibility name now
+        # means the environment-backed SUPERADMIN has Tenant-wide authority.
+        return self.is_superadmin
 
     def require_tenant(self, tenant_id: str) -> None:
         if tenant_id not in self.allowed_tenants:
@@ -56,6 +60,14 @@ class Principal:
     def require_admin(self) -> None:
         if not self.is_admin:
             raise HTTPException(status_code=403, detail="admin_required")
+
+    def require_tenant_admin(self) -> None:
+        if not self.is_admin:
+            raise HTTPException(status_code=403, detail="tenant_admin_required")
+
+    def require_superadmin(self) -> None:
+        if not self.is_superadmin:
+            raise HTTPException(status_code=403, detail="superadmin_required")
 
     def can_access_account(self, account: models.PlatformAccount) -> bool:
         if account.tenant_id not in self.allowed_tenants:
@@ -133,6 +145,18 @@ async def issue_session() -> tuple[str, uuid.UUID]:
                 expires_at=datetime.now(UTC) + _SESSION_TTL,
             )
         )
+        settings = get_settings()
+        session.add(
+            models.AuditLog(
+                tenant_id=DEFAULT_TENANT_ID,
+                category="authentication",
+                actor=f"user:{settings.admin_username}",
+                action="LOGIN_SUCCESS",
+                subject_type="bootstrap_admin",
+                subject_id=settings.admin_username,
+                detail={"username": settings.admin_username, "role": "SUPERADMIN"},
+            )
+        )
         await session.commit()
     return raw_token, session_id
 
@@ -141,9 +165,43 @@ async def revoke_session(raw_token: str) -> None:
     if not raw_token:
         return
     async with get_session_factory()() as session:
+        stored_session = await session.scalar(
+            select(models.AdminSession).where(
+                models.AdminSession.token_digest == _token_digest(raw_token)
+            )
+        )
+        if stored_session is None:
+            return
+        if stored_session.user_id is None:
+            settings = get_settings()
+            tenant_id = DEFAULT_TENANT_ID
+            actor = f"user:{settings.admin_username}"
+            subject_type = "bootstrap_admin"
+            subject_id = settings.admin_username
+            detail = {"username": settings.admin_username, "role": "SUPERADMIN"}
+        else:
+            user = await session.get(models.AdminUser, stored_session.user_id)
+            if user is None:
+                return
+            tenant_id = user.tenant_id
+            actor = f"user:{user.username}"
+            subject_type = "admin_user"
+            subject_id = str(user.id)
+            detail = {"username": user.username, "role": user.role}
         await session.execute(
             delete(models.AdminSession).where(
                 models.AdminSession.token_digest == _token_digest(raw_token)
+            )
+        )
+        session.add(
+            models.AuditLog(
+                tenant_id=tenant_id,
+                category="authentication",
+                actor=actor,
+                action="LOGOUT",
+                subject_type=subject_type,
+                subject_id=subject_id,
+                detail=detail,
             )
         )
         await session.commit()
@@ -200,6 +258,17 @@ async def authenticate(username: str, password: str) -> tuple[Principal, str] | 
                 expires_at=datetime.now(UTC) + _SESSION_TTL,
             )
         )
+        session.add(
+            models.AuditLog(
+                tenant_id=stored_user.tenant_id,
+                category="authentication",
+                actor=f"user:{stored_user.username}",
+                action="LOGIN_SUCCESS",
+                subject_type="admin_user",
+                subject_id=str(stored_user.id),
+                detail={"username": stored_user.username, "role": stored_user.role},
+            )
+        )
         await session.commit()
         principal = _user_principal(session_id, stored_user)
     return principal, raw_token
@@ -212,6 +281,8 @@ def _bootstrap_principal(session_id: uuid.UUID) -> Principal:
         username=settings.admin_username,
         actor=f"user:{settings.admin_username}",
         allowed_tenants=settings.allowed_admin_tenants,
+        tenant_id=DEFAULT_TENANT_ID,
+        role="SUPERADMIN",
     )
 
 

@@ -1,12 +1,17 @@
+import asyncio
+import uuid
 
 import httpx
 import pytest
+import redis.asyncio as aioredis
+from sqlalchemy import select
 
 from apps.api.main import create_app
 from social_reply.application.account_management.auth import hash_password
 from social_reply.application.account_management.meta_credentials import (
     MetaAppCredentials,
 )
+from social_reply.application.account_management.ui_i18n import LOCALE_COOKIE_NAME
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
@@ -27,7 +32,7 @@ async def _seed_users(session) -> tuple[models.AdminUser, models.AdminUser]:
     first_user = models.AdminUser(
         username="channel-user-a",
         password_hash=await hash_password(_USER_PASSWORD),
-        tenant_id="tenant-a",
+        tenant_id="default",
         role="USER",
         must_change_password=False,
         status="active",
@@ -35,7 +40,7 @@ async def _seed_users(session) -> tuple[models.AdminUser, models.AdminUser]:
     second_user = models.AdminUser(
         username="channel-user-b",
         password_hash=await hash_password(_USER_PASSWORD),
-        tenant_id="tenant-a",
+        tenant_id="default",
         role="USER",
         must_change_password=False,
         status="active",
@@ -61,13 +66,29 @@ async def _login(client: httpx.AsyncClient, username: str) -> str:
     return csrf
 
 
+async def _login_superadmin(client: httpx.AsyncClient) -> str:
+    await client.get("/auth/login")
+    csrf = client.cookies["reply_admin_csrf"]
+    response = await client.post(
+        "/auth/login",
+        data={
+            "csrf_token": csrf,
+            "username": "admin",
+            "password": "test-admin-password",
+        },
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/system/overview"
+    return csrf
+
+
 async def test_channels_page_profile_and_job_endpoint_are_owner_scoped(
     session,
     migrated_db,
 ) -> None:
     first_user, second_user = await _seed_users(session)
     own_account = models.PlatformAccount(
-        tenant_id="tenant-a",
+        tenant_id="default",
         brand_id="default",
         platform="x",
         owner_user_id=first_user.id,
@@ -82,7 +103,7 @@ async def test_channels_page_profile_and_job_endpoint_are_owner_scoped(
         status="active",
     )
     sibling_account = models.PlatformAccount(
-        tenant_id="tenant-a",
+        tenant_id="default",
         brand_id="default",
         platform="telegram",
         owner_user_id=second_user.id,
@@ -98,7 +119,7 @@ async def test_channels_page_profile_and_job_endpoint_are_owner_scoped(
     session.add_all([own_account, sibling_account])
     await session.flush()
     own_job = models.ProvisioningJob(
-        tenant_id="tenant-a",
+        tenant_id="default",
         brand_id="default",
         platform="x",
         actor="user:channel-user-a",
@@ -113,7 +134,7 @@ async def test_channels_page_profile_and_job_endpoint_are_owner_scoped(
         last_error_message="raw provider details should never render",
     )
     sibling_job = models.ProvisioningJob(
-        tenant_id="tenant-a",
+        tenant_id="default",
         brand_id="default",
         platform="telegram",
         actor="user:channel-user-b",
@@ -129,14 +150,12 @@ async def test_channels_page_profile_and_job_endpoint_are_owner_scoped(
 
     async with _client() as client:
         await _login(client, first_user.username)
-        channels_page = await client.get("/app/t/tenant-a/channels")
-        profile_page = await client.get("/app/t/tenant-a/profile")
-        own_job_response = await client.get(
-            f"/app/t/tenant-a/channels/jobs/{own_job.id}"
-        )
-        sibling_job_response = await client.get(
-            f"/app/t/tenant-a/channels/jobs/{sibling_job.id}"
-        )
+        channels_page = await client.get("/app/t/default/channels")
+        profile_page = await client.get("/app/t/default/profile")
+        own_job_response = await client.get(f"/app/t/default/channels/jobs/{own_job.id}")
+        sibling_job_response = await client.get(f"/app/t/default/channels/jobs/{sibling_job.id}")
+        client.cookies.set(LOCALE_COOKIE_NAME, "en")
+        english_channels_page = await client.get("/app/t/default/channels")
 
     assert channels_page.status_code == 200
     assert channels_page.headers["cache-control"] == "no-store"
@@ -150,9 +169,23 @@ async def test_channels_page_profile_and_job_endpoint_are_owner_scoped(
     assert "raw provider details" not in channels_page.text
     assert 'href="/admin' not in channels_page.text
     assert 'action="/admin' not in channels_page.text
+    assert 'data-pending-label="正在连接…"' in channels_page.text
+    assert "owned-secret-token" not in channels_page.text
+
+    assert english_channels_page.status_code == 200
+    assert '<html lang="en">' in english_channels_page.text
+    assert 'data-pending-label="Connecting…"' in english_channels_page.text
+    assert "Connected accounts" in english_channels_page.text
+    assert "Add channels" in english_channels_page.text
+    assert "授权进度" not in english_channels_page.text
+    assert "owned-secret-token" not in english_channels_page.text
+    assert "raw provider details" not in english_channels_page.text
+    assert "Sibling Secret Account" not in english_channels_page.text
+    assert 'href="/admin' not in english_channels_page.text
+    assert 'action="/admin' not in english_channels_page.text
 
     assert profile_page.status_code == 200
-    assert "/app/t/tenant-a/channels" in profile_page.text
+    assert "/app/t/default/channels" in profile_page.text
     assert "/auth/change-password" in profile_page.text
     assert "Bot Token" not in profile_page.text
     assert "App Password" not in profile_page.text
@@ -164,6 +197,528 @@ async def test_channels_page_profile_and_job_endpoint_are_owner_scoped(
     assert "其他归属范围" in own_job_response.json()["last_error_message"]
     assert "secret-token" not in own_job_response.text
     assert sibling_job_response.status_code == 404
+
+
+async def test_superadmin_channels_page_is_tenant_wide_without_legacy_admin_links(
+    session,
+    migrated_db,
+) -> None:
+    first_user, _second_user = await _seed_users(session)
+    user_account = models.PlatformAccount(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        owner_user_id=first_user.id,
+        name="User-owned Telegram",
+        external_account_id="telegram-owned",
+        public_id="tg_owned",
+        config={},
+        capability={},
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    organization_account = models.PlatformAccount(
+        tenant_id="default",
+        brand_id="default",
+        platform="feishu",
+        owner_user_id=None,
+        name="Tenant Feishu",
+        external_account_id="feishu-tenant",
+        public_id="fs_tenant",
+        config={"feishu_health_status": "READY"},
+        capability={},
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    session.add_all([user_account, organization_account])
+    await session.flush()
+    session.add_all(
+        [
+            models.ProvisioningJob(
+                tenant_id="default",
+                brand_id="default",
+                platform="telegram",
+                actor=first_user.username,
+                owner_user_id=first_user.id,
+                idempotency_key="admin-visible-user-job",
+                request={"name": "User-owned Telegram"},
+                status="PENDING",
+                current_step="QUEUED",
+                result={},
+            ),
+            models.ProvisioningJob(
+                tenant_id="default",
+                brand_id="default",
+                platform="feishu",
+                actor="user:admin",
+                owner_user_id=None,
+                idempotency_key="admin-visible-tenant-job",
+                request={"name": "Tenant Feishu"},
+                status="FAILED",
+                current_step="FAILED",
+                result={},
+                last_error_code="PLATFORM_HTTP_503",
+                last_error_message="raw provider response must stay private",
+            ),
+        ]
+    )
+    await session.commit()
+
+    async with _client() as client:
+        await _login_superadmin(client)
+        response = await client.get("/app/t/default/channels")
+
+    assert response.status_code == 200
+    assert "User-owned Telegram" in response.text
+    assert "Tenant Feishu" in response.text
+    assert first_user.username in response.text
+    assert "raw provider response" not in response.text
+    assert 'href="/admin/integrations/accounts"' not in response.text
+    assert 'href="/admin/accounts"' not in response.text
+    assert 'href="/admin/feishu-handoff"' not in response.text
+    assert 'action="/admin' not in response.text
+    assert "/app/t/default/channels/feishu/handoff" in response.text
+    assert "/app/t/default/channels/jobs/" in response.text
+    assert "/retry" in response.text
+    for provider in ("Telegram", "Facebook", "Instagram", "WhatsApp", "X", "Feishu", "Email"):
+        assert provider in response.text
+
+
+async def test_user_cannot_provision_admin_managed_channels(
+    session,
+    migrated_db,
+) -> None:
+    user, _sibling_user = await _seed_users(session)
+
+    async with _client() as client:
+        csrf = await _login(client, user.username)
+        whatsapp_response = await client.post(
+            "/app/t/default/channels/accounts/whatsapp",
+            data={"csrf_token": csrf},
+        )
+        feishu_response = await client.post(
+            "/app/t/default/channels/accounts/feishu",
+            data={"csrf_token": csrf},
+        )
+        telegram_active_response = await client.post(
+            "/app/t/default/channels/accounts/telegram",
+            data={"csrf_token": csrf, "automation_default": "BOT_ACTIVE"},
+        )
+        x_active_response = await client.post(
+            "/app/t/default/channels/accounts/x",
+            data={"csrf_token": csrf, "automation_default": "BOT_ACTIVE"},
+        )
+
+    for response in (
+        whatsapp_response,
+        feishu_response,
+        telegram_active_response,
+        x_active_response,
+    ):
+        assert response.status_code == 403
+        assert response.json() == {"detail": "tenant_admin_required"}
+    assert (
+        await session.scalar(
+            select(models.ProvisioningJob.id).where(
+                models.ProvisioningJob.owner_user_id == user.id,
+                models.ProvisioningJob.platform.in_(("whatsapp", "feishu", "telegram", "x")),
+            )
+        )
+        is None
+    )
+
+
+async def test_historical_user_job_is_blocked_on_retry_and_worker_execution(
+    session,
+    migrated_db,
+) -> None:
+    from social_reply.application.account_management import jobs
+
+    user, _sibling_user = await _seed_users(session)
+    historical_job = models.ProvisioningJob(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        actor=f"user:{user.username}",
+        owner_user_id=user.id,
+        idempotency_key="historical-user-active-job",
+        request={"automation_default": "BOT_ACTIVE"},
+        staging_secret=encrypt_secret_bundle({"token": "historical-secret"}),
+        status="FAILED",
+        current_step="FAILED",
+        result={},
+        last_error_code="PLATFORM_UNAVAILABLE",
+        last_error_message="temporary",
+    )
+    session.add(historical_job)
+    await session.commit()
+
+    async with _client() as client:
+        csrf = await _login(client, user.username)
+        retry_response = await client.post(
+            f"/app/t/default/channels/jobs/{historical_job.id}/retry",
+            data={"csrf_token": csrf},
+        )
+
+    assert retry_response.status_code == 403
+    assert retry_response.json() == {"detail": "tenant_admin_required"}
+    worker_result = await jobs.process_provisioning_job(str(historical_job.id))
+    assert worker_result == "NEEDS_ACTION"
+    await session.refresh(historical_job)
+    assert historical_job.status == "NEEDS_ACTION"
+    assert historical_job.last_error_code == "INVALID_REQUEST"
+    assert historical_job.account_id is None
+
+
+async def test_channel_lifecycle_commands_are_scoped_optimistic_and_audited(
+    session,
+    migrated_db,
+) -> None:
+    first_user, second_user = await _seed_users(session)
+    account = models.PlatformAccount(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        owner_user_id=first_user.id,
+        name="Lifecycle account",
+        external_account_id="telegram-lifecycle",
+        public_id="tg_lifecycle",
+        config={},
+        capability={},
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    sibling_account = models.PlatformAccount(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        owner_user_id=second_user.id,
+        name="Sibling lifecycle account",
+        external_account_id="telegram-lifecycle-sibling",
+        public_id="tg_lifecycle_sibling",
+        config={},
+        capability={},
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    session.add_all([account, sibling_account])
+    await session.commit()
+
+    async with _client() as client:
+        csrf = await _login(client, first_user.username)
+        sibling_detail = await client.get(
+            f"/app/t/default/channels/accounts/{sibling_account.id}"
+        )
+        renamed = await client.post(
+            f"/app/t/default/channels/accounts/{account.id}/rename",
+            data={
+                "csrf_token": csrf,
+                "name": "Renamed lifecycle account",
+                "expected_config_version": "1",
+            },
+        )
+        stale_rename = await client.post(
+            f"/app/t/default/channels/accounts/{account.id}/rename",
+            data={
+                "csrf_token": csrf,
+                "name": "Stale write must fail",
+                "expected_config_version": "1",
+            },
+        )
+        forbidden_active = await client.post(
+            f"/app/t/default/channels/accounts/{account.id}/automation",
+            data={
+                "csrf_token": csrf,
+                "target": "BOT_ACTIVE",
+                "expected_config_version": "2",
+            },
+        )
+        disabled = await client.post(
+            f"/app/t/default/channels/accounts/{account.id}/status",
+            data={
+                "csrf_token": csrf,
+                "enabled": "false",
+                "expected_status": "active",
+                "expected_config_version": "2",
+            },
+        )
+
+    assert sibling_detail.status_code == 404
+    assert renamed.status_code == disabled.status_code == 303
+    assert stale_rename.status_code == 409
+    assert forbidden_active.status_code == 403
+    assert forbidden_active.json() == {"detail": "tenant_admin_required"}
+    await session.refresh(account)
+    assert account.name == "Renamed lifecycle account"
+    assert account.status == "DISABLED"
+    assert account.config_version == 3
+
+    async with _client() as client:
+        admin_csrf = await _login_superadmin(client)
+        assigned = await client.post(
+            f"/app/t/default/channels/accounts/{account.id}/owner",
+            data={
+                "csrf_token": admin_csrf,
+                "owner_user_id": str(second_user.id),
+                "expected_config_version": "3",
+            },
+        )
+
+    assert assigned.status_code == 303
+    await session.refresh(account)
+    assert account.owner_user_id == second_user.id
+    assert account.config_version == 4
+
+    async with _client() as client:
+        await _login(client, first_user.username)
+        former_owner_detail = await client.get(
+            f"/app/t/default/channels/accounts/{account.id}"
+        )
+    async with _client() as client:
+        await _login(client, second_user.username)
+        current_owner_detail = await client.get(
+            f"/app/t/default/channels/accounts/{account.id}"
+        )
+
+    assert former_owner_detail.status_code == 404
+    assert current_owner_detail.status_code == 200
+    audits = list(
+        (
+            await session.execute(
+                select(models.AuditLog).where(
+                    models.AuditLog.tenant_id == "default",
+                    models.AuditLog.subject_id == str(account.id),
+                )
+            )
+        ).scalars()
+    )
+    assert {
+        "RENAME_PLATFORM_ACCOUNT",
+        "SET_PLATFORM_ACCOUNT_STATUS",
+        "ASSIGN_PLATFORM_ACCOUNT_OWNER",
+    } <= {audit.action for audit in audits}
+
+
+async def test_channel_provisioning_form_rejects_extra_fields_without_secret_leak(
+    session,
+    migrated_db,
+) -> None:
+    first_user, _second_user = await _seed_users(session)
+    secret_token = "123456:super-secret-telegram-token"
+
+    async with _client() as client:
+        csrf = await _login(client, first_user.username)
+        response = await client.post(
+            "/app/t/default/channels/accounts/telegram",
+            data={
+                "csrf_token": csrf,
+                "tenant_id": "attacker-tenant",
+                "brand_id": "default",
+                "automation_default": "BOT_DRAFT_ONLY",
+                "token": secret_token,
+                "unexpected_field": "must-fail-closed",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_channel_account_form_fields"}
+    assert secret_token not in response.text
+    assert (
+        await session.scalar(
+            select(models.ProvisioningJob).where(
+                models.ProvisioningJob.tenant_id == "default"
+            )
+        )
+        is None
+    )
+
+
+async def test_kill_switch_and_job_retry_are_idempotent_scoped_and_audited(
+    session,
+    migrated_db,
+    monkeypatch,
+) -> None:
+    from social_reply.application.account_management import channel_management
+    from social_reply.shared.config import get_settings
+
+    first_user, _second_user = await _seed_users(session)
+    account = models.PlatformAccount(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        owner_user_id=first_user.id,
+        name="Kill switch account",
+        external_account_id="telegram-kill-switch",
+        public_id="tg_kill_switch",
+        config={},
+        capability={},
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    job = models.ProvisioningJob(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        actor=first_user.username,
+        owner_user_id=first_user.id,
+        idempotency_key="channel-retry-audit",
+        request={"name": "Kill switch account"},
+        status="FAILED",
+        current_step="FAILED",
+        result={},
+        last_error_code="PLATFORM_UNAVAILABLE",
+        last_error_message="provider details stay private",
+    )
+    session.add_all([account, job])
+    await session.commit()
+
+    async def ignore_dispatch(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(channel_management, "dispatch_actor", ignore_dispatch)
+    redis = aioredis.from_url(get_settings().redis_url)
+    redis_key = f"killswitch:account:default:{account.id}"
+    await redis.delete(redis_key)
+    first_client = _client()
+    second_client = _client()
+    try:
+        first_csrf, second_csrf = await asyncio.gather(
+            _login(first_client, first_user.username),
+            _login(second_client, first_user.username),
+        )
+
+        async def enable_kill_switch(client: httpx.AsyncClient, csrf: str):
+            return await client.post(
+                f"/app/t/default/channels/accounts/{account.id}/kill-switch",
+                data={"csrf_token": csrf, "enabled": "true"},
+            )
+
+        first_response, second_response = await asyncio.gather(
+            enable_kill_switch(first_client, first_csrf),
+            enable_kill_switch(second_client, second_csrf),
+        )
+        retry_response = await first_client.post(
+            f"/app/t/default/channels/jobs/{job.id}/retry",
+            data={"csrf_token": first_csrf},
+        )
+        disable_response = await first_client.post(
+            f"/app/t/default/channels/accounts/{account.id}/kill-switch",
+            data={"csrf_token": first_csrf, "enabled": "false"},
+        )
+    finally:
+        await first_client.aclose()
+        await second_client.aclose()
+
+    assert first_response.status_code == second_response.status_code == 303
+    assert retry_response.status_code == disable_response.status_code == 303
+    assert await redis.exists(redis_key) == 0
+    await redis.aclose()
+    await session.refresh(job)
+    assert job.status == "PENDING"
+    assert job.last_error_code is None
+
+    kill_switch_audits = list(
+        (
+            await session.execute(
+                select(models.AuditLog)
+                .where(
+                    models.AuditLog.tenant_id == "default",
+                    models.AuditLog.action == "SET_PLATFORM_ACCOUNT_KILL_SWITCH",
+                    models.AuditLog.subject_id == str(account.id),
+                )
+                .order_by(models.AuditLog.created_at)
+            )
+        ).scalars()
+    )
+    assert len(kill_switch_audits) == 3
+    assert [audit.detail["enabled"] for audit in kill_switch_audits].count(True) == 2
+    assert [audit.detail["changed"] for audit in kill_switch_audits].count(True) == 2
+    retry_audit = await session.scalar(
+        select(models.AuditLog).where(
+            models.AuditLog.tenant_id == "default",
+            models.AuditLog.action == "RETRY_PROVISIONING_JOB",
+            models.AuditLog.subject_id == str(job.id),
+        )
+    )
+    assert retry_audit is not None
+    assert "provider details" not in str(retry_audit.detail)
+
+
+async def test_kill_switch_persists_unknown_audit_when_redis_apply_fails(
+    session,
+    migrated_db,
+    monkeypatch,
+) -> None:
+    from social_reply.application.account_management import (
+        channel_management,
+        kill_switch_recovery,
+    )
+
+    first_user, _second_user = await _seed_users(session)
+    account = models.PlatformAccount(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        owner_user_id=first_user.id,
+        name="Redis failure account",
+        external_account_id="telegram-redis-failure",
+        public_id="tg_redis_failure",
+        config={},
+        capability={},
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    session.add(account)
+    await session.commit()
+
+    class FailingRedis:
+        async def exists(self, _key):
+            return 0
+
+        async def set(self, _key, _value):
+            raise RuntimeError("redis unavailable")
+
+        async def delete(self, _key):
+            raise AssertionError("delete must not run")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        kill_switch_recovery.aioredis,
+        "from_url",
+        lambda _url: FailingRedis(),
+    )
+
+    with pytest.raises(RuntimeError, match="redis unavailable"):
+        await channel_management.set_channel_account_kill_switch(
+            tenant_id="default",
+            account_id=account.id,
+            actor=channel_management.ChannelActor(
+                actor=f"user:{first_user.username}",
+                role="USER",
+                user_id=first_user.id,
+                session_id=uuid.uuid4(),
+            ),
+            enabled=True,
+        )
+
+    audit = await session.scalar(
+        select(models.AuditLog).where(
+            models.AuditLog.action == "SET_PLATFORM_ACCOUNT_KILL_SWITCH",
+            models.AuditLog.subject_id == str(account.id),
+        )
+    )
+    assert audit is not None
+    assert audit.detail["operation_id"] == str(audit.id)
+    assert audit.detail["tenant_id"] == "default"
+    assert audit.detail["account_id"] == str(account.id)
+    assert audit.detail["target_enabled"] is True
+    assert audit.detail["enabled"] is True
+    assert audit.detail["status"] == "UNKNOWN"
+    assert audit.detail["outcome"] == "UNKNOWN"
+    assert audit.detail["error_code"] == "REDIS_APPLY_UNCERTAIN"
+    assert audit.detail["fail_closed"] is False
 
 
 async def test_user_can_start_all_channels_oauth_flows_with_bound_context(
@@ -220,7 +775,7 @@ async def test_user_can_start_all_channels_oauth_flows_with_bound_context(
     async with _client() as client:
         csrf = await _login(client, first_user.username)
         x_response = await client.post(
-            "/app/t/tenant-a/channels/oauth/x/start",
+            "/app/t/default/channels/oauth/x/start",
             data={
                 "csrf_token": csrf,
                 "tenant_id": "tenant-b",
@@ -228,7 +783,7 @@ async def test_user_can_start_all_channels_oauth_flows_with_bound_context(
             },
         )
         facebook_response = await client.post(
-            "/app/t/tenant-a/channels/oauth/meta/start",
+            "/app/t/default/channels/oauth/meta/start",
             data={
                 "csrf_token": csrf,
                 "tenant_id": "tenant-b",
@@ -237,7 +792,7 @@ async def test_user_can_start_all_channels_oauth_flows_with_bound_context(
             },
         )
         instagram_response = await client.post(
-            "/app/t/tenant-a/channels/oauth/instagram/start",
+            "/app/t/default/channels/oauth/instagram/start",
             data={
                 "csrf_token": csrf,
                 "tenant_id": "tenant-b",
@@ -246,24 +801,20 @@ async def test_user_can_start_all_channels_oauth_flows_with_bound_context(
         )
 
     assert x_response.status_code == 303
-    assert x_response.headers["location"].startswith(
-        "https://api.x.com/oauth/authorize?"
-    )
+    assert x_response.headers["location"].startswith("https://api.x.com/oauth/authorize?")
     assert facebook_response.status_code == 303
-    assert facebook_response.headers["location"].startswith(
-        "https://www.facebook.com/"
-    )
+    assert facebook_response.headers["location"].startswith("https://www.facebook.com/")
     assert instagram_response.status_code == 303
     assert instagram_response.headers["location"].startswith(
         "https://www.instagram.com/oauth/authorize?"
     )
     for provider, context in stored_contexts.items():
         assert context["provider"] == provider
-        assert context["tenant_id"] == "tenant-a"
+        assert context["tenant_id"] == "default"
         assert context["initiator_user_id"] == str(first_user.id)
         assert context["initiator_session_id"]
         assert context["surface"] == "channels"
-        assert context["return_to"] == "/app/t/tenant-a/channels"
+        assert context["return_to"] == "/app/t/default/channels"
 
 
 async def test_channels_oauth_cancellation_returns_without_admin_links(
@@ -278,23 +829,23 @@ async def test_channels_oauth_cancellation_returns_without_admin_links(
     async def x_context(_namespace, _key):
         return {
             "surface": "channels",
-            "tenant_id": "tenant-a",
-            "return_to": "/app/t/tenant-a/channels",
+            "tenant_id": "default",
+            "return_to": "/app/t/default/channels",
         }
 
     async def meta_context(_namespace, _key):
         return {
             "surface": "channels",
-            "tenant_id": "tenant-a",
+            "tenant_id": "default",
             "platform": "facebook",
-            "return_to": "/app/t/tenant-a/channels",
+            "return_to": "/app/t/default/channels",
         }
 
     async def instagram_context(_namespace, _key):
         return {
             "surface": "channels",
-            "tenant_id": "tenant-a",
-            "return_to": "/app/t/tenant-a/channels",
+            "tenant_id": "default",
+            "return_to": "/app/t/default/channels",
         }
 
     monkeypatch.setattr(x, "take_oauth_state", x_context)
@@ -303,9 +854,7 @@ async def test_channels_oauth_cancellation_returns_without_admin_links(
 
     async with _client() as client:
         await _login(client, first_user.username)
-        x_response = await client.get(
-            "/admin/oauth/x/callback?denied=request-token"
-        )
+        x_response = await client.get("/admin/oauth/x/callback?denied=request-token")
         facebook_response = await client.get(
             "/admin/oauth/meta/callback?error=access_denied&state=meta-state"
         )
@@ -315,8 +864,6 @@ async def test_channels_oauth_cancellation_returns_without_admin_links(
 
     for response in (x_response, facebook_response, instagram_response):
         assert response.status_code == 303
-        assert response.headers["location"].startswith(
-            "/app/t/tenant-a/channels?"
-        )
+        assert response.headers["location"].startswith("/app/t/default/channels?")
         assert "/admin" not in response.headers["location"]
         assert response.headers["cache-control"] == "no-store"

@@ -1,105 +1,25 @@
-"""回复模板 CSV 导入：content_hash 幂等 + 批量 embedding"""
+"""Compatibility wrappers for tenant-scoped knowledge CSV commands."""
 
-import csv
-import json
-import logging
-import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from social_reply.application.knowledge.drafts import (
-    KnowledgeDraft,
-    build_knowledge_draft,
-    existing_content_hashes,
-    persist_knowledge_draft,
+from social_reply.application.knowledge.commands import (
+    ImportKnowledgeBatchCommand,
+    KnowledgeImportReport,
+    execute_import_knowledge_batch,
 )
+from social_reply.application.knowledge.upload import MAX_IMPORT_ROWS
 from social_reply.domain.knowledge.embeddings import EmbeddingClient
-from social_reply.domain.reply.language import assess_knowledge_language
 from social_reply.infrastructure.database.engine import get_session_factory
 
-logger = logging.getLogger(__name__)
+ImportReport = KnowledgeImportReport
 
-_REQUIRED_HEADERS = {"question", "reply"}
-_EMBED_BATCH_SIZE = 100  # 单次 embeddings 请求上限，防超大 CSV 打爆单请求
-MAX_IMPORT_ROWS = 2000
-
-
-@dataclass(frozen=True)
-class ImportReport:
-    inserted: int
-    skipped: int  # content_hash 已存在（重复模板）
-    blank: int  # 空 question/reply 行
-    total: int  # CSV 有效数据行数（含空行）
-    batch_id: uuid.UUID
-
-
-def parse_optional_bool(value: str | None) -> bool:
-    """Parse an optional strict CSV boolean; blank values are false."""
-    normalized = (value or "").strip().casefold()
-    if normalized in {"", "false", "0", "no"}:
-        return False
-    if normalized in {"true", "1", "yes"}:
-        return True
-    raise ValueError(f"is_official_contact must be true/false, got {value!r}")
-
-
-def parse_protected_values(value: str | None) -> tuple[str, ...]:
-    """Parse an optional JSON string array; semantic checks run in build_knowledge_draft."""
-    if not (value or "").strip():
-        return ()
-    try:
-        parsed = json.loads(value or "")
-    except json.JSONDecodeError as exc:
-        raise ValueError("protected_values_json must be a JSON string array") from exc
-    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
-        raise ValueError("protected_values_json must be a JSON string array")
-    return tuple(parsed)
-
-
-def _parse_rows(
-    f: TextIO,
-    *,
-    tenant_id: str,
-    brand_id_default: str,
-    source_name: str,
-    batch_id: uuid.UUID,
-) -> tuple[list[KnowledgeDraft], int]:
-    """解析 CSV，返回 (有效行, 空行数)；表头缺失或超行数抛 ValueError"""
-    reader = csv.DictReader(f)
-    headers = set(reader.fieldnames or [])
-    missing = _REQUIRED_HEADERS - headers
-    if missing:
-        raise ValueError(f"CSV 表头缺少必需列: {'、'.join(sorted(missing))}（必需 question,reply）")
-    rows: list[KnowledgeDraft] = []
-    blank = 0
-    for row_number, raw in enumerate(reader, start=2):
-        question = (raw.get("question") or "").strip()
-        reply = (raw.get("reply") or "").strip()
-        if not question or not reply:
-            blank += 1
-            logger.warning("Skipping blank knowledge CSV row: row=%d", row_number)
-            continue
-        detected_language, detection_status = assess_knowledge_language(question, reply)
-        rows.append(
-            build_knowledge_draft(
-                tenant_id=tenant_id,
-                question=question,
-                reply=reply,
-                brand_id=(raw.get("brand_id") or "").strip() or brand_id_default,
-                platform=(raw.get("platform") or "").strip() or None,
-                category=(raw.get("category") or "").strip() or None,
-                is_official_contact=parse_optional_bool(raw.get("is_official_contact")),
-                protected_values=parse_protected_values(raw.get("protected_values_json")),
-                detected_language=detected_language,
-                language_detection_status=detection_status,
-                source_file=source_name,
-                import_batch_id=batch_id,
-            )
-        )
-    if len(rows) + blank > MAX_IMPORT_ROWS:
-        raise ValueError(f"CSV 超过上限 {MAX_IMPORT_ROWS} 行（当前 {len(rows) + blank} 行）")
-    return rows, blank
+__all__ = [
+    "ImportReport",
+    "MAX_IMPORT_ROWS",
+    "import_knowledge_csv",
+    "import_knowledge_rows",
+]
 
 
 async def import_knowledge_rows(
@@ -111,59 +31,21 @@ async def import_knowledge_rows(
     brand_id_default: str = "default",
     actor: str = "knowledge-import",
 ) -> ImportReport:
-    """导入回复模板（文本流）：同 content_hash 跳过（幂等），新行批量 embed 后落库"""
-    batch_id = uuid.uuid4()
-    rows, blank = _parse_rows(
-        f,
-        tenant_id=tenant_id,
-        brand_id_default=brand_id_default,
-        source_name=source_name,
-        batch_id=batch_id,
-    )
-    # Persist the version reported by the client that produced the vectors.
-    embedding_version = embedder.version
-
-    hashes = [row.content_hash for row in rows]
+    """Import one UTF-8 CSV text stream through the shared typed command."""
     async with get_session_factory()() as session:
-        existing = await existing_content_hashes(
-            session, tenant_id=tenant_id, content_hashes=hashes
-        )
-
-    # Deduplicate within the CSV while preserving the first row.
-    seen: set[str] = set()
-    new_rows: list[KnowledgeDraft] = []
-    skipped = 0
-    for row in rows:
-        if row.content_hash in existing or row.content_hash in seen:
-            skipped += 1
-            continue
-        seen.add(row.content_hash)
-        new_rows.append(row)
-
-    # Embed questions in ordered batches of at most 100.
-    embeddings: list[list[float]] = []
-    for i in range(0, len(new_rows), _EMBED_BATCH_SIZE):
-        batch = new_rows[i : i + _EMBED_BATCH_SIZE]
-        embeddings.extend(await embedder.embed([r.embed_text for r in batch]))
-
-    async with get_session_factory()() as session:
-        for row, embedding in zip(new_rows, embeddings, strict=True):
-            await persist_knowledge_draft(
-                session,
-                row,
-                embedding_version=embedding_version,
-                embedding=embedding,
+        report = await execute_import_knowledge_batch(
+            session,
+            ImportKnowledgeBatchCommand(
+                required_tenant_id=tenant_id,
                 actor=actor,
-            )
+                csv_text=f.read(),
+                source_name=source_name,
+                brand_id_default=brand_id_default,
+            ),
+            embedder=embedder,
+        )
         await session.commit()
-
-    return ImportReport(
-        inserted=len(new_rows),
-        skipped=skipped,
-        blank=blank,
-        total=len(rows) + blank,
-        batch_id=batch_id,
-    )
+        return report
 
 
 async def import_knowledge_csv(

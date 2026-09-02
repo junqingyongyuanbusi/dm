@@ -35,7 +35,6 @@ def test_external_protocol_and_admin_routes_remain_stable() -> None:
         "/admin/integrations/feishu/handoff",
         "/admin/system/health",
         "/admin/system/safety",
-        "/admin/system/users",
     }
     legacy_pages = {
         "/admin/knowledge",
@@ -49,6 +48,7 @@ def test_external_protocol_and_admin_routes_remain_stable() -> None:
     for path in current_pages | legacy_pages:
         assert routes[path] == {"GET"}
     assert routes["/admin/users"] == {"GET", "POST"}
+    assert routes["/admin/system/users"] == {"GET", "POST"}
 
 
 def test_control_api_v1_routes_remain_stable() -> None:
@@ -83,18 +83,51 @@ def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
         "/app/t/{tenant_id}": {"GET"},
         "/app/t/{tenant_id}/agents": {"GET"},
         "/app/t/{tenant_id}/agents/{agent_id}": {"GET"},
+        "/app/t/{tenant_id}/agents/{agent_id}/instructions": {"GET"},
+        "/app/t/{tenant_id}/agents/{agent_id}/instructions/save": {"POST"},
+        "/app/t/{tenant_id}/agents/{agent_id}/instructions/trial": {"POST"},
+        "/app/t/{tenant_id}/agents/{agent_id}/instructions/versions/{version_id}/rollback": {
+            "POST"
+        },
         "/app/t/{tenant_id}/agents/{agent_id}/{section}": {"GET"},
         "/app/t/{tenant_id}/inbox": {"GET"},
+        "/app/t/{tenant_id}/decisions/{decision_id}/approve": {"POST"},
+        "/app/t/{tenant_id}/decisions/{decision_id}/discard": {"POST"},
+        "/app/t/{tenant_id}/delivery/{outbox_id}/retry": {"POST"},
+        "/app/t/{tenant_id}/delivery/{outbox_id}/resolve": {"POST"},
         "/app/t/{tenant_id}/knowledge": {"GET"},
+        "/app/t/{tenant_id}/knowledge/documents": {"POST"},
+        "/app/t/{tenant_id}/knowledge/import": {"POST"},
+        "/app/t/{tenant_id}/knowledge/bulk-confirm-english": {"POST"},
+        "/app/t/{tenant_id}/knowledge/bulk-publish": {"POST"},
         "/app/t/{tenant_id}/knowledge/documents/{document_id}": {"GET"},
+        "/app/t/{tenant_id}/knowledge/documents/{document_id}/confirm-english": {"POST"},
+        "/app/t/{tenant_id}/knowledge/documents/{document_id}/official-contact": {"POST"},
+        "/app/t/{tenant_id}/knowledge/documents/{document_id}/publish": {"POST"},
+        "/app/t/{tenant_id}/knowledge/documents/{document_id}/unpublish": {"POST"},
+        "/app/t/{tenant_id}/knowledge/documents/{document_id}/delete": {"POST"},
         "/app/t/{tenant_id}/audit": {"GET"},
         "/app/t/{tenant_id}/audit/{audit_id}": {"GET"},
         "/app/t/{tenant_id}/journeys": {"GET"},
         "/app/t/{tenant_id}/journeys/{journey_id}": {"GET"},
+        "/app/t/{tenant_id}/health": {"GET"},
         "/app/t/{tenant_id}/settings": {"GET"},
         "/app/t/{tenant_id}/channels": {"GET"},
         "/app/t/{tenant_id}/channels/accounts/{platform}": {"POST"},
+        "/app/t/{tenant_id}/channels/accounts/{account_id}": {"GET"},
+        "/app/t/{tenant_id}/channels/accounts/{account_id}/rename": {"POST"},
+        "/app/t/{tenant_id}/channels/accounts/{account_id}/status": {"POST"},
+        "/app/t/{tenant_id}/channels/accounts/{account_id}/automation": {"POST"},
+        "/app/t/{tenant_id}/channels/accounts/{account_id}/kill-switch": {"POST"},
+        "/app/t/{tenant_id}/channels/accounts/{account_id}/owner": {"POST"},
+        "/app/t/{tenant_id}/channels/accounts/{account_id}/xchat/repair": {"POST"},
         "/app/t/{tenant_id}/channels/jobs/{job_id}": {"GET"},
+        "/app/t/{tenant_id}/channels/jobs/{job_id}/retry": {"POST"},
+        "/app/t/{tenant_id}/channels/feishu/handoff": {"GET"},
+        "/app/t/{tenant_id}/channels/feishu/handoff/config": {"POST"},
+        "/app/t/{tenant_id}/channels/feishu/handoff/operators": {"POST"},
+        "/app/t/{tenant_id}/channels/feishu/handoff/operators/{operator_id}/status": {"POST"},
+        "/app/t/{tenant_id}/channels/feishu/handoff/test": {"POST"},
         "/app/t/{tenant_id}/channels/oauth/x/start": {"POST"},
         "/app/t/{tenant_id}/channels/oauth/meta/start": {"POST"},
         "/app/t/{tenant_id}/channels/oauth/meta/select": {"POST"},
@@ -105,8 +138,14 @@ def test_saas_workspace_and_system_admin_routes_are_mounted() -> None:
     system_pages = {
         "/admin/system/overview": {"GET"},
         "/admin/system/audit": {"GET"},
+        "/admin/system/users": {"GET", "POST"},
+        "/admin/system/users/{user_id}/status": {"POST"},
+        "/admin/system/users/{user_id}/password-reset": {"POST"},
+        "/admin/system/users/{user_id}/sessions/revoke": {"POST"},
         "/help": {"GET"},
     }
 
     for path, methods in (auth_pages | tenant_pages | system_pages).items():
         assert routes[path] == methods
+
+    assert "/admin/system/users/{user_id}/role" not in routes

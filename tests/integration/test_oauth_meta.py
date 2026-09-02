@@ -11,12 +11,18 @@ import pytest
 from sqlalchemy import insert
 
 from apps.api.main import create_app
+from social_reply.application.account_management.jobs import (
+    submit_provisioning_job as persist_provisioning_job,
+)
 from social_reply.application.account_management.meta_credentials import MetaAppCredentials
 from social_reply.application.account_management.oauth import meta
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 pytestmark = pytest.mark.integration
+
+_SUPERADMIN_USERNAME = "admin"
+_SUPERADMIN_PASSWORD = "test-admin-password"
 
 
 def _graph_transport(calls: list[str], pages: list[dict]) -> httpx.MockTransport:
@@ -58,7 +64,11 @@ async def _login(client: httpx.AsyncClient) -> str:
     csrf = client.cookies["reply_admin_csrf"]
     await client.post(
         "/admin/login",
-        data={"csrf_token": csrf, "username": "admin", "password": "test-admin-password"},
+        data={
+            "csrf_token": csrf,
+            "username": _SUPERADMIN_USERNAME,
+            "password": _SUPERADMIN_PASSWORD,
+        },
     )
     return csrf
 
@@ -92,26 +102,81 @@ async def test_meta_oauth_start_rejects_disabled_platform_before_state_storage(
     assert "平台集成已关闭" in response.text
 
 
-async def test_meta_oauth_callback_does_not_consume_state_when_target_is_disabled(
-    migrated_db, monkeypatch
+async def test_meta_non_default_route_404_precedes_disabled_gate(
+    migrated_db,
+    monkeypatch,
 ):
-    settings = meta.get_settings().model_copy(update={"instagram_messaging_enabled": False})
+    settings = meta.get_settings().model_copy(update={"facebook_messenger_enabled": False})
     monkeypatch.setattr(meta, "get_settings", lambda: settings)
 
-    async def pending_state(_namespace, _key):
-        return {"platform": "instagram"}
+    async def unexpected_store(*_args, **_kwargs):
+        raise AssertionError("non-default OAuth must not store state")
 
-    async def unexpected_take(*_args, **_kwargs):
-        raise AssertionError("disabled callback must preserve OAuth state")
+    monkeypatch.setattr(meta, "store_oauth_state", unexpected_store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="http://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(client)
+        response = await client.post(
+            "/app/t/tenant-a/channels/oauth/meta/start",
+            data={"csrf_token": csrf, "platform": "facebook"},
+        )
 
-    monkeypatch.setattr(meta, "peek_oauth_state", pending_state)
-    monkeypatch.setattr(meta, "take_oauth_state", unexpected_take)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "tenant_workspace_not_found"}
+
+
+@pytest.mark.parametrize(
+    ("surface", "expected_first_status"),
+    (("admin", 503), ("channels", 303)),
+)
+async def test_meta_oauth_callback_consumes_disabled_state_once_on_every_surface(
+    migrated_db,
+    monkeypatch,
+    surface: str,
+    expected_first_status: int,
+) -> None:
+    settings = meta.get_settings().model_copy(update={"instagram_messaging_enabled": False})
+    monkeypatch.setattr(meta, "get_settings", lambda: settings)
+    stored_state = {
+        "platform": "instagram",
+        "surface": surface,
+        "tenant_id": "default",
+        "return_to": (
+            "/app/t/default/channels" if surface == "channels" else "/admin/accounts"
+        ),
+    }
+    state_holder = {"value": stored_state}
+    take_calls: list[str] = []
+
+    async def take_state(_namespace, key):
+        take_calls.append(key)
+        state = state_holder["value"]
+        state_holder["value"] = None
+        return state
+
+    monkeypatch.setattr(meta, "take_oauth_state", take_state)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
     ) as client:
-        response = await client.get("/admin/oauth/meta/callback?code=code&state=state-token")
-    assert response.status_code == 503
-    assert "平台集成已关闭" in response.text
+        first = await client.get("/admin/oauth/meta/callback?code=code&state=state-token")
+        replay = await client.get("/admin/oauth/meta/callback?code=code&state=state-token")
+
+    assert first.status_code == expected_first_status
+    if surface == "channels":
+        assert first.headers["location"] == (
+            "/app/t/default/channels?provider=instagram&status=error"
+            "&code=platform_integration_disabled"
+        )
+    else:
+        assert "平台集成已关闭" in first.text
+    assert replay.status_code == 400
+    assert take_calls == ["state-token", "state-token"]
+    for response in (first, replay):
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "no-referrer"
 
 
 @pytest.fixture
@@ -166,25 +231,49 @@ async def _run_start(client: httpx.AsyncClient, csrf: str, platform: str) -> htt
     )
 
 
-async def test_full_facebook_flow_submits_provisioning(session, meta_env):
+async def test_full_facebook_flow_submits_provisioning(session, meta_env, monkeypatch):
     await _seed_meta_app(session)
     meta_env["pages"]["pages"] = [{"id": "page-9", "name": "Acme", "access_token": "PAGE-TOKEN-9"}]
+
+    async def persist_submit(**kwargs):
+        meta_env["submitted"].update(kwargs)
+        job_id = await persist_provisioning_job(**kwargs)
+        meta_env["submitted"]["job_id"] = job_id
+        return job_id
+
+    monkeypatch.setattr(meta, "submit_provisioning_job", persist_submit)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="https://test",
         follow_redirects=False,
     ) as client:
         csrf = await _login(client)
-        start = await _run_start(client, csrf, "facebook")
+        start = await client.post(
+            "/app/t/default/channels/oauth/meta/start",
+            data={
+                "csrf_token": csrf,
+                "platform": "facebook",
+                "brand_id": "brand-m",
+            },
+        )
         assert "pages_messaging" in start.headers["location"]
         assert "pages_manage_engagement" not in start.headers["location"]
         state_token = start.headers["location"].split("state=")[1].split("&")[0]
+        stored_context = await meta.peek_oauth_state("meta", state_token)
+        assert stored_context is not None
+        assert stored_context["surface"] == "channels"
+        assert stored_context["initiator_user_id"] is None
+        restored_principal = await meta.principal_from_oauth_context(stored_context)
+        assert restored_principal is not None
+        assert restored_principal.is_superadmin
         callback = await client.get(
             f"/admin/oauth/meta/callback?code=auth-code-9&state={state_token}"
         )
     assert callback.status_code == 303
-    assert callback.headers["location"] == f"/admin/jobs/{meta_env['job_id']}"
     submitted = meta_env["submitted"]
+    assert callback.headers["location"] == (
+        f"/app/t/default/channels?status=processing&job_id={submitted['job_id']}"
+    )
     assert submitted["platform"] == "facebook"
     assert submitted["tenant_id"] == "default"
     assert submitted["brand_id"] == "brand-m"
@@ -197,6 +286,9 @@ async def test_full_facebook_flow_submits_provisioning(session, meta_env):
     assert submitted["secrets"]["access_token"] == "PAGE-TOKEN-9"
     assert submitted["secrets"]["app_secret"] == "meta-app-secret"
     assert submitted["secrets"]["verify_token"] == "vt-1"
+    job = await session.get(models.ProvisioningJob, submitted["job_id"])
+    assert job is not None
+    assert job.owner_user_id is None
     # 交换链路:短 token → 长 token → me/accounts
     assert sum("access_token" in c for c in meta_env["calls"]) == 2
     assert any(c.endswith("/me/accounts") for c in meta_env["calls"])

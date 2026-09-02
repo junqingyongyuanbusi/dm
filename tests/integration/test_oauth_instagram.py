@@ -5,11 +5,18 @@ import httpx
 import pytest
 
 from apps.api.main import create_app
+from social_reply.application.account_management.jobs import (
+    submit_provisioning_job as persist_provisioning_job,
+)
 from social_reply.application.account_management.meta_credentials import MetaAppCredentials
 from social_reply.application.account_management.oauth import instagram
 from social_reply.connectors.meta.client import appsecret_proof
+from social_reply.infrastructure.database import models
 
 pytestmark = pytest.mark.integration
+
+_SUPERADMIN_USERNAME = "admin"
+_SUPERADMIN_PASSWORD = "test-admin-password"
 
 
 class FakeRedis:
@@ -53,7 +60,11 @@ async def _login(client: httpx.AsyncClient) -> str:
     csrf = client.cookies["reply_admin_csrf"]
     await client.post(
         "/admin/login",
-        data={"csrf_token": csrf, "username": "admin", "password": "test-admin-password"},
+        data={
+            "csrf_token": csrf,
+            "username": _SUPERADMIN_USERNAME,
+            "password": _SUPERADMIN_PASSWORD,
+        },
     )
     return csrf
 
@@ -86,22 +97,55 @@ async def test_instagram_oauth_start_rejects_disabled_platform_before_state_stor
     assert "Instagram 集成已关闭" in response.text
 
 
-async def test_instagram_oauth_callback_does_not_consume_state_when_disabled(
-    migrated_db, monkeypatch
-):
+@pytest.mark.parametrize(
+    ("surface", "expected_first_status"),
+    (("admin", 503), ("channels", 303)),
+)
+async def test_instagram_oauth_callback_consumes_disabled_state_once_on_every_surface(
+    migrated_db,
+    monkeypatch,
+    surface: str,
+    expected_first_status: int,
+) -> None:
     settings = instagram.get_settings().model_copy(update={"instagram_messaging_enabled": False})
     monkeypatch.setattr(instagram, "get_settings", lambda: settings)
+    stored_context = {
+        "provider": "instagram",
+        "surface": surface,
+        "tenant_id": "default",
+        "return_to": (
+            "/app/t/default/channels" if surface == "channels" else "/admin/accounts"
+        ),
+    }
+    context_holder = {"value": stored_context}
+    take_calls: list[str] = []
 
-    async def unexpected_take(*_args, **_kwargs):
-        raise AssertionError("disabled callback must preserve OAuth state")
+    async def take_context(_namespace, key):
+        take_calls.append(key)
+        context = context_holder["value"]
+        context_holder["value"] = None
+        return context
 
-    monkeypatch.setattr(instagram, "take_oauth_state", unexpected_take)
+    monkeypatch.setattr(instagram, "take_oauth_state", take_context)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
     ) as client:
-        response = await client.get("/admin/oauth/instagram/callback?code=code&state=state-token")
-    assert response.status_code == 503
-    assert "Instagram 集成已关闭" in response.text
+        first = await client.get("/admin/oauth/instagram/callback?code=code&state=state-token")
+        replay = await client.get("/admin/oauth/instagram/callback?code=code&state=state-token")
+
+    assert first.status_code == expected_first_status
+    if surface == "channels":
+        assert first.headers["location"] == (
+            "/app/t/default/channels?provider=instagram&status=error"
+            "&code=platform_integration_disabled"
+        )
+    else:
+        assert "Instagram 集成已关闭" in first.text
+    assert replay.status_code == 400
+    assert take_calls == ["state-token", "state-token"]
+    for response in (first, replay):
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "no-referrer"
 
 
 @pytest.fixture
@@ -178,7 +222,18 @@ def instagram_env(monkeypatch):
     return {"calls": calls, "submitted": submitted, "job_id": job_id}
 
 
-async def test_instagram_login_oauth_submits_standalone_account(instagram_env, migrated_db):
+async def test_instagram_login_oauth_submits_standalone_account(
+    instagram_env,
+    session,
+    monkeypatch,
+):
+    async def persist_submit(**kwargs):
+        instagram_env["submitted"].update(kwargs)
+        job_id = await persist_provisioning_job(**kwargs)
+        instagram_env["submitted"]["job_id"] = job_id
+        return job_id
+
+    monkeypatch.setattr(instagram, "submit_provisioning_job", persist_submit)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="https://test",
@@ -186,8 +241,8 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
     ) as client:
         csrf = await _login(client)
         start = await client.post(
-            "/admin/oauth/instagram/start",
-            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-ig"},
+            "/app/t/default/channels/oauth/instagram/start",
+            data={"csrf_token": csrf, "brand_id": "brand-ig"},
         )
         assert start.status_code == 303
         query = parse_qs(urlparse(start.headers["location"]).query)
@@ -201,8 +256,10 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
         )
 
     assert callback.status_code == 303
-    assert callback.headers["location"] == f"/admin/jobs/{instagram_env['job_id']}"
     submitted = instagram_env["submitted"]
+    assert callback.headers["location"] == (
+        f"/app/t/default/channels?status=processing&job_id={submitted['job_id']}"
+    )
     assert submitted["tenant_id"] == "default"
     assert submitted["brand_id"] == "brand-ig"
     assert submitted["platform"] == "instagram"
@@ -219,6 +276,9 @@ async def test_instagram_login_oauth_submits_standalone_account(instagram_env, m
         "app_secret": "ig-app-secret",
         "verify_token": "ig-verify-token",
     }
+    job = await session.get(models.ProvisioningJob, submitted["job_id"])
+    assert job is not None
+    assert job.owner_user_id is None
     assert instagram_env["submitted"]["dispatched"] is True
     assert [request.url.host for request in instagram_env["calls"]] == [
         "api.instagram.com",

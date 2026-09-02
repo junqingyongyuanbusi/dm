@@ -1,3 +1,5 @@
+# ruff: noqa: E501
+
 import html
 import secrets
 import uuid
@@ -5,7 +7,6 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from social_reply.application.account_management.admin import (
     _csrf,
@@ -15,98 +16,158 @@ from social_reply.application.account_management.admin import (
     _secure_cookie,
     _web_principal,
 )
-from social_reply.application.account_management.auth import hash_password
+from social_reply.application.account_management.system_user_management import (
+    SystemUserActor,
+    SystemUserAuthenticationError,
+    SystemUserConflictError,
+    SystemUserManagementError,
+    SystemUserNotFoundError,
+    SystemUserValidationError,
+    create_system_user,
+    force_system_user_password_reset,
+    revoke_system_user_sessions,
+    set_system_user_status,
+)
+from social_reply.application.account_management.ui_i18n import translate
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import DEFAULT_TENANT_ID
 
 router = APIRouter(prefix="/admin", tags=["admin-users"])
 _CSRF_COOKIE = "reply_admin_csrf"
 
 
-def _field(name: str, label: str, *, input_type: str = "text") -> str:
+def _field(
+    name: str,
+    label: str,
+    *,
+    input_type: str = "text",
+    autocomplete: str = "",
+) -> str:
     field_id = f"f-user-{name}-{secrets.token_hex(3)}"
+    autocomplete_attribute = (
+        f' autocomplete="{html.escape(autocomplete, quote=True)}"' if autocomplete else ""
+    )
     return (
         f'<label for="{field_id}">{html.escape(label)}</label>'
-        f'<input id="{field_id}" name="{name}" type="{input_type}" required>'
+        f'<input id="{field_id}" name="{name}" type="{input_type}"'
+        f"{autocomplete_attribute} required>"
     )
 
 
 async def _superadmin(request: Request):
-    principal = await _web_principal(request)
+    principal = await _web_principal(request, require_admin=False)
     if isinstance(principal, Response):
         return principal
-    if not principal.is_superadmin:
-        raise HTTPException(status_code=403, detail="superadmin_required")
+    principal.require_superadmin()
     return principal
 
 
-@router.get("/system/users", response_class=HTMLResponse)
+def _actor(principal) -> SystemUserActor:
+    return SystemUserActor(actor=principal.actor, session_id=principal.session_id)
+
+
+def _management_http_error(exc: SystemUserManagementError) -> HTTPException:
+    if isinstance(exc, SystemUserAuthenticationError):
+        return HTTPException(status_code=401, detail=exc.code)
+    if isinstance(exc, SystemUserValidationError):
+        return HTTPException(status_code=422, detail=exc.code)
+    if isinstance(exc, SystemUserConflictError):
+        return HTTPException(status_code=409, detail=exc.code)
+    if isinstance(exc, SystemUserNotFoundError):
+        return HTTPException(status_code=404, detail=exc.code)
+    return HTTPException(status_code=500, detail="system_user_management_failed")
+
+
+def _reauthentication_field() -> str:
+    return _field(
+        "bootstrap_password",
+        translate("admin.users.bootstrap_password"),
+        input_type="password",
+        autocomplete="current-password",
+    )
+
+
+def _csrf_field(csrf: str) -> str:
+    return f'<input type="hidden" name="csrf_token" value="{html.escape(csrf, quote=True)}">'
+
+
+def _user_actions(user: models.AdminUser, csrf: str) -> str:
+    target_status = "active" if user.status == "disabled" else "disabled"
+    status_form = f"""<form method="post" action="/admin/system/users/{user.id}/status">
+{_csrf_field(csrf)}<input type="hidden" name="status" value="{target_status}">
+{_reauthentication_field()}<button>{html.escape(translate("admin.users.set_status", status=target_status))}</button></form>"""
+    reset_form = f"""<form method="post" action="/admin/system/users/{user.id}/password-reset">
+{_csrf_field(csrf)}{_field("initial_password", translate("admin.users.initial_password"), input_type="password", autocomplete="new-password")}
+{_reauthentication_field()}<button>{html.escape(translate("admin.users.force_password_reset"))}</button></form>"""
+    revoke_form = f"""<form method="post" action="/admin/system/users/{user.id}/sessions/revoke">
+{_csrf_field(csrf)}{_reauthentication_field()}<button>{html.escape(translate("admin.users.revoke_sessions"))}</button></form>"""
+    return f'<details><summary>{html.escape(translate("admin.users.manage"))}</summary>{status_form}{reset_form}{revoke_form}</details>'
+
+
 @router.get("/users", response_class=HTMLResponse)
+async def legacy_users_page(request: Request) -> Response:
+    principal = await _superadmin(request)
+    if isinstance(principal, Response):
+        return principal
+    return RedirectResponse("/admin/system/users", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.get("/system/users", response_class=HTMLResponse)
 async def users_page(request: Request, notice: str = "") -> Response:
     principal = await _superadmin(request)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
-        users = (
+        users = list(
             (
                 await session.execute(
                     select(models.AdminUser)
-                    .where(models.AdminUser.tenant_id.in_(principal.allowed_tenants))
-                    .order_by(models.AdminUser.created_at)
+                    .where(models.AdminUser.tenant_id == DEFAULT_TENANT_ID)
+                    .order_by(models.AdminUser.created_at, models.AdminUser.username)
                 )
-            )
-            .scalars()
-            .all()
+            ).scalars()
         )
-    available = sorted(principal.allowed_tenants)
+
+    csrf = _csrf(request)
+    role_labels = {
+        "USER": translate("admin.users.role.user"),
+    }
     rows = (
         "".join(
             f"<tr><td>{html.escape(user.username)}</td>"
-            f"<td><code>{html.escape(user.tenant_id)}</code></td>"
-            f"<td>{html.escape(user.role)}</td>"
-            f"<td>{'待首次改密' if user.must_change_password else '正常'}</td>"
+            f"<td>{html.escape(role_labels.get(user.role, user.role))}</td>"
             f"<td>{html.escape(user.status)}</td>"
-            f"<td class='muted'>{user.created_at:%Y-%m-%d %H:%M}</td></tr>"
+            f"<td>{html.escape(translate('admin.users.must_change_password') if user.must_change_password else translate('admin.users.normal'))}</td>"
+            f"<td class='muted'>{user.created_at:%Y-%m-%d %H:%M}</td>"
+            f"<td>{_user_actions(user, csrf)}</td></tr>"
             for user in users
         )
-        or "<tr><td colspan='6' class='muted'>暂无用户</td></tr>"
+        or f"<tr><td colspan='6' class='muted'>{translate('admin.users.empty')}</td></tr>"
     )
-    csrf = _csrf(request)
-    tenant_options = "".join(
-        f'<option value="{html.escape(tenant)}">{html.escape(tenant)}</option>'
-        for tenant in available
-    )
-    create_form = (
-        f"""<section class="card"><h2>创建普通用户</h2>
-<p class="hint">用户仅能访问绑定的一个 Tenant，首次登录必须修改初始密码。不发送邮件或邀请。</p>
-<form method="post" action="/admin/users"><input type="hidden" name="csrf_token" value="{csrf}">
-{_field("username", "用户名")}
-{_field("initial_password", "初始密码（12–128 个字符）", input_type="password")}
-<label for="f-user-tenant">Tenant</label>
-<select id="f-user-tenant" name="tenant_id" required>{tenant_options}</select>
-<label for="f-user-role">角色</label>
-<select id="f-user-role" name="role" required>
-<option value="USER" selected>普通用户</option><option value="ADMIN">管理员</option>
-</select>
-<button class="btn-block">创建用户</button></form></section>"""
-        if available
-        else (
-            '<section class="card"><h2>创建普通用户</h2>'
-            '<p class="hint">所有允许的 Tenant 均已分配用户。</p></section>'
-        )
-    )
+    create_form = f"""<section class="card"><h2>{translate("admin.users.create_title")}</h2>
+<p class="hint">{translate("admin.users.default_tenant_hint")}</p>
+<form method="post" action="/admin/system/users">{_csrf_field(csrf)}
+{_field("username", translate("admin.users.username"), autocomplete="username")}
+{_field("initial_password", translate("admin.users.initial_password"), input_type="password", autocomplete="new-password")}
+{_reauthentication_field()}
+<button class="btn-block">{translate("admin.users.create")}</button></form></section>"""
     banner = (
-        '<div class="banner ok">用户已创建。请通过线下安全渠道交付初始密码。</div>'
-        if notice == "created"
+        f'<div class="banner ok">{html.escape(translate("admin.users.operation_completed"))}</div>'
+        if notice
         else ""
     )
-    body = f"""<h1>用户</h1>
-<p class="lede">管理员负责配置系统，普通用户只处理自己授权账号的业务。</p>{banner}
-{create_form}<section class="card"><h2>用户列表</h2><div class="tablewrap"><table>
-<thead><tr><th>用户名</th><th>Tenant</th><th>角色</th><th>密码状态</th><th>账号状态</th><th>创建时间</th></tr></thead>
+    page_title = translate("admin.users.title")
+    body = f"""<h1>{page_title}</h1><p class="lede">{translate("admin.users.description")}</p>{banner}
+<section class="card"><p><strong>Tenant:</strong> <code>{DEFAULT_TENANT_ID}</code></p></section>
+{create_form}<section class="card"><h2>{translate("admin.users.list_title")}</h2><div class="tablewrap"><table>
+<thead><tr><th>{translate("admin.users.username")}</th><th>{translate("admin.users.role")}</th>
+<th>{translate("admin.users.account_status")}</th><th>{translate("admin.users.password_status")}</th>
+<th>{translate("admin.users.created_at")}</th><th>{translate("admin.common.operation")}</th></tr></thead>
 <tbody>{rows}</tbody></table></div></section>"""
-    response = HTMLResponse(_page("用户", body, active="users", show_users=True))
+    response = HTMLResponse(
+        _page(page_title, body, active="users", show_users=True, principal=principal)
+    )
     if not request.cookies.get(_CSRF_COOKIE):
         response.set_cookie(
             _CSRF_COOKIE,
@@ -118,55 +179,90 @@ async def users_page(request: Request, notice: str = "") -> Response:
     return response
 
 
-@router.post("/users")
-async def create_user(request: Request) -> Response:
+async def _management_form(request: Request):
     principal = await _superadmin(request)
     if isinstance(principal, Response):
-        return principal
+        return principal, None
     form = await _form(request)
     _require_csrf(request, form)
-    username = (form.get("username") or "").strip()
-    tenant_id = (form.get("tenant_id") or "").strip()
-    role = (form.get("role") or "USER").strip().upper()
-    password = form.get("initial_password") or ""
-    if not username or len(username) > 128 or any(char.isspace() for char in username):
-        raise HTTPException(status_code=422, detail="invalid_username")
-    if secrets.compare_digest(username, get_settings().admin_username):
-        raise HTTPException(status_code=409, detail="username_conflicts_with_superadmin")
-    principal.require_tenant(tenant_id)
-    if role not in {"ADMIN", "USER"}:
-        raise HTTPException(status_code=422, detail="invalid_user_role")
-    try:
-        password_hash = await hash_password(password)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    user = models.AdminUser(
-        id=uuid.uuid4(),
-        username=username,
-        password_hash=password_hash,
-        tenant_id=tenant_id,
-        role=role,
-        must_change_password=True,
-        status="active",
+    return principal, form
+
+
+def _redirect(notice: str) -> RedirectResponse:
+    return RedirectResponse(
+        f"/admin/system/users?notice={notice}",
+        status_code=status.HTTP_303_SEE_OTHER,
     )
-    async with get_session_factory()() as session:
-        session.add(user)
-        session.add(
-            models.AuditLog(
-                tenant_id=tenant_id,
-                category="user_management",
-                actor=principal.actor,
-                action="CREATE_USER",
-                subject_type="admin_user",
-                subject_id=str(user.id),
-                detail={"username": username, "role": role},
-            )
+
+
+@router.post("/system/users")
+@router.post("/users")
+async def create_user(request: Request) -> Response:
+    principal, form = await _management_form(request)
+    if isinstance(principal, Response):
+        return principal
+    assert form is not None
+    try:
+        await create_system_user(
+            username=form.get("username", ""),
+            initial_password=form.get("initial_password", ""),
+            role=form.get("role", "USER"),
+            bootstrap_password=form.get("bootstrap_password", ""),
+            actor=_actor(principal),
         )
-        try:
-            await session.commit()
-        except IntegrityError as exc:
-            await session.rollback()
-            raise HTTPException(
-                status_code=409, detail="username_already_exists"
-            ) from exc
-    return RedirectResponse("/admin/users?notice=created", status_code=status.HTTP_303_SEE_OTHER)
+    except SystemUserManagementError as exc:
+        raise _management_http_error(exc) from exc
+    return _redirect("created")
+
+
+@router.post("/system/users/{user_id}/status")
+async def change_user_status(request: Request, user_id: uuid.UUID) -> Response:
+    principal, form = await _management_form(request)
+    if isinstance(principal, Response):
+        return principal
+    assert form is not None
+    try:
+        await set_system_user_status(
+            user_id=user_id,
+            user_status=form.get("status", ""),
+            bootstrap_password=form.get("bootstrap_password", ""),
+            actor=_actor(principal),
+        )
+    except SystemUserManagementError as exc:
+        raise _management_http_error(exc) from exc
+    return _redirect("status-updated")
+
+
+@router.post("/system/users/{user_id}/password-reset")
+async def reset_user_password(request: Request, user_id: uuid.UUID) -> Response:
+    principal, form = await _management_form(request)
+    if isinstance(principal, Response):
+        return principal
+    assert form is not None
+    try:
+        await force_system_user_password_reset(
+            user_id=user_id,
+            initial_password=form.get("initial_password", ""),
+            bootstrap_password=form.get("bootstrap_password", ""),
+            actor=_actor(principal),
+        )
+    except SystemUserManagementError as exc:
+        raise _management_http_error(exc) from exc
+    return _redirect("password-reset")
+
+
+@router.post("/system/users/{user_id}/sessions/revoke")
+async def revoke_user_sessions(request: Request, user_id: uuid.UUID) -> Response:
+    principal, form = await _management_form(request)
+    if isinstance(principal, Response):
+        return principal
+    assert form is not None
+    try:
+        await revoke_system_user_sessions(
+            user_id=user_id,
+            bootstrap_password=form.get("bootstrap_password", ""),
+            actor=_actor(principal),
+        )
+    except SystemUserManagementError as exc:
+        raise _management_http_error(exc) from exc
+    return _redirect("sessions-revoked")

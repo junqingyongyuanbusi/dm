@@ -14,7 +14,7 @@ pytestmark = pytest.mark.integration
 
 _PREVIOUS_REVISION = "b9d5e2f7c314"
 _OWNERSHIP_REVISION = "c8f1a4d7e203"
-_HEAD_REVISION = "d4e9a2f6b710"
+_HEAD_REVISION = "f3a7c9e1b5d2"
 
 
 async def test_role_and_account_ownership_migration_enforces_tenant_scope():
@@ -178,5 +178,5 @@ async def test_role_and_account_ownership_migration_enforces_tenant_scope():
         await engine.dispose()
 
         assert revision == _HEAD_REVISION
-        assert roles == ["ADMIN", "ADMIN"]
+        assert roles == ["USER", "USER"]
         assert account_owner is None

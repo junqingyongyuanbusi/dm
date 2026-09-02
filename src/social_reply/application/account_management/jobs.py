@@ -43,6 +43,9 @@ _MAX_ATTEMPTS = 8
 _STALE_AFTER = timedelta(minutes=5)
 _RETRY_DISPLAY_GRACE = timedelta(minutes=2)
 _PLATFORM_DISABLED_STATUS = "PAUSED_PLATFORM_DISABLED"
+_USER_SELF_SERVICE_PLATFORMS = frozenset(
+    {"x", "facebook", "instagram", "telegram", "email"}
+)
 
 
 def _disabled_platform(exc: Exception) -> str | None:
@@ -78,6 +81,22 @@ def _idempotency_key(tenant_id: str, platform: str, request: dict[str, Any]) -> 
 def _safe_request(platform: str, request: dict[str, Any]) -> dict[str, Any]:
     public, _secrets = split_submission(platform, request)
     return public
+
+
+def validate_owner_provisioning_policy(
+    *,
+    platform: str,
+    owner_user_id: uuid.UUID | None,
+    request: dict[str, Any],
+) -> None:
+    if owner_user_id is None:
+        return
+    requested_automation = str(request.get("automation_default") or "BOT_DRAFT_ONLY")
+    if (
+        platform not in _USER_SELF_SERVICE_PLATFORMS
+        or requested_automation != "BOT_DRAFT_ONLY"
+    ):
+        raise ValueError("user_provisioning_policy_rejected")
 
 
 def _validate_email_secrets(secrets: object) -> None:
@@ -389,9 +408,14 @@ def _result_payload(result: AccountConnectionResult) -> dict[str, Any]:
 
 async def _connect(job: models.ProvisioningJob) -> AccountConnectionResult:
     settings = get_settings()
+    request = dict(getattr(job, "request", {}) or {})
+    validate_owner_provisioning_policy(
+        platform=job.platform,
+        owner_user_id=getattr(job, "owner_user_id", None),
+        request=request,
+    )
     if not settings.platform_integration_enabled(job.platform):
         raise ValueError(f"{job.platform}_integration_disabled")
-    request = dict(job.request or {})
     credentials = decrypt_secret_bundle(job.staging_secret)
     common = {
         "public_base_url": settings.public_base_url,
@@ -698,19 +722,33 @@ def provisioning_job_is_in_flight(
     return job.next_attempt_at >= current - _RETRY_DISPLAY_GRACE
 
 
-async def retry_provisioning_job(job_id: uuid.UUID) -> None:
+async def retry_provisioning_job(
+    job_id: uuid.UUID,
+    *,
+    tenant_id: str | None = None,
+    owner_user_id: uuid.UUID | None = None,
+    scope_owner: bool = False,
+    actor: str | None = None,
+) -> None:
     async with get_session_factory()() as session:
-        job = (
-            await session.execute(
-                select(models.ProvisioningJob)
-                .where(models.ProvisioningJob.id == job_id)
-                .with_for_update()
+        statement = select(models.ProvisioningJob).where(
+            models.ProvisioningJob.id == job_id
+        )
+        if tenant_id is not None:
+            statement = statement.where(models.ProvisioningJob.tenant_id == tenant_id)
+        if scope_owner:
+            statement = statement.where(
+                models.ProvisioningJob.owner_user_id == owner_user_id
             )
-        ).scalar_one_or_none()
-        if job is None or job.status not in {"FAILED", "NEEDS_ACTION"}:
+        job = (await session.execute(statement.with_for_update())).scalar_one_or_none()
+        if job is None:
+            raise LookupError("provisioning_job_not_found")
+        if job.status not in {"FAILED", "NEEDS_ACTION"}:
             raise ValueError("provisioning_job_not_retryable")
         if requires_secret_resubmission(job):
             raise ValueError("provisioning_secret_resubmission_required")
+        previous_status = job.status
+        previous_attempt_count = job.attempt_count
         if job.attempt_count >= _MAX_ATTEMPTS:
             job.attempt_count = 0
         job.status = "PENDING"
@@ -718,6 +756,23 @@ async def retry_provisioning_job(job_id: uuid.UUID) -> None:
         job.next_attempt_at = None
         job.last_error_code = None
         job.last_error_message = None
+        if actor is not None:
+            session.add(
+                models.AuditLog(
+                    tenant_id=job.tenant_id,
+                    category="account_management",
+                    actor=actor,
+                    action="RETRY_PROVISIONING_JOB",
+                    subject_type="provisioning_job",
+                    subject_id=str(job.id),
+                    detail={
+                        "platform": job.platform,
+                        "previous_status": previous_status,
+                        "previous_attempt_count": previous_attempt_count,
+                        "status": "PENDING",
+                    },
+                )
+            )
         await session.commit()
 
 
@@ -910,7 +965,9 @@ def public_job(job: models.ProvisioningJob) -> dict[str, Any]:
         "platform_app_id": str(job.platform_app_id) if job.platform_app_id else None,
         "result": _public_result(dict(job.result or {})),
         "last_error_code": job.last_error_code,
-        "last_error_message": job.last_error_message,
+        # Provider diagnostics remain server-side. Each HTTP surface maps the
+        # stable error code to approved operator copy for its audience.
+        "last_error_message": None,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,

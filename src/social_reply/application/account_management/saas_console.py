@@ -1,8 +1,11 @@
+import hashlib
+import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlencode, urlsplit
 
+import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import and_, func, or_, select
@@ -13,19 +16,75 @@ from social_reply.application.account_management.admin import (
     _form,
     _require_csrf,
     _secure_cookie,
-    _submit_form,
+)
+from social_reply.application.account_management.admin_console import (
+    _health_age,
+    _load_health_metrics,
+    _raw_action_condition,
+    _raw_warning_condition,
 )
 from social_reply.application.account_management.auth import Principal, current_principal
+from social_reply.application.account_management.channel_management import (
+    ChannelActor,
+    ChannelConflictError,
+    ChannelManagementError,
+    ChannelNotFoundError,
+    ChannelPermissionError,
+    ChannelValidationError,
+    assign_channel_account_owner,
+    build_provisioning_command,
+    rename_channel_account,
+    repair_channel_xchat,
+    retry_channel_job,
+    set_channel_account_automation,
+    set_channel_account_kill_switch,
+    set_channel_account_status,
+    submit_channel_provisioning,
+)
+from social_reply.application.account_management.feishu_handoff_service import (
+    FeishuHandoffConflict,
+    FeishuHandoffError,
+    FeishuHandoffNotFound,
+    load_feishu_handoff_snapshot,
+    save_feishu_handoff_config,
+    send_feishu_handoff_test_card,
+    set_feishu_handoff_operator_status,
+    upsert_feishu_handoff_operator,
+)
 from social_reply.application.account_management.human_workflow import (
     HumanWorkflowError,
     claim_human_work_item,
     resolve_human_work_item,
     send_human_reply,
 )
-from social_reply.application.account_management.jobs import public_job
+from social_reply.application.account_management.jobs import (
+    provisioning_job_is_in_flight,
+    public_job,
+    requires_secret_resubmission,
+)
 from social_reply.application.account_management.meta_credentials import (
     facebook_app_credentials,
     instagram_app_credentials,
+)
+from social_reply.application.account_management.reply_prompt_policy import (
+    ReplyBusinessPromptConflict,
+    ReplyBusinessPromptScopeError,
+)
+from social_reply.application.account_management.reply_prompt_trial import (
+    ReplyBusinessPromptTrialExecutionError,
+    ReplyBusinessPromptTrialRateLimited,
+    ReplyBusinessPromptTrialResult,
+    ReplyBusinessPromptTrialUnavailable,
+    ReplyBusinessPromptTrialValidationError,
+    run_reply_business_prompt_trial,
+)
+from social_reply.application.account_management.reply_prompt_web import (
+    ReplyBusinessPromptEditorView,
+    RollbackReplyBusinessPromptCommand,
+    SaveReplyBusinessPromptCommand,
+    execute_rollback_reply_business_prompt,
+    execute_save_reply_business_prompt,
+    load_reply_business_prompt_editor_view,
 )
 from social_reply.application.account_management.saas_ui import (
     definition_list,
@@ -41,12 +100,127 @@ from social_reply.application.account_management.saas_ui import (
     status_badge,
     tabs,
 )
+from social_reply.application.account_management.ui_i18n import (
+    reset_request_location,
+    set_request_location,
+    translate,
+)
 from social_reply.application.account_management.x_app import x_app_credentials
+from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.application.knowledge.commands import (
+    ConfirmKnowledgeEnglishBatchCommand,
+    ConfirmKnowledgeEnglishCommand,
+    CreateKnowledgeDocumentCommand,
+    DeleteKnowledgeDraftCommand,
+    ImportKnowledgeBatchCommand,
+    KnowledgeApplicationError,
+    KnowledgeConflictError,
+    KnowledgeNotFoundError,
+    SetKnowledgeOfficialContactCommand,
+    execute_confirm_knowledge_english,
+    execute_confirm_knowledge_english_batch,
+    execute_create_knowledge_document,
+    execute_delete_knowledge_draft,
+    execute_import_knowledge_batch,
+    execute_set_knowledge_official_contact,
+)
+from social_reply.application.knowledge.publication import (
+    BulkPublishKnowledgeCommand,
+    PublishKnowledgeCommand,
+    UnpublishKnowledgeCommand,
+    execute_bulk_publish_knowledge,
+    execute_publish_knowledge,
+    execute_unpublish_knowledge,
+)
+from social_reply.application.knowledge.queries import (
+    GetKnowledgeDocumentQuery,
+    ListKnowledgeDocumentsQuery,
+    SearchPublishedKnowledgeQuery,
+    execute_get_knowledge_document,
+    execute_list_knowledge_documents,
+    execute_search_published_knowledge,
+    knowledge_review_condition,
+    load_knowledge_filter_values,
+)
+from social_reply.application.knowledge.upload import (
+    MAX_KNOWLEDGE_UPLOAD_BYTES,
+    decode_knowledge_csv_upload,
+    parse_protected_values,
+)
+from social_reply.application.message_delivery.recovery import (
+    DeliveryRecoveryConflict,
+    DeliveryRecoveryNotFound,
+    DeliveryRecoveryValidationError,
+    resolve_needs_review_outbox,
+    retry_failed_outbox,
+)
+from social_reply.application.reply_review.queries import reviewable_draft_condition
+from social_reply.application.reply_review.service import (
+    DraftReviewConflict,
+    DraftReviewNotFound,
+    DraftReviewValidationError,
+)
+from social_reply.application.reply_review.service import (
+    approve_draft as approve_draft_review,
+)
+from social_reply.application.reply_review.service import (
+    reject_draft as reject_draft_review,
+)
+from social_reply.domain.reply.business_prompt import (
+    BUSINESS_PROMPT_CHANGE_NOTE_MAX_CHARS,
+    BUSINESS_PROMPT_MAX_CHARS,
+    BusinessPromptValidationError,
+)
+from social_reply.domain.reply.guard import has_contact_like
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.shared.config import get_settings
+from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
 router = APIRouter(tags=["saas-console"])
+logger = logging.getLogger(__name__)
+
+SYSTEM_AUDIT_CATEGORIES = frozenset(
+    {
+        "authentication",
+        "session_management",
+        "user_management",
+        "role_change",
+        "global_safety",
+        "security_configuration",
+    }
+)
+_SYSTEM_AUDIT_CATEGORY_ALIASES = {
+    "admin_auth": "authentication",
+}
+_SYSTEM_AUDIT_SUBJECT_TYPES = frozenset(
+    {"admin_user", "admin_session", "bootstrap_admin", "tenant", "system_security"}
+)
+_SYSTEM_AUDIT_SECRET_KEY_PARTS = (
+    "password",
+    "secret",
+    "token",
+    "hash",
+    "credential",
+    "private_key",
+)
+_SYSTEM_AUDIT_SAFE_DETAIL_KEYS = frozenset(
+    {
+        "username",
+        "role",
+        "previous_role",
+        "status",
+        "previous_status",
+        "first_login",
+        "must_change_password",
+        "sessions_revoked",
+        "revoked_session_count",
+        "enabled",
+        "previous_enabled",
+        "attempted_enabled",
+        "outcome",
+        "error_code",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +250,12 @@ class InboxItem:
     reason: str
     created_at: datetime
     work_item_version: int | None = None
+    draft_text: str | None = None
+    decision_generation: int | None = None
+    review_action: str | None = None
+    expected_status: str | None = None
+    expected_attempt_count: int | None = None
+    delivery_error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +293,8 @@ async def _require_tenant_principal(
     principal = await _require_web_principal(request)
     if isinstance(principal, Response):
         return principal
+    if tenant_id != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
     return principal
 
@@ -124,7 +306,7 @@ async def _require_tenant_admin_principal(
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
-    principal.require_admin()
+    principal.require_tenant_admin()
     return principal
 
 
@@ -157,12 +339,7 @@ async def _load_inbox_summary(
     )
     draft_condition = and_(
         models.ReplyDecision.tenant_id == tenant_id,
-        models.ReplyDecision.action == "draft",
-        or_(
-            models.ReplyDecision.review_action.is_(None),
-            models.ReplyDecision.review_action == "PENDING",
-        ),
-        models.ReplyDecision.review_outbox_id.is_(None),
+        reviewable_draft_condition(),
     )
     delivery_condition = and_(
         models.OutboxMessage.tenant_id == tenant_id,
@@ -239,6 +416,8 @@ async def _load_agent_ids(
             )
         ).scalars()
     )
+    if not principal.is_admin:
+        return sorted(account_brands) if account_brands else [DEFAULT_TENANT_ID]
     prompt_brands = set(
         (
             await session.execute(
@@ -257,12 +436,12 @@ async def _load_agent_ids(
             )
         ).scalars()
     )
-    return sorted(account_brands | prompt_brands | knowledge_brands | {"default"})
+    return sorted(account_brands | prompt_brands | knowledge_brands | {DEFAULT_TENANT_ID})
 
 
 def _display_agent_name(agent_id: str) -> str:
     if agent_id == "default":
-        return "默认客户支持 Agent"
+        return translate("agent.default_name")
     normalized = agent_id.replace("_", " ").replace("-", " ").strip()
     return f"{normalized.title()} Agent"
 
@@ -278,6 +457,7 @@ def _render_page(
     inbox_count: int,
     primary_action_html: str = "",
     breadcrumbs: tuple[tuple[str, str | None], ...] = (),
+    workbench: bool = False,
 ) -> HTMLResponse:
     return HTMLResponse(
         render_saas_page(
@@ -290,6 +470,7 @@ def _render_page(
             primary_action_html=primary_action_html,
             breadcrumbs=breadcrumbs,
             inbox_count=inbox_count,
+            workbench=workbench,
         )
     )
 
@@ -299,34 +480,18 @@ async def tenant_selector(request: Request) -> Response:
     principal = await _require_web_principal(request)
     if isinstance(principal, Response):
         return principal
-    tenants = sorted(principal.allowed_tenants)
-    if len(tenants) == 1:
-        return RedirectResponse(
-            _tenant_root(tenants[0]),
-            status_code=status.HTTP_303_SEE_OTHER,
-        )
-    tenant_cards = "".join(
-        '<a class="saas-card saas-agent-card" '
-        f'href="{escape(_tenant_root(tenant_id))}">'
-        f"<div><h2>{escape(tenant_id)}</h2>"
-        '<p class="saas-muted">进入租户工作区，查看 Agent、知识、收件箱和运行链路。</p>'
-        '</div><span class="saas-button">打开工作区 →</span></a>'
-        for tenant_id in tenants
+    target_tenant = (
+        principal.tenant_id
+        if principal.tenant_id in principal.allowed_tenants
+        else min(principal.allowed_tenants, default="")
     )
-    body = (
-        f'<div class="saas-grid two">{tenant_cards}</div>'
-        if tenant_cards
-        else empty_state("没有可访问的 Tenant", "请联系系统管理员分配工作区权限。")
-    )
-    return HTMLResponse(
-        render_saas_page(
-            principal=principal,
-            title="选择 Tenant",
-            description="选择本次要进入的租户工作区。跨租户系统操作仍在系统后台完成。",
-            body=body,
-            active_navigation="home",
-            tenant_id=None,
-        )
+    if not target_tenant:
+        raise HTTPException(status_code=403, detail="tenant_access_denied")
+    if target_tenant != DEFAULT_TENANT_ID:
+        raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
+    return RedirectResponse(
+        _tenant_root(target_tenant),
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
@@ -403,57 +568,81 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
             (
                 metric_card(
                     inbox_summary.human_count,
-                    "待人工",
-                    detail=f"最老等待 {format_age(inbox_summary.oldest_human_at)}",
+                    translate("home.metric.human"),
+                    detail=translate(
+                        "home.oldest_wait",
+                        age=format_age(inbox_summary.oldest_human_at),
+                    ),
                 ),
                 metric_card(
                     inbox_summary.draft_count,
-                    "待审核草稿",
-                    detail=f"最老等待 {format_age(inbox_summary.oldest_draft_at)}",
+                    translate("home.metric.drafts"),
+                    detail=translate(
+                        "home.oldest_wait",
+                        age=format_age(inbox_summary.oldest_draft_at),
+                    ),
                 ),
                 metric_card(
                     inbox_summary.delivery_count,
-                    "投递异常",
-                    detail=f"最老等待 {format_age(inbox_summary.oldest_delivery_at)}",
+                    translate("home.metric.delivery"),
+                    detail=translate(
+                        "home.oldest_wait",
+                        age=format_age(inbox_summary.oldest_delivery_at),
+                    ),
                 ),
             )
         )
-        attention_description = "按人工、草稿和投递风险汇总当前工作。"
+        attention_description = translate("home.attention_admin_description")
     else:
         attention_cards = "".join(
             (
                 metric_card(
                     int(account_count or 0),
-                    "我的授权账号",
-                    detail=f"{int(active_account_count or 0)} 个当前可用",
+                    translate("home.metric.my_accounts"),
+                    detail=translate(
+                        "home.accounts_available",
+                        count=int(active_account_count or 0),
+                    ),
                 ),
                 metric_card(
                     inbox_summary.human_count,
-                    "待人工",
-                    detail=f"最老等待 {format_age(inbox_summary.oldest_human_at)}",
+                    translate("home.metric.human"),
+                    detail=translate(
+                        "home.oldest_wait",
+                        age=format_age(inbox_summary.oldest_human_at),
+                    ),
                 ),
                 metric_card(
                     int(message_count or 0),
-                    "今日消息",
-                    detail="仅统计我的账号",
+                    translate("home.metric.today_messages"),
+                    detail=translate("home.own_accounts_only"),
                 ),
             )
         )
-        attention_description = "只汇总归属于你的账号、消息和人工工作。"
+        attention_description = translate("home.attention_user_description")
     readiness_rows = "".join(
         (
-            _progress_row(True, f"已识别 {len(agent_ids)} 个 Agent 作用域"),
+            _progress_row(
+                True,
+                translate("home.agent_scope_count", count=len(agent_ids)),
+            ),
             _progress_row(
                 bool(published_knowledge_count),
-                f"{int(published_knowledge_count or 0)} 条知识已发布",
+                translate(
+                    "home.knowledge_published_count",
+                    count=int(published_knowledge_count or 0),
+                ),
             ),
             _progress_row(
-                int(active_account_count or 0) == int(account_count or 0)
-                and bool(account_count),
-                f"{int(active_account_count or 0)}/{int(account_count or 0)} 个渠道账号可用",
+                int(active_account_count or 0) == int(account_count or 0) and bool(account_count),
+                translate(
+                    "home.channel_availability",
+                    active=int(active_account_count or 0),
+                    total=int(account_count or 0),
+                ),
                 warning=bool(account_count),
             ),
-            _progress_row(True, "发送仍经过 kill switch、Final Guard 与 Outbox"),
+            _progress_row(True, translate("home.safety_path")),
         )
     )
     audit_rows = "".join(
@@ -464,36 +653,43 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
     )
     recent_activity = (
         '<div class="saas-table-wrap"><table class="saas-table">'
-        '<thead><tr><th>时间</th><th>Actor</th><th>动作</th><th>资源</th></tr></thead>'
+        f"<thead><tr><th>{escape(translate('common.time'))}</th><th>Actor</th>"
+        f"<th>{escape(translate('common.action'))}</th>"
+        f"<th>{escape(translate('common.resource'))}</th></tr></thead>"
         f"<tbody>{audit_rows}</tbody></table></div>"
         if audit_rows
-        else empty_state("暂无最近活动", "配置、审核和人工操作将在这里形成可追溯记录。")
+        else empty_state(
+            translate("home.empty_activity_title"),
+            translate("home.empty_activity_description"),
+        )
     )
     body = f"""{next_action}
-<div class="saas-section-title"><div><h2>需要关注</h2>
+<div class="saas-section-title"><div><h2>{escape(translate("home.attention_title"))}</h2>
 <p>{escape(attention_description)}</p></div></div>
 <div class="saas-grid three">{attention_cards}</div>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("home.readiness_title"))}</h2>
+<p>{escape(translate("home.readiness_description"))}</p></div>
+{secondary_action(f"{_tenant_root(tenant_id)}/agents", translate("home.view_agents"), small=True)}</div>
+<div class="saas-card-body"><ul class="saas-progress-list">{readiness_rows}</ul></div></section>
+<div class="saas-section-title"><div><h2>{escape(translate("home.today_overview"))}</h2>
+<p>{escape(translate("home.today_overview_description"))}</p></div></div>
 <div class="saas-grid two">
-  <section class="saas-card"><div class="saas-card-header"><div><h2>工作区就绪度</h2>
-  <p>Agent 能力仍受现有安全链路约束。</p></div>
-  {secondary_action(f'{_tenant_root(tenant_id)}/agents', '查看 Agents', small=True)}</div>
-  <div class="saas-card-body"><ul class="saas-progress-list">{readiness_rows}</ul></div></section>
-  <section class="saas-card"><div class="saas-card-header"><div><h2>今日概览</h2>
-  <p>只展示帮助判断下一步的基础数据。</p></div></div>
-  <div class="saas-card-body"><div class="saas-grid two" style="margin-top:0">
-  {metric_card(int(message_count or 0), '今日消息')}
-  {metric_card(int(published_knowledge_count or 0), '已发布知识')}
-  </div></div></section>
+{metric_card(int(message_count or 0), translate("home.metric.today_messages"))}
+{metric_card(int(published_knowledge_count or 0), translate("home.metric.published_knowledge"))}
 </div>
-<div class="saas-section-title"><div><h2>最近活动</h2>
-<p>配置、审核与状态变更的审计摘要。</p></div>
-{secondary_action(f'{_tenant_root(tenant_id)}/audit' if principal.is_admin else f'{_tenant_root(tenant_id)}/activity', '查看全部', small=True)}</div>
+<div class="saas-section-title"><div><h2>{escape(translate("home.recent_activity"))}</h2>
+<p>{escape(translate("home.recent_activity_description"))}</p></div>
+{secondary_action(f"{_tenant_root(tenant_id)}/audit" if principal.is_admin else f"{_tenant_root(tenant_id)}/activity", translate("home.view_all"), small=True)}</div>
 {recent_activity}"""
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="首页",
-        description=f"{tenant_id} 工作区当前有 {inbox_summary.total} 项需要处理。",
+        title=translate("home.title"),
+        description=translate(
+            "home.description",
+            tenant_id=tenant_id,
+            count=inbox_summary.total,
+        ),
         body=body,
         active_navigation="home",
         inbox_count=inbox_summary.total,
@@ -508,49 +704,51 @@ def _home_next_action(
 ) -> str:
     inbox_href = f"{_tenant_root(tenant_id)}/inbox"
     if summary.delivery_count:
-        title = "先核实最老的投递异常"
-        description = (
-            f"共有 {summary.delivery_count} 条异常，最老已等待 "
-            f"{format_age(summary.oldest_delivery_at)}。结果不确定的发送不会直接重试。"
+        title = translate("next.delivery_title")
+        description = translate(
+            "next.delivery_description",
+            count=summary.delivery_count,
+            age=format_age(summary.oldest_delivery_at),
         )
         href = f"{inbox_href}?queue=delivery"
-        action_label = "查看投递异常"
+        action_label = translate("next.delivery_action")
     elif summary.human_count:
-        title = "处理最老的人工工作项"
-        description = (
-            f"共有 {summary.human_count} 项等待人工，最老已等待 "
-            f"{format_age(summary.oldest_human_at)}。"
+        title = translate("next.human_title")
+        description = translate(
+            "next.human_description",
+            count=summary.human_count,
+            age=format_age(summary.oldest_human_at),
         )
         href = f"{inbox_href}?queue=human"
-        action_label = "打开并处理"
+        action_label = translate("next.human_action")
     elif summary.draft_count:
-        title = "审核最老的 AI 草稿"
-        description = (
-            f"共有 {summary.draft_count} 条草稿待审核，最老已等待 "
-            f"{format_age(summary.oldest_draft_at)}。"
+        title = translate("next.draft_title")
+        description = translate(
+            "next.draft_description",
+            count=summary.draft_count,
+            age=format_age(summary.oldest_draft_at),
         )
         href = f"{inbox_href}?queue=drafts"
-        action_label = "开始审核"
+        action_label = translate("next.draft_action")
     elif not account_count:
         if principal.is_admin:
-            title = "完成第一个 Agent 的渠道配置"
-            description = "当前没有平台账号。连接渠道后，Agent 才能开始接收消息。"
+            title = translate("next.admin_account_title")
+            description = translate("next.admin_account_description")
             href = f"{_tenant_root(tenant_id)}/agents/default/channels"
-            action_label = "继续设置"
+            action_label = translate("next.admin_account_action")
         else:
-            title = "授权你的第一个平台账号"
-            description = (
-                "连接 Telegram Bot 或 Email 后，你就能在工作区查看并处理该账号的对话。"
-            )
+            title = translate("next.user_account_title")
+            description = translate("next.user_account_description")
             href = f"{_tenant_root(tenant_id)}/channels"
-            action_label = "授权新账号"
+            action_label = translate("next.user_account_action")
     else:
-        title = "当前没有紧急工作"
-        description = "建议检查 Agent 运行状态和最近配置变更。"
+        title = translate("next.clear_title")
+        description = translate("next.clear_description")
         href = f"{_tenant_root(tenant_id)}/agents"
-        action_label = "查看 Agents"
+        action_label = translate("next.clear_action")
     return (
-        '<section class="saas-next-action"><div><div class="saas-eyebrow">下一步</div>'
+        '<section class="saas-next-action"><div><div class="saas-eyebrow">'
+        f"{escape(translate('next.eyebrow'))}</div>"
         f"<h2>{escape(title)}</h2><p>{escape(description)}</p></div>"
         f"{primary_action(href, action_label)}</section>"
     )
@@ -619,20 +817,23 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
             )
     body = (
         '<div class="saas-filter-bar"><span class="saas-status neutral">'
-        f"全部 {len(agent_ids)}</span><span class=\"saas-muted\">"
-        "Agent 当前按 Tenant + Brand 作用域聚合。</span></div>"
+        f"{escape(translate('agent.list_summary', count=len(agent_ids)))}</span>"
+        f'<span class="saas-muted">{escape(translate("agent.list_scope_description"))}</span></div>'
         f'<div class="saas-grid">{"".join(cards)}</div>'
     )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="Agents",
-        description="集中查看每个业务 Agent 的指令、模型、渠道、知识和运行状态。",
+        title=translate("nav.agents"),
+        description=translate("agent.list_description"),
         body=body,
         active_navigation="agents",
         inbox_count=inbox_summary.total,
         primary_action_html=(
-            primary_action("/admin/content/reply-prompt", "配置新作用域")
+            primary_action(
+                f"{_agent_root(tenant_id, DEFAULT_TENANT_ID)}/instructions",
+                translate("agent.configure_scope"),
+            )
             if principal.is_admin
             else ""
         ),
@@ -652,29 +853,33 @@ def _render_agent_card(
     if not accounts:
         automation_mode = "unconfigured"
         status = "unconfigured"
-        next_step = "连接第一个渠道账号"
+        next_step = translate("agent.connect_first_channel")
     elif len(modes) > 1:
         automation_mode = "mixed"
         status = "degraded"
-        next_step = "统一或确认账号自动化模式"
+        next_step = translate("agent.confirm_automation_mode")
     else:
         automation_mode = next(iter(modes))
         status = "healthy" if len(active_accounts) == len(accounts) else "degraded"
         next_step = (
-            "检查不可用的渠道账号"
+            translate("agent.check_unavailable_channels")
             if status == "degraded"
-            else "检查最近运行活动"
+            else translate("agent.check_recent_activity")
         )
-    prompt_text = f"业务指令 v{prompt.revision}" if prompt else "使用代码默认业务指令"
+    prompt_text = (
+        translate("agent.prompt_version", revision=prompt.revision)
+        if prompt
+        else translate("agent.default_prompt")
+    )
     return f"""<section class="saas-card saas-agent-card">
 <div><div style="display:flex;align-items:center;gap:10px"><h2>{escape(_display_agent_name(agent_id))}</h2>
 {status_badge(status)}</div>
-<p class="saas-muted">作用域 <span class="saas-mono">{escape(agent_id)}</span> · {escape(prompt_text)}</p>
-<div class="saas-agent-meta"><span>模式：{status_badge(automation_mode)}</span>
-<span>渠道：{len(active_accounts)}/{len(accounts)} 可用</span>
-<span>知识：{published_count} 条已发布</span></div>
-<p><strong>下一步：</strong>{escape(next_step)}</p></div>
-<div>{secondary_action(f'{_agent_root(tenant_id, agent_id)}/overview', '打开 Agent →')}</div>
+<p class="saas-muted">{escape(translate("agent.scope"))} <span class="saas-mono">{escape(agent_id)}</span> · {escape(prompt_text)}</p>
+<div class="saas-agent-meta"><span>{escape(translate("agent.mode"))}{status_badge(automation_mode)}</span>
+<span>{escape(translate("agent.channels_available", active=len(active_accounts), total=len(accounts)))}</span>
+<span>{escape(translate("agent.knowledge_published", count=published_count))}</span></div>
+<p><strong>{escape(translate("agent.next_step"))}</strong>{escape(next_step)}</p></div>
+<div>{secondary_action(f"{_agent_root(tenant_id, agent_id)}/overview", translate("agent.open"))}</div>
 </section>"""
 
 
@@ -688,12 +893,783 @@ _AGENT_SECTIONS = {
     "activity",
 }
 
+_PROMPT_NOTICE_KEYS = {
+    "saved": ("success", "admin.prompt.banner.saved"),
+    "rolled_back": ("success", "admin.prompt.banner.rolled_back"),
+    "revision_conflict": ("danger", "admin.prompt.banner.revision_conflict"),
+    "prompt_invalid": ("danger", "admin.prompt.banner.prompt_invalid"),
+}
+
+
+def _agent_section_tabs(tenant_id: str, agent_id: str, section: str) -> str:
+    agent_base = _agent_root(tenant_id, agent_id)
+    return tabs(
+        (
+            ("overview", f"{agent_base}/overview", translate("agent.tab.overview")),
+            (
+                "instructions",
+                f"{agent_base}/instructions",
+                translate("agent.tab.instructions"),
+            ),
+            ("model", f"{agent_base}/model", translate("agent.tab.model")),
+            ("channels", f"{agent_base}/channels", translate("agent.tab.channels")),
+            (
+                "knowledge",
+                f"{agent_base}/knowledge",
+                translate("agent.tab.knowledge"),
+            ),
+            ("flow", f"{agent_base}/flow", translate("agent.tab.flow")),
+            ("activity", f"{agent_base}/activity", translate("agent.tab.activity")),
+        ),
+        section,
+    )
+
+
+def _prompt_expected_revision(form: dict[str, str]) -> int:
+    try:
+        expected_revision = int(form.get("expected_revision", ""))
+    except ValueError as exc:
+        raise ReplyBusinessPromptConflict("reply_business_prompt_revision_conflict") from exc
+    if expected_revision < 0:
+        raise ReplyBusinessPromptConflict("reply_business_prompt_revision_conflict")
+    return expected_revision
+
+
+def _prompt_canonical_location(
+    tenant_id: str,
+    agent_id: str,
+    *,
+    notice: str = "",
+) -> str:
+    location = f"{_agent_root(tenant_id, agent_id)}/instructions"
+    if notice:
+        return f"{location}?{urlencode({'notice': notice})}"
+    return location
+
+
+def _render_user_agent_behavior_summary(
+    *,
+    accounts: list[models.PlatformAccount],
+    published_knowledge_count: int,
+) -> str:
+    automation_modes = {account.automation_default for account in accounts}
+    if not automation_modes:
+        automation_summary = translate("agent.instructions.summary.unconfigured")
+    elif automation_modes == {"BOT_DRAFT_ONLY"}:
+        automation_summary = translate("agent.instructions.summary.draft_only")
+    elif automation_modes == {"BOT_ACTIVE"}:
+        automation_summary = translate("agent.instructions.summary.active")
+    else:
+        automation_summary = translate("agent.instructions.summary.mixed")
+    fact_source_summary = translate(
+        "agent.instructions.summary.fact_source",
+        count=published_knowledge_count,
+    )
+    return f"""<div class="saas-grid three" style="margin-top:0">
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.instructions.summary.mode_title"))}</h2></div></div>
+<div class="saas-card-body"><p>{escape(automation_summary)}</p></div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.instructions.summary.fact_title"))}</h2></div></div>
+<div class="saas-card-body"><p>{escape(fact_source_summary)}</p></div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.instructions.summary.handoff_title"))}</h2></div></div>
+<div class="saas-card-body"><p>{escape(translate("agent.instructions.summary.handoff"))}</p></div></section>
+</div><section class="saas-alert" style="margin-top:18px">{escape(translate("agent.instructions.summary.read_only"))}</section>"""
+
+
+def _render_reply_prompt_trial_result(
+    result: ReplyBusinessPromptTrialResult | None,
+    *,
+    trial_failed: bool,
+) -> str:
+    if trial_failed:
+        return (
+            '<section class="saas-alert danger" style="margin-top:16px">'
+            f"{escape(translate('admin.prompt.trial_failed'))}</section>"
+        )
+    if result is None:
+        return ""
+    metadata = definition_list(
+        (
+            (translate("common.action"), result.action),
+            (translate("admin.overview.intent"), result.intent or "—"),
+            (translate("admin.prompt.risk"), result.risk_level),
+            (translate("admin.conversation.confidence"), f"{result.confidence:.2f}"),
+            (
+                translate("admin.prompt.reason_codes"),
+                ", ".join(result.reason_codes) or "—",
+            ),
+            (translate("agent.instructions.trial.duration"), f"{result.duration_ms} ms"),
+        )
+    )
+    reply_html = (
+        f'<div class="saas-alert" style="margin-top:12px">{escape(result.reply_text)}</div>'
+        if result.reply_text
+        else f'<p class="saas-muted">{escape(translate("admin.prompt.trial_no_reply"))}</p>'
+    )
+    return (
+        '<section class="saas-alert" style="margin-top:16px">'
+        f"{escape(translate('admin.prompt.trial_result_notice'))}</section>"
+        f"{metadata}{reply_html}"
+    )
+
+
+def _render_admin_reply_prompt_editor(
+    editor_view: ReplyBusinessPromptEditorView,
+    *,
+    csrf_token: str,
+    notice: str = "",
+    trial_result: ReplyBusinessPromptTrialResult | None = None,
+    trial_failed: bool = False,
+) -> str:
+    canonical_root = f"{_agent_root(editor_view.tenant_id, editor_view.brand_id)}/instructions"
+    notice_html = ""
+    notice_presentation = _PROMPT_NOTICE_KEYS.get(notice)
+    if notice_presentation is not None:
+        tone, message_key = notice_presentation
+        notice_html = (
+            f'<section class="saas-alert {tone}">{escape(translate(message_key))}</section>'
+        )
+    feature_enabled = get_settings().reply_business_prompt_enabled
+    feature_status = (
+        translate("admin.prompt.feature_enabled")
+        if feature_enabled
+        else translate("admin.prompt.feature_disabled")
+    )
+    metadata = definition_list(
+        (
+            ("Tenant", editor_view.tenant_id),
+            ("Brand / Agent", editor_view.brand_id),
+            (translate("agent.instructions.active_version"), editor_view.current_revision),
+            (translate("agent.instructions.content_hash"), editor_view.content_hash),
+            (translate("agent.instructions.last_updated"), format_datetime(editor_view.updated_at)),
+            (translate("agent.instructions.updated_by"), editor_view.updated_by),
+        )
+    )
+    version_rows: list[str] = []
+    for version in editor_view.versions:
+        active_badge = (
+            status_badge("active", label=translate("admin.common.current"))
+            if version.is_active
+            else ""
+        )
+        rollback_form = ""
+        if not version.is_active:
+            rollback_form = f"""<form method="post" action="{escape(canonical_root)}/versions/{version.id}/rollback">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<input type="hidden" name="expected_revision" value="{editor_view.current_revision}">
+<button class="saas-button small" type="submit">{escape(translate("admin.prompt.restore_version"))}</button></form>"""
+        version_rows.append(
+            f"<tr><td>r{version.revision} {active_badge}</td>"
+            f"<td><details><summary>{escape(translate('admin.prompt.view_content'))}</summary>"
+            f"<pre>{escape(version.content)}</pre></details></td>"
+            f"<td>{escape(version.change_note or '—')}</td>"
+            f'<td>{escape(version.created_by)}<br><span class="saas-muted">'
+            f"{escape(format_datetime(version.created_at, include_year=True))} · "
+            f"{escape(version.content_hash)}</span></td><td>{rollback_form}</td></tr>"
+        )
+    version_history = "".join(version_rows) or (
+        f'<tr><td colspan="5" class="saas-muted">'
+        f"{escape(translate('admin.prompt.no_versions'))}</td></tr>"
+    )
+    return f"""{notice_html}
+<section class="saas-alert {"success" if feature_enabled else "warning"}">{escape(feature_status)}</section>
+<div class="saas-grid two">
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("admin.prompt.current_prompt"))}</h2>
+<p>{escape(translate("admin.prompt.edit_hint", count=BUSINESS_PROMPT_MAX_CHARS))}</p></div></div>
+<div class="saas-card-body"><form method="post" action="{escape(canonical_root)}/save">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<input type="hidden" name="expected_revision" value="{editor_view.current_revision}">
+<label class="saas-field"><span>{escape(translate("admin.prompt.instructions"))}</span>
+<textarea name="content" maxlength="{BUSINESS_PROMPT_MAX_CHARS}" required style="min-height:300px">{escape(editor_view.current_content)}</textarea></label>
+<label class="saas-field"><span>{escape(translate("admin.prompt.change_note"))}</span>
+<input name="change_note" maxlength="{BUSINESS_PROMPT_CHANGE_NOTE_MAX_CHARS}" placeholder="{escape(translate("admin.prompt.change_note_placeholder"))}"></label>
+<button class="saas-button primary" type="submit">{escape(translate("admin.prompt.save_version"))}</button></form></div></section>
+<aside class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.instructions.security_metadata"))}</h2></div></div>
+<div class="saas-card-body">{metadata}<div class="saas-alert warning" style="margin-top:16px">{escape(translate("agent.instructions.safety_notice"))}</div></div></aside>
+</div>
+<section class="saas-card" id="prompt-trial"><div class="saas-card-header"><div><h2>{escape(translate("admin.prompt.trial"))}</h2>
+<p>{escape(translate("admin.prompt.trial_hint"))}</p></div></div><div class="saas-card-body">
+<form method="post" action="{escape(canonical_root)}/trial">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<label class="saas-field"><span>{escape(translate("admin.prompt.test_message"))}</span>
+<textarea name="text" maxlength="4000" required></textarea></label>
+<button class="saas-button primary" type="submit">{escape(translate("admin.prompt.trial"))}</button></form>
+{_render_reply_prompt_trial_result(trial_result, trial_failed=trial_failed)}</div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("admin.prompt.version_history"))}</h2>
+<p>{escape(translate("admin.prompt.version_history_hint"))}</p></div></div><div class="saas-table-wrap"><table class="saas-table"><thead><tr>
+<th>{escape(translate("admin.prompt.version"))}</th><th>{escape(translate("admin.common.content"))}</th><th>{escape(translate("admin.prompt.note"))}</th><th>{escape(translate("admin.prompt.audit"))}</th><th>{escape(translate("admin.common.operation"))}</th>
+</tr></thead><tbody>{version_history}</tbody></table></div></section>"""
+
+
+async def _agent_instructions_page_response(
+    request: Request,
+    principal: Principal,
+    *,
+    tenant_id: str,
+    agent_id: str,
+    notice: str = "",
+    trial_result: ReplyBusinessPromptTrialResult | None = None,
+    trial_failed: bool = False,
+) -> Response:
+    async with get_session_factory()() as session:
+        agent_ids = await _load_agent_ids(session, principal, tenant_id)
+        if agent_id not in agent_ids:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        accounts = (
+            (
+                await session.execute(
+                    select(models.PlatformAccount)
+                    .where(
+                        _account_scope_condition(principal, tenant_id),
+                        models.PlatformAccount.brand_id == agent_id,
+                    )
+                    .order_by(models.PlatformAccount.platform, models.PlatformAccount.name)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if principal.is_admin:
+            editor_view = await load_reply_business_prompt_editor_view(
+                session,
+                tenant_id=tenant_id,
+                brand_id=agent_id,
+            )
+            section_body = _render_admin_reply_prompt_editor(
+                editor_view,
+                csrf_token=_csrf(request),
+                notice=notice,
+                trial_result=trial_result,
+                trial_failed=trial_failed,
+            )
+        else:
+            published_knowledge_count = int(
+                await session.scalar(
+                    select(func.count()).where(
+                        models.KnowledgeDocument.tenant_id == tenant_id,
+                        models.KnowledgeDocument.brand_id == agent_id,
+                        models.KnowledgeDocument.status == "published",
+                    )
+                )
+                or 0
+            )
+            section_body = _render_user_agent_behavior_summary(
+                accounts=accounts,
+                published_knowledge_count=published_knowledge_count,
+            )
+
+    automation_modes = {account.automation_default for account in accounts}
+    agent_mode = (
+        next(iter(automation_modes))
+        if len(automation_modes) == 1
+        else ("mixed" if automation_modes else "unconfigured")
+    )
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title=_display_agent_name(agent_id),
+        description=translate(
+            "agent.detail_description",
+            agent_id=agent_id,
+            mode=_plain_status_label(agent_mode),
+            count=len(accounts),
+        ),
+        body=(f"{_agent_section_tabs(tenant_id, agent_id, 'instructions')}{section_body}"),
+        active_navigation="agents",
+        inbox_count=inbox_summary.total,
+        breadcrumbs=(
+            (translate("nav.agents"), f"{_tenant_root(tenant_id)}/agents"),
+            (_display_agent_name(agent_id), None),
+        ),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/app/t/{tenant_id}/knowledge/documents")
+async def create_tenant_knowledge_document(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    allowed_fields = {
+        "csrf_token",
+        "question",
+        "reply",
+        "brand_id",
+        "platform",
+        "category",
+        "is_official_contact",
+        "protected_values_json",
+    }
+    if set(form) - allowed_fields:
+        raise HTTPException(status_code=422, detail="knowledge_document_fields_invalid")
+    official_value = form.get("is_official_contact", "")
+    if official_value not in {"", "true"}:
+        raise HTTPException(status_code=422, detail="invalid_is_official_contact")
+    try:
+        protected_values = parse_protected_values(form.get("protected_values_json"))
+        from social_reply.application.reply_decision.runner import _get_embedder
+
+        async with get_session_factory()() as session:
+            await execute_create_knowledge_document(
+                session,
+                CreateKnowledgeDocumentCommand(
+                    required_tenant_id=tenant_id,
+                    actor=principal.actor,
+                    question=form.get("question", ""),
+                    reply=form.get("reply", ""),
+                    brand_id=form.get("brand_id", "") or "default",
+                    platform=form.get("platform") or None,
+                    category=form.get("category") or None,
+                    is_official_contact=official_value == "true",
+                    protected_values=protected_values,
+                ),
+                embedder=_get_embedder(),
+            )
+            await session.commit()
+    except ValueError as exc:
+        if isinstance(exc, KnowledgeApplicationError):
+            raise _knowledge_http_error(exc) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return RedirectResponse(
+        _knowledge_location(tenant_id, notice="created"),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/knowledge/import")
+async def import_tenant_knowledge_batch(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await request.form()
+    _require_csrf(request, {"csrf_token": str(form.get("csrf_token") or "")})
+    if set(form) - {"csrf_token", "brand_id", "file"}:
+        raise HTTPException(status_code=422, detail="knowledge_import_fields_invalid")
+    upload = form.get("file")
+    read_upload = getattr(upload, "read", None)
+    if not callable(read_upload):
+        raise HTTPException(status_code=422, detail="knowledge_csv_required")
+    raw = await read_upload(MAX_KNOWLEDGE_UPLOAD_BYTES + 1)
+    source_name = str(getattr(upload, "filename", "") or "import.csv")[:256]
+    try:
+        csv_text = decode_knowledge_csv_upload(raw)
+        from social_reply.application.reply_decision.runner import _get_embedder
+
+        async with get_session_factory()() as session:
+            report = await execute_import_knowledge_batch(
+                session,
+                ImportKnowledgeBatchCommand(
+                    required_tenant_id=tenant_id,
+                    actor=principal.actor,
+                    csv_text=csv_text,
+                    source_name=source_name,
+                    brand_id_default=str(form.get("brand_id") or "default"),
+                ),
+                embedder=_get_embedder(),
+            )
+            await session.commit()
+    except ValueError as exc:
+        if isinstance(exc, KnowledgeApplicationError):
+            raise _knowledge_http_error(exc) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return RedirectResponse(
+        _knowledge_location(
+            tenant_id,
+            notice="imported",
+            inserted=report.inserted,
+            skipped=report.skipped,
+            blank=report.blank,
+            batch_id=report.batch_id,
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/knowledge/bulk-confirm-english")
+async def confirm_tenant_knowledge_batch(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        import_batch_id = uuid.UUID(form.get("import_batch_id", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_import_batch_id") from exc
+    try:
+        async with get_session_factory()() as session:
+            confirmed_count = await execute_confirm_knowledge_english_batch(
+                session,
+                ConfirmKnowledgeEnglishBatchCommand(
+                    required_tenant_id=tenant_id,
+                    actor=principal.actor,
+                    import_batch_id=import_batch_id,
+                ),
+            )
+            await session.commit()
+    except KnowledgeApplicationError as exc:
+        raise _knowledge_http_error(exc) from exc
+    return RedirectResponse(
+        _knowledge_location(tenant_id, notice="bulk_confirmed", count=confirmed_count),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/knowledge/bulk-publish")
+async def publish_tenant_knowledge_batch(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        async with get_session_factory()() as session:
+            result = await execute_bulk_publish_knowledge(
+                session,
+                BulkPublishKnowledgeCommand(
+                    required_tenant_id=tenant_id,
+                    actor=principal.actor,
+                ),
+            )
+            await session.commit()
+    except KnowledgeApplicationError as exc:
+        raise _knowledge_http_error(exc) from exc
+    return RedirectResponse(
+        _knowledge_location(
+            tenant_id,
+            notice="bulk_published",
+            published=result.published_count,
+            skipped=result.skipped_count,
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+async def _execute_tenant_knowledge_document_command(
+    request: Request,
+    tenant_id: str,
+    document_id: uuid.UUID,
+    operation: str,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        async with get_session_factory()() as session:
+            if operation == "confirm":
+                await execute_confirm_knowledge_english(
+                    session,
+                    ConfirmKnowledgeEnglishCommand(
+                        required_tenant_id=tenant_id,
+                        actor=principal.actor,
+                        document_id=document_id,
+                        confirmation_reason=form.get("confirmation_reason", ""),
+                    ),
+                )
+            elif operation == "official":
+                target = form.get("target", "")
+                if target not in {"true", "false"}:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="invalid_official_contact_target",
+                    )
+                await execute_set_knowledge_official_contact(
+                    session,
+                    SetKnowledgeOfficialContactCommand(
+                        required_tenant_id=tenant_id,
+                        actor=principal.actor,
+                        document_id=document_id,
+                        is_official_contact=target == "true",
+                    ),
+                )
+            elif operation == "publish":
+                await execute_publish_knowledge(
+                    session,
+                    PublishKnowledgeCommand(
+                        required_tenant_id=tenant_id,
+                        actor=principal.actor,
+                        document_id=document_id,
+                    ),
+                )
+            elif operation == "unpublish":
+                await execute_unpublish_knowledge(
+                    session,
+                    UnpublishKnowledgeCommand(
+                        required_tenant_id=tenant_id,
+                        actor=principal.actor,
+                        document_id=document_id,
+                    ),
+                )
+            elif operation == "delete":
+                await execute_delete_knowledge_draft(
+                    session,
+                    DeleteKnowledgeDraftCommand(
+                        required_tenant_id=tenant_id,
+                        actor=principal.actor,
+                        document_id=document_id,
+                    ),
+                )
+            else:
+                raise HTTPException(status_code=404, detail="knowledge_operation_not_found")
+            await session.commit()
+    except KnowledgeApplicationError as exc:
+        raise _knowledge_http_error(exc) from exc
+    target = (
+        _knowledge_location(tenant_id, notice="deleted")
+        if operation == "delete"
+        else f"{_tenant_root(tenant_id)}/knowledge/documents/{document_id}"
+    )
+    return RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/app/t/{tenant_id}/knowledge/documents/{document_id}/confirm-english")
+async def confirm_tenant_knowledge_english(
+    request: Request, tenant_id: str, document_id: uuid.UUID
+) -> Response:
+    return await _execute_tenant_knowledge_document_command(
+        request, tenant_id, document_id, "confirm"
+    )
+
+
+@router.post("/app/t/{tenant_id}/knowledge/documents/{document_id}/official-contact")
+async def classify_tenant_knowledge_document(
+    request: Request, tenant_id: str, document_id: uuid.UUID
+) -> Response:
+    return await _execute_tenant_knowledge_document_command(
+        request, tenant_id, document_id, "official"
+    )
+
+
+@router.post("/app/t/{tenant_id}/knowledge/documents/{document_id}/publish")
+async def publish_tenant_knowledge_document(
+    request: Request, tenant_id: str, document_id: uuid.UUID
+) -> Response:
+    return await _execute_tenant_knowledge_document_command(
+        request, tenant_id, document_id, "publish"
+    )
+
+
+@router.post("/app/t/{tenant_id}/knowledge/documents/{document_id}/unpublish")
+async def unpublish_tenant_knowledge_document(
+    request: Request, tenant_id: str, document_id: uuid.UUID
+) -> Response:
+    return await _execute_tenant_knowledge_document_command(
+        request, tenant_id, document_id, "unpublish"
+    )
+
+
+@router.post("/app/t/{tenant_id}/knowledge/documents/{document_id}/delete")
+async def delete_tenant_knowledge_document(
+    request: Request, tenant_id: str, document_id: uuid.UUID
+) -> Response:
+    return await _execute_tenant_knowledge_document_command(
+        request, tenant_id, document_id, "delete"
+    )
+
+
+@router.get(
+    "/app/t/{tenant_id}/agents/{agent_id}/instructions",
+    response_class=HTMLResponse,
+)
+async def agent_instructions_page(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+    notice: str = "",
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    return await _agent_instructions_page_response(
+        request,
+        principal,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        notice=notice,
+    )
+
+
+@router.post("/app/t/{tenant_id}/agents/{agent_id}/instructions/save")
+async def save_agent_instructions(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as authorization_session:
+        if agent_id not in await _load_agent_ids(
+            authorization_session,
+            principal,
+            tenant_id,
+        ):
+            raise HTTPException(status_code=404, detail="agent_not_found")
+    form = await _form(request)
+    _require_csrf(request, form)
+    if set(form) != {
+        "csrf_token",
+        "expected_revision",
+        "content",
+        "change_note",
+    }:
+        raise HTTPException(status_code=422, detail="reply_business_prompt_fields_invalid")
+    try:
+        command = SaveReplyBusinessPromptCommand(
+            tenant_id=tenant_id,
+            brand_id=agent_id,
+            content=form.get("content", ""),
+            expected_revision=_prompt_expected_revision(form),
+            actor=principal.actor,
+            change_note=form.get("change_note"),
+        )
+        async with get_session_factory()() as session:
+            await execute_save_reply_business_prompt(session, command)
+            await session.commit()
+    except ReplyBusinessPromptConflict:
+        notice = "revision_conflict"
+    except BusinessPromptValidationError:
+        notice = "prompt_invalid"
+    except ReplyBusinessPromptScopeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    else:
+        notice = "saved"
+    return RedirectResponse(
+        _prompt_canonical_location(tenant_id, agent_id, notice=notice),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/agents/{agent_id}/instructions/versions/{version_id}/rollback")
+async def rollback_agent_instructions(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+    version_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as authorization_session:
+        if agent_id not in await _load_agent_ids(
+            authorization_session,
+            principal,
+            tenant_id,
+        ):
+            raise HTTPException(status_code=404, detail="agent_not_found")
+    form = await _form(request)
+    _require_csrf(request, form)
+    if set(form) != {"csrf_token", "expected_revision"}:
+        raise HTTPException(status_code=422, detail="reply_business_prompt_fields_invalid")
+    try:
+        command = RollbackReplyBusinessPromptCommand(
+            tenant_id=tenant_id,
+            brand_id=agent_id,
+            source_version_id=version_id,
+            expected_revision=_prompt_expected_revision(form),
+            actor=principal.actor,
+        )
+        async with get_session_factory()() as session:
+            await execute_rollback_reply_business_prompt(session, command)
+            await session.commit()
+    except ReplyBusinessPromptConflict:
+        notice = "revision_conflict"
+    except BusinessPromptValidationError:
+        notice = "prompt_invalid"
+    except ReplyBusinessPromptScopeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    else:
+        notice = "rolled_back"
+    return RedirectResponse(
+        _prompt_canonical_location(tenant_id, agent_id, notice=notice),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+def _no_store_error_response(*, status_code: int, message_key: str) -> HTMLResponse:
+    response = HTMLResponse(
+        f'<section class="saas-alert danger">{escape(translate(message_key))}</section>',
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/app/t/{tenant_id}/agents/{agent_id}/instructions/trial")
+async def trial_agent_instructions(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as authorization_session:
+        if agent_id not in await _load_agent_ids(
+            authorization_session,
+            principal,
+            tenant_id,
+        ):
+            raise HTTPException(status_code=404, detail="agent_not_found")
+    form = await _form(request)
+    _require_csrf(request, form)
+    if set(form) != {"csrf_token", "text"}:
+        raise HTTPException(status_code=422, detail="reply_business_prompt_fields_invalid")
+    try:
+        trial_result = await run_reply_business_prompt_trial(
+            tenant_id=tenant_id,
+            brand_id=agent_id,
+            input_text=form.get("text", ""),
+            actor=principal.actor,
+        )
+    except ReplyBusinessPromptTrialValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except ReplyBusinessPromptTrialRateLimited:
+        return _no_store_error_response(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            message_key="agent.instructions.trial.rate_limited",
+        )
+    except ReplyBusinessPromptTrialUnavailable:
+        return _no_store_error_response(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            message_key="agent.instructions.trial.unavailable",
+        )
+    except ReplyBusinessPromptScopeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ReplyBusinessPromptTrialExecutionError:
+        return await _agent_instructions_page_response(
+            request,
+            principal,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            trial_failed=True,
+        )
+    return await _agent_instructions_page_response(
+        request,
+        principal,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        trial_result=trial_result,
+    )
+
 
 @router.get(
     "/app/t/{tenant_id}/agents/{agent_id}",
     response_class=HTMLResponse,
 )
-async def agent_detail_redirect(tenant_id: str, agent_id: str) -> Response:
+async def agent_detail_redirect(
+    request: Request,
+    tenant_id: str,
+    agent_id: str,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
     return RedirectResponse(
         f"{_agent_root(tenant_id, agent_id)}/overview",
         status_code=status.HTTP_303_SEE_OTHER,
@@ -782,18 +1758,7 @@ async def agent_detail(
         )
 
     agent_base = _agent_root(tenant_id, agent_id)
-    section_tabs = tabs(
-        (
-            ("overview", f"{agent_base}/overview", "Overview"),
-            ("instructions", f"{agent_base}/instructions", "Instructions"),
-            ("model", f"{agent_base}/model", "Model"),
-            ("channels", f"{agent_base}/channels", "Channels"),
-            ("knowledge", f"{agent_base}/knowledge", "Knowledge"),
-            ("flow", f"{agent_base}/flow", "Flow"),
-            ("activity", f"{agent_base}/activity", "Activity"),
-        ),
-        section,
-    )
+    section_tabs = _agent_section_tabs(tenant_id, agent_id, section)
     section_body = _render_agent_section(
         section=section,
         tenant_id=tenant_id,
@@ -811,24 +1776,25 @@ async def agent_detail(
         principal=principal,
         tenant_id=tenant_id,
         title=_display_agent_name(agent_id),
-        description=(
-            f"作用域 {agent_id} · 当前模式 "
-            f"{_plain_status_label(agent_mode)} · {len(accounts)} 个渠道账号。"
+        description=translate(
+            "agent.detail_description",
+            agent_id=agent_id,
+            mode=_plain_status_label(agent_mode),
+            count=len(accounts),
         ),
         body=f"{section_tabs}{section_body}",
         active_navigation="agents",
         inbox_count=inbox_summary.total,
         primary_action_html=(
             primary_action(
-                "/admin/prompt?tenant_id="
-                f"{quote(tenant_id)}&brand_id={quote(agent_id)}",
-                "运行试验",
+                f"{agent_base}/instructions#prompt-trial",
+                translate("agent.run_experiment"),
             )
             if principal.is_admin
             else ""
         ),
         breadcrumbs=(
-            ("Agents", f"{_tenant_root(tenant_id)}/agents"),
+            (translate("nav.agents"), f"{_tenant_root(tenant_id)}/agents"),
             (_display_agent_name(agent_id), None),
         ),
     )
@@ -836,10 +1802,10 @@ async def agent_detail(
 
 def _plain_status_label(status: str) -> str:
     labels = {
-        "BOT_ACTIVE": "自动回复",
-        "BOT_DRAFT_ONLY": "仅生成草稿",
-        "mixed": "混合模式",
-        "unconfigured": "尚未配置",
+        "BOT_ACTIVE": translate("agent.status.auto_reply"),
+        "BOT_DRAFT_ONLY": translate("agent.status.draft_only"),
+        "mixed": translate("agent.status.mixed"),
+        "unconfigured": translate("agent.status.unconfigured"),
     }
     return labels.get(status, status)
 
@@ -904,67 +1870,92 @@ def _render_agent_overview(
 ) -> str:
     active_accounts = [account for account in accounts if account.status == "active"]
     if not accounts:
-        next_title = "连接第一个渠道账号"
-        next_description = "Agent 已有安全运行框架，但还不能接收或发送平台消息。"
+        next_title = translate("agent.connect_first_channel")
+        next_description = translate("agent.overview.framework_description")
         next_href = (
-            "/admin/integrations/accounts"
-            if is_admin
-            else f"{_tenant_root(tenant_id)}/channels"
+            "/admin/integrations/accounts" if is_admin else f"{_tenant_root(tenant_id)}/channels"
         )
-        action_label = "连接渠道" if is_admin else "授权我的账号"
+        action_label = (
+            translate("agent.overview.connect_channel")
+            if is_admin
+            else translate("agent.overview.authorize_account")
+        )
     elif len(active_accounts) != len(accounts):
-        next_title = "修复不可用的渠道账号"
-        next_description = f"{len(accounts) - len(active_accounts)} 个账号当前不可用。"
-        next_href = (
-            "/admin/integrations/accounts"
-            if is_admin
-            else f"{_tenant_root(tenant_id)}/channels"
+        next_title = translate("agent.check_unavailable_channels")
+        next_description = translate(
+            "agent.overview.unavailable_description",
+            count=len(accounts) - len(active_accounts),
         )
-        action_label = "查看账号"
+        next_href = (
+            "/admin/integrations/accounts" if is_admin else f"{_tenant_root(tenant_id)}/channels"
+        )
+        action_label = translate("agent.overview.view_accounts")
     elif not prompt_pointer:
-        next_title = "补充业务指令"
-        next_description = "当前仍使用代码默认业务说明；可保存 Tenant + Brand 版本化指令。"
-        next_href = "/admin/content/reply-prompt" if is_admin else f"{_agent_root(tenant_id, agent_id)}/instructions"
-        action_label = "编辑指令" if is_admin else "查看指令"
-    elif not knowledge_counts.get("published", 0):
-        next_title = "发布第一条批准知识"
-        next_description = (
-            "没有已发布知识时，事实类问题将更容易转人工或只生成草稿。"
+        next_title = translate("agent.overview.add_instructions")
+        next_description = translate("agent.overview.instructions_description")
+        next_href = (
+            f"{_agent_root(tenant_id, agent_id)}/instructions"
             if is_admin
-            else "当前没有可查询的已发布知识，请联系管理员补充并发布内容。"
+            else f"{_agent_root(tenant_id, agent_id)}/instructions"
+        )
+        action_label = (
+            translate("agent.overview.edit_instructions")
+            if is_admin
+            else translate("agent.overview.view_instructions")
+        )
+    elif not knowledge_counts.get("published", 0):
+        next_title = translate("agent.overview.publish_knowledge")
+        next_description = (
+            translate("agent.overview.knowledge_admin_description")
+            if is_admin
+            else translate("agent.overview.knowledge_user_description")
         )
         next_href = (
             f"{_tenant_root(tenant_id)}/knowledge"
             if is_admin
             else f"{_tenant_root(tenant_id)}/knowledge-query"
         )
-        action_label = "打开知识中心" if is_admin else "查询知识"
+        action_label = (
+            translate("agent.overview.open_knowledge")
+            if is_admin
+            else translate("agent.overview.query_knowledge")
+        )
     else:
-        next_title = "检查最近运行活动"
-        next_description = "当前配置完整，建议查看最近决策和配置变更。"
+        next_title = translate("agent.check_recent_activity")
+        next_description = translate("agent.overview.activity_description")
         next_href = f"{_agent_root(tenant_id, agent_id)}/activity"
-        action_label = "查看活动"
+        action_label = translate("agent.overview.view_activity")
     readiness = "".join(
         (
-            _progress_row(bool(prompt_pointer), "业务指令已版本化"),
-            _progress_row(bool(knowledge_counts.get("published")), "已有已发布知识"),
+            _progress_row(
+                bool(prompt_pointer),
+                translate("agent.overview.instructions_ready"),
+            ),
+            _progress_row(
+                bool(knowledge_counts.get("published")),
+                translate("agent.overview.knowledge_ready"),
+            ),
             _progress_row(
                 bool(accounts) and len(active_accounts) == len(accounts),
-                f"{len(active_accounts)}/{len(accounts)} 个渠道可用",
+                translate(
+                    "agent.overview.channel_count",
+                    active=len(active_accounts),
+                    total=len(accounts),
+                ),
                 warning=bool(accounts),
             ),
-            _progress_row(True, "Draft-only、Final Guard 与 Outbox 安全边界有效"),
+            _progress_row(True, translate("agent.overview.safety_ready")),
         )
     )
     return f"""<div class="saas-grid two" style="margin-top:0">
-<section class="saas-next-action"><div><div class="saas-eyebrow">下一步</div>
+<section class="saas-next-action"><div><div class="saas-eyebrow">{escape(translate("next.eyebrow"))}</div>
 <h2>{escape(next_title)}</h2><p>{escape(next_description)}</p></div>
 {primary_action(next_href, action_label)}</section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>运行摘要</h2>
-<p>聚合当前 Agent 作用域的真实配置。</p></div></div><div class="saas-card-body">
-{definition_list((('渠道账号', len(accounts)), ('已发布知识', knowledge_counts.get('published', 0)), ('业务指令', f'v{prompt_pointer.revision}' if prompt_pointer else '代码默认')))}
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.overview.runtime_summary"))}</h2>
+<p>{escape(translate("agent.overview.runtime_summary_description"))}</p></div></div><div class="saas-card-body">
+{definition_list(((translate("agent.overview.channel_accounts"), len(accounts)), (translate("home.metric.published_knowledge"), knowledge_counts.get("published", 0)), (translate("agent.overview.business_instructions"), f"v{prompt_pointer.revision}" if prompt_pointer else translate("agent.overview.code_default"))))}
 </div></section></div>
-<div class="saas-section-title"><div><h2>就绪度</h2><p>只展示用户可以继续完成的配置步骤。</p></div></div>
+<div class="saas-section-title"><div><h2>{escape(translate("agent.overview.readiness"))}</h2><p>{escape(translate("agent.overview.readiness_description"))}</p></div></div>
 <section class="saas-card"><div class="saas-card-body"><ul class="saas-progress-list">{readiness}</ul></div></section>"""
 
 
@@ -976,38 +1967,61 @@ def _render_agent_instructions(
     prompt_version: models.ReplyBusinessPromptVersion | None,
     is_admin: bool,
 ) -> str:
-    content = prompt_version.content if prompt_version else "当前使用代码默认业务指令。"
+    if not is_admin:
+        return _render_user_agent_behavior_summary(
+            accounts=[],
+            published_knowledge_count=0,
+        )
+    content = (
+        prompt_version.content
+        if prompt_version
+        else translate("agent.instructions.current_default")
+    )
     metadata = definition_list(
         (
             ("Tenant", tenant_id),
             ("Brand / Agent", agent_id),
-            ("活动版本", f"v{prompt_pointer.revision}" if prompt_pointer else "代码默认"),
-            ("内容 Hash", prompt_pointer.content_hash[:12] if prompt_pointer else "—"),
-            ("最后更新", format_datetime(prompt_pointer.updated_at) if prompt_pointer else "—"),
-            ("更新人", prompt_pointer.updated_by if prompt_pointer else "system"),
+            (
+                translate("agent.instructions.active_version"),
+                f"v{prompt_pointer.revision}"
+                if prompt_pointer
+                else translate("agent.overview.code_default"),
+            ),
+            (
+                translate("agent.instructions.content_hash"),
+                prompt_pointer.content_hash[:12] if prompt_pointer else "—",
+            ),
+            (
+                translate("agent.instructions.last_updated"),
+                format_datetime(prompt_pointer.updated_at) if prompt_pointer else "—",
+            ),
+            (
+                translate("agent.instructions.updated_by"),
+                prompt_pointer.updated_by if prompt_pointer else "system",
+            ),
         )
     )
     edit_action = (
         secondary_action(
-            "/admin/content/reply-prompt",
-            "进入编辑器",
+            f"{_agent_root(tenant_id, agent_id)}/instructions",
+            translate("agent.instructions.open_editor"),
             small=True,
         )
         if is_admin
         else ""
     )
     return f"""<div class="saas-grid" style="grid-template-columns:220px minmax(0,1fr) 280px;margin-top:0">
-<aside class="saas-card"><div class="saas-card-header"><div><h2>版本</h2>
-<p>不可变历史由现有 Prompt 域维护。</p></div></div><div class="saas-card-body">
-{status_badge('active' if prompt_pointer else 'unconfigured', label=f'活动 v{prompt_pointer.revision}' if prompt_pointer else '代码默认')}
+<aside class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.instructions.version"))}</h2>
+<p>{escape(translate("agent.instructions.version_description"))}</p></div></div><div class="saas-card-body">
+{status_badge("active" if prompt_pointer else "unconfigured", label=translate("agent.instructions.active_badge", revision=prompt_pointer.revision) if prompt_pointer else translate("agent.overview.code_default"))}
 </div></aside>
-<section class="saas-card"><div class="saas-card-header"><div><h2>业务指令</h2>
-<p>低权限业务说明，不能覆盖系统安全契约。</p></div>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.instructions.business_title"))}</h2>
+<p>{escape(translate("agent.instructions.business_description"))}</p></div>
 {edit_action}</div>
 <div class="saas-card-body"><div class="saas-alert">{escape(content)}</div></div></section>
-<aside class="saas-card"><div class="saas-card-header"><div><h2>安全与元数据</h2></div></div>
+<aside class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.instructions.security_metadata"))}</h2></div></div>
 <div class="saas-card-body">{metadata}<div class="saas-alert warning" style="margin-top:16px">
-系统身份、输出 Schema、知识权威和发送授权保持代码拥有，租户不能编辑。</div></div></aside>
+{escape(translate("agent.instructions.safety_notice"))}</div></div></aside>
 </div>"""
 
 
@@ -1017,14 +2031,14 @@ def _render_agent_model() -> str:
     model_label = settings.openai_model if settings.llm_provider == "openai" else "stub"
     grounding_model = settings.openai_grounding_model or model_label
     return f"""<div class="saas-grid two" style="margin-top:0">
-<section class="saas-card"><div class="saas-card-header"><div><h2>主回复模型</h2>
-<p>当前是部署级受控连接，Tenant 尚不能填写任意 Base URL。</p></div>{status_badge('active')}</div>
-<div class="saas-card-body">{definition_list((('Provider', provider_label), ('Model', model_label), ('用途', '主决策与回复生成'), ('配置来源', 'Railway / Settings')))}</div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>Grounding 模型</h2>
-<p>独立验证知识回复与证据是否一致。</p></div>{status_badge('active')}</div>
-<div class="saas-card-body">{definition_list((('Model', grounding_model), ('用途', '语义忠实度验证'), ('Fallback', model_label), ('密钥状态', '已配置' if settings.openai_api_key.get_secret_value() else '未配置')))}</div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.model.primary_title"))}</h2>
+<p>{escape(translate("agent.model.primary_description"))}</p></div>{status_badge("active")}</div>
+<div class="saas-card-body">{definition_list((("Provider", provider_label), ("Model", model_label), (translate("agent.model.usage"), translate("agent.model.primary_usage")), (translate("agent.model.config_source"), "Railway / Settings")))}</div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.model.grounding_title"))}</h2>
+<p>{escape(translate("agent.model.grounding_description"))}</p></div>{status_badge("active")}</div>
+<div class="saas-card-body">{definition_list((("Model", grounding_model), (translate("agent.model.usage"), translate("agent.model.grounding_usage")), ("Fallback", model_label), (translate("agent.model.key_status"), translate("agent.model.configured") if settings.openai_api_key.get_secret_value() else translate("agent.model.not_configured"))))}</div></section>
 </div>
-<section class="saas-alert warning" style="margin-top:18px">Model Profile 管理仍处于规划阶段。当前页面只展示安全裁剪后的有效配置，不回显 API Key 或完整上游地址。</section>"""
+<section class="saas-alert warning" style="margin-top:18px">{escape(translate("agent.model.notice"))}</section>"""
 
 
 def _render_agent_channels(
@@ -1034,11 +2048,13 @@ def _render_agent_channels(
     is_admin: bool,
 ) -> str:
     account_href = (
-        "/admin/integrations/accounts"
-        if is_admin
-        else f"{_tenant_root(tenant_id)}/channels"
+        "/admin/integrations/accounts" if is_admin else f"{_tenant_root(tenant_id)}/channels"
     )
-    account_action_label = "管理账号" if is_admin else "管理我的渠道"
+    account_action_label = (
+        translate("agent.channels.manage_accounts")
+        if is_admin
+        else translate("agent.channels.manage_mine")
+    )
     rows = "".join(
         f"<tr><td><strong>{escape(account.name)}</strong><br>"
         f'<span class="saas-muted">{escape(account.platform)}</span></td>'
@@ -1050,16 +2066,21 @@ def _render_agent_channels(
     )
     if not rows:
         return empty_state(
-            "尚未连接渠道",
-            "连接渠道后，Agent 才能接收消息；新账号仍默认仅生成草稿。",
+            translate("agent.channels.empty_title"),
+            translate("agent.channels.empty_description"),
             action_html=primary_action(
                 account_href,
-                "连接第一个渠道" if is_admin else "授权我的账号",
+                translate("agent.channels.connect_first")
+                if is_admin
+                else translate("agent.channels.authorize_mine"),
             ),
         )
     return (
         '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        "<th>账号</th><th>连接状态</th><th>自动化模式</th><th>配置版本</th><th></th>"
+        f"<th>{escape(translate('common.account'))}</th>"
+        f"<th>{escape(translate('agent.channels.connection_status'))}</th>"
+        f"<th>{escape(translate('agent.channels.automation_mode'))}</th>"
+        f"<th>{escape(translate('agent.channels.config_version'))}</th><th></th>"
         f"</tr></thead><tbody>{rows}</tbody></table></div>"
     )
 
@@ -1078,37 +2099,49 @@ def _render_agent_knowledge(
         if is_admin
         else f"{_tenant_root(tenant_id)}/knowledge-query"
     )
-    knowledge_action_label = "打开知识中心" if is_admin else "查询知识"
+    knowledge_action_label = (
+        translate("agent.overview.open_knowledge")
+        if is_admin
+        else translate("agent.overview.query_knowledge")
+    )
     body = f"""<div class="saas-grid three" style="margin-top:0">
-{metric_card(published_count, '已发布知识')}
-{metric_card(draft_count, '草稿与待审核')}
-{metric_card(published_count + draft_count, '作用域内总数')}
+{metric_card(published_count, translate("home.metric.published_knowledge"))}
+{metric_card(draft_count, translate("agent.knowledge.drafts"))}
+{metric_card(published_count + draft_count, translate("agent.knowledge.total"))}
 </div>
 <section class="saas-card" style="margin-top:18px"><div class="saas-card-header"><div>
-<h2>知识绑定</h2><p>当前 Agent 使用 Tenant + Brand + Platform 作用域检索。</p></div>
+<h2>{escape(translate("agent.knowledge.binding_title"))}</h2><p>{escape(translate("agent.knowledge.binding_description"))}</p></div>
 {secondary_action(knowledge_href, knowledge_action_label, small=True)}</div>
-<div class="saas-card-body"><p>来源文档、检索 Chunk 和批准答案保持分层；只有已发布并通过语言与安全检查的知识进入自动回复路径。</p></div></section>"""
+<div class="saas-card-body"><p>{escape(translate("agent.knowledge.layer_description"))}</p></div></section>"""
     return body
 
 
 def _render_agent_flow() -> str:
     stages = (
-        ("1", "确定性规则与 kill switch", "系统强制，Flow 不可覆盖"),
-        ("2", "语言解析与知识检索", "按 Tenant、Brand、Platform 作用域"),
-        ("3", "LLM 决策", "严格结构化 ReplyDecision"),
-        ("4", "Final Guard 与 Grounding", "失败时转 DRAFT 或 HANDOFF"),
-        ("5", "Outbox 与发送前复检", "所有外发统一经过耐久边界"),
+        ("1", translate("agent.flow.stage.rules"), translate("agent.flow.stage.rules_detail")),
+        (
+            "2",
+            translate("agent.flow.stage.retrieval"),
+            translate("agent.flow.stage.retrieval_detail"),
+        ),
+        (
+            "3",
+            translate("agent.flow.stage.decision"),
+            translate("agent.flow.stage.decision_detail"),
+        ),
+        ("4", translate("agent.flow.stage.guard"), translate("agent.flow.stage.guard_detail")),
+        ("5", translate("agent.flow.stage.outbox"), translate("agent.flow.stage.outbox_detail")),
     )
     rows = "".join(
         '<li class="saas-timeline-item"><span class="saas-timeline-marker success">'
-        f"{escape(marker)}</span><div><div class=\"saas-timeline-title\">{escape(title)}</div>"
+        f'{escape(marker)}</span><div><div class="saas-timeline-title">{escape(title)}</div>'
         f'<div class="saas-timeline-detail">{escape(detail)}</div></div></li>'
         for marker, title, detail in stages
     )
-    return f"""<section class="saas-card"><div class="saas-card-header"><div><h2>当前 Reply Policy Flow</h2>
-<p>先展示代码拥有的实际安全流程；可编辑 Flow 将在版本、评测和审计基础稳定后开放。</p></div>{status_badge('active', label='系统受控')}</div>
+    return f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("agent.flow.title"))}</h2>
+<p>{escape(translate("agent.flow.description"))}</p></div>{status_badge("active", label=translate("agent.flow.controlled"))}</div>
 <div class="saas-card-body"><ol class="saas-timeline">{rows}</ol></div></section>
-<section class="saas-alert warning" style="margin-top:18px">不会开放任意 HTTP、Python、SQL 或直接发送节点。未来 Flow 只能编排允许的只读和决策节点。</section>"""
+<section class="saas-alert warning" style="margin-top:18px">{escape(translate("agent.flow.notice"))}</section>"""
 
 
 def _render_agent_activity(audits: list[models.AuditLog]) -> str:
@@ -1119,12 +2152,53 @@ def _render_agent_activity(audits: list[models.AuditLog]) -> str:
         for audit in audits
     )
     if not rows:
-        return empty_state("暂无 Agent 活动", "Prompt、知识、渠道和审核变更将在这里显示。")
+        return empty_state(
+            translate("agent.activity.empty_title"),
+            translate("agent.activity.empty_description"),
+        )
     return (
         '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        "<th>时间</th><th>Actor</th><th>动作</th><th>资源</th>"
+        f"<th>{escape(translate('common.time'))}</th><th>Actor</th>"
+        f"<th>{escape(translate('common.action'))}</th>"
+        f"<th>{escape(translate('common.resource'))}</th>"
         f"</tr></thead><tbody>{rows}</tbody></table></div>"
     )
+
+
+def _render_inbox_workspace(
+    *,
+    queue_tabs: str,
+    item_list: str,
+    thread: str,
+    action_panel: str,
+    item_count: int = 0,
+) -> str:
+    action_panel_html = (
+        f'<aside class="saas-inbox-action" aria-label="{escape(translate("inbox.current_action"))}" '
+        f"data-inbox-actions>{action_panel}</aside>"
+        if action_panel
+        else ""
+    )
+    return f"""<div class="saas-inbox-layout" data-inbox-workspace>
+  <section class="saas-inbox-column saas-list-pane" aria-label="{escape(translate("inbox.queue_label"))}" data-inbox-list data-list-filter>
+    <header class="saas-inbox-column-header saas-list-pane-header">
+      <div class="saas-list-pane-title"><h1>{escape(translate("inbox.title"))}</h1>
+      <span class="saas-muted">{escape(translate("inbox.item_count", count=item_count))}</span></div>
+      <label for="inbox-list-search">{escape(translate("inbox.search_label"))}</label>
+      <input id="inbox-list-search" type="search" autocomplete="off" data-list-search
+             placeholder="{escape(translate("inbox.search_placeholder"))}">
+      {queue_tabs}
+    </header>
+    <div data-list-items>{item_list}</div>
+    <div class="saas-empty" data-search-empty hidden>
+      <h2>{escape(translate("inbox.search_empty_title"))}</h2>
+      <p>{escape(translate("inbox.search_empty_description"))}</p>
+    </div>
+  </section>
+  <section class="saas-inbox-column saas-workspace-pane" aria-label="{escape(translate("conversations.workspace_label"))}" data-inbox-thread>
+    {thread}{action_panel_html}
+  </section>
+</div>"""
 
 
 @router.get("/app/t/{tenant_id}/inbox", response_class=HTMLResponse)
@@ -1152,10 +2226,10 @@ async def tenant_inbox(
         items = await _load_inbox_items(session, principal, tenant_id, queue)
         selected_item = next(
             (item for item in items if item.item_id == selected_item_uuid),
-            items[0] if items else None,
+            None,
         )
         messages: list[models.Message] = []
-        if selected_item:
+        if selected_item and selected_item.queue != "delivery":
             newest_messages = list(
                 (
                     await session.execute(
@@ -1165,8 +2239,7 @@ async def tenant_inbox(
                             models.Message.conversation_id == models.Conversation.id,
                         )
                         .where(
-                            models.Message.conversation_id
-                            == selected_item.conversation_id,
+                            models.Message.conversation_id == selected_item.conversation_id,
                             models.Conversation.tenant_id == tenant_id,
                         )
                         .order_by(models.Message.history_seq.desc())
@@ -1188,28 +2261,219 @@ async def tenant_inbox(
         tenant_id,
         messages,
         selected_item,
+        suggested_item=items[0] if items else None,
     )
-    action_panel = _render_inbox_action_panel(tenant_id, selected_item)
-    body = f"""<section class="saas-alert" style="margin-bottom:14px">
-列表不会在阅读或编辑时自动重排。完成当前项目后，再进入下一项。</section>
-<div class="saas-inbox-layout">
-  <section class="saas-inbox-column"><div class="saas-inbox-column-header">{queue_tabs}</div>
-  <div>{item_list}</div></section>
-  <section class="saas-inbox-column">{thread}</section>
-  <aside class="saas-inbox-column">{action_panel}</aside>
-</div>"""
+    action_panel = _render_inbox_action_panel(
+        tenant_id,
+        selected_item,
+        csrf_token=_csrf(request),
+    )
+    body = _render_inbox_workspace(
+        queue_tabs=queue_tabs,
+        item_list=item_list,
+        thread=thread,
+        action_panel=action_panel,
+        item_count=len(items),
+    )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="收件箱",
+        title=translate("inbox.title"),
         description=(
-            "按最老等待优先处理人工工作、草稿审核和投递异常。"
+            translate("inbox.admin_description")
             if principal.is_admin
-            else "按最老等待优先处理归属于你账号的人工工作。"
+            else translate("inbox.user_description")
         ),
         body=body,
         active_navigation="inbox",
         inbox_count=inbox_summary.total,
+        workbench=True,
+    )
+
+
+def _required_draft_generation(form: dict[str, str]) -> int:
+    raw_value = form.get("expected_generation", "").strip()
+    try:
+        expected_generation = int(raw_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="draft_expected_generation_invalid") from exc
+    if expected_generation < 0:
+        raise HTTPException(status_code=422, detail="draft_expected_generation_invalid")
+    return expected_generation
+
+
+def _required_draft_review_action(form: dict[str, str]) -> str:
+    expected_review_action = form.get("expected_review_action", "").strip()
+    if not expected_review_action:
+        raise HTTPException(status_code=422, detail="draft_expected_review_action_invalid")
+    return expected_review_action
+
+
+def _tenant_draft_review_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, DraftReviewNotFound):
+        return HTTPException(status_code=404, detail=exc.code)
+    if isinstance(exc, DraftReviewConflict):
+        return HTTPException(status_code=409, detail=exc.code)
+    if isinstance(exc, DraftReviewValidationError):
+        return HTTPException(status_code=422, detail=exc.code)
+    return HTTPException(status_code=500, detail="draft_review_failed")
+
+
+@router.post("/app/t/{tenant_id}/decisions/{decision_id}/approve")
+async def tenant_approve_draft(
+    request: Request,
+    tenant_id: str,
+    decision_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await approve_draft_review(
+            decision_id=decision_id,
+            required_tenant_id=tenant_id,
+            actor=principal.actor,
+            final_reply_text=form.get("final_reply_text"),
+            expected_generation=_required_draft_generation(form),
+            expected_review_action=_required_draft_review_action(form),
+        )
+    except (DraftReviewNotFound, DraftReviewConflict, DraftReviewValidationError) as exc:
+        raise _tenant_draft_review_http_error(exc) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/inbox?queue=drafts",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/decisions/{decision_id}/discard")
+async def tenant_discard_draft(
+    request: Request,
+    tenant_id: str,
+    decision_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await reject_draft_review(
+            decision_id=decision_id,
+            required_tenant_id=tenant_id,
+            actor=principal.actor,
+            review_reason=form.get("review_reason", ""),
+            expected_generation=_required_draft_generation(form),
+            expected_review_action=_required_draft_review_action(form),
+        )
+    except (DraftReviewNotFound, DraftReviewConflict, DraftReviewValidationError) as exc:
+        raise _tenant_draft_review_http_error(exc) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/inbox?queue=drafts",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+def _required_delivery_attempt_count(form: dict[str, str]) -> int:
+    raw_value = form.get("expected_attempt_count", "").strip()
+    try:
+        expected_attempt_count = int(raw_value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="delivery_expected_attempt_count_invalid",
+        ) from exc
+    if expected_attempt_count < 0:
+        raise HTTPException(
+            status_code=422,
+            detail="delivery_expected_attempt_count_invalid",
+        )
+    return expected_attempt_count
+
+
+def _required_delivery_status(form: dict[str, str]) -> str:
+    expected_status = form.get("expected_status", "").strip()
+    if not expected_status:
+        raise HTTPException(status_code=422, detail="delivery_expected_status_invalid")
+    return expected_status
+
+
+def _delivery_recovery_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, DeliveryRecoveryNotFound):
+        return HTTPException(status_code=404, detail=exc.code)
+    if isinstance(exc, DeliveryRecoveryConflict):
+        return HTTPException(status_code=409, detail=exc.code)
+    if isinstance(exc, DeliveryRecoveryValidationError):
+        return HTTPException(status_code=422, detail=exc.code)
+    return HTTPException(status_code=500, detail="delivery_recovery_failed")
+
+
+@router.post("/app/t/{tenant_id}/delivery/{outbox_id}/retry")
+async def tenant_retry_failed_delivery(
+    request: Request,
+    tenant_id: str,
+    outbox_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await retry_failed_outbox(
+            outbox_id=outbox_id,
+            required_tenant_id=tenant_id,
+            actor=principal.actor,
+            expected_status=_required_delivery_status(form),
+            expected_attempt_count=_required_delivery_attempt_count(form),
+            review_reason=form.get("review_reason", ""),
+            verification_source=form.get("verification_source", ""),
+        )
+    except (
+        DeliveryRecoveryNotFound,
+        DeliveryRecoveryConflict,
+        DeliveryRecoveryValidationError,
+    ) as exc:
+        raise _delivery_recovery_http_error(exc) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/inbox?queue=delivery",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/delivery/{outbox_id}/resolve")
+async def tenant_resolve_reviewed_delivery(
+    request: Request,
+    tenant_id: str,
+    outbox_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await resolve_needs_review_outbox(
+            outbox_id=outbox_id,
+            required_tenant_id=tenant_id,
+            actor=principal.actor,
+            expected_status=_required_delivery_status(form),
+            expected_attempt_count=_required_delivery_attempt_count(form),
+            review_reason=form.get("review_reason", ""),
+            verification_source=form.get("verification_source", ""),
+            resolution=form.get("resolution", ""),
+            provider_message_id=form.get("provider_message_id"),
+        )
+    except (
+        DeliveryRecoveryNotFound,
+        DeliveryRecoveryConflict,
+        DeliveryRecoveryValidationError,
+    ) as exc:
+        raise _delivery_recovery_http_error(exc) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/inbox?queue=delivery",
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
@@ -1232,7 +2496,15 @@ async def _load_inbox_items(
                     models.Conversation,
                     models.HumanWorkItem.conversation_id == models.Conversation.id,
                 )
-                .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+                .join(
+                    models.Contact,
+                    and_(
+                        models.Conversation.contact_id == models.Contact.id,
+                        models.Contact.tenant_id == tenant_id,
+                        models.Contact.platform_account_id
+                        == models.Conversation.platform_account_id,
+                    ),
+                )
                 .join(
                     models.PlatformAccount,
                     models.Conversation.platform_account_id == models.PlatformAccount.id,
@@ -1253,7 +2525,7 @@ async def _load_inbox_items(
                 item_id=work_item.id,
                 conversation_id=conversation.id,
                 queue="human",
-                title=contact.display_name or "匿名联系人",
+                title=contact.display_name or translate("common.anonymous_contact"),
                 platform=conversation.platform,
                 channel_type=conversation.channel_type,
                 account_name=account.name,
@@ -1277,7 +2549,15 @@ async def _load_inbox_items(
                     models.Conversation,
                     models.ReplyDecision.conversation_id == models.Conversation.id,
                 )
-                .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+                .join(
+                    models.Contact,
+                    and_(
+                        models.Conversation.contact_id == models.Contact.id,
+                        models.Contact.tenant_id == tenant_id,
+                        models.Contact.platform_account_id
+                        == models.Conversation.platform_account_id,
+                    ),
+                )
                 .join(
                     models.PlatformAccount,
                     models.Conversation.platform_account_id == models.PlatformAccount.id,
@@ -1287,17 +2567,7 @@ async def _load_inbox_items(
                     models.Conversation.tenant_id == tenant_id,
                     models.PlatformAccount.tenant_id == tenant_id,
                     _account_scope_condition(principal, tenant_id),
-                    models.ReplyDecision.action == "draft",
-                    or_(
-                        models.ReplyDecision.review_action.is_(None),
-                        models.ReplyDecision.review_action == "PENDING",
-                    ),
-                    models.ReplyDecision.review_outbox_id.is_(None),
-                    or_(
-                        models.ReplyDecision.decision_generation.is_(None),
-                        models.ReplyDecision.decision_generation
-                        == models.Conversation.decision_generation,
-                    ),
+                    reviewable_draft_condition(),
                 )
                 .order_by(models.ReplyDecision.created_at)
                 .limit(100)
@@ -1308,13 +2578,19 @@ async def _load_inbox_items(
                 item_id=decision.id,
                 conversation_id=conversation.id,
                 queue="drafts",
-                title=contact.display_name or "匿名联系人",
+                title=contact.display_name or translate("common.anonymous_contact"),
                 platform=conversation.platform,
                 channel_type=conversation.channel_type,
                 account_name=account.name,
                 status=decision.review_action or "PENDING",
-                reason=", ".join(decision.reason_codes or []) or "等待人工审核",
+                reason=", ".join(decision.reason_codes or []) or translate("status.needs_review"),
                 created_at=decision.created_at,
+                draft_text=(
+                    (decision.original_reply_text or "").strip()
+                    or (decision.reply_text or "").strip()
+                ),
+                decision_generation=decision.decision_generation,
+                review_action=decision.review_action or "PENDING",
             )
             for decision, conversation, contact, account in rows
         ]
@@ -1330,7 +2606,15 @@ async def _load_inbox_items(
                 models.Conversation,
                 models.OutboxMessage.conversation_id == models.Conversation.id,
             )
-            .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+            .join(
+                models.Contact,
+                and_(
+                    models.Conversation.contact_id == models.Contact.id,
+                    models.Contact.tenant_id == tenant_id,
+                    models.Contact.platform_account_id
+                    == models.Conversation.platform_account_id,
+                ),
+            )
             .join(
                 models.PlatformAccount,
                 models.OutboxMessage.platform_account_id == models.PlatformAccount.id,
@@ -1351,13 +2635,16 @@ async def _load_inbox_items(
             item_id=outbox.id,
             conversation_id=conversation.id,
             queue="delivery",
-            title=contact.display_name or "匿名联系人",
+            title=contact.display_name or translate("common.anonymous_contact"),
             platform=conversation.platform,
             channel_type=conversation.channel_type,
             account_name=account.name,
             status=outbox.status,
-            reason=outbox.last_error_code or "投递结果需要核实",
+            reason=outbox.last_error_code or translate("status.needs_review"),
             created_at=outbox.created_at,
+            expected_status=outbox.status,
+            expected_attempt_count=outbox.attempt_count,
+            delivery_error_code=outbox.last_error_code,
         )
         for outbox, conversation, contact, account in rows
     ]
@@ -1373,19 +2660,24 @@ def _render_queue_tabs(
     root = f"{_tenant_root(tenant_id)}/inbox"
     queue_data = (
         (
-            ("human", "人工", summary.human_count),
-            ("drafts", "草稿", summary.draft_count),
-            ("delivery", "投递", summary.delivery_count),
+            ("human", translate("inbox.queue.human"), summary.human_count),
+            ("drafts", translate("inbox.queue.drafts"), summary.draft_count),
+            ("delivery", translate("inbox.queue.delivery"), summary.delivery_count),
         )
         if include_admin_queues
-        else (("human", "人工", summary.human_count),)
+        else (("human", translate("inbox.queue.human"), summary.human_count),)
     )
     links = "".join(
         f'<a class="saas-queue-tab{" active" if key == active_queue else ""}" '
-        f'href="{root}?queue={key}">{escape(label)} {count}</a>'
+        f'href="{root}?queue={key}"'
+        f"{" aria-current='page'" if key == active_queue else ''}>"
+        f"{escape(label)} {count}</a>"
         for key, label, count in queue_data
     )
-    return f'<nav class="saas-queue-tabs" aria-label="工作队列">{links}</nav>'
+    return (
+        f'<nav class="saas-queue-tabs" aria-label="{escape(translate("inbox.queue_label"))}">'
+        f"{links}</nav>"
+    )
 
 
 def _render_inbox_item_list(
@@ -1396,76 +2688,302 @@ def _render_inbox_item_list(
 ) -> str:
     if not items:
         return (
-            '<div class="saas-empty"><h2>当前队列已清空</h2>'
-            "<p>完成得很好。切换到其他队列查看下一项工作。</p></div>"
+            f'<div class="saas-empty"><h2>{escape(translate("inbox.queue_empty_title"))}</h2>'
+            f"<p>{escape(translate('inbox.queue_empty_description'))}</p></div>"
         )
     root = f"{_tenant_root(tenant_id)}/inbox?queue={queue}"
-    return "".join(
-        f'<a class="saas-work-item{" active" if selected_item and item.item_id == selected_item.item_id else ""}" '
-        f'href="{root}&amp;item_id={item.item_id}">'
-        f'<div class="saas-work-item-title"><span>{escape(item.title)}</span>'
-        f"<span>{format_age(item.created_at)}</span></div>"
-        f"<p>{escape(item.platform)} · {escape(item.channel_type)} · "
-        f"{escape(item.account_name)}</p>"
-        f'<div class="saas-work-item-meta"><span>{status_badge(item.status)}</span>'
-        f"<span>{escape(item.reason)}</span></div></a>"
-        for item in items
-    )
+    rendered_items: list[str] = []
+    for item in items:
+        is_selected = selected_item is not None and item.item_id == selected_item.item_id
+        filter_text = f"{item.title} {item.account_name} {item.platform}"
+        rendered_items.append(
+            f'<a class="saas-work-item{" active" if is_selected else ""}" '
+            f'href="{root}&amp;item_id={item.item_id}" '
+            f'data-filter-text="{escape(filter_text)}"'
+            f"{" aria-current='true'" if is_selected else ''}>"
+            f'<div class="saas-work-item-title"><span>{escape(item.title)}</span>'
+            f"<span>{format_age(item.created_at)}</span></div>"
+            f"<p>{escape(item.platform)} · {escape(item.channel_type)} · "
+            f"{escape(item.account_name)}</p>"
+            f'<div class="saas-work-item-meta"><span>{status_badge(item.status)}</span>'
+            f"<span>{escape(item.reason)}</span></div></a>"
+        )
+    return "".join(rendered_items)
 
 
 def _render_conversation_thread(
     tenant_id: str,
     messages: list[models.Message],
     selected_item: InboxItem | None,
+    *,
+    suggested_item: InboxItem | None = None,
 ) -> str:
     if selected_item is None:
-        return empty_state("选择一个工作项", "左侧列表按最老等待排序。打开第一项开始处理。")
+        action_html = ""
+        if suggested_item is not None:
+            action_html = primary_action(
+                f"{_tenant_root(tenant_id)}/inbox?queue={suggested_item.queue}"
+                f"&item_id={suggested_item.item_id}",
+                translate("inbox.open_oldest"),
+            )
+        return empty_state(
+            translate("inbox.select_title"),
+            translate("inbox.select_description"),
+            action_html=action_html,
+        )
     message_rows = "".join(
         '<article class="saas-message '
         f'{"outbound" if message.direction == "outbound" else "inbound"}">'
-        f'<div class="saas-message-bubble">{escape(message.text or "[非文本消息]")}</div>'
+        f'<div class="saas-message-bubble">{escape(message.text or translate("common.non_text_message"))}</div>'
         f'<div class="saas-message-meta">{escape(message.sender_type)} · '
         f"{format_datetime(message.occurred_at or message.created_at)}</div></article>"
         for message in messages
     )
     if not message_rows:
-        message_rows = '<div class="saas-empty"><p>这条会话尚无可展示的文本消息。</p></div>'
+        message_rows = (
+            f'<div class="saas-empty"><p>{escape(translate("inbox.no_messages"))}</p></div>'
+        )
     return f"""<div class="saas-thread">
 <div class="saas-inbox-column-header"><strong>{escape(selected_item.title)}</strong>
 <div class="saas-muted">{escape(selected_item.platform)} · {escape(selected_item.channel_type)}</div></div>
 <div class="saas-thread-messages">{message_rows}</div>
-<div class="saas-composer"><textarea disabled placeholder="选择右侧操作进入受保护的处理流程"></textarea>
+<div class="saas-composer"><textarea disabled placeholder="{escape(translate("inbox.composer_placeholder"))}"></textarea>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
-<span class="saas-muted">人工回复仍沿用现有 CSRF、目标消息和 Outbox 保护。</span>
-{secondary_action(f'{_tenant_root(tenant_id)}/conversations/{selected_item.conversation_id}', '打开完整处理页', small=True)}</div></div>
+<span class="saas-muted">{escape(translate("inbox.reply_safety"))}</span>
+{secondary_action(f"{_tenant_root(tenant_id)}/conversations/{selected_item.conversation_id}", translate("inbox.open_full"), small=True)}</div></div>
 </div>"""
+
+
+def _delivery_verification_source_options() -> str:
+    options = (
+        ("PROVIDER_DASHBOARD", translate("inbox.delivery.source.provider_dashboard")),
+        ("PROVIDER_API", translate("inbox.delivery.source.provider_api")),
+        (
+            "CUSTOMER_CONFIRMATION",
+            translate("inbox.delivery.source.customer_confirmation"),
+        ),
+        (
+            "ADMIN_OPERATOR_ATTESTED",
+            translate("inbox.delivery.source.admin_attested"),
+        ),
+        (
+            "SUPERVISOR_OVERRIDE",
+            translate("inbox.delivery.source.supervisor_override"),
+        ),
+    )
+    return "".join(
+        f'<option value="{source}">{escape(label)}</option>' for source, label in options
+    )
+
+
+def _delivery_fence_fields(selected_item: InboxItem) -> str:
+    expected_status = selected_item.expected_status or selected_item.status
+    expected_attempt_count = (
+        selected_item.expected_attempt_count
+        if selected_item.expected_attempt_count is not None
+        else 0
+    )
+    return (
+        f'<input type="hidden" name="expected_status" value="{escape(expected_status)}">'
+        f'<input type="hidden" name="expected_attempt_count" '
+        f'value="{expected_attempt_count}">'
+    )
+
+
+def _delivery_evidence_fields(*, field_suffix: str) -> str:
+    return f"""<label class="saas-field" for="delivery-source-{escape(field_suffix)}"><span>{escape(translate("inbox.delivery.verification_source"))}</span>
+<select id="delivery-source-{escape(field_suffix)}" name="verification_source" required>{_delivery_verification_source_options()}</select></label>
+<label class="saas-field" for="delivery-reason-{escape(field_suffix)}"><span>{escape(translate("inbox.delivery.review_reason"))}</span>
+<textarea id="delivery-reason-{escape(field_suffix)}" name="review_reason" required maxlength="500"></textarea></label>"""
+
+
+def _delivery_resolution_form(
+    *,
+    tenant_id: str,
+    selected_item: InboxItem,
+    csrf_token: str,
+    resolution: str,
+    title_key: str,
+    description_key: str,
+    button_key: str,
+    include_provider_message_id: bool = False,
+) -> str:
+    field_suffix = resolution.lower().replace("_", "-")
+    provider_message_field = ""
+    if include_provider_message_id:
+        provider_message_field = f"""<label class="saas-field" for="provider-message-{field_suffix}"><span>{escape(translate("inbox.delivery.provider_message_id"))}</span>
+<input id="provider-message-{field_suffix}" name="provider_message_id" required maxlength="255" pattern="[A-Za-z0-9][A-Za-z0-9._:/=+\\-]{{0,254}}"></label>"""
+    return f"""<section class="saas-draft-review"><h4>{escape(translate(title_key))}</h4>
+<p class="saas-muted">{escape(translate(description_key))}</p>
+<form method="post" action="{_tenant_root(tenant_id)}/delivery/{selected_item.item_id}/resolve">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+{_delivery_fence_fields(selected_item)}
+<input type="hidden" name="resolution" value="{resolution}">
+{_delivery_evidence_fields(field_suffix=field_suffix)}
+{provider_message_field}
+<button class="saas-button" type="submit">{escape(translate(button_key))}</button></form></section>"""
+
+
+def _render_delivery_action_panel(
+    tenant_id: str,
+    selected_item: InboxItem,
+    *,
+    csrf_token: str,
+) -> str:
+    attempt_count = selected_item.expected_attempt_count or 0
+    error_code = selected_item.delivery_error_code or selected_item.reason
+    delivery_details = definition_list(
+        (
+            (translate("common.account"), selected_item.account_name),
+            (translate("common.platform"), selected_item.platform),
+            (translate("inbox.waiting"), format_age(selected_item.created_at)),
+            (translate("inbox.delivery.error_code"), error_code),
+            (
+                translate("inbox.delivery.attempt"),
+                translate("inbox.delivery.attempt_value", attempt=attempt_count),
+            ),
+            ("Item ID", str(selected_item.item_id)),
+        )
+    )
+    header = f"""<div class="saas-action-panel"><h3>{escape(translate("inbox.current_action"))}</h3>
+{status_badge(selected_item.status)}
+<p><strong>{escape(error_code)}</strong></p>
+{delivery_details}"""
+    if selected_item.status == "FAILED":
+        retry_form = f"""<div class="saas-alert warning" style="margin:16px 0">{escape(translate("inbox.warning.retry"))}</div>
+<form method="post" action="{_tenant_root(tenant_id)}/delivery/{selected_item.item_id}/retry">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+{_delivery_fence_fields(selected_item)}
+{_delivery_evidence_fields(field_suffix="failed-retry")}
+<button class="saas-button primary" type="submit">{escape(translate("inbox.delivery.retry_confirmed_failure"))}</button></form>"""
+        return f"{header}{retry_form}</div>"
+    review_forms = "".join(
+        (
+            _delivery_resolution_form(
+                tenant_id=tenant_id,
+                selected_item=selected_item,
+                csrf_token=csrf_token,
+                resolution="CONFIRMED_NOT_SENT_RETRY",
+                title_key="inbox.delivery.not_sent_title",
+                description_key="inbox.delivery.not_sent_description",
+                button_key="inbox.delivery.not_sent_action",
+            ),
+            _delivery_resolution_form(
+                tenant_id=tenant_id,
+                selected_item=selected_item,
+                csrf_token=csrf_token,
+                resolution="CONFIRMED_SENT",
+                title_key="inbox.delivery.sent_title",
+                description_key="inbox.delivery.sent_description",
+                button_key="inbox.delivery.sent_action",
+                include_provider_message_id=True,
+            ),
+            _delivery_resolution_form(
+                tenant_id=tenant_id,
+                selected_item=selected_item,
+                csrf_token=csrf_token,
+                resolution="CANCEL",
+                title_key="inbox.delivery.cancel_title",
+                description_key="inbox.delivery.cancel_description",
+                button_key="inbox.delivery.cancel_action",
+            ),
+        )
+    )
+    warning = f'<div class="saas-alert warning" style="margin:16px 0">{escape(translate("inbox.warning.verify"))}</div>'
+    return f"{header}{warning}{review_forms}</div>"
 
 
 def _render_inbox_action_panel(
     tenant_id: str,
     selected_item: InboxItem | None,
+    *,
+    csrf_token: str = "",
 ) -> str:
     if selected_item is None:
-        return '<div class="saas-action-panel"><p class="saas-muted">尚未选择工作项。</p></div>'
+        return ""
+    if selected_item.queue == "delivery":
+        return _render_delivery_action_panel(
+            tenant_id,
+            selected_item,
+            csrf_token=csrf_token,
+        )
     if selected_item.queue == "human":
-        action_label = "认领并处理"
-        warning = "人工工作项使用版本保护；若已被他人认领，系统不会覆盖对方状态。"
+        action_label = translate("inbox.action.claim")
+        warning = translate("inbox.warning.claim")
     elif selected_item.queue == "drafts":
-        action_label = "审核草稿"
-        warning = "批准前会再次检查 decision generation、Prompt 和发送资格。"
-    elif selected_item.status == "NEEDS_REVIEW":
-        action_label = "核实平台结果"
-        warning = "平台可能已经接收消息。核实前不要直接重试，以免重复发送。"
-    else:
-        action_label = "检查并重试"
-        warning = "只有确定失败的投递才允许进入自动重试路径。"
-    return f"""<div class="saas-action-panel"><h3>当前操作</h3>
+        draft_text = selected_item.draft_text or ""
+        expected_generation = (
+            str(selected_item.decision_generation)
+            if selected_item.decision_generation is not None
+            else ""
+        )
+        expected_review_action = selected_item.review_action or selected_item.status
+        return f"""<div class="saas-action-panel"><h3>{escape(translate("inbox.current_action"))}</h3>
 {status_badge(selected_item.status)}
 <p><strong>{escape(selected_item.reason)}</strong></p>
-{definition_list((('账号', selected_item.account_name), ('平台', selected_item.platform), ('等待', format_age(selected_item.created_at)), ('Item ID', str(selected_item.item_id))))}
+{definition_list(((translate("common.account"), selected_item.account_name), (translate("common.platform"), selected_item.platform), (translate("inbox.waiting"), format_age(selected_item.created_at)), ("Item ID", str(selected_item.item_id))))}
+<div class="saas-alert warning" style="margin:16px 0">{escape(translate("inbox.warning.review"))}</div>
+<section class="saas-draft-review"><h4>{escape(translate("inbox.original_draft"))}</h4>
+<blockquote>{escape(draft_text)}</blockquote>
+<form method="post" action="{_tenant_root(tenant_id)}/decisions/{selected_item.item_id}/approve">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<input type="hidden" name="expected_generation" value="{escape(expected_generation)}">
+<input type="hidden" name="expected_review_action" value="{escape(expected_review_action)}">
+<label class="saas-field"><span>{escape(translate("inbox.final_reply"))}</span>
+<textarea name="final_reply_text" required maxlength="10000">{escape(draft_text)}</textarea></label>
+<button class="saas-button primary" type="submit">{escape(translate("inbox.approve_send"))}</button></form>
+<form method="post" action="{_tenant_root(tenant_id)}/decisions/{selected_item.item_id}/discard">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<input type="hidden" name="expected_generation" value="{escape(expected_generation)}">
+<input type="hidden" name="expected_review_action" value="{escape(expected_review_action)}">
+<label class="saas-field"><span>{escape(translate("inbox.rejection_reason"))}</span>
+<input name="review_reason" required maxlength="500"></label>
+<button class="saas-button" type="submit">{escape(translate("inbox.reject_draft"))}</button></form></section>
+<p class="saas-muted">{escape(translate("inbox.return_after_completion"))}</p></div>"""
+    elif selected_item.status == "NEEDS_REVIEW":
+        action_label = translate("inbox.action.verify_delivery")
+        warning = translate("inbox.warning.verify")
+    else:
+        action_label = translate("inbox.action.retry_delivery")
+        warning = translate("inbox.warning.retry")
+    return f"""<div class="saas-action-panel"><h3>{escape(translate("inbox.current_action"))}</h3>
+{status_badge(selected_item.status)}
+<p><strong>{escape(selected_item.reason)}</strong></p>
+{definition_list(((translate("common.account"), selected_item.account_name), (translate("common.platform"), selected_item.platform), (translate("inbox.waiting"), format_age(selected_item.created_at)), ("Item ID", str(selected_item.item_id))))}
 <div class="saas-alert warning" style="margin:16px 0">{escape(warning)}</div>
-{primary_action(f'{_tenant_root(tenant_id)}/conversations/{selected_item.conversation_id}', action_label)}
-<p class="saas-muted">完成后返回此页，继续下一项。</p></div>"""
+{primary_action(f"{_tenant_root(tenant_id)}/conversations/{selected_item.conversation_id}", action_label)}
+<p class="saas-muted">{escape(translate("inbox.return_after_completion"))}</p></div>"""
+
+
+def _render_conversations_workspace(
+    *,
+    conversation_items: str,
+    item_count: int,
+    workspace_empty: str,
+) -> str:
+    list_content = conversation_items or (
+        f'<div class="saas-empty"><h2>{escape(translate("conversations.empty_title"))}</h2>'
+        f"<p>{escape(translate('conversations.empty_description'))}</p></div>"
+    )
+    return f"""<div class="saas-inbox-layout saas-conversations-layout" data-conversation-workspace>
+  <section class="saas-inbox-column saas-list-pane" aria-label="{escape(translate("conversations.list_label"))}" data-conversation-list data-list-filter>
+    <header class="saas-inbox-column-header saas-list-pane-header">
+      <div class="saas-list-pane-title"><h1>{escape(translate("conversations.title"))}</h1>
+      <span class="saas-muted">{escape(translate("conversations.item_count", count=item_count))}</span></div>
+      <label for="conversation-list-search">{escape(translate("conversations.search_label"))}</label>
+      <input id="conversation-list-search" type="search" autocomplete="off" data-list-search
+             placeholder="{escape(translate("conversations.search_placeholder"))}">
+    </header>
+    <div data-list-items>{list_content}</div>
+    <div class="saas-empty" data-search-empty hidden>
+      <h2>{escape(translate("conversations.search_empty_title"))}</h2>
+      <p>{escape(translate("conversations.search_empty_description"))}</p>
+    </div>
+  </section>
+  <section class="saas-inbox-column saas-workspace-pane" aria-label="{escape(translate("conversations.workspace_label"))}" data-conversation-main>
+    {workspace_empty}
+  </section>
+</div>"""
 
 
 @router.get("/app/t/{tenant_id}/conversations", response_class=HTMLResponse)
@@ -1489,7 +3007,15 @@ async def tenant_conversations(request: Request, tenant_id: str) -> Response:
                     models.PlatformAccount,
                     latest_message_at.label("latest_message_at"),
                 )
-                .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+                .join(
+                    models.Contact,
+                    and_(
+                        models.Conversation.contact_id == models.Contact.id,
+                        models.Contact.tenant_id == tenant_id,
+                        models.Contact.platform_account_id
+                        == models.Conversation.platform_account_id,
+                    ),
+                )
                 .join(
                     models.PlatformAccount,
                     models.Conversation.platform_account_id == models.PlatformAccount.id,
@@ -1502,30 +3028,51 @@ async def tenant_conversations(request: Request, tenant_id: str) -> Response:
                 .limit(100)
             )
         ).all()
-    table_rows = "".join(
-        f"<tr><td><a href='{_tenant_root(tenant_id)}/conversations/{conversation.id}'>"
-        f"<strong>{escape(contact.display_name or '匿名联系人')}</strong></a></td>"
-        f"<td>{escape(account.name)}</td><td>{escape(conversation.platform)}</td>"
-        f"<td>{escape(conversation.channel_type)}</td>"
-        f"<td>{format_datetime(latest_at)}</td>"
-        f"<td><a href='{_tenant_root(tenant_id)}/conversations/{conversation.id}'>打开 →</a></td></tr>"
-        for conversation, contact, account, latest_at in rows
-    )
-    body = (
-        '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        '<th>联系人</th><th>授权账号</th><th>平台</th><th>渠道</th><th>最近消息</th><th></th>'
-        f"</tr></thead><tbody>{table_rows}</tbody></table></div>"
-        if table_rows
-        else empty_state("暂无对话", "连接自己的授权账号后，新对话会显示在这里。")
+    rendered_conversation_items: list[str] = []
+    for conversation, contact, account, latest_at in rows:
+        contact_name = contact.display_name or translate("common.anonymous_contact")
+        filter_text = f"{contact_name} {account.name} {conversation.platform}"
+        rendered_conversation_items.append(
+            f'<a class="saas-work-item" '
+            f'href="{_tenant_root(tenant_id)}/conversations/{conversation.id}" '
+            f'data-filter-text="{escape(filter_text)}">'
+            f'<div class="saas-work-item-title"><span>{escape(contact_name)}</span>'
+            f"<span>{format_datetime(latest_at)}</span></div>"
+            f"<p>{escape(account.name)} · {escape(conversation.platform)} · "
+            f"{escape(conversation.channel_type)}</p>"
+            f'<div class="saas-work-item-meta"><span>{escape(translate("conversations.latest_message"))}</span>'
+            f"<span>{escape(translate('conversations.open'))}</span></div></a>"
+        )
+    conversation_items = "".join(rendered_conversation_items)
+    if conversation_items:
+        first_conversation = rows[0][0]
+        workspace_empty = empty_state(
+            translate("conversations.select_title"),
+            translate("conversations.select_description"),
+            action_html=primary_action(
+                f"{_tenant_root(tenant_id)}/conversations/{first_conversation.id}",
+                translate("conversations.open_latest"),
+            ),
+        )
+    else:
+        workspace_empty = empty_state(
+            translate("conversations.empty_title"),
+            translate("conversations.empty_description"),
+        )
+    body = _render_conversations_workspace(
+        conversation_items=conversation_items,
+        item_count=len(rows),
+        workspace_empty=workspace_empty,
     )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="对话",
-        description="仅显示你有权访问的平台账号产生的客户对话。",
+        title=translate("conversations.title"),
+        description=translate("conversations.description"),
         body=body,
         active_navigation="conversations",
         inbox_count=inbox_summary.total,
+        workbench=True,
     )
 
 
@@ -1545,11 +3092,14 @@ async def tenant_conversation_detail(
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         row = (
             await session.execute(
-                select(models.Conversation, models.Contact, models.PlatformAccount)
-                .join(models.Contact, models.Conversation.contact_id == models.Contact.id)
+                select(models.Conversation, models.PlatformAccount)
                 .join(
                     models.PlatformAccount,
-                    models.Conversation.platform_account_id == models.PlatformAccount.id,
+                    and_(
+                        models.Conversation.platform_account_id
+                        == models.PlatformAccount.id,
+                        models.PlatformAccount.tenant_id == tenant_id,
+                    ),
                 )
                 .where(
                     models.Conversation.id == conversation_id,
@@ -1560,7 +3110,49 @@ async def tenant_conversation_detail(
         ).one_or_none()
         if row is None:
             raise HTTPException(status_code=404, detail="conversation_not_found")
-        conversation, contact, account = row
+        conversation, account = row
+        contact = await session.scalar(
+            select(models.Contact).where(
+                models.Contact.id == conversation.contact_id,
+                models.Contact.tenant_id == tenant_id,
+                models.Contact.platform_account_id == conversation.platform_account_id,
+            )
+        )
+        if contact is None:
+            logger.warning(
+                "conversation detail scope mismatch conversation_id=%s relation=contact "
+                "related_id=%s",
+                conversation_id,
+                conversation.contact_id,
+            )
+            raise HTTPException(status_code=404, detail="conversation_not_found")
+        invalid_source_outbox_id = await session.scalar(
+            select(models.Message.source_outbox_id)
+            .outerjoin(
+                models.OutboxMessage,
+                models.Message.source_outbox_id == models.OutboxMessage.id,
+            )
+            .where(
+                models.Message.conversation_id == conversation_id,
+                models.Message.source_outbox_id.is_not(None),
+                or_(
+                    models.OutboxMessage.id.is_(None),
+                    models.OutboxMessage.tenant_id != tenant_id,
+                    models.OutboxMessage.conversation_id != conversation_id,
+                    models.OutboxMessage.platform_account_id
+                    != conversation.platform_account_id,
+                ),
+            )
+            .limit(1)
+        )
+        if invalid_source_outbox_id is not None:
+            logger.warning(
+                "conversation detail scope mismatch conversation_id=%s "
+                "relation=message_source_outbox related_id=%s",
+                conversation_id,
+                invalid_source_outbox_id,
+            )
+            raise HTTPException(status_code=404, detail="conversation_not_found")
         newest_messages = list(
             (
                 await session.execute(
@@ -1584,29 +3176,25 @@ async def tenant_conversation_detail(
         )
     csrf = _csrf(request)
     reply_target = next(
-        (
-            message
-            for message in newest_messages
-            if message.direction == "inbound"
-        ),
+        (message for message in newest_messages if message.direction == "inbound"),
         None,
     )
     message_rows = "".join(
         '<article class="saas-card saas-card-body">'
         f"<div class='saas-muted'>{escape(message.sender_type)} · "
         f"{format_datetime(message.created_at, include_year=True)}</div>"
-        f"<p>{escape(message.text or '（非文本消息）')}</p></article>"
+        f"<p>{escape(message.text or translate('common.non_text_message'))}</p></article>"
         for message in reversed(newest_messages)
     )
     work_actions = ""
     if work_item is not None and work_item.status == "WAITING":
         work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/claim">
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_version" value="{work_item.version}">
-<button class="saas-button primary" type="submit">认领此对话</button></form>"""
+<button class="saas-button primary" type="submit">{escape(translate("conversation.claim"))}</button></form>"""
     elif work_item is not None and work_item.assigned_actor == principal.actor:
         work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/resolve">
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_version" value="{work_item.version}">
-<button class="saas-button" type="submit">标记已解决</button></form>"""
+<button class="saas-button" type="submit">{escape(translate("conversation.resolve"))}</button></form>"""
     reply_form = ""
     if reply_target is not None:
         work_fields = ""
@@ -1615,28 +3203,34 @@ async def tenant_conversation_detail(
                 f'<input type="hidden" name="work_item_id" value="{work_item.id}">'
                 f'<input type="hidden" name="expected_version" value="{work_item.version}">'
             )
-        reply_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>人工回复</h2>
-<p>提交后仍进入统一 Outbox 和发送前安全复检。</p></div></div><div class="saas-card-body">
+        reply_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("conversation.reply_title"))}</h2>
+<p>{escape(translate("conversation.reply_description"))}</p></div></div><div class="saas-card-body">
 <form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/conversations/{conversation_id}/reply">
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="reply_to_message_id" value="{reply_target.id}">
 <input type="hidden" name="idempotency_key" value="{uuid.uuid4()}">{work_fields}
-<label for="manual-reply">回复内容</label><textarea id="manual-reply" name="text" rows="5" maxlength="10000" required></textarea>
-<button class="saas-button primary" type="submit">发送人工回复</button></form></div></section>"""
+<label for="manual-reply">{escape(translate("conversation.reply_label"))}</label><textarea id="manual-reply" name="text" rows="5" maxlength="10000" required></textarea>
+<button class="saas-button primary" type="submit">{escape(translate("conversation.send_reply"))}</button></form></div></section>"""
     body = (
         '<section class="saas-card"><div class="saas-card-body">'
-        f"{definition_list((('联系人', contact.display_name or '匿名联系人'), ('账号', account.name), ('平台', conversation.platform), ('渠道', conversation.channel_type), ('Conversation ID', conversation.id)))}"
+        f"{definition_list(((translate('common.contact'), contact.display_name or translate('common.anonymous_contact')), (translate('common.account'), account.name), (translate('common.platform'), conversation.platform), (translate('common.channel'), conversation.channel_type), ('Conversation ID', conversation.id)))}"
         f"{work_actions}</div></section>"
         f'<div class="saas-stack">{message_rows}</div>{reply_form}'
     )
     response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title=contact.display_name or "对话详情",
-        description="查看该授权账号范围内的完整对话记录。",
+        title=contact.display_name or translate("conversation.detail_title"),
+        description=translate("conversation.detail_description"),
         body=body,
         active_navigation="conversations",
         inbox_count=inbox_summary.total,
-        breadcrumbs=(("对话", f"{_tenant_root(tenant_id)}/conversations"), ("详情", None)),
+        breadcrumbs=(
+            (
+                translate("conversations.title"),
+                f"{_tenant_root(tenant_id)}/conversations",
+            ),
+            (translate("common.details"), None),
+        ),
     )
     if not request.cookies.get("reply_admin_csrf"):
         response.set_cookie(
@@ -1722,16 +3316,8 @@ async def reply_to_tenant_conversation(
     if not text:
         raise HTTPException(status_code=422, detail="reply_text_required")
     try:
-        work_item_id = (
-            uuid.UUID(form["work_item_id"])
-            if form.get("work_item_id")
-            else None
-        )
-        expected_version = (
-            int(form["expected_version"])
-            if form.get("expected_version")
-            else None
-        )
+        work_item_id = uuid.UUID(form["work_item_id"]) if form.get("work_item_id") else None
+        expected_version = int(form["expected_version"]) if form.get("expected_version") else None
         await send_human_reply(
             conversation_id=conversation_id,
             reply_to_message_id=uuid.UUID(form.get("reply_to_message_id", "")),
@@ -1759,7 +3345,12 @@ async def tenant_knowledge_query(request: Request, tenant_id: str) -> Response:
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
-    query = (request.query_params.get("q") or "").strip()
+    if request.method == "GET" and request.query_params.get("q"):
+        return RedirectResponse(
+            f"{_tenant_root(tenant_id)}/knowledge-query",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    query = ""
     if request.method == "POST":
         form = await _form(request)
         _require_csrf(request, form)
@@ -1770,53 +3361,76 @@ async def tenant_knowledge_query(request: Request, tenant_id: str) -> Response:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         documents: list[models.KnowledgeDocument] = []
         if query:
-            search_pattern = f"%{query}%"
-            documents = list(
-                (
-                    await session.execute(
-                        select(models.KnowledgeDocument)
+            allowed_brand_ids: tuple[str, ...] | None = None
+            if not principal.is_admin:
+                owned_brand_ids = set(
+                    await session.scalars(
+                        select(models.PlatformAccount.brand_id)
                         .where(
-                            models.KnowledgeDocument.tenant_id == tenant_id,
-                            models.KnowledgeDocument.status == "published",
-                            or_(
-                                models.KnowledgeDocument.question.ilike(search_pattern),
-                                models.KnowledgeDocument.reply.ilike(search_pattern),
-                            ),
+                            models.PlatformAccount.tenant_id == tenant_id,
+                            models.PlatformAccount.owner_user_id == principal.user_id,
                         )
-                        .order_by(models.KnowledgeDocument.updated_at.desc())
-                        .limit(20)
+                        .distinct()
                     )
                 )
-                .scalars()
-                .all()
+                allowed_brand_ids = tuple(sorted({"default", *owned_brand_ids}))
+            documents = await execute_search_published_knowledge(
+                session,
+                SearchPublishedKnowledgeQuery(
+                    required_tenant_id=tenant_id,
+                    actor=principal.actor,
+                    search_text=query,
+                    allowed_brand_ids=allowed_brand_ids,
+                ),
             )
+            documents = [
+                document
+                for document in documents
+                if not _knowledge_document_is_sensitive(document)
+                and not any(
+                    has_contact_like(str(value or ""))
+                    for value in (
+                        document.brand_id,
+                        document.platform,
+                        document.category,
+                        document.source_file,
+                    )
+                )
+            ]
     csrf = _csrf(request)
     results = "".join(
         '<article class="saas-card"><div class="saas-card-header"><div>'
         f"<h2>{escape(document.question)}</h2>"
-        f"<p>{escape(document.brand_id)} · {escape(document.platform)}</p></div>"
+        f"<p>{escape(_knowledge_visible_metadata(document, document.brand_id))} · {escape(_knowledge_visible_metadata(document, document.platform))}</p></div>"
         f"{status_badge(document.status)}</div>"
         f'<div class="saas-card-body"><p>{escape(document.reply)}</p></div></article>'
         for document in documents
     )
     if query and not results:
-        results = empty_state("没有找到已发布知识", "换一个更具体的关键词再试。")
+        results = empty_state(
+            translate("knowledge_query.empty_title"),
+            translate("knowledge_query.empty_description"),
+        )
     body = f"""<section class="saas-card"><div class="saas-card-body">
-<form class="saas-form" method="post"><input type="hidden" name="csrf_token" value="{csrf}">
-<label for="knowledge-query">输入客户问题或关键词</label>
+<form class="saas-form" method="post" role="search" aria-label="{escape(translate("knowledge_query.title"))}"><input type="hidden" name="csrf_token" value="{csrf}">
+<label for="knowledge-query">{escape(translate("knowledge_query.label"))}</label>
 <div class="saas-form-row"><input id="knowledge-query" name="q" value="{escape(query)}" maxlength="500" required>
-<button class="saas-button primary" type="submit">查询已发布知识</button></div>
-<p class="saas-muted">只查询已发布内容，不会生成回复或触发外发。</p></form></div></section>
+<button class="saas-button primary" type="submit">{escape(translate("knowledge_query.submit"))}</button></div>
+<p class="saas-muted">{escape(translate("knowledge_query.notice"))}</p></form></div></section>
 <div class="saas-stack">{results}</div>"""
-    response = _render_page(
-        principal=principal,
-        tenant_id=tenant_id,
-        title="知识查询",
-        description="搜索管理员已经审核并发布的标准答案。",
-        body=body,
-        active_navigation="knowledge-query",
-        inbox_count=inbox_summary.total,
-    )
+    request_location_token = set_request_location(request.url.path, ())
+    try:
+        response = _render_page(
+            principal=principal,
+            tenant_id=tenant_id,
+            title=translate("knowledge_query.title"),
+            description=translate("knowledge_query.description"),
+            body=body,
+            active_navigation="knowledge-query",
+            inbox_count=inbox_summary.total,
+        )
+    finally:
+        reset_request_location(request_location_token)
     if not request.cookies.get("reply_admin_csrf"):
         response.set_cookie(
             "reply_admin_csrf",
@@ -1859,15 +3473,21 @@ async def tenant_my_activity(request: Request, tenant_id: str) -> Response:
     )
     body = (
         '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        f"<th>时间</th><th>动作</th><th>资源</th><th>ID</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        f"<th>{escape(translate('common.time'))}</th>"
+        f"<th>{escape(translate('common.action'))}</th>"
+        f"<th>{escape(translate('common.resource'))}</th>"
+        f"<th>ID</th></tr></thead><tbody>{rows}</tbody></table></div>"
         if rows
-        else empty_state("暂无个人活动", "你处理会话、审核草稿或绑定账号后会显示在这里。")
+        else empty_state(
+            translate("activity.empty_title"),
+            translate("activity.empty_description"),
+        )
     )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="我的活动",
-        description="仅显示由当前账号执行的操作，不暴露其他用户或系统内部审计。",
+        title=translate("activity.title"),
+        description=translate("activity.description"),
         body=body,
         active_navigation="activity",
         inbox_count=inbox_summary.total,
@@ -1901,15 +3521,20 @@ def _safe_channel_avatar_url(value: object) -> str | None:
 
 
 def _channel_icon_path(platform: str) -> str:
-    known_platform = platform if platform in {
-        "email",
-        "facebook",
-        "feishu",
-        "instagram",
-        "telegram",
-        "whatsapp",
-        "x",
-    } else "email"
+    known_platform = (
+        platform
+        if platform
+        in {
+            "email",
+            "facebook",
+            "feishu",
+            "instagram",
+            "telegram",
+            "whatsapp",
+            "x",
+        }
+        else "email"
+    )
     return f"/static/channel-icons/{known_platform}.svg"
 
 
@@ -1922,15 +3547,12 @@ def _channel_avatar(account: models.PlatformAccount) -> str:
             'referrerpolicy="no-referrer">'
         )
     initial = (account.name or account.platform or "?").strip()[:1].upper()
-    return (
-        '<span class="saas-account-avatar fallback" aria-hidden="true">'
-        f"{escape(initial)}</span>"
-    )
+    return f'<span class="saas-account-avatar fallback" aria-hidden="true">{escape(initial)}</span>'
 
 
 def _channel_account_health(account: models.PlatformAccount) -> tuple[str, str]:
     if account.status != "active":
-        return "danger", "已禁用"
+        return "danger", translate("channels.health.disabled")
     config = dict(account.config or {})
     health_values = {
         str(config.get("meta_health_status") or ""),
@@ -1938,57 +3560,82 @@ def _channel_account_health(account: models.PlatformAccount) -> tuple[str, str]:
         str(config.get("feishu_health_status") or ""),
     }
     if "ERROR" in health_values:
-        return "warning", "需要重新授权"
+        return "warning", translate("channels.health.reauthorize")
     if "PROVISIONING" in health_values:
-        return "info", "正在配置"
-    return "success", "已连接"
+        return "info", translate("channels.health.provisioning")
+    return "success", translate("channels.health.connected")
 
 
 def _channel_job_error_message(job: models.ProvisioningJob) -> str:
     if job.status == "FAILED":
-        return "平台暂时不可用，系统会按安全退避策略自动重试。"
+        return translate("channels.job.failed")
     error_code = str(job.last_error_code or "")
     if error_code == "ACCOUNT_OWNER_CONFLICT":
-        return "该平台账号已被其他归属范围绑定，不能重复认领。"
+        return translate("channels.job.owner_conflict")
     if error_code.startswith(("EMAIL_", "imap_", "smtp_")):
-        return "邮箱验证未完成，请检查地址、App Password 和服务器设置后重新提交。"
+        return translate("channels.job.email_error")
     if error_code.startswith("X_"):
-        return "X 授权或权限验证未完成，请检查 App 权限后重新授权。"
+        return translate("channels.job.x_error")
     if error_code.startswith(("META_", "PLATFORM_HTTP_")):
-        return "平台授权未完成，请确认应用权限和账号类型后重新授权。"
-    return "账号验证未完成，请重新授权；如问题持续存在，请联系管理员。"
+        return translate("channels.job.meta_error")
+    return translate("channels.job.default_error")
 
 
-def _channel_job_action(job: models.ProvisioningJob) -> str:
+def _channel_job_action(
+    job: models.ProvisioningJob,
+    *,
+    tenant_id: str,
+    csrf: str,
+) -> str:
     if job.status not in {"NEEDS_ACTION", "FAILED"}:
         return ""
-    if job.status == "FAILED":
-        return '<span class="saas-muted">等待自动重试</span>'
-    if job.platform in {"telegram", "email"}:
+    if job.status == "FAILED" and provisioning_job_is_in_flight(job):
+        return f'<span class="saas-muted">{escape(translate("channels.job.waiting_retry"))}</span>'
+    if requires_secret_resubmission(job) and job.platform in {"telegram", "email"}:
         return (
             '<button class="saas-button small" type="button" '
-            f'data-open-channel-dialog="{escape(job.platform)}-dialog">重新填写凭证</button>'
+            f'data-open-channel-dialog="{escape(job.platform)}-dialog">'
+            f"{escape(translate('channels.job.refill_credentials'))}</button>"
         )
-    return '<a class="saas-button small" href="#add-channels">重新授权</a>'
+    if requires_secret_resubmission(job):
+        return (
+            '<a class="saas-button small" href="#add-channels">'
+            f"{escape(translate('channels.job.reauthorize'))}</a>"
+        )
+    return f"""<form method="post" action="{_tenant_root(tenant_id)}/channels/jobs/{job.id}/retry">
+<input type="hidden" name="csrf_token" value="{escape(csrf)}">
+<button class="saas-button small" type="submit">{escape(translate("button.retry"))}</button></form>"""
 
 
-def _render_connected_channel(account: models.PlatformAccount) -> str:
+def _render_connected_channel(
+    account: models.PlatformAccount,
+    *,
+    tenant_id: str,
+    owner_name: str | None,
+    kill_switch_enabled: bool,
+) -> str:
     health_tone, health_label = _channel_account_health(account)
     username = (
         f"@{account.provider_username.lstrip('@')}"
-        if account.provider_username
-        and account.platform not in {"email", "telegram"}
+        if account.provider_username and account.platform not in {"email", "telegram"}
         else account.provider_username
     )
-    profile_line = username or account.external_account_id or "平台账号"
+    profile_line = username or account.external_account_id or translate("channels.platform_account")
     connected_at = account.profile_updated_at or account.created_at
+    owner_label = owner_name or translate("channels.organization_account")
+    kill_switch_label = translate(
+        "channels.kill_switch.enabled" if kill_switch_enabled else "channels.kill_switch.disabled"
+    )
     return f"""<article class="saas-connected-channel">
 <div class="saas-connected-identity">{_channel_avatar(account)}<div>
 <h3>{escape(account.name)}</h3><p>{escape(profile_line)}</p></div></div>
 <div class="saas-connected-meta"><span class="saas-platform-label">
 <img src="{_channel_icon_path(account.platform)}" alt="">{escape(account.platform.title())}</span>
 <span class="saas-status {health_tone}">{escape(health_label)}</span>
-<span class="saas-muted">最近连接 {format_datetime(connected_at, include_year=True)}</span></div>
+<span class="saas-muted">{escape(translate("channels.owner", owner=owner_label))}</span>
+<span class="saas-muted">{escape(kill_switch_label)}</span>
+<span class="saas-muted">{escape(translate("channels.recent_connection", time=format_datetime(connected_at, include_year=True)))}</span></div>
+<div class="saas-provider-actions"><a class="saas-button small" href="{_tenant_root(tenant_id)}/channels/accounts/{account.id}">{escape(translate("channels.manage_account"))}</a></div>
 </article>"""
 
 
@@ -2001,17 +3648,16 @@ def _channel_oauth_form(
     platform: str | None = None,
     available: bool,
 ) -> str:
-    disabled = "" if available else " disabled aria-disabled=\"true\""
+    disabled = "" if available else ' disabled aria-disabled="true"'
+    pending_label = escape(translate("common.connecting"))
     platform_input = (
-        f'<input type="hidden" name="platform" value="{escape(platform)}">'
-        if platform
-        else ""
+        f'<input type="hidden" name="platform" value="{escape(platform)}">' if platform else ""
     )
-    return f"""<form method="post" action="{escape(action)}" data-channel-oauth-form>
+    return f"""<form method="post" action="{escape(action)}" data-channel-oauth-form data-pending-label="{pending_label}">
 <input type="hidden" name="csrf_token" value="{escape(csrf)}">
 <input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
 <input type="hidden" name="brand_id" value="default">{platform_input}
-<button class="saas-button primary small" type="submit"{disabled}>{escape(label)}</button>
+<button class="saas-button primary small" type="submit" data-pending-label="{pending_label}"{disabled}>{escape(label)}</button>
 </form>"""
 
 
@@ -2025,10 +3671,10 @@ def _channel_provider_card(
     availability_label: str | None = None,
 ) -> str:
     state_label = availability_label or (
-        "可连接" if available else "联系管理员配置应用"
+        translate("channels.available") if available else translate("channels.admin_configuration")
     )
     state_class = "ready" if available else "managed"
-    return f"""<article class="saas-provider-card{' disabled' if not available else ''}">
+    return f"""<article class="saas-provider-card{" disabled" if not available else ""}">
 <div class="saas-provider-heading"><span class="saas-provider-icon">
 <img src="{_channel_icon_path(platform)}" alt=""></span>
 <span class="saas-provider-state {state_class}">{escape(state_label)}</span></div>
@@ -2044,11 +3690,6 @@ async def tenant_channels(
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
-    if principal.is_admin:
-        return RedirectResponse(
-            "/admin/integrations/accounts",
-            status_code=status.HTTP_303_SEE_OTHER,
-        )
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
         accounts = list(
@@ -2062,14 +3703,26 @@ async def tenant_channels(
             .scalars()
             .all()
         )
+        owner_names = dict(
+            (
+                await session.execute(
+                    select(models.AdminUser.id, models.AdminUser.username).where(
+                        models.AdminUser.tenant_id == tenant_id,
+                    )
+                )
+            ).all()
+        )
+        job_scope = models.ProvisioningJob.tenant_id == tenant_id
+        if not principal.is_admin:
+            job_scope = and_(
+                job_scope,
+                models.ProvisioningJob.owner_user_id == principal.user_id,
+            )
         jobs = list(
             (
                 await session.execute(
                     select(models.ProvisioningJob)
-                    .where(
-                        models.ProvisioningJob.tenant_id == tenant_id,
-                        models.ProvisioningJob.owner_user_id == principal.user_id,
-                    )
+                    .where(job_scope)
                     .order_by(models.ProvisioningJob.created_at.desc())
                     .limit(12)
                 )
@@ -2078,189 +3731,260 @@ async def tenant_channels(
             .all()
         )
     settings = get_settings()
+    redis = aioredis.from_url(settings.redis_url)
+    try:
+        kill_switch_values = (
+            await redis.mget(
+                [f"killswitch:account:{tenant_id}:{account.id}" for account in accounts]
+            )
+            if accounts
+            else []
+        )
+    finally:
+        await redis.aclose()
+    kill_switches = {
+        account.id: kill_switch_values[index] is not None for index, account in enumerate(accounts)
+    }
     facebook_app = await facebook_app_credentials(tenant_id)
     instagram_app = await instagram_app_credentials(tenant_id)
     x_available = settings.x_integration_enabled and x_app_credentials() is not None
     facebook_available = settings.facebook_messenger_enabled and facebook_app is not None
-    instagram_direct_available = (
-        settings.instagram_messaging_enabled and instagram_app is not None
-    )
-    instagram_meta_available = (
-        settings.instagram_messaging_enabled and facebook_app is not None
-    )
+    instagram_direct_available = settings.instagram_messaging_enabled and instagram_app is not None
+    instagram_meta_available = settings.instagram_messaging_enabled and facebook_app is not None
     csrf = _csrf(request)
-    connected_channels = "".join(_render_connected_channel(account) for account in accounts)
+    connected_channels = "".join(
+        _render_connected_channel(
+            account,
+            tenant_id=tenant_id,
+            owner_name=owner_names.get(account.owner_user_id),
+            kill_switch_enabled=kill_switches.get(account.id, False),
+        )
+        for account in accounts
+    )
     if not connected_channels:
         connected_channels = empty_state(
-            "还没有已连接账号",
-            "从下方选择一个渠道。连接成功后，账号会以名称、头像和健康状态显示在这里。",
+            translate("channels.connected_empty_title"),
+            translate("channels.connected_empty_description"),
         )
-    job_cards = "".join(
-        f"""<article class="saas-channel-job" data-channel-job
+    job_cards = (
+        "".join(
+            f"""<article class="saas-channel-job" data-channel-job
 data-job-url="{_tenant_root(tenant_id)}/channels/jobs/{job.id}"
 data-job-status="{escape(job.status)}">
 <div><img src="{_channel_icon_path(job.platform)}" alt=""><strong>{escape(job.platform.title())}</strong>
-<span>{format_datetime(job.created_at, include_year=True)}</span></div>
-<div>{status_badge(job.status)}<span data-job-step>{escape(job.current_step)}</span>{_channel_job_action(job)}</div>
-{f'<p class="saas-job-error">{escape(_channel_job_error_message(job))}</p>' if job.last_error_code else ''}
+<span>{format_datetime(job.created_at, include_year=True)}</span>
+<span>{escape(translate("channels.owner", owner=owner_names.get(job.owner_user_id) or translate("channels.organization_account")))}</span></div>
+<div>{status_badge(job.status)}<span data-job-step>{escape(job.current_step)}</span>{_channel_job_action(job, tenant_id=tenant_id, csrf=csrf)}</div>
+{f'<p class="saas-job-error">{escape(_channel_job_error_message(job))}</p>' if job.last_error_code else ""}
 </article>"""
-        for job in jobs
-    ) or '<p class="saas-muted">暂无授权任务。</p>'
+            for job in jobs
+        )
+        or f'<p class="saas-muted">{escape(translate("channels.no_jobs"))}</p>'
+    )
     oauth_status = request.query_params.get("status", "")
     job_id = request.query_params.get("job_id", "")
     error_code = request.query_params.get("code", "")
     banner = ""
     if oauth_status in {"processing", "connected"}:
         banner = (
-            '<div class="saas-alert success" role="status">授权已提交，正在安全验证账号。'
-            f"{f' 任务 {escape(job_id)}' if job_id else ''}</div>"
+            '<div class="saas-alert success" role="status">'
+            f"{escape(translate('channels.banner.processing'))}"
+            f"{escape(translate('channels.banner.job', job_id=job_id)) if job_id else ''}</div>"
         )
     elif oauth_status == "error":
         banner = (
-            '<div class="saas-alert danger" role="alert">授权未完成。'
-            f"错误代码：{escape(error_code or 'oauth_failed')}。请检查应用配置后重试。</div>"
+            '<div class="saas-alert danger" role="alert">'
+            f"{escape(translate('channels.banner.error', error_code=error_code or 'oauth_failed'))}</div>"
         )
     x_actions = _channel_oauth_form(
         action=f"{_tenant_root(tenant_id)}/channels/oauth/x/start",
         csrf=csrf,
         tenant_id=tenant_id,
-        label="使用 X 授权",
+        label=translate("channels.oauth.x"),
         available=x_available,
     )
     facebook_actions = _channel_oauth_form(
         action=f"{_tenant_root(tenant_id)}/channels/oauth/meta/start",
         csrf=csrf,
         tenant_id=tenant_id,
-        label="连接 Facebook Page",
+        label=translate("channels.oauth.facebook"),
         platform="facebook",
         available=facebook_available,
     )
-    instagram_actions = (
-        _channel_oauth_form(
-            action=f"{_tenant_root(tenant_id)}/channels/oauth/instagram/start",
-            csrf=csrf,
-            tenant_id=tenant_id,
-            label="Instagram Login",
-            available=instagram_direct_available,
-        )
-        + _channel_oauth_form(
-            action=f"{_tenant_root(tenant_id)}/channels/oauth/meta/start",
-            csrf=csrf,
-            tenant_id=tenant_id,
-            label="通过 Facebook 连接",
-            platform="instagram",
-            available=instagram_meta_available,
-        )
+    instagram_actions = _channel_oauth_form(
+        action=f"{_tenant_root(tenant_id)}/channels/oauth/instagram/start",
+        csrf=csrf,
+        tenant_id=tenant_id,
+        label="Instagram Login",
+        available=instagram_direct_available,
+    ) + _channel_oauth_form(
+        action=f"{_tenant_root(tenant_id)}/channels/oauth/meta/start",
+        csrf=csrf,
+        tenant_id=tenant_id,
+        label=translate("channels.oauth.instagram_meta"),
+        platform="instagram",
+        available=instagram_meta_available,
     )
-    email_button_attributes = (
-        "" if settings.email_enabled else ' disabled aria-disabled="true"'
+    telegram_available = settings.platform_integration_enabled("telegram")
+    whatsapp_available = settings.platform_integration_enabled("whatsapp")
+    feishu_available = settings.platform_integration_enabled("feishu")
+    email_available = settings.platform_integration_enabled("email")
+
+    def manual_button(dialog_id: str, label: str, *, available: bool) -> str:
+        disabled = "" if available else ' disabled aria-disabled="true"'
+        return (
+            '<button class="saas-button primary small" type="button" '
+            f'data-open-channel-dialog="{escape(dialog_id)}"{disabled}>'
+            f"{escape(label)}</button>"
+        )
+
+    feishu_actions = manual_button(
+        "feishu-dialog",
+        translate("channels.fill_feishu_credentials"),
+        available=feishu_available,
     )
+    if principal.is_admin:
+        feishu_actions += (
+            f'<a class="saas-button small" href="{_tenant_root(tenant_id)}/channels/feishu/handoff">'
+            f"{escape(translate('channels.feishu_handoff'))}</a>"
+        )
     provider_cards = "".join(
         (
             _channel_provider_card(
                 platform="x",
                 title="X",
-                description="授权个人或品牌 X 账号，用于私信与已启用的互动能力。",
+                description=translate("channels.provider.x_description"),
                 actions=x_actions,
                 available=x_available,
             ),
             _channel_provider_card(
                 platform="facebook",
                 title="Facebook",
-                description="授权后选择一个或多个可管理的 Facebook Page。",
+                description=translate("channels.provider.facebook_description"),
                 actions=facebook_actions,
                 available=facebook_available,
             ),
             _channel_provider_card(
                 platform="instagram",
                 title="Instagram",
-                description="支持 Instagram Login，或选择 Facebook 关联的专业账号。",
+                description=translate("channels.provider.instagram_description"),
                 actions=instagram_actions,
                 available=instagram_direct_available or instagram_meta_available,
             ),
             _channel_provider_card(
                 platform="telegram",
                 title="Telegram Bot",
-                description="使用 BotFather 生成的 Bot Token 连接。",
-                actions=(
-                    '<button class="saas-button primary small" type="button" '
-                    'data-open-channel-dialog="telegram-dialog">填写 Bot Token</button>'
+                description=translate("channels.provider.telegram_description"),
+                actions=manual_button(
+                    "telegram-dialog",
+                    translate("channels.fill_bot_token"),
+                    available=telegram_available,
                 ),
-                available=True,
+                available=telegram_available,
             ),
             _channel_provider_card(
                 platform="email",
                 title="Email",
-                description="使用 App Password 验证 IMAP 收件与 SMTP 回复。",
-                actions=(
-                    '<button class="saas-button primary small" type="button" '
-                    'data-open-channel-dialog="email-dialog"'
-                    f"{email_button_attributes}>"
-                    "填写邮箱凭证</button>"
+                description=translate("channels.provider.email_description"),
+                actions=manual_button(
+                    "email-dialog",
+                    translate("channels.fill_email_credentials"),
+                    available=email_available,
                 ),
-                available=settings.email_enabled,
+                available=email_available,
             ),
             _channel_provider_card(
                 platform="whatsapp",
                 title="WhatsApp",
-                description="首期由管理员配置 Meta App、WABA 与手机号。",
-                actions="",
-                available=False,
-                availability_label="由管理员配置",
+                description=translate("channels.provider.whatsapp_description"),
+                actions=manual_button(
+                    "whatsapp-dialog",
+                    translate("channels.fill_whatsapp_credentials"),
+                    available=whatsapp_available,
+                ),
+                available=whatsapp_available,
             ),
             _channel_provider_card(
                 platform="feishu",
                 title="Feishu",
-                description="首期由管理员配置自建应用与事件回调。",
-                actions="",
-                available=False,
-                availability_label="由管理员配置",
+                description=translate("channels.provider.feishu_description"),
+                actions=feishu_actions,
+                available=feishu_available,
             ),
         )
     )
+    pending_label = escape(translate("common.connecting"))
     dialogs = f"""<dialog class="saas-channel-dialog" id="telegram-dialog" aria-labelledby="telegram-dialog-title">
-<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/telegram" data-channel-credential-form>
-<div class="saas-dialog-header"><div><div class="saas-eyebrow">Telegram</div><h2 id="telegram-dialog-title">连接 Telegram Bot</h2></div>
-<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="关闭">×</button></div>
-<div class="saas-alert">Token 仅发送到服务端并加密暂存，不会在页面或任务结果中回显。</div>
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/telegram" data-channel-credential-form data-pending-label="{pending_label}">
+<div class="saas-dialog-header"><div><div class="saas-eyebrow">Telegram</div><h2 id="telegram-dialog-title">{escape(translate("channels.telegram_dialog_title"))}</h2></div>
+<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
+<div class="saas-alert">{escape(translate("channels.telegram_secret_notice"))}</div>
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
 <input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
-<label for="telegram-name">账号显示名称 <span class="saas-optional">选填</span></label><input id="telegram-name" name="name" placeholder="例如：售后 Telegram">
+<label for="telegram-name">{escape(translate("channels.display_name"))} <span class="saas-optional">{escape(translate("common.optional"))}</span></label><input id="telegram-name" name="name" placeholder="{escape(translate("channels.telegram_name_placeholder"))}">
 <label for="telegram-token">Bot Token</label><input id="telegram-token" name="token" type="password" autocomplete="new-password" required>
-<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>取消</button>
-<button class="saas-button primary" type="submit">验证并连接</button></div></form></dialog>
+<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>{escape(translate("button.cancel"))}</button>
+<button class="saas-button primary" type="submit" data-pending-label="{pending_label}">{escape(translate("channels.validate_connect"))}</button></div></form></dialog>
 <dialog class="saas-channel-dialog wide" id="email-dialog" aria-labelledby="email-dialog-title">
-<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/email" data-channel-credential-form>
-<div class="saas-dialog-header"><div><div class="saas-eyebrow">Email</div><h2 id="email-dialog-title">连接邮箱账号</h2></div>
-<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="关闭">×</button></div>
-<div class="saas-alert">推荐使用邮箱提供商生成的 App Password。系统以只读 IMAP 收件。</div>
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/email" data-channel-credential-form data-pending-label="{pending_label}">
+<div class="saas-dialog-header"><div><div class="saas-eyebrow">Email</div><h2 id="email-dialog-title">{escape(translate("channels.email_dialog_title"))}</h2></div>
+<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
+<div class="saas-alert">{escape(translate("channels.email_secret_notice"))}</div>
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
 <input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
-<div class="saas-form-grid"><div><label for="email-address">邮箱地址</label><input id="email-address" name="email_address" type="email" autocomplete="email" required></div>
-<div><label for="email-username">登录用户名</label><input id="email-username" name="username" autocomplete="username" required></div></div>
-<label for="email-password">密码或 App Password</label><input id="email-password" name="password" type="password" autocomplete="new-password" required>
+<div class="saas-form-grid"><div><label for="email-address">{escape(translate("channels.email_address"))}</label><input id="email-address" name="email_address" type="email" autocomplete="email" required></div>
+<div><label for="email-username">{escape(translate("channels.login_username"))}</label><input id="email-username" name="username" autocomplete="username" required></div></div>
+<label for="email-password">{escape(translate("channels.password"))}</label><input id="email-password" name="password" type="password" autocomplete="new-password" required>
 <div class="saas-form-grid"><div><label for="imap-host">IMAP Host</label><input id="imap-host" name="imap_host" required></div>
 <div><label for="smtp-host">SMTP Host</label><input id="smtp-host" name="smtp_host" required></div></div>
 <input type="hidden" name="imap_port" value="993"><input type="hidden" name="smtp_port" value="465">
 <input type="hidden" name="smtp_security" value="ssl"><input type="hidden" name="mailbox" value="INBOX">
 <input type="hidden" name="internal_domain_policy" value="ignore">
-<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>取消</button>
-<button class="saas-button primary" type="submit">验证并连接</button></div></form></dialog>"""
-    body = f"""{banner}<section><div class="saas-section-title"><div><h2>已连接账号</h2>
-<p>这里只显示属于你的账号。管理员可在系统后台查看 Tenant 全部账号。</p></div></div>
+<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>{escape(translate("button.cancel"))}</button>
+<button class="saas-button primary" type="submit" data-pending-label="{pending_label}">{escape(translate("channels.validate_connect"))}</button></div></form></dialog>
+<dialog class="saas-channel-dialog wide" id="whatsapp-dialog" aria-labelledby="whatsapp-dialog-title">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/whatsapp" data-channel-credential-form data-pending-label="{pending_label}">
+<div class="saas-dialog-header"><div><div class="saas-eyebrow">WhatsApp</div><h2 id="whatsapp-dialog-title">{escape(translate("channels.whatsapp_dialog_title"))}</h2></div>
+<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY"><input type="hidden" name="api_version" value="v23.0">
+<label for="whatsapp-name">{escape(translate("channels.display_name"))}</label><input id="whatsapp-name" name="name" required>
+<label for="whatsapp-account-id">WhatsApp Business Account ID</label><input id="whatsapp-account-id" name="external_account_id" required>
+<label for="whatsapp-app-id">Meta App ID</label><input id="whatsapp-app-id" name="app_id" required>
+<label for="whatsapp-access-token">Access Token</label><input id="whatsapp-access-token" name="access_token" type="password" autocomplete="new-password" required>
+<label for="whatsapp-app-secret">App Secret</label><input id="whatsapp-app-secret" name="app_secret" type="password" autocomplete="new-password" required>
+<label for="whatsapp-verify-token">Verify Token</label><input id="whatsapp-verify-token" name="verify_token" type="password" autocomplete="new-password" required>
+<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>{escape(translate("button.cancel"))}</button>
+<button class="saas-button primary" type="submit" data-pending-label="{pending_label}">{escape(translate("channels.validate_connect"))}</button></div></form></dialog>
+<dialog class="saas-channel-dialog wide" id="feishu-dialog" aria-labelledby="feishu-dialog-title">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/accounts/feishu" data-channel-credential-form data-pending-label="{pending_label}">
+<div class="saas-dialog-header"><div><div class="saas-eyebrow">Feishu</div><h2 id="feishu-dialog-title">{escape(translate("channels.feishu_dialog_title"))}</h2></div>
+<button class="saas-dialog-close" type="button" data-close-channel-dialog aria-label="{escape(translate("button.close"))}">×</button></div>
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="tenant_id" value="{escape(tenant_id)}">
+<input type="hidden" name="brand_id" value="default"><input type="hidden" name="automation_default" value="BOT_DRAFT_ONLY">
+<input type="hidden" name="api_base_url" value="https://open.feishu.cn/open-apis"><input type="hidden" name="group_mode" value="mentions_only">
+<label for="feishu-name">{escape(translate("channels.display_name"))}</label><input id="feishu-name" name="name" required>
+<label for="feishu-app-id">App ID</label><input id="feishu-app-id" name="app_id" required>
+<label for="feishu-app-secret">App Secret</label><input id="feishu-app-secret" name="app_secret" type="password" autocomplete="new-password" required>
+<label for="feishu-verification-token">Verification Token</label><input id="feishu-verification-token" name="verification_token" type="password" autocomplete="new-password" required>
+<label for="feishu-encrypt-key">Encrypt Key</label><input id="feishu-encrypt-key" name="encrypt_key" type="password" autocomplete="new-password" required>
+<div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>{escape(translate("button.cancel"))}</button>
+<button class="saas-button primary" type="submit" data-pending-label="{pending_label}">{escape(translate("channels.validate_connect"))}</button></div></form></dialog>"""
+    body = f"""{banner}<section><div class="saas-section-title"><div><h2>{escape(translate("channels.connected_title"))}</h2>
+<p>{escape(translate("channels.connected_description"))}</p></div></div>
 <div class="saas-connected-grid">{connected_channels}</div></section>
-<section id="add-channels"><div class="saas-section-title"><div><h2>添加渠道</h2>
-<p>OAuth 渠道可直接授权；Telegram 与 Email 会打开安全凭证表单。</p></div></div>
+<section id="add-channels"><div class="saas-section-title"><div><h2>{escape(translate("channels.add_title"))}</h2>
+<p>{escape(translate("channels.add_description"))}</p></div></div>
 <div class="saas-provider-grid">{provider_cards}</div></section>
-<section><div class="saas-section-title"><div><h2>授权进度</h2>
-<p>页面会刷新仍在处理中的任务，不会展示 Token、密码或其他用户信息。</p></div></div>
+<section><div class="saas-section-title"><div><h2>{escape(translate("channels.progress_title"))}</h2>
+<p>{escape(translate("channels.progress_description"))}</p></div></div>
 <div class="saas-channel-jobs">{job_cards}</div></section>{dialogs}
 <script src="/static/channels.js" defer></script>"""
     response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="Channels",
-        description="连接并管理属于你的消息渠道。所有新账号默认仅生成草稿。",
+        title=translate("channels.title"),
+        description=translate("channels.description"),
         body=body,
         active_navigation="channels",
         inbox_count=inbox_summary.total,
@@ -2285,26 +4009,69 @@ async def tenant_profile(request: Request, tenant_id: str) -> Response:
         return principal
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-    body = f"""<div class="saas-grid two">
-<section class="saas-card"><div class="saas-card-header"><div><h2>账号信息</h2></div></div><div class="saas-card-body">
-{definition_list((('用户名', principal.username), ('角色', principal.role), ('Tenant', tenant_id), ('User ID', principal.user_id or 'System')))}
-<p><a class="saas-button primary" href="/auth/change-password">修改密码</a></p></div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>权限说明</h2></div></div><div class="saas-card-body">
-<p>普通用户只能查看和处理自己授权账号产生的对话、收件箱和活动。平台账号请在独立 Channels 页面管理。</p>
-{secondary_action(f'{_tenant_root(tenant_id)}/channels', '打开 Channels')}</div></section></div>"""
+    body = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("profile.account_information"))}</h2></div></div><div class="saas-card-body">
+{definition_list(((translate("profile.username"), principal.username), (translate("profile.role"), principal.role), ("Tenant", tenant_id), ("User ID", principal.user_id or translate("common.system"))))}
+<p><a class="saas-button primary" href="/auth/change-password">{escape(translate("profile.change_password"))}</a></p></div></section>
+<div class="saas-section-title"><div><h2>{escape(translate("profile.permissions"))}</h2>
+<p>{escape(translate("profile.permissions_description"))}</p></div>
+{secondary_action(f"{_tenant_root(tenant_id)}/channels", translate("profile.open_channels"))}</div>"""
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="个人中心",
-        description="管理个人资料、登录密码和权限说明。",
+        title=translate("profile.title"),
+        description=translate("profile.description"),
         body=body,
         active_navigation="profile",
         inbox_count=inbox_summary.total,
     )
 
 
+def _channel_actor(principal: Principal) -> ChannelActor:
+    return ChannelActor(
+        actor=principal.actor,
+        role="ADMIN" if principal.is_admin else "USER",
+        user_id=principal.user_id,
+        session_id=principal.session_id,
+    )
+
+
+def _channel_management_http_error(exc: ChannelManagementError) -> HTTPException:
+    if isinstance(exc, ChannelNotFoundError):
+        return HTTPException(status_code=404, detail=exc.code)
+    if isinstance(exc, ChannelConflictError):
+        return HTTPException(status_code=409, detail=exc.code)
+    if isinstance(exc, ChannelPermissionError):
+        return HTTPException(status_code=403, detail=exc.code)
+    if isinstance(exc, ChannelValidationError) and exc.code.endswith("_integration_disabled"):
+        return HTTPException(status_code=503, detail=exc.code)
+    return HTTPException(status_code=422, detail=exc.code)
+
+
+def _required_form_bool(form: dict[str, str], field_name: str) -> bool:
+    value = form.get(field_name)
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise HTTPException(status_code=422, detail=f"invalid_boolean:{field_name}")
+
+
+def _required_form_int(form: dict[str, str], field_name: str) -> int:
+    try:
+        return int(form.get(field_name) or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"invalid_integer:{field_name}") from exc
+
+
+def _channel_redirect(tenant_id: str, account_id: uuid.UUID | None = None) -> RedirectResponse:
+    path = f"{_tenant_root(tenant_id)}/channels"
+    if account_id is not None:
+        path = f"{path}/accounts/{account_id}"
+    return RedirectResponse(path, status_code=status.HTTP_303_SEE_OTHER)
+
+
 @router.post("/app/t/{tenant_id}/channels/accounts/{platform}")
-async def connect_personal_account(
+async def connect_channel_account(
     request: Request,
     tenant_id: str,
     platform: str,
@@ -2312,19 +4079,23 @@ async def connect_personal_account(
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
-    if principal.is_admin:
-        raise HTTPException(status_code=403, detail="use_admin_account_management")
-    if platform not in {"telegram", "email"}:
-        raise HTTPException(status_code=422, detail="unsupported_personal_account_platform")
     form = await _form(request)
     _require_csrf(request, form)
-    form["tenant_id"] = tenant_id
-    return await _submit_form(
-        request,
-        platform,
-        form=form,
-        require_admin=False,
-        redirect_path=f"{_tenant_root(tenant_id)}/channels?status=processing",
+    try:
+        command = build_provisioning_command(
+            route_tenant_id=tenant_id,
+            platform=platform,
+            actor=_channel_actor(principal),
+            values=form,
+        )
+        job_id = await submit_channel_provisioning(command)
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    except (PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/channels?status=processing&job_id={job_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
@@ -2334,7 +4105,271 @@ async def connect_personal_account_compatibility(
     tenant_id: str,
     platform: str,
 ) -> Response:
-    return await connect_personal_account(request, tenant_id, platform)
+    return await connect_channel_account(request, tenant_id, platform)
+
+
+@router.get(
+    "/app/t/{tenant_id}/channels/accounts/{account_id}",
+    response_class=HTMLResponse,
+)
+async def channel_account_detail(
+    request: Request,
+    tenant_id: str,
+    account_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        statement = select(models.PlatformAccount).where(
+            models.PlatformAccount.id == account_id,
+            _account_scope_condition(principal, tenant_id),
+        )
+        account = await session.scalar(statement)
+        if account is None:
+            raise HTTPException(status_code=404, detail="platform_account_not_found")
+        owner = (
+            await session.get(models.AdminUser, account.owner_user_id)
+            if account.owner_user_id is not None
+            else None
+        )
+        assignable_owners = (
+            list(
+                (
+                    await session.execute(
+                        select(models.AdminUser)
+                        .where(
+                            models.AdminUser.tenant_id == tenant_id,
+                            models.AdminUser.role == "USER",
+                            models.AdminUser.status == "active",
+                        )
+                        .order_by(models.AdminUser.username)
+                    )
+                ).scalars()
+            )
+            if principal.is_admin
+            else []
+        )
+    redis = aioredis.from_url(get_settings().redis_url)
+    try:
+        kill_switch_enabled = bool(
+            await redis.exists(f"killswitch:account:{tenant_id}:{account_id}")
+        )
+    finally:
+        await redis.aclose()
+    csrf = _csrf(request)
+    account_path = f"{_tenant_root(tenant_id)}/channels/accounts/{account.id}"
+    next_status_enabled = account.status != "active"
+    next_status_label = translate(
+        "channels.account.enable" if next_status_enabled else "channels.account.disable"
+    )
+    next_automation_target = (
+        "BOT_DRAFT_ONLY" if account.automation_default == "BOT_ACTIVE" else "BOT_ACTIVE"
+    )
+    owner_options = '<option value="">Tenant managed</option>' + "".join(
+        f'<option value="{candidate.id}"'
+        f"{' selected' if candidate.id == account.owner_user_id else ''}>"
+        f"{escape(candidate.username)}</option>"
+        for candidate in assignable_owners
+    )
+    owner_form = (
+        f"""<form class="saas-form" method="post" action="{account_path}/owner">
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}">
+<label for="channel-owner">{escape(translate("channels.account.owner"))}</label><select id="channel-owner" name="owner_user_id">{owner_options}</select>
+<button class="saas-button" type="submit">{escape(translate("channels.account.save_owner"))}</button></form>"""
+        if principal.is_admin
+        else ""
+    )
+    xchat_form = ""
+    if account.platform == "x" and get_settings().xchat_enabled:
+        xchat_form = f"""<form class="saas-form" method="post" action="{account_path}/xchat/repair">
+<input type="hidden" name="csrf_token" value="{csrf}"><label for="channel-xchat-pin">XChat PIN</label>
+<input id="channel-xchat-pin" name="xchat_pin" type="password" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" autocomplete="new-password" required>
+<button class="saas-button" type="submit">{escape(translate("channels.account.repair_xchat"))}</button></form>"""
+    body = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(account.name)}</h2>
+<p>{escape(account.platform.title())} · {escape(account.public_id or str(account.id))}</p></div>{status_badge(account.status)}</div>
+<div class="saas-card-body">{definition_list(((translate("channels.account.owner"), owner.username if owner else translate("channels.organization_account")), (translate("channels.account.health"), _channel_account_health(account)[1]), (translate("channels.account.automation"), account.automation_default), (translate("channels.account.kill_switch"), translate("channels.kill_switch.enabled") if kill_switch_enabled else translate("channels.kill_switch.disabled")), ("Config version", account.config_version)))}</div></section>
+<div class="saas-grid two"><section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.lifecycle"))}</h2></div><div class="saas-card-body">
+<form class="saas-form" method="post" action="{account_path}/rename"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}">
+<label for="channel-account-name">{escape(translate("channels.display_name"))}</label><input id="channel-account-name" name="name" value="{escape(account.name)}" maxlength="255" required><button class="saas-button" type="submit">{escape(translate("channels.account.rename"))}</button></form>
+<form class="saas-form" method="post" action="{account_path}/status"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="expected_status" value="{escape(account.status)}"><input type="hidden" name="enabled" value="{"true" if next_status_enabled else "false"}"><button class="saas-button" type="submit">{escape(next_status_label)}</button></form>
+<p><a class="saas-button" href="{_tenant_root(tenant_id)}/channels#add-channels">{escape(translate("channels.account.reauthorize"))}</a></p></div></section>
+<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.controls"))}</h2></div><div class="saas-card-body">
+<form class="saas-form" method="post" action="{account_path}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="target" value="{next_automation_target}"><button class="saas-button" type="submit">{escape(translate("channels.account.set_automation", target=next_automation_target))}</button></form>
+<form class="saas-form" method="post" action="{account_path}/kill-switch"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="enabled" value="{"false" if kill_switch_enabled else "true"}"><button class="saas-button" type="submit">{escape(translate("channels.account.set_kill_switch", enabled=not kill_switch_enabled))}</button></form>
+{owner_form}{xchat_form}</div></section></div>"""
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title=translate("channels.account.title"),
+        description=translate("channels.account.description"),
+        body=body,
+        active_navigation="channels",
+        inbox_count=inbox_summary.total,
+        breadcrumbs=(
+            (translate("channels.title"), f"{_tenant_root(tenant_id)}/channels"),
+            (account.name, None),
+        ),
+    )
+    return _ensure_channel_csrf(response, request, csrf)
+
+
+def _ensure_channel_csrf(response: Response, request: Request, csrf: str) -> Response:
+    if not request.cookies.get("reply_admin_csrf"):
+        response.set_cookie(
+            "reply_admin_csrf",
+            csrf,
+            httponly=False,
+            samesite="lax",
+            secure=_secure_cookie(request),
+        )
+    return response
+
+
+async def _channel_mutation_principal_and_form(
+    request: Request,
+    tenant_id: str,
+) -> tuple[Principal, dict[str, str]] | Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    return principal, form
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/rename")
+async def rename_channel_account_route(
+    request: Request, tenant_id: str, account_id: uuid.UUID
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    try:
+        await rename_channel_account(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            name=form.get("name") or "",
+            expected_config_version=_required_form_int(form, "expected_config_version"),
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id, account_id)
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/status")
+async def set_channel_account_status_route(
+    request: Request, tenant_id: str, account_id: uuid.UUID
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    try:
+        await set_channel_account_status(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            enabled=_required_form_bool(form, "enabled"),
+            expected_config_version=_required_form_int(form, "expected_config_version"),
+            expected_status=form.get("expected_status") or "",
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id, account_id)
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/automation")
+async def set_channel_account_automation_route(
+    request: Request, tenant_id: str, account_id: uuid.UUID
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    target = form.get("target") or ""
+    try:
+        await set_channel_account_automation(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            target=target,  # type: ignore[arg-type]
+            expected_config_version=_required_form_int(form, "expected_config_version"),
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id, account_id)
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/kill-switch")
+async def set_channel_account_kill_switch_route(
+    request: Request, tenant_id: str, account_id: uuid.UUID
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    try:
+        await set_channel_account_kill_switch(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            enabled=_required_form_bool(form, "enabled"),
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id, account_id)
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/owner")
+async def assign_channel_account_owner_route(
+    request: Request, tenant_id: str, account_id: uuid.UUID
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    owner_value = (form.get("owner_user_id") or "").strip()
+    try:
+        owner_user_id = uuid.UUID(owner_value) if owner_value else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_owner_user_id") from exc
+    try:
+        await assign_channel_account_owner(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            owner_user_id=owner_user_id,
+            expected_config_version=_required_form_int(form, "expected_config_version"),
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id, account_id)
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/xchat/repair")
+async def repair_channel_xchat_route(
+    request: Request, tenant_id: str, account_id: uuid.UUID
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    try:
+        await repair_channel_xchat(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            pin=form.get("xchat_pin") or "",
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    except XChatActivationError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    return _channel_redirect(tenant_id, account_id)
 
 
 @router.get("/app/t/{tenant_id}/channels/jobs/{job_id}")
@@ -2347,29 +4382,293 @@ async def channel_job_status(
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         raise HTTPException(status_code=401, detail="authentication_required")
-    if principal.is_admin:
-        raise HTTPException(status_code=403, detail="use_admin_account_management")
     async with get_session_factory()() as session:
-        job = (
-            await session.execute(
-                select(models.ProvisioningJob).where(
-                    models.ProvisioningJob.id == job_id,
-                    models.ProvisioningJob.tenant_id == tenant_id,
-                    models.ProvisioningJob.owner_user_id == principal.user_id,
-                )
-            )
-        ).scalar_one_or_none()
+        statement = select(models.ProvisioningJob).where(
+            models.ProvisioningJob.id == job_id,
+            models.ProvisioningJob.tenant_id == tenant_id,
+        )
+        if not principal.is_admin:
+            statement = statement.where(models.ProvisioningJob.owner_user_id == principal.user_id)
+        job = (await session.execute(statement)).scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
     payload = public_job(job)
-    payload["last_error_message"] = (
-        _channel_job_error_message(job)
-        if job.last_error_code
-        else None
-    )
+    payload["last_error_message"] = _channel_job_error_message(job) if job.last_error_code else None
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     return payload
+
+
+@router.post("/app/t/{tenant_id}/channels/jobs/{job_id}/retry")
+async def retry_channel_job_route(
+    request: Request,
+    tenant_id: str,
+    job_id: uuid.UUID,
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, _form_values = context
+    try:
+        await retry_channel_job(
+            tenant_id=tenant_id,
+            job_id=job_id,
+            actor=_channel_actor(principal),
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id)
+
+
+def _feishu_handoff_http_error(exc: FeishuHandoffError) -> HTTPException:
+    if isinstance(exc, FeishuHandoffNotFound):
+        return HTTPException(status_code=404, detail=exc.code)
+    if isinstance(exc, FeishuHandoffConflict):
+        return HTTPException(status_code=409, detail=exc.code)
+    return HTTPException(status_code=422, detail=exc.code)
+
+
+def _feishu_handoff_redirect(tenant_id: str, notice: str) -> RedirectResponse:
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/channels/feishu/handoff?{urlencode({'notice': notice})}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.get(
+    "/app/t/{tenant_id}/channels/feishu/handoff",
+    response_class=HTMLResponse,
+)
+async def tenant_feishu_handoff_page(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+    snapshot = await load_feishu_handoff_snapshot(tenant_id)
+    csrf = _csrf(request)
+    selected_account_id = snapshot.config.feishu_platform_account_id if snapshot.config else None
+    account_options = "".join(
+        f'<option value="{account.id}"'
+        f"{' selected' if account.id == selected_account_id else ''}>"
+        f"{escape(account.name)} · {escape(account.public_id or str(account.id))}</option>"
+        for account in snapshot.accounts
+    )
+    if not account_options:
+        account_options = '<option value="">Connect a Feishu account first</option>'
+    config = snapshot.config
+    operator_rows = (
+        "".join(
+            f"<tr><td>{escape(operator.display_name or '—')}</td>"
+            f"<td><code>{escape(operator.operator_open_id)}</code></td>"
+            f"<td>{status_badge(operator.status)}</td><td>"
+            f'<form method="post" action="{_tenant_root(tenant_id)}/channels/feishu/handoff/operators/{operator.id}/status">'
+            f'<input type="hidden" name="csrf_token" value="{csrf}">'
+            f'<input type="hidden" name="enabled" value="{"false" if operator.status == "ACTIVE" else "true"}">'
+            f'<button class="saas-button small" type="submit">{escape(translate("admin.handoff.disable") if operator.status == "ACTIVE" else translate("admin.handoff.enable"))}</button>'
+            "</form></td></tr>"
+            for operator in snapshot.operators
+        )
+        or '<tr><td colspan="4">—</td></tr>'
+    )
+    failure_rows = (
+        "".join(
+            f"<tr><td><code>{str(intent.public_id)[:8]}</code></td>"
+            f"<td>{status_badge(intent.status)}</td>"
+            f"<td><code>{escape(intent.last_error_code or '—')}</code></td></tr>"
+            for intent in snapshot.failures
+        )
+        or '<tr><td colspan="3">—</td></tr>'
+    )
+    notice = request.query_params.get("notice") or ""
+    notice_html = f'<div class="saas-alert" role="status">{escape(notice)}</div>' if notice else ""
+    body = f"""{notice_html}<div class="saas-grid two"><section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("admin.handoff.route_title"))}</h2></div><div class="saas-card-body">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/feishu/handoff/config"><input type="hidden" name="csrf_token" value="{csrf}">
+<label for="handoff-account">{escape(translate("admin.handoff.account"))}</label><select id="handoff-account" name="feishu_platform_account_id" required>{account_options}</select>
+<label for="handoff-chat">{escape(translate("admin.handoff.chat_id"))}</label><input id="handoff-chat" name="destination_chat_id" value="{escape(config.destination_chat_id if config else "")}" maxlength="256" required>
+<label><input type="checkbox" name="enabled" value="true"{" checked" if config and config.enabled else ""}> {escape(translate("admin.handoff.enable_cards"))}</label>
+<button class="saas-button primary" type="submit">{escape(translate("admin.handoff.save_config"))}</button></form>
+<form method="post" action="{_tenant_root(tenant_id)}/channels/feishu/handoff/test"><input type="hidden" name="csrf_token" value="{csrf}"><button class="saas-button" type="submit">{escape(translate("admin.handoff.send_test"))}</button></form></div></section>
+<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("admin.handoff.operator_permissions"))}</h2></div><div class="saas-card-body">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/feishu/handoff/operators"><input type="hidden" name="csrf_token" value="{csrf}">
+<label for="operator-open-id">Operator Open ID</label><input id="operator-open-id" name="operator_open_id" maxlength="128" required>
+<label for="operator-name">{escape(translate("admin.handoff.display_name"))}</label><input id="operator-name" name="display_name" maxlength="100">
+<label><input type="checkbox" name="can_claim" value="true" checked> {escape(translate("admin.handoff.can_claim"))}</label>
+<label><input type="checkbox" name="can_resolve" value="true" checked> {escape(translate("admin.handoff.can_resolve"))}</label>
+<button class="saas-button primary" type="submit">{escape(translate("admin.handoff.save_operator"))}</button></form></div></section></div>
+<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("admin.handoff.operator_permissions"))}</h2></div><div class="saas-card-body"><div class="saas-table-wrap"><table class="saas-table"><tbody>{operator_rows}</tbody></table></div></div></section>
+<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("admin.handoff.failures"))}</h2></div><div class="saas-card-body"><div class="saas-table-wrap"><table class="saas-table"><tbody>{failure_rows}</tbody></table></div></div></section>"""
+    response = _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title=translate("admin.handoff.title"),
+        description=translate("admin.handoff.description"),
+        body=body,
+        active_navigation="channels",
+        inbox_count=inbox_summary.total,
+        breadcrumbs=(
+            (translate("channels.title"), f"{_tenant_root(tenant_id)}/channels"),
+            (translate("admin.handoff.title"), None),
+        ),
+    )
+    return _ensure_channel_csrf(response, request, csrf)
+
+
+@router.post("/app/t/{tenant_id}/channels/feishu/handoff/config")
+async def save_tenant_feishu_handoff_config(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        account_id = uuid.UUID(form.get("feishu_platform_account_id") or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_feishu_account_id") from exc
+    try:
+        await save_feishu_handoff_config(
+            tenant_id=tenant_id,
+            actor=principal.actor,
+            account_id=account_id,
+            destination_chat_id=form.get("destination_chat_id") or "",
+            enabled=form.get("enabled") == "true",
+        )
+    except FeishuHandoffError as exc:
+        raise _feishu_handoff_http_error(exc) from exc
+    return _feishu_handoff_redirect(tenant_id, "config_saved")
+
+
+@router.post("/app/t/{tenant_id}/channels/feishu/handoff/operators")
+async def save_tenant_feishu_handoff_operator(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await upsert_feishu_handoff_operator(
+            tenant_id=tenant_id,
+            actor=principal.actor,
+            operator_open_id=form.get("operator_open_id") or "",
+            display_name=form.get("display_name") or "",
+            can_claim=form.get("can_claim") == "true",
+            can_resolve=form.get("can_resolve") == "true",
+        )
+    except FeishuHandoffError as exc:
+        raise _feishu_handoff_http_error(exc) from exc
+    return _feishu_handoff_redirect(tenant_id, "operator_saved")
+
+
+@router.post("/app/t/{tenant_id}/channels/feishu/handoff/operators/{operator_id}/status")
+async def set_tenant_feishu_handoff_operator_status(
+    request: Request,
+    tenant_id: str,
+    operator_id: uuid.UUID,
+) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await set_feishu_handoff_operator_status(
+            tenant_id=tenant_id,
+            actor=principal.actor,
+            operator_id=operator_id,
+            enabled=_required_form_bool(form, "enabled"),
+        )
+    except FeishuHandoffError as exc:
+        raise _feishu_handoff_http_error(exc) from exc
+    return _feishu_handoff_redirect(tenant_id, "operator_updated")
+
+
+@router.post("/app/t/{tenant_id}/channels/feishu/handoff/test")
+async def send_tenant_feishu_handoff_test(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    outcome = await send_feishu_handoff_test_card(
+        tenant_id=tenant_id,
+        actor=principal.actor,
+        title=translate("admin.handoff.test_card_title"),
+        content=(
+            translate("admin.handoff.test_card_connected", tenant_id=tenant_id)
+            + translate("admin.handoff.test_card_safe")
+        ),
+    )
+    return _feishu_handoff_redirect(tenant_id, outcome)
+
+
+def _knowledge_location(
+    tenant_id: str,
+    *,
+    status_filter: str = "all",
+    brand_id: str = "",
+    platform: str = "",
+    category: str = "",
+    notice: str = "",
+    **notice_values: object,
+) -> str:
+    query = {
+        key: str(value)
+        for key, value in {
+            "status_filter": status_filter if status_filter != "all" else "",
+            "brand_id": brand_id,
+            "platform": platform,
+            "category": category,
+            "notice": notice,
+            **notice_values,
+        }.items()
+        if value not in (None, "")
+    }
+    root = f"{_tenant_root(tenant_id)}/knowledge"
+    return f"{root}?{urlencode(query)}" if query else root
+
+
+def _knowledge_http_error(exc: KnowledgeApplicationError) -> HTTPException:
+    if isinstance(exc, KnowledgeNotFoundError):
+        return HTTPException(status_code=404, detail=exc.code)
+    if isinstance(exc, KnowledgeConflictError):
+        return HTTPException(status_code=409, detail=exc.code)
+    return HTTPException(status_code=422, detail=exc.code)
+
+
+def _knowledge_filter_select(name: str, label: str, values: tuple[str, ...], selected: str) -> str:
+    options = f'<option value="">{escape(translate("common.all"))}</option>' + "".join(
+        f'<option value="{escape(value)}"'
+        f"{' selected' if value == selected else ''}>{escape(value)}</option>"
+        for value in values
+    )
+    return (
+        f'<label class="saas-field"><span>{escape(label)}</span>'
+        f'<select name="{escape(name)}">{options}</select></label>'
+    )
+
+
+def _knowledge_document_is_sensitive(document: models.KnowledgeDocument) -> bool:
+    return bool(
+        document.is_official_contact
+        or document.protected_values
+        or has_contact_like(document.question or "")
+        or has_contact_like(document.reply or "")
+    )
+
+
+def _knowledge_list_question(document: models.KnowledgeDocument) -> str:
+    if _knowledge_document_is_sensitive(document):
+        return translate("knowledge.detail.sensitive_redacted")
+    return document.question[:100]
+
+
+def _knowledge_visible_metadata(
+    document: models.KnowledgeDocument,
+    value: object,
+) -> object:
+    if _knowledge_document_is_sensitive(document) or has_contact_like(str(value or "")):
+        return translate("knowledge.detail.sensitive_redacted")
+    return value
 
 
 @router.get("/app/t/{tenant_id}/knowledge", response_class=HTMLResponse)
@@ -2378,130 +4677,197 @@ async def tenant_knowledge(
     tenant_id: str,
     status_filter: str = "all",
     brand_id: str = "",
+    platform: str = "",
+    category: str = "",
 ) -> Response:
     principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
-    if status_filter not in {"all", "draft", "published", "review"}:
-        raise HTTPException(status_code=422, detail="invalid_knowledge_status")
-    async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-        statement = select(models.KnowledgeDocument).where(
-            models.KnowledgeDocument.tenant_id == tenant_id
-        )
-        if status_filter in {"draft", "published"}:
-            statement = statement.where(models.KnowledgeDocument.status == status_filter)
-        elif status_filter == "review":
-            statement = statement.where(
-                or_(
-                    models.KnowledgeDocument.language_verified.is_(False),
-                    models.KnowledgeDocument.language_detection_status != "confirmed",
-                )
-            )
-        if brand_id:
-            statement = statement.where(models.KnowledgeDocument.brand_id == brand_id)
-        documents = (
-            (
-                await session.execute(
-                    statement.order_by(models.KnowledgeDocument.updated_at.desc()).limit(200)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        counts = dict(
-            (
-                await session.execute(
-                    select(models.KnowledgeDocument.status, func.count())
-                    .where(models.KnowledgeDocument.tenant_id == tenant_id)
-                    .group_by(models.KnowledgeDocument.status)
-                )
-            ).all()
-        )
-        review_count = await session.scalar(
-            select(func.count()).where(
-                models.KnowledgeDocument.tenant_id == tenant_id,
-                or_(
-                    models.KnowledgeDocument.language_verified.is_(False),
-                    models.KnowledgeDocument.language_detection_status != "confirmed",
+    try:
+        async with get_session_factory()() as session:
+            inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+            documents = await execute_list_knowledge_documents(
+                session,
+                ListKnowledgeDocumentsQuery(
+                    required_tenant_id=tenant_id,
+                    actor=principal.actor,
+                    status_filter=status_filter,
+                    brand_id=brand_id or None,
+                    platform=platform or None,
+                    category=category or None,
                 ),
             )
+            counts = dict(
+                (
+                    await session.execute(
+                        select(models.KnowledgeDocument.status, func.count())
+                        .where(models.KnowledgeDocument.tenant_id == tenant_id)
+                        .group_by(models.KnowledgeDocument.status)
+                    )
+                ).all()
+            )
+            review_count = await session.scalar(
+                select(func.count()).where(
+                    models.KnowledgeDocument.tenant_id == tenant_id,
+                    knowledge_review_condition(),
+                )
+            )
+            filter_values = await load_knowledge_filter_values(
+                session,
+                required_tenant_id=tenant_id,
+                actor=principal.actor,
+            )
+            batch_rows = (
+                await session.execute(
+                    select(
+                        models.KnowledgeDocument.import_batch_id,
+                        models.KnowledgeDocument.source_file,
+                        func.count(),
+                    )
+                    .where(
+                        models.KnowledgeDocument.tenant_id == tenant_id,
+                        models.KnowledgeDocument.import_batch_id.is_not(None),
+                        models.KnowledgeDocument.status == "draft",
+                        models.KnowledgeDocument.language_detection_status == "english",
+                        models.KnowledgeDocument.language_verified.is_(False),
+                    )
+                    .group_by(
+                        models.KnowledgeDocument.import_batch_id,
+                        models.KnowledgeDocument.source_file,
+                    )
+                    .order_by(func.max(models.KnowledgeDocument.created_at).desc())
+                )
+            ).all()
+    except KnowledgeApplicationError as exc:
+        raise _knowledge_http_error(exc) from exc
+
+    brands, platforms, categories = filter_values
+    safe_brand_filter = brand_id if brand_id in brands else ""
+    safe_platform_filter = platform if platform in platforms else ""
+    safe_category_filter = category if category in categories else ""
+
+    def tab_href(target: str) -> str:
+        return _knowledge_location(
+            tenant_id,
+            status_filter=target,
+            brand_id=safe_brand_filter,
+            platform=safe_platform_filter,
+            category=safe_category_filter,
         )
-    next_review = next(
-        (
-            document
-            for document in documents
-            if not document.language_verified
-            or document.language_detection_status != "confirmed"
-        ),
-        None,
-    )
+
     filter_tabs = tabs(
         (
-            ("all", f"{_tenant_root(tenant_id)}/knowledge", f"全部 {sum(counts.values())}"),
+            ("all", tab_href("all"), translate("agent.list_summary", count=sum(counts.values()))),
             (
                 "review",
-                f"{_tenant_root(tenant_id)}/knowledge?status_filter=review",
-                f"待审核 {int(review_count or 0)}",
-            ),
-            (
-                "published",
-                f"{_tenant_root(tenant_id)}/knowledge?status_filter=published",
-                f"已发布 {int(counts.get('published', 0))}",
+                tab_href("review"),
+                translate("knowledge.filter.review", count=int(review_count or 0)),
             ),
             (
                 "draft",
-                f"{_tenant_root(tenant_id)}/knowledge?status_filter=draft",
-                f"草稿 {int(counts.get('draft', 0))}",
+                tab_href("draft"),
+                translate("knowledge.filter.draft", count=int(counts.get("draft", 0))),
+            ),
+            (
+                "published",
+                tab_href("published"),
+                translate("knowledge.filter.published", count=int(counts.get("published", 0))),
             ),
         ),
         status_filter,
     )
-    next_review_html = ""
-    if next_review:
-        review_action = primary_action(
-            f"{_tenant_root(tenant_id)}/knowledge/documents/{next_review.id}",
-            "审核文档",
-        )
-        next_review_html = (
-            '<section class="saas-next-action"><div><div class="saas-eyebrow">下一条审核</div>'
-            f"<h2>{escape(next_review.question)}</h2>"
-            f"<p>{escape(next_review.detected_language)} · "
-            f"来源 {escape(next_review.source_file or '人工录入')}</p></div>"
-            f"{review_action}</section>"
-        )
+    safe_brand_prefill = safe_brand_filter or "default"
+    filters = f"""<form class="saas-filter-bar" method="get">
+<input type="hidden" name="status_filter" value="{escape(status_filter)}">
+{_knowledge_filter_select("brand_id", "Brand", brands, safe_brand_filter)}
+{_knowledge_filter_select("platform", "Platform", platforms, safe_platform_filter)}
+{_knowledge_filter_select("category", translate("common.category"), categories, safe_category_filter)}
+<button class="saas-button" type="submit">{escape(translate("common.apply_filters"))}</button></form>"""
+    csrf = _csrf(request)
+    add_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("knowledge.add_document"))}</h2></div></div>
+<div class="saas-card-body"><form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/knowledge/documents">
+<input type="hidden" name="csrf_token" value="{escape(csrf)}">
+<label>Question<input name="question" maxlength="2000" required></label>
+<label>Reply<textarea name="reply" maxlength="10000" required></textarea></label>
+<div class="saas-form-row"><label>Brand<input name="brand_id" maxlength="64" value="{escape(safe_brand_prefill)}" required></label>
+<label>Platform<input name="platform" maxlength="32" value="{escape(safe_platform_filter)}"></label>
+<label>{escape(translate("common.category"))}<input name="category" maxlength="64" value="{escape(safe_category_filter)}"></label></div>
+<label>Protected values JSON<input name="protected_values_json" placeholder='["Acme Portal"]'></label>
+<label><input type="checkbox" name="is_official_contact" value="true"> Official/contact-only content</label>
+<button class="saas-button primary" type="submit">{escape(translate("knowledge.add_document"))}</button></form></div></section>"""
+    import_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>CSV Import</h2></div></div>
+<div class="saas-card-body"><form class="saas-form" method="post" enctype="multipart/form-data" action="{_tenant_root(tenant_id)}/knowledge/import">
+<input type="hidden" name="csrf_token" value="{escape(csrf)}"><label>Default brand<input name="brand_id" value="{escape(safe_brand_prefill)}" required></label>
+<label>UTF-8 CSV (max 2 MiB / 2000 rows)<input type="file" name="file" accept=".csv" required></label>
+<button class="saas-button primary" type="submit">Import</button></form></div></section>"""
+    batch_options = "".join(
+        f'<option value="{escape(row.import_batch_id)}">CSV batch · {escape(row[2])}</option>'
+        for row in batch_rows
+    )
+    batch_forms = f"""<div class="saas-grid two"><section class="saas-card"><div class="saas-card-body">
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/knowledge/bulk-confirm-english"><input type="hidden" name="csrf_token" value="{escape(csrf)}">
+<label>English import batch<select name="import_batch_id" required>{batch_options or '<option value="">No pending batch</option>'}</select></label>
+<button class="saas-button" type="submit">Confirm English batch</button></form></div></section>
+<section class="saas-card"><div class="saas-card-body"><form method="post" action="{_tenant_root(tenant_id)}/knowledge/bulk-publish">
+<input type="hidden" name="csrf_token" value="{escape(csrf)}"><button class="saas-button" type="submit">Publish safe drafts</button></form></div></section></div>"""
+    next_review = next(
+        (
+            document
+            for document in documents
+            if document.status == "draft" and not document.language_verified
+        ),
+        None,
+    )
+    next_review_html = (
+        f'<section class="saas-next-action"><div><div class="saas-eyebrow">{escape(translate("knowledge.next_review"))}</div>'
+        f"<h2>{escape(_knowledge_list_question(next_review))}</h2></div>{primary_action(f'{_tenant_root(tenant_id)}/knowledge/documents/{next_review.id}', translate('knowledge.review_document'))}</section>"
+        if next_review
+        else ""
+    )
     rows = "".join(
-        f"<tr><td><strong>{escape(document.question[:100])}</strong><br>"
-        f'<span class="saas-muted">{escape(document.category or "未分类")}</span></td>'
-        f"<td>{escape(document.detected_language or document.source_language)}</td>"
-        f"<td>{status_badge(document.status)}</td>"
-        f"<td>{'已确认' if document.language_verified else '待确认'}</td>"
-        f"<td>{format_datetime(document.updated_at)}</td>"
-        f'<td><a href="{_tenant_root(tenant_id)}/knowledge/documents/{document.id}">审核 →</a></td></tr>'
+        f'<tr><td><strong>{escape(_knowledge_list_question(document))}</strong><br><span class="saas-muted">{escape(_knowledge_visible_metadata(document, document.category or translate("knowledge.uncategorized")))}</span></td>'
+        f"<td>{escape(_knowledge_visible_metadata(document, document.brand_id))} / {escape(_knowledge_visible_metadata(document, document.platform or translate('knowledge.detail.all_platforms')))}</td>"
+        f"<td>{escape(document.detected_language)} / {escape(document.language_detection_status)}</td><td>{status_badge(document.status)}</td>"
+        f"<td>{escape(translate('knowledge.language_confirmed') if document.language_verified else translate('knowledge.language_pending'))}</td>"
+        f'<td><a href="{_tenant_root(tenant_id)}/knowledge/documents/{document.id}">{escape(translate("knowledge.review_action"))}</a></td></tr>'
         for document in documents
     )
     table = (
-        '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        "<th>问题与分类</th><th>语言</th><th>发布状态</th><th>审核</th><th>更新</th><th></th>"
-        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        f'<div class="saas-table-wrap"><table class="saas-table"><thead><tr><th>{escape(translate("knowledge.question_category"))}</th><th>Scope</th><th>{escape(translate("common.language"))}</th><th>{escape(translate("knowledge.publication_status"))}</th><th>{escape(translate("common.review"))}</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>'
         if rows
         else empty_state(
-            "没有匹配的知识文档",
-            "调整筛选，或进入兼容知识页新增和导入草稿。",
-            action_html=primary_action("/admin/content/knowledge", "添加文档"),
+            translate("knowledge.empty_title"), translate("knowledge.empty_description")
         )
     )
-    body = f'{filter_tabs}{next_review_html}<div style="margin-top:18px">{table}</div>'
-    return _render_page(
-        principal=principal,
-        tenant_id=tenant_id,
-        title="文档与知识",
-        description="将来源、语言审核、发布状态和批准答案保持在清晰的治理流程中。",
-        body=body,
-        active_navigation="knowledge",
-        inbox_count=inbox_summary.total,
-        primary_action_html=primary_action("/admin/content/knowledge", "添加文档"),
+    safe_request_query = tuple(
+        (key, value)
+        for key, value in (
+            ("status_filter", status_filter if status_filter != "all" else ""),
+            ("brand_id", safe_brand_filter),
+            ("platform", safe_platform_filter),
+            ("category", safe_category_filter),
+        )
+        if value
     )
+    request_location_token = set_request_location(request.url.path, safe_request_query)
+    try:
+        response = _render_page(
+            principal=principal,
+            tenant_id=tenant_id,
+            title=translate("knowledge.title"),
+            description=translate("knowledge.description"),
+            body=f'{filter_tabs}{filters}{next_review_html}<div class="saas-grid two">{add_form}{import_form}</div>{batch_forms}{table}',
+            active_navigation="knowledge",
+            inbox_count=inbox_summary.total,
+        )
+    finally:
+        reset_request_location(request_location_token)
+    if not request.cookies.get("reply_admin_csrf"):
+        response.set_cookie(
+            "reply_admin_csrf", csrf, httponly=False, samesite="lax", secure=_secure_cookie(request)
+        )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.get(
@@ -2516,55 +4882,78 @@ async def knowledge_document_detail(
     principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
-    async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-        document = await session.scalar(
-            select(models.KnowledgeDocument).where(
-                models.KnowledgeDocument.id == document_id,
-                models.KnowledgeDocument.tenant_id == tenant_id,
+    try:
+        async with get_session_factory()() as session:
+            inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+            document = await execute_get_knowledge_document(
+                session,
+                GetKnowledgeDocumentQuery(
+                    required_tenant_id=tenant_id,
+                    actor=principal.actor,
+                    document_id=document_id,
+                ),
             )
-        )
-        if document is None:
-            raise HTTPException(status_code=404, detail="knowledge_document_not_found")
-        chunk_count = await session.scalar(
-            select(func.count()).where(
-                models.KnowledgeChunk.tenant_id == tenant_id,
-                models.KnowledgeChunk.document_id == document_id,
-            )
-        )
-        localization_count = await session.scalar(
-            select(func.count()).where(
-                models.KnowledgeLocalization.tenant_id == tenant_id,
-                models.KnowledgeLocalization.document_id == document_id,
-                models.KnowledgeLocalization.status == "published",
-            )
-        )
-        audits = (
-            (
-                await session.execute(
-                    select(models.AuditLog)
-                    .where(
-                        models.AuditLog.tenant_id == tenant_id,
-                        models.AuditLog.subject_type == "knowledge_document",
-                        models.AuditLog.subject_id == str(document_id),
-                    )
-                    .order_by(models.AuditLog.created_at.desc())
-                    .limit(20)
+            chunk_count = await session.scalar(
+                select(func.count()).where(
+                    models.KnowledgeChunk.tenant_id == tenant_id,
+                    models.KnowledgeChunk.document_id == document_id,
                 )
             )
-            .scalars()
-            .all()
-        )
+            localization_count = await session.scalar(
+                select(func.count()).where(
+                    models.KnowledgeLocalization.tenant_id == tenant_id,
+                    models.KnowledgeLocalization.document_id == document_id,
+                    models.KnowledgeLocalization.status == "published",
+                )
+            )
+            audits = list(
+                (
+                    await session.execute(
+                        select(models.AuditLog)
+                        .where(
+                            models.AuditLog.tenant_id == tenant_id,
+                            models.AuditLog.subject_type == "knowledge_document",
+                            models.AuditLog.subject_id == str(document_id),
+                        )
+                        .order_by(models.AuditLog.created_at.desc())
+                        .limit(20)
+                    )
+                ).scalars()
+            )
+    except KnowledgeApplicationError as exc:
+        raise _knowledge_http_error(exc) from exc
+    sensitive_content = _knowledge_document_is_sensitive(document)
+    visible_question = (
+        translate("knowledge.detail.sensitive_redacted") if sensitive_content else document.question
+    )
+    visible_reply = (
+        translate("knowledge.detail.sensitive_redacted") if sensitive_content else document.reply
+    )
     checklist = "".join(
         (
-            _progress_row(bool(document.question.strip()), "问题或触发语句存在"),
-            _progress_row(bool(document.reply.strip()), "批准回复候选存在"),
-            _progress_row(document.language_verified, "语言已经人工确认"),
-            _progress_row(bool(chunk_count), f"{int(chunk_count or 0)} 个检索 Chunk 可用"),
             _progress_row(
-                not document.is_official_contact or document.status == "published",
-                "官方联系方式经过单独发布审查",
-                warning=document.is_official_contact,
+                bool(document.question.strip()),
+                translate("knowledge.detail.question_present"),
+            ),
+            _progress_row(
+                bool(document.reply.strip()),
+                translate("knowledge.detail.reply_present"),
+            ),
+            _progress_row(
+                document.language_verified,
+                translate("knowledge.detail.language_verified"),
+            ),
+            _progress_row(
+                bool(chunk_count),
+                translate(
+                    "knowledge.detail.chunks_available",
+                    count=int(chunk_count or 0),
+                ),
+            ),
+            _progress_row(
+                document.is_official_contact or not has_contact_like(document.reply or ""),
+                translate("knowledge.detail.official_contact_reviewed"),
+                warning=has_contact_like(document.reply or "") and not document.is_official_contact,
             ),
         )
     )
@@ -2573,32 +4962,67 @@ async def knowledge_document_detail(
         f"<td>{escape(audit.action)}</td></tr>"
         for audit in audits
     )
+    csrf = _csrf(request)
+    action_root = f"{_tenant_root(tenant_id)}/knowledge/documents/{document.id}"
+    if document.status == "published":
+        publication_action = f"""<form method="post" action="{action_root}/unpublish"><input type="hidden" name="csrf_token" value="{escape(csrf)}"><button class="saas-button" type="submit">Unpublish</button></form>"""
+        classification_action = ""
+        confirmation_action = ""
+        delete_action = ""
+    else:
+        publication_action = f"""<form method="post" action="{action_root}/publish"><input type="hidden" name="csrf_token" value="{escape(csrf)}"><button class="saas-button primary" type="submit">Publish</button></form>"""
+        classification_action = f"""<form method="post" action="{action_root}/official-contact"><input type="hidden" name="csrf_token" value="{escape(csrf)}"><input type="hidden" name="target" value="{"false" if document.is_official_contact else "true"}"><button class="saas-button" type="submit">{"Remove official classification" if document.is_official_contact else "Mark official/contact-only"}</button></form>"""
+        confirmation_reason = (
+            '<label>Confirmation reason<input name="confirmation_reason" maxlength="500" minlength="10" required></label>'
+            if document.language_detection_status == "unknown"
+            else '<input type="hidden" name="confirmation_reason" value="">'
+        )
+        confirmation_action = (
+            f"""<form class="saas-form" method="post" action="{action_root}/confirm-english"><input type="hidden" name="csrf_token" value="{escape(csrf)}">{confirmation_reason}<button class="saas-button" type="submit">Confirm English</button></form>"""
+            if not document.language_verified
+            and document.language_detection_status not in {"mixed", "non_english"}
+            else ""
+        )
+        delete_action = f"""<form method="post" action="{action_root}/delete"><input type="hidden" name="csrf_token" value="{escape(csrf)}"><button class="saas-button danger" type="submit">Delete draft</button></form>"""
     body = f"""<div class="saas-grid two" style="margin-top:0">
-<section class="saas-card"><div class="saas-card-header"><div><h2>内容</h2>
-<p>来源文档和批准回复候选。</p></div>{status_badge(document.status)}</div>
-<div class="saas-card-body"><h3>问题</h3><p>{escape(document.question)}</p>
-<h3>批准回复候选</h3><p>{escape(document.reply)}</p></div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>审核清单</h2>
-<p>发布不会绕过语言、联系方式和检索治理。</p></div></div>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("knowledge.detail.content"))}</h2>
+<p>{escape(translate("knowledge.detail.content_description"))}</p></div>{status_badge(document.status)}</div>
+<div class="saas-card-body"><h3>{escape(translate("knowledge.detail.question"))}</h3><p>{escape(visible_question)}</p>
+<h3>{escape(translate("knowledge.detail.reply_candidate"))}</h3><p>{escape(visible_reply)}</p></div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("knowledge.detail.checklist"))}</h2>
+<p>{escape(translate("knowledge.detail.checklist_description"))}</p></div></div>
 <div class="saas-card-body"><ul class="saas-progress-list">{checklist}</ul></div></section>
 </div>
+<section class="saas-card"><div class="saas-card-header"><div><h2>Actions</h2></div></div><div class="saas-card-body"><div class="saas-form-row">{confirmation_action}{classification_action}{publication_action}{delete_action}</div></div></section>
 <div class="saas-grid two">
-<section class="saas-card"><div class="saas-card-header"><div><h2>来源与范围</h2></div></div>
-<div class="saas-card-body">{definition_list((('Brand', document.brand_id), ('Platform', document.platform or '全平台'), ('分类', document.category or '未分类'), ('来源文件', document.source_file or '人工录入'), ('已发布本地化', int(localization_count or 0)), ('更新时间', format_datetime(document.updated_at, include_year=True))))}</div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>审计历史</h2></div></div>
-<div class="saas-card-body">{f'<table class="saas-table"><tbody>{audit_rows}</tbody></table>' if audit_rows else '<p class="saas-muted">暂无专属审计记录。</p>'}</div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("knowledge.detail.source_scope"))}</h2></div></div>
+<div class="saas-card-body">{definition_list((("Brand", _knowledge_visible_metadata(document, document.brand_id)), ("Platform", _knowledge_visible_metadata(document, document.platform or translate("knowledge.detail.all_platforms"))), (translate("common.category"), _knowledge_visible_metadata(document, document.category or translate("knowledge.uncategorized"))), (translate("knowledge.detail.source_file"), _knowledge_visible_metadata(document, document.source_file or translate("knowledge.manual_entry"))), (translate("knowledge.detail.localizations"), int(localization_count or 0)), (translate("common.updated"), format_datetime(document.updated_at, include_year=True))))}</div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("knowledge.detail.audit_history"))}</h2></div></div>
+<div class="saas-card-body">{f'<table class="saas-table"><tbody>{audit_rows}</tbody></table>' if audit_rows else f'<p class="saas-muted">{escape(translate("knowledge.detail.no_audit"))}</p>'}</div></section>
 </div>"""
-    return _render_page(
+    response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="知识文档审核",
-        description="确认内容、语言、来源和检索状态，再进入现有发布流程。",
+        title=translate("knowledge.detail.title"),
+        description=translate("knowledge.detail.description"),
         body=body,
         active_navigation="knowledge",
         inbox_count=inbox_summary.total,
-        primary_action_html=primary_action("/admin/content/knowledge", "进入发布操作"),
-        breadcrumbs=(("文档与知识", f"{_tenant_root(tenant_id)}/knowledge"), ("审核", None)),
+        breadcrumbs=(
+            (translate("knowledge.title"), f"{_tenant_root(tenant_id)}/knowledge"),
+            (translate("common.review"), None),
+        ),
     )
+    if not request.cookies.get("reply_admin_csrf"):
+        response.set_cookie(
+            "reply_admin_csrf",
+            csrf,
+            httponly=False,
+            samesite="lax",
+            secure=_secure_cookie(request),
+        )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.get("/app/t/{tenant_id}/audit", response_class=HTMLResponse)
@@ -2634,35 +5058,43 @@ async def tenant_audit(
                 )
             ).scalars()
         )
-    category_options = '<option value="">全部类别</option>' + "".join(
-        f'<option value="{escape(value)}"'
-        f'{" selected" if value == category else ""}>{escape(value)}</option>'
-        for value in categories
+    category_options = (
+        f'<option value="">{escape(translate("audit.all_categories"))}</option>'
+        + "".join(
+            f'<option value="{escape(value)}"'
+            f"{' selected' if value == category else ''}>{escape(value)}</option>"
+            for value in categories
+        )
     )
-    filters = f"""<form class="saas-filter-bar" method="get">
-<label class="saas-field"><span>类别</span><select name="category">{category_options}</select></label>
-<button class="saas-button" type="submit">应用筛选</button></form>"""
+    filters = f"""<form class="saas-filter-bar" method="get" aria-label="{escape(translate("audit.title"))}">
+<label class="saas-field"><span>{escape(translate("common.category"))}</span><select name="category">{category_options}</select></label>
+<button class="saas-button" type="submit">{escape(translate("common.apply_filters"))}</button></form>"""
     rows = "".join(
         f"<tr><td>{format_datetime(audit.created_at, include_year=True)}</td>"
         f"<td>{escape(audit.actor)}</td><td>{escape(audit.category)}</td>"
         f"<td><strong>{escape(audit.action)}</strong><br>"
         f'<span class="saas-muted">{escape(audit.subject_type)} · '
         f"{escape(audit.subject_id)}</span></td>"
-        f'<td><a href="{_tenant_root(tenant_id)}/audit/{audit.id}">查看 →</a></td></tr>'
+        f'<td><a href="{_tenant_root(tenant_id)}/audit/{audit.id}">{escape(translate("audit.view"))}</a></td></tr>'
         for audit in audits
     )
     table = (
         '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        "<th>时间</th><th>Actor</th><th>类别</th><th>动作与资源</th><th></th>"
+        f"<th>{escape(translate('common.time'))}</th><th>Actor</th>"
+        f"<th>{escape(translate('common.category'))}</th>"
+        f"<th>{escape(translate('audit.action_resource'))}</th><th></th>"
         f"</tr></thead><tbody>{rows}</tbody></table></div>"
         if rows
-        else empty_state("暂无审计记录", "当前筛选范围内没有可展示的不可变审计事实。")
+        else empty_state(
+            translate("audit.empty_title"),
+            translate("audit.empty_description"),
+        )
     )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="审计中心",
-        description="按 Tenant 查看配置、审核、状态转换和系统操作记录。",
+        title=translate("audit.title"),
+        description=translate("audit.description"),
         body=f"{filters}{table}",
         active_navigation="audit",
         inbox_count=inbox_summary.total,
@@ -2688,23 +5120,61 @@ async def tenant_audit_detail(
         )
     if audit is None:
         raise HTTPException(status_code=404, detail="audit_not_found")
+    safe_audit_detail = _audit_detail_for_display(audit)
     body = f"""<div class="saas-grid two" style="margin-top:0">
-<section class="saas-card"><div class="saas-card-header"><div><h2>审计事实</h2>
-<p>标识、Actor 和资源范围。</p></div></div><div class="saas-card-body">
-{definition_list((('Audit ID', audit.id), ('时间', format_datetime(audit.created_at, include_year=True)), ('Actor', audit.actor), ('类别', audit.category), ('动作', audit.action), ('资源类型', audit.subject_type), ('资源 ID', audit.subject_id)))}</div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>结构化详情</h2>
-<p>敏感信息应在写入审计前完成裁剪。</p></div></div><div class="saas-card-body">
-{safe_json_details(audit.detail, summary='展开审计详情')}</div></section></div>"""
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("audit.detail.facts"))}</h2>
+<p>{escape(translate("audit.detail.facts_description"))}</p></div></div><div class="saas-card-body">
+{definition_list((("Audit ID", audit.id), (translate("common.time"), format_datetime(audit.created_at, include_year=True)), ("Actor", audit.actor), (translate("common.category"), audit.category), (translate("common.action"), audit.action), (translate("audit.detail.resource_type"), audit.subject_type), (translate("common.resource") + " ID", audit.subject_id)))}</div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("audit.detail.structured"))}</h2>
+<p>{escape(translate("audit.detail.structured_description"))}</p></div></div><div class="saas-card-body">
+{safe_json_details(safe_audit_detail, summary=translate("audit.detail.expand"))}</div></section></div>"""
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="审计详情",
+        title=translate("audit.detail.title"),
         description=f"{audit.action} · {audit.subject_type}",
         body=body,
         active_navigation="audit",
         inbox_count=inbox_summary.total,
-        breadcrumbs=(("审计中心", f"{_tenant_root(tenant_id)}/audit"), (str(audit.id), None)),
+        breadcrumbs=(
+            (translate("audit.title"), f"{_tenant_root(tenant_id)}/audit"),
+            (str(audit.id), None),
+        ),
     )
+
+
+_HISTORICAL_KNOWLEDGE_AUDIT_SENSITIVE_KEYS = frozenset(
+    {
+        "question",
+        "reply",
+        "protected_values",
+        "confirmation_reason",
+        "source_file",
+        "brand",
+        "platform",
+        "category",
+    }
+)
+
+
+def _audit_detail_for_display(audit: models.AuditLog) -> dict:
+    detail = dict(audit.detail or {})
+    is_knowledge_audit = (
+        audit.subject_type in {"knowledge_document", "knowledge_import_batch"}
+        or "KNOWLEDGE" in audit.action
+    )
+    if not is_knowledge_audit:
+        return detail
+    for key in _HISTORICAL_KNOWLEDGE_AUDIT_SENSITIVE_KEYS:
+        if key not in detail or detail[key] in (None, "", [], {}):
+            continue
+        serialized_value = repr(detail.pop(key))
+        detail.setdefault(
+            f"{key}_hash",
+            hashlib.sha256(serialized_value.encode()).hexdigest(),
+        )
+        detail.setdefault(f"{key}_length", len(serialized_value))
+    return detail
 
 
 def _journey_decision_join_condition():
@@ -2771,27 +5241,33 @@ async def tenant_journeys(request: Request, tenant_id: str) -> Response:
         journey_rows = await _load_journey_rows(session, tenant_id)
     rows = "".join(
         f"<tr><td>{format_datetime(row.job.created_at, include_year=True)}</td>"
-        f"<td><strong>{escape(row.contact.display_name or '匿名联系人')}</strong><br>"
+        f"<td><strong>{escape(row.contact.display_name or translate('common.anonymous_contact'))}</strong><br>"
         f'<span class="saas-muted">{escape(row.account.name)} · '
         f"{escape(row.conversation.channel_type)}</span></td>"
         f"<td>{status_badge(row.job.status)}</td>"
         f"<td>{status_badge(row.decision.action) if row.decision else '—'}</td>"
         f"<td>g{escape(row.job.decision_generation if row.job.decision_generation is not None else '—')}</td>"
-        f'<td><a href="{_tenant_root(tenant_id)}/journeys/{row.job.id}">查看链路 →</a></td></tr>'
+        f'<td><a href="{_tenant_root(tenant_id)}/journeys/{row.job.id}">{escape(translate("journey.view"))}</a></td></tr>'
         for row in journey_rows
     )
     table = (
         '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        "<th>开始时间</th><th>会话</th><th>Job</th><th>决策</th><th>Generation</th><th></th>"
+        f"<th>{escape(translate('journey.start_time'))}</th>"
+        f"<th>{escape(translate('journey.conversation'))}</th><th>Job</th>"
+        f"<th>{escape(translate('journey.decision'))}</th>"
+        "<th>Generation</th><th></th>"
         f"</tr></thead><tbody>{rows}</tbody></table></div>"
         if rows
-        else empty_state("暂无处理链路", "入站消息形成 DecisionJob 后，会在这里显示完整 Journey。")
+        else empty_state(
+            translate("journey.empty_title"),
+            translate("journey.empty_description"),
+        )
     )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="Processing Journey",
-        description="从入站证据到决策、Outbox 和投递尝试的只读事实链。",
+        title=translate("journey.title"),
+        description=translate("journey.description"),
         body=table,
         active_navigation="journeys",
         inbox_count=inbox_summary.total,
@@ -2892,14 +5368,14 @@ async def tenant_journey_detail(
     timeline_items = [
         _journey_timeline_item(
             "1",
-            "RawEvent 已接收" if raw_event else "无 RawEvent 引用",
-            raw_event.processing_status if raw_event else "历史或内部触发",
+            translate("journey.raw_received") if raw_event else translate("journey.raw_missing"),
+            raw_event.processing_status if raw_event else translate("journey.historical_trigger"),
             raw_event.received_at if raw_event else job.created_at,
             "success" if raw_event else "neutral",
         ),
         _journey_timeline_item(
             "2",
-            "Message 已归一化",
+            translate("journey.message_normalized"),
             f"{message.direction} · {message.sender_type}",
             message.occurred_at or message.created_at,
             "success",
@@ -2923,7 +5399,11 @@ async def tenant_journey_detail(
             )
         )
     for outbox in outboxes:
-        role_label = "审核 Outbox" if decision and outbox.id == decision.review_outbox_id else "发送 Outbox"
+        role_label = (
+            translate("journey.review_outbox")
+            if decision and outbox.id == decision.review_outbox_id
+            else translate("journey.send_outbox")
+        )
         timeline_items.append(
             _journey_timeline_item(
                 "5",
@@ -2937,8 +5417,8 @@ async def tenant_journey_detail(
         timeline_items.append(
             _journey_timeline_item(
                 str(attempt.attempt_no),
-                "投递尝试",
-                f"{attempt.outcome} · {attempt.error_code or '无错误码'}",
+                translate("journey.delivery_attempt"),
+                f"{attempt.outcome} · {attempt.error_code or translate('journey.no_error_code')}",
                 attempt.created_at,
                 "success" if attempt.outcome == "SENT" else "warning",
             )
@@ -2957,7 +5437,7 @@ async def tenant_journey_detail(
             )
         )
         if decision
-        else '<p class="saas-muted">当前 Job 尚未形成 ReplyDecision。</p>'
+        else f'<p class="saas-muted">{escape(translate("journey.no_decision"))}</p>'
     )
     evidence_details = safe_json_details(
         {
@@ -2965,27 +5445,30 @@ async def tenant_journey_detail(
             "raw_event_context": raw_event.context if raw_event else None,
             "decision_rag_evidence": decision.rag_evidence if decision else None,
         },
-        summary="展开证据与快照",
+        summary=translate("journey.expand_evidence"),
     )
     body = f"""<div class="saas-grid" style="grid-template-columns:minmax(0,1fr) 340px;margin-top:0">
-<section class="saas-card"><div class="saas-card-header"><div><h2>处理时间线</h2>
-<p>阶段来自 PostgreSQL 事实，不根据日志推测。</p></div></div>
-<div class="saas-card-body"><ol class="saas-timeline">{''.join(timeline_items)}</ol></div></section>
-<aside class="saas-card"><div class="saas-card-header"><div><h2>上下文</h2></div></div>
-<div class="saas-card-body">{definition_list((('联系人', contact.display_name or '匿名联系人'), ('账号', account.name), ('平台', conversation.platform), ('会话', conversation.id), ('Generation', job.decision_generation), ('Job ID', job.id)))}</div></aside></div>
-<div class="saas-grid two"><section class="saas-card"><div class="saas-card-header"><div><h2>决策来源</h2></div></div>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("journey.timeline"))}</h2>
+<p>{escape(translate("journey.timeline_description"))}</p></div></div>
+<div class="saas-card-body"><ol class="saas-timeline">{"".join(timeline_items)}</ol></div></section>
+<aside class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("journey.context"))}</h2></div></div>
+<div class="saas-card-body">{definition_list(((translate("common.contact"), contact.display_name or translate("common.anonymous_contact")), (translate("common.account"), account.name), (translate("common.platform"), conversation.platform), (translate("journey.conversation"), conversation.id), ("Generation", job.decision_generation), ("Job ID", job.id)))}</div></aside></div>
+<div class="saas-grid two"><section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("journey.decision_source"))}</h2></div></div>
 <div class="saas-card-body">{decision_details}</div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>结构化证据</h2></div></div>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("journey.structured_evidence"))}</h2></div></div>
 <div class="saas-card-body">{evidence_details}</div></section></div>"""
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="Journey 详情",
-        description=f"DecisionJob {job.id} 的端到端处理事实。",
+        title=translate("journey.detail_title"),
+        description=translate("journey.detail_description", job_id=job.id),
         body=body,
         active_navigation="journeys",
         inbox_count=inbox_summary.total,
-        breadcrumbs=(("Processing Journey", f"{_tenant_root(tenant_id)}/journeys"), (str(job.id), None)),
+        breadcrumbs=(
+            (translate("journey.title"), f"{_tenant_root(tenant_id)}/journeys"),
+            (str(job.id), None),
+        ),
     )
 
 
@@ -3005,6 +5488,111 @@ def _journey_timeline_item(
     )
 
 
+@router.get("/app/t/{tenant_id}/health", response_class=HTMLResponse)
+async def tenant_health(request: Request, tenant_id: str) -> Response:
+    principal = await _require_tenant_admin_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    current_time = datetime.now(UTC)
+    day_ago = current_time - timedelta(hours=24)
+    async with get_session_factory()() as session:
+        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
+        health_metrics = await _load_health_metrics(
+            session,
+            frozenset({tenant_id}),
+            current_time,
+        )
+        outbox_rows = list(
+            (
+                await session.execute(
+                    select(models.OutboxMessage)
+                    .where(models.OutboxMessage.tenant_id == tenant_id)
+                    .order_by(models.OutboxMessage.created_at.desc())
+                    .limit(50)
+                )
+            ).scalars()
+        )
+        ingress_rows = list(
+            (
+                await session.execute(
+                    select(
+                        models.RawEvent.source,
+                        models.RawEvent.processing_status,
+                        func.count(func.distinct(models.RawEvent.id)),
+                        func.max(models.RawEvent.received_at),
+                    )
+                    .outerjoin(
+                        models.NormalizedEvent,
+                        models.NormalizedEvent.raw_event_id == models.RawEvent.id,
+                    )
+                    .where(
+                        or_(
+                            models.RawEvent.tenant_id == tenant_id,
+                            and_(
+                                models.RawEvent.tenant_id.is_(None),
+                                models.NormalizedEvent.tenant_id == tenant_id,
+                            ),
+                        ),
+                        or_(
+                            models.RawEvent.received_at >= day_ago,
+                            _raw_action_condition(),
+                            _raw_warning_condition(),
+                        ),
+                    )
+                    .group_by(models.RawEvent.source, models.RawEvent.processing_status)
+                )
+            ).all()
+        )
+
+    metric_rows = "".join(
+        f'<tr data-health="{escape(metric.key)}">'
+        f"<td><strong>{escape(metric.label)}</strong></td>"
+        f"<td>{status_badge(metric.level)}</td>"
+        f"<td>{escape(translate('admin.health.backlog_summary', action_count=metric.action_count, warning_count=metric.warning_count))}</td>"
+        f"<td>{escape(_health_age(current_time, metric.oldest_at))}</td>"
+        f'<td>{secondary_action(metric.href, translate("admin.common.view"), small=True)}</td></tr>'
+        for metric in health_metrics
+    )
+    delivery_rows = (
+        "".join(
+            f"<tr><td>{escape(format_datetime(outbox.created_at, include_year=True))}</td>"
+            f"<td>{status_badge(outbox.status)}</td>"
+            f"<td>{escape(outbox.destination_type)}</td>"
+            f"<td>{escape(str((outbox.payload or {}).get('text', ''))[:80])}</td>"
+            f"<td>{escape(outbox.attempt_count)}</td>"
+            f"<td>{escape(outbox.last_error_code or '—')}</td></tr>"
+            for outbox in outbox_rows
+        )
+        or f'<tr><td colspan="6">{escape(translate("admin.health.no_delivery_records"))}</td></tr>'
+    )
+    ingress_table_rows = (
+        "".join(
+            f"<tr><td>{escape(source)}</td><td>{status_badge(processing_status)}</td>"
+            f"<td>{escape(count)}</td><td>{escape(format_datetime(last_at, include_year=True))}</td></tr>"
+            for source, processing_status, count, last_at in ingress_rows
+        )
+        or f'<tr><td colspan="4">{escape(translate("admin.health.no_ingress"))}</td></tr>'
+    )
+    body = f"""<section class="saas-card"><div class="saas-card-header"><div>
+<h2>{escape(translate("admin.health.core_pipeline"))}</h2></div></div>
+<div class="saas-table-wrap"><table class="saas-table"><tbody>{metric_rows}</tbody></table></div></section>
+<section class="saas-card"><div class="saas-card-header"><div><h2>Outbox</h2>
+<p>{escape(translate("admin.health.outbox_hint"))}</p></div></div>
+<div class="saas-table-wrap"><table class="saas-table"><tbody>{delivery_rows}</tbody></table></div></section>
+<section class="saas-card" id="ingress"><div class="saas-card-header"><div>
+<h2>{escape(translate("admin.health.ingress"))}</h2></div></div>
+<div class="saas-table-wrap"><table class="saas-table"><tbody>{ingress_table_rows}</tbody></table></div></section>"""
+    return _render_page(
+        principal=principal,
+        tenant_id=tenant_id,
+        title=translate("admin.health.title"),
+        description=translate("admin.health.description"),
+        body=body,
+        active_navigation="health",
+        inbox_count=inbox_summary.total,
+    )
+
+
 @router.get("/app/t/{tenant_id}/settings", response_class=HTMLResponse)
 async def tenant_settings(request: Request, tenant_id: str) -> Response:
     principal = await _require_tenant_admin_principal(request, tenant_id)
@@ -3012,25 +5600,47 @@ async def tenant_settings(request: Request, tenant_id: str) -> Response:
         return principal
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-        user = await session.scalar(
-            select(models.AdminUser).where(models.AdminUser.tenant_id == tenant_id)
-        )
         account_count = await session.scalar(
             select(func.count()).where(models.PlatformAccount.tenant_id == tenant_id)
         )
-    body = f"""<div class="saas-grid two" style="margin-top:0">
-<section class="saas-card"><div class="saas-card-header"><div><h2>工作区身份</h2>
-<p>Tenant 是所有业务数据查询和授权的边界。</p></div></div><div class="saas-card-body">
-{definition_list((('Tenant ID', tenant_id), ('工作区用户', user.username if user else 'Bootstrap 管理员'), ('账号数量', int(account_count or 0)), ('默认安全模式', 'BOT_DRAFT_ONLY')))}</div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>配置入口</h2>
-<p>写操作继续复用现有经过 CSRF 保护的后台。</p></div></div><div class="saas-card-body">
-<div style="display:flex;gap:10px;flex-wrap:wrap">{secondary_action('/admin/integrations/accounts', '渠道账号')}{secondary_action('/admin/content/reply-prompt', '业务指令')}{secondary_action('/admin/content/knowledge', '知识治理')}</div>
-<div class="saas-alert warning" style="margin-top:18px">生产配置事实源仍是 Railway 服务变量。工作区设置不会覆盖跨角色安全配置或功能开关。</div></div></section></div>"""
+    tenant_root = _tenant_root(tenant_id)
+    canonical_links = "".join(
+        (
+            secondary_action(
+                f"{_agent_root(tenant_id, DEFAULT_TENANT_ID)}/instructions",
+                translate("settings.business_instructions"),
+            ),
+            secondary_action(
+                f"{tenant_root}/knowledge",
+                translate("settings.knowledge_governance"),
+            ),
+            secondary_action(
+                f"{tenant_root}/channels",
+                translate("agent.overview.channel_accounts"),
+            ),
+            secondary_action(
+                f"{tenant_root}/channels/feishu/handoff",
+                translate("nav.feishu_handoff"),
+            ),
+            secondary_action(f"{tenant_root}/health", translate("nav.system_health")),
+            secondary_action(f"{tenant_root}/audit", translate("nav.audit_center")),
+            secondary_action(f"{tenant_root}/journeys", translate("nav.processing_journey")),
+        )
+    )
+    body = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("settings.identity"))}</h2>
+<p>{escape(translate("settings.identity_description"))}</p></div></div><div class="saas-card-body">
+{definition_list((("Tenant ID", tenant_id), (translate("settings.workspace_user"), principal.username), (translate("settings.account_count"), int(account_count or 0)), (translate("settings.default_mode"), "BOT_DRAFT_ONLY")))}</div></section>
+<div class="saas-section-title"><div><h2>{escape(translate("settings.configuration"))}</h2>
+<p>{escape(translate("settings.configuration_description"))}</p></div></div>
+<div class="saas-action-row">{canonical_links}</div>
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("settings.preferences"))}</h2></div></div>
+<div class="saas-card-body">{definition_list(((translate("settings.language"), translate("settings.not_persisted")), (translate("settings.timezone"), translate("settings.not_persisted")), (translate("settings.notifications"), translate("settings.not_persisted"))))}
+<p class="saas-muted">{escape(translate("settings.preferences_deferred"))}</p></div></section>"""
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
-        title="工作区设置",
-        description="查看租户身份、访问边界和受控配置入口。",
+        title=translate("settings.title"),
+        description=translate("settings.description"),
         body=body,
         active_navigation="settings",
         inbox_count=inbox_summary.total,
@@ -3041,8 +5651,7 @@ async def _require_system_principal(request: Request) -> Principal | Response:
     principal = await _require_web_principal(request)
     if isinstance(principal, Response):
         return principal
-    if not principal.is_superadmin:
-        raise HTTPException(status_code=403, detail="system_admin_required")
+    principal.require_superadmin()
     return principal
 
 
@@ -3067,69 +5676,179 @@ def _render_system_page(
     )
 
 
-@router.get("/admin/system/overview", response_class=HTMLResponse)
-async def system_overview(request: Request) -> Response:
-    principal = await _require_system_principal(request)
-    if isinstance(principal, Response):
-        return principal
-    async with get_session_factory()() as session:
-        tenant_count = await session.scalar(select(func.count()).select_from(models.AdminUser))
-        account_count = await session.scalar(
-            select(func.count()).select_from(models.PlatformAccount)
-        )
-        disabled_account_count = await session.scalar(
-            select(func.count()).where(models.PlatformAccount.status == "DISABLED")
-        )
-        failed_outbox_count = await session.scalar(
-            select(func.count()).where(
-                models.OutboxMessage.status.in_(("FAILED", "NEEDS_REVIEW"))
+def _redact_system_audit_detail(value: object) -> object:
+    if isinstance(value, dict):
+        redacted_detail: dict[str, object] = {}
+        for key, item in value.items():
+            normalized_key = str(key).casefold()
+            is_secret_key = any(
+                secret_part in normalized_key for secret_part in _SYSTEM_AUDIT_SECRET_KEY_PARTS
             )
+            if is_secret_key or normalized_key not in _SYSTEM_AUDIT_SAFE_DETAIL_KEYS:
+                redacted_detail[str(key)] = "[REDACTED]"
+            else:
+                redacted_detail[str(key)] = _redact_system_audit_detail(item)
+        return redacted_detail
+    if isinstance(value, list):
+        return [_redact_system_audit_detail(item) for item in value]
+    return value
+
+
+def _security_configuration_complete() -> bool:
+    settings = get_settings()
+    return all(
+        (
+            bool(settings.admin_username.strip()),
+            bool(settings.admin_password.get_secret_value()),
+            len(settings.admin_session_secret.get_secret_value()) >= 32,
+            DEFAULT_TENANT_ID in settings.allowed_admin_tenants,
+            bool(settings.platform_secret_key_list),
+        )
+    )
+
+
+def _canonical_system_audit_category(category: str) -> str:
+    return _SYSTEM_AUDIT_CATEGORY_ALIASES.get(category, category)
+
+
+async def _load_system_overview() -> tuple[dict[str, int | str | bool], list[models.AuditLog]]:
+    current_time = datetime.now(UTC)
+    query_categories = SYSTEM_AUDIT_CATEGORIES | frozenset(_SYSTEM_AUDIT_CATEGORY_ALIASES)
+    async with get_session_factory()() as session:
+        active_user_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(models.AdminUser)
+                .where(
+                    models.AdminUser.tenant_id == DEFAULT_TENANT_ID,
+                    models.AdminUser.role == "USER",
+                    models.AdminUser.status == "active",
+                )
+            )
+            or 0
+        )
+        disabled_user_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(models.AdminUser)
+                .where(
+                    models.AdminUser.tenant_id == DEFAULT_TENANT_ID,
+                    models.AdminUser.status == "disabled",
+                )
+            )
+            or 0
+        )
+        active_session_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(models.AdminSession)
+                .where(models.AdminSession.expires_at > current_time)
+            )
+            or 0
+        )
+        expired_session_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(models.AdminSession)
+                .where(models.AdminSession.expires_at <= current_time)
+            )
+            or 0
         )
         recent_audits = list(
             (
                 await session.execute(
                     select(models.AuditLog)
+                    .where(
+                        models.AuditLog.category.in_(query_categories),
+                        models.AuditLog.subject_type.in_(_SYSTEM_AUDIT_SUBJECT_TYPES),
+                    )
                     .order_by(models.AuditLog.created_at.desc())
                     .limit(12)
                 )
             ).scalars()
         )
+
+    global_kill_switch_state = "unavailable"
+    redis = aioredis.from_url(get_settings().redis_url)
+    try:
+        global_kill_switch_state = (
+            "enabled"
+            if await redis.exists(f"killswitch:global:{DEFAULT_TENANT_ID}")
+            else "disabled"
+        )
+    except Exception:  # noqa: BLE001 - overview remains available during Redis incidents
+        logger.exception("system overview could not read the global kill switch")
+    finally:
+        await redis.aclose()
+
+    summary: dict[str, int | str | bool] = {
+        "active_user_count": active_user_count,
+        "disabled_user_count": disabled_user_count,
+        "active_session_count": active_session_count,
+        "expired_session_count": expired_session_count,
+        "global_kill_switch_state": global_kill_switch_state,
+        "security_configuration_complete": _security_configuration_complete(),
+    }
+    return summary, recent_audits
+
+
+@router.get("/admin/system/overview", response_class=HTMLResponse)
+async def system_overview(request: Request) -> Response:
+    principal = await _require_system_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    summary, recent_audits = await _load_system_overview()
     audit_rows = "".join(
-        f"<tr><td>{format_datetime(audit.created_at)}</td><td>{escape(audit.tenant_id)}</td>"
+        f"<tr><td>{format_datetime(audit.created_at)}</td>"
+        f"<td>{escape(_canonical_system_audit_category(audit.category))}</td>"
         f"<td>{escape(audit.actor)}</td><td>{escape(audit.action)}</td></tr>"
         for audit in recent_audits
     )
-    body = f"""<section class="saas-alert warning" style="margin-bottom:18px">
-这是跨租户特权区域。租户业务操作应返回对应工作区完成。</section>
-<div class="saas-grid four">
-{metric_card(int(tenant_count or 0), 'Tenant 用户')}
-{metric_card(int(account_count or 0), '平台账号')}
-{metric_card(int(disabled_account_count or 0), '禁用账号')}
-{metric_card(int(failed_outbox_count or 0), '投递风险')}</div>
-<div class="saas-grid two"><section class="saas-card"><div class="saas-card-header"><div><h2>系统操作</h2>
-<p>沿用现有健康、安全和访问管理能力。</p></div></div><div class="saas-card-body">
-<div style="display:flex;gap:10px;flex-wrap:wrap">{secondary_action('/admin/system/health', '系统健康')}{secondary_action('/admin/system/safety', '安全控制')}{secondary_action('/admin/system/users', '用户与访问')}</div></div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>最近跨租户活动</h2></div>
-{secondary_action('/admin/system/audit', '查看全部', small=True)}</div><div class="saas-card-body">
-{f'<table class="saas-table"><tbody>{audit_rows}</tbody></table>' if audit_rows else '<p class="saas-muted">暂无审计记录。</p>'}</div></section></div>"""
+    body = f"""<section class="saas-alert warning">
+{escape(translate("system.overview.security_notice"))}</section>
+<div class="saas-grid three">
+{metric_card(summary["active_user_count"], translate("system.overview.active_users"))}
+{metric_card(summary["disabled_user_count"], translate("system.overview.disabled_users"))}
+{metric_card(summary["active_session_count"], translate("system.overview.active_sessions"))}</div>
+<div class="saas-grid three">
+{metric_card(summary["expired_session_count"], translate("system.overview.expired_sessions"))}
+{metric_card(summary["global_kill_switch_state"], translate("system.overview.global_kill_switch"))}
+{metric_card(translate("common.complete") if summary["security_configuration_complete"] else translate("common.incomplete"), translate("system.overview.security_configuration"))}</div>
+<div class="saas-section-title"><div><h2>{escape(translate("system.overview.operations"))}</h2>
+<p>{escape(translate("system.overview.operations_description"))}</p></div></div>
+<div class="saas-action-row">{secondary_action("/admin/system/users", translate("system.overview.access"))}{secondary_action("/admin/system/safety", translate("system.overview.safety"))}{secondary_action("/admin/system/audit", translate("home.view_all"))}</div>
+<div class="saas-section-title"><div><h2>{escape(translate("system.overview.recent_activity"))}</h2></div>
+{secondary_action("/admin/system/audit", translate("home.view_all"), small=True)}</div>
+{f'<div class="saas-table-wrap"><table class="saas-table"><tbody>{audit_rows}</tbody></table></div>' if audit_rows else f'<p class="saas-muted">{escape(translate("system.overview.no_audit"))}</p>'}"""
     return _render_system_page(
         principal=principal,
-        title="系统总览",
-        description="查看跨租户运行风险并进入受控系统操作。",
+        title=translate("system.overview.title"),
+        description=translate("system.overview.description"),
         body=body,
         active_navigation="system-overview",
     )
 
 
 @router.get("/admin/system/audit", response_class=HTMLResponse)
-async def system_audit(request: Request, tenant_id: str = "") -> Response:
+async def system_audit(request: Request, category: str = "") -> Response:
     principal = await _require_system_principal(request)
     if isinstance(principal, Response):
         return principal
+    if category and category not in SYSTEM_AUDIT_CATEGORIES:
+        raise HTTPException(status_code=422, detail="invalid_system_audit_category")
+    query_categories = SYSTEM_AUDIT_CATEGORIES | frozenset(_SYSTEM_AUDIT_CATEGORY_ALIASES)
     async with get_session_factory()() as session:
-        statement = select(models.AuditLog)
-        if tenant_id:
-            statement = statement.where(models.AuditLog.tenant_id == tenant_id)
+        statement = select(models.AuditLog).where(
+            models.AuditLog.category.in_(query_categories),
+            models.AuditLog.subject_type.in_(_SYSTEM_AUDIT_SUBJECT_TYPES),
+        )
+        if category:
+            matching_categories = {category} | {
+                source
+                for source, target in _SYSTEM_AUDIT_CATEGORY_ALIASES.items()
+                if target == category
+            }
+            statement = statement.where(models.AuditLog.category.in_(matching_categories))
         audits = list(
             (
                 await session.execute(
@@ -3137,37 +5856,33 @@ async def system_audit(request: Request, tenant_id: str = "") -> Response:
                 )
             ).scalars()
         )
-        tenant_ids = list(
-            (
-                await session.execute(
-                    select(models.AuditLog.tenant_id)
-                    .distinct()
-                    .order_by(models.AuditLog.tenant_id)
-                )
-            ).scalars()
+    category_options = (
+        f'<option value="">{escape(translate("system.audit.all_categories"))}</option>'
+        + "".join(
+            f'<option value="{escape(value)}"'
+            f"{' selected' if value == category else ''}>{escape(value)}</option>"
+            for value in sorted(SYSTEM_AUDIT_CATEGORIES)
         )
-    tenant_options = '<option value="">全部 Tenant</option>' + "".join(
-        f'<option value="{escape(value)}"'
-        f'{" selected" if value == tenant_id else ""}>{escape(value)}</option>'
-        for value in tenant_ids
     )
     rows = "".join(
         f"<tr><td>{format_datetime(audit.created_at, include_year=True)}</td>"
-        f"<td>{escape(audit.tenant_id)}</td><td>{escape(audit.actor)}</td>"
-        f"<td>{escape(audit.category)}</td><td>{escape(audit.action)}</td>"
-        f"<td>{escape(audit.subject_type)} · {escape(audit.subject_id)}</td></tr>"
+        f"<td>{escape(audit.actor)}</td>"
+        f"<td>{escape(_canonical_system_audit_category(audit.category))}</td>"
+        f"<td>{escape(audit.action)}</td>"
+        f"<td>{escape(audit.subject_type)} · {escape(audit.subject_id)}"
+        f"{safe_json_details(_redact_system_audit_detail(audit.detail or {}), summary=translate('common.structured_details'))}</td></tr>"
         for audit in audits
     )
-    body = f"""<form class="saas-filter-bar" method="get"><label class="saas-field">
-<span>Tenant</span><select name="tenant_id">{tenant_options}</select></label>
-<button class="saas-button" type="submit">应用筛选</button></form>
+    body = f"""<form class="saas-filter-bar" method="get" aria-label="{escape(translate("system.audit.title"))}"><label class="saas-field">
+<span>{escape(translate("common.category"))}</span><select name="category">{category_options}</select></label>
+<button class="saas-button" type="submit">{escape(translate("common.apply_filters"))}</button></form>
 <div class="saas-table-wrap"><table class="saas-table"><thead><tr>
-<th>时间</th><th>Tenant</th><th>Actor</th><th>类别</th><th>动作</th><th>资源</th>
+<th>{escape(translate("common.time"))}</th><th>Actor</th><th>{escape(translate("common.category"))}</th><th>{escape(translate("common.action"))}</th><th>{escape(translate("common.resource"))}</th>
 </tr></thead><tbody>{rows}</tbody></table></div>"""
     return _render_system_page(
         principal=principal,
-        title="跨租户审计",
-        description="系统管理员只读查看所有 Tenant 的审计事实。",
+        title=translate("system.audit.title"),
+        description=translate("system.audit.description"),
         body=body,
         active_navigation="system-audit",
     )
@@ -3178,21 +5893,21 @@ async def product_help(request: Request) -> Response:
     principal = await _require_web_principal(request)
     if isinstance(principal, Response):
         return principal
-    body = """<div class="saas-grid two" style="margin-top:0">
-<section class="saas-card"><div class="saas-card-header"><div><h2>从哪里开始</h2></div></div>
+    body = f"""<div class="saas-grid two" style="margin-top:0">
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("help.get_started"))}</h2></div></div>
 <div class="saas-card-body"><ol class="saas-progress-list">
-<li class="saas-progress-item"><span class="saas-progress-icon done">1</span><span>选择 Tenant 并查看首页下一步。</span></li>
-<li class="saas-progress-item"><span class="saas-progress-icon done">2</span><span>在 Agents 中检查指令、模型、渠道和知识。</span></li>
-<li class="saas-progress-item"><span class="saas-progress-icon done">3</span><span>在收件箱按最老等待处理人工、草稿和投递风险。</span></li>
+<li class="saas-progress-item"><span class="saas-progress-icon done">1</span><span>{escape(translate("help.step.select"))}</span></li>
+<li class="saas-progress-item"><span class="saas-progress-icon done">2</span><span>{escape(translate("help.step.agents"))}</span></li>
+<li class="saas-progress-item"><span class="saas-progress-icon done">3</span><span>{escape(translate("help.step.inbox"))}</span></li>
 </ol></div></section>
-<section class="saas-card"><div class="saas-card-header"><div><h2>安全边界</h2></div></div>
-<div class="saas-card-body"><p>新账号默认仅生成草稿。外发始终经过 Tenant 检查、kill switch、Generation、Final Guard、幂等和 Outbox 约束。</p>
-<p>Processing Journey 与审计中心是只读事实视图，不会改变业务状态。</p></div></section></div>"""
+<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("help.safety"))}</h2></div></div>
+<div class="saas-card-body"><p>{escape(translate("help.safety_description"))}</p>
+<p>{escape(translate("help.read_only_description"))}</p></div></section></div>"""
     return HTMLResponse(
         render_saas_page(
             principal=principal,
-            title="帮助中心",
-            description="Reply Core SaaS 工作区的快速使用说明。",
+            title=translate("help.title"),
+            description=translate("help.description"),
             body=body,
             active_navigation="",
             tenant_id=None,

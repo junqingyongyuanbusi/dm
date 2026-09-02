@@ -15,7 +15,11 @@ async def _login(client: httpx.AsyncClient) -> str:
     csrf = client.cookies["reply_admin_csrf"]
     await client.post(
         "/admin/login",
-        data={"csrf_token": csrf, "username": "admin", "password": "test-admin-password"},
+        data={
+            "csrf_token": csrf,
+            "username": "admin",
+            "password": "test-admin-password",
+        },
     )
     return csrf
 
@@ -145,7 +149,7 @@ async def test_admin_approved_draft_can_send_in_bot_modes(
             f"/admin/decisions/{decision_id}/approve", data={"csrf_token": csrf}
         )
     assert response.status_code == 303
-    assert replay.status_code == 303
+    assert replay.status_code == 303, replay.text
     assert conflict.status_code == 409
     assert conflict.json()["detail"] == "draft_approval_conflict"
     assert stale_replay.status_code == 409

@@ -23,9 +23,44 @@ Code-only releases do not create this compatibility image. `latest` promotion an
 Railway rollout belong exclusively to `scripts/publish_railway_release.sh`; the local release path
 only inspects or retags registry manifests and never builds, pulls or runs image layers. Railway
 native image auto-update must remain disabled.
-The current Alembic graph has one head: `d4e9a2f6b710`. Database migration verifies schema state
+The current Alembic graph has one head: `f3a7c9e1b5d2`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
+
+## SUPERADMIN + USER role consolidation
+
+Revision `f3a7c9e1b5d2` follows `d4e9a2f6b710`. It converts every persisted
+`admin_users.role='ADMIN'` row to `USER` and replaces `ck_admin_users_role` with a USER-only check.
+It does not rewrite account ownership, sessions, passwords, platform credentials, or audit history.
+Downgrade only widens the check back to `ADMIN|USER`; it cannot infer and restore former ADMIN
+membership, and must never promote every USER.
+
+The migration sets a bounded PostgreSQL `lock_timeout` and acquires `ACCESS EXCLUSIVE` on
+`admin_users` before conversion. This briefly pauses authentication/user writes, prevents a legacy
+writer from inserting ADMIN between conversion and CHECK replacement, and fails the rollout rather
+than waiting indefinitely behind a long transaction.
+
+The target application removes the active-database-ADMIN startup/readiness/release fence before the
+migration is applied. Bootstrap `SUPERADMIN` from `ADMIN_USERNAME` / `ADMIN_PASSWORD` has no
+database row, can use `/admin/system/*` and `/app/t/default`, and takes over all Tenant-wide access.
+Database `USER` remains account-owner scoped. New users and all role write boundaries accept USER
+only; the role-change HTTP route is removed.
+
+This is a coordinated migration release, not code-only. The CI/release path must prepare the
+migration-compatible predecessor required whenever `migrations/versions` changes. Deploy API first
+so it applies the new head, then verify `/healthz`, SUPERADMIN login, `/admin/system/overview`,
+`/app/t/default`, and one authorized OAuth flow before deploying Worker and Scheduler on the same
+digest. Verify that all persisted roles are USER and that PostgreSQL rejects ADMIN/SUPERADMIN writes.
+
+Application rollback after migration must use the reviewed migration-compatible predecessor on the
+new schema. A raw predecessor that still requires an active database ADMIN is not safe. Schema
+downgrade is not an authorization rollback; restoring former ADMIN membership requires an approved
+database backup or explicit user-ID mapping, not a blanket update.
+
+Accepted security costs must be included in release review: Railway variables now directly grant
+access to customer business data, and SUPERADMIN audit actors have no database `user_id`, reducing
+individual attribution. Compatibility names such as `is_admin`, `role="ADMIN"`, and
+`admin_required` remain in selected internal/HTTP contracts but no longer identify a database role.
 
 ## Channels account profile revision
 

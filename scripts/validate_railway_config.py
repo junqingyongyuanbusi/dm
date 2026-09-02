@@ -8,7 +8,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 
-from social_reply.shared.config import Settings
+from social_reply.shared.config import DEFAULT_TENANT_ID, Settings
 
 _SERVICES = ("api", "worker", "scheduler")
 _EXPECTED_ROLES = {"api": "api", "worker": "worker", "scheduler": "scheduler"}
@@ -16,6 +16,7 @@ _RAILWAY_COMMAND_TIMEOUT_SECONDS = 60
 _REQUIRED_SHARED = (
     "DATABASE_URL",
     "REDIS_URL",
+    "TENANT_ID",
     "PLATFORM_SECRET_KEYS",
     "CONTROL_API_KEY",
     "ADMIN_SESSION_SECRET",
@@ -80,6 +81,12 @@ def validate(variables: Mapping[str, Mapping[str, str]], *, public_base_url: str
             errors.append(f"{service}:SERVICE_ROLE_must_equal_{expected_role}")
         if values.get("TESTING", "").strip().lower() != "false":
             errors.append(f"{service}:TESTING_must_equal_false")
+        if values.get("TENANT_ID") != DEFAULT_TENANT_ID:
+            errors.append(f"{service}:TENANT_ID_must_equal_{DEFAULT_TENANT_ID}")
+        if values.get("ADMIN_ALLOWED_TENANTS") != DEFAULT_TENANT_ID:
+            errors.append(
+                f"{service}:ADMIN_ALLOWED_TENANTS_must_equal_{DEFAULT_TENANT_ID}"
+            )
         if values.get("PUBLIC_BASE_URL", "").rstrip("/") != public_base_url.rstrip("/"):
             errors.append(f"{service}:PUBLIC_BASE_URL_mismatch")
         for key in _REQUIRED_SHARED:

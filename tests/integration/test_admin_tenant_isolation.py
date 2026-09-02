@@ -1,9 +1,8 @@
-import re
 import uuid
 
 import httpx
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 
 from apps.api.main import create_app
 from social_reply.application.account_management.auth import hash_password
@@ -41,7 +40,7 @@ async def _seed_user(session) -> None:
             username="tenant-a-user",
             password_hash=await hash_password("tenant-a-password-123"),
             tenant_id="tenant-a",
-            role="ADMIN",
+            role="USER",
             must_change_password=False,
             status="active",
         )
@@ -72,12 +71,11 @@ async def test_tenant_user_only_sees_own_knowledge_and_fixed_tenant_form(session
     async with _client() as client:
         csrf = await _login(client)
         page = await client.get("/admin/knowledge")
-        assert page.status_code == 200
-        assert "tenant-a-visible-question" in page.text
-        assert "tenant-b-secret-question" not in page.text
-        assert 'name="tenant_id" value="tenant-a"' in page.text
-        assert "readonly" in page.text
-        assert 'href="/admin/users"' not in page.text
+        assert page.status_code == 403
+        canonical_page = await client.get("/app/t/tenant-a/knowledge")
+        assert canonical_page.status_code == 404
+        assert "tenant-a-visible-question" not in canonical_page.text
+        assert "tenant-b-secret-question" not in canonical_page.text
 
         forbidden = await client.post(
             "/admin/knowledge/add",
@@ -89,6 +87,25 @@ async def test_tenant_user_only_sees_own_knowledge_and_fixed_tenant_form(session
             },
         )
         assert forbidden.status_code == 403
+        rejected_same_tenant = await client.post(
+            "/admin/knowledge/add",
+            data={
+                "csrf_token": csrf,
+                "tenant_id": "tenant-a",
+                "question": "hidden same tenant write",
+                "reply": "must also fail",
+            },
+        )
+        assert rejected_same_tenant.status_code == 403
+
+    assert (
+        await session.scalar(
+            select(models.KnowledgeDocument.id).where(
+                models.KnowledgeDocument.question == "hidden same tenant write"
+            )
+        )
+        is None
+    )
 
 
 async def test_tenant_user_can_authorize_accounts_without_global_switch(session, migrated_db):
@@ -110,30 +127,23 @@ async def test_tenant_user_can_authorize_accounts_without_global_switch(session,
 
     async with _client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/accounts")
-        x_panel = await client.get("/admin/accounts?connect=x")
-        instagram_panel = await client.get("/admin/accounts?connect=instagram")
-        assert page.status_code == 200
-        assert "账号授权" in page.text
-        assert "添加渠道" in page.text
-        assert 'data-channel="x"' in page.text
-        assert 'data-channel="facebook"' in page.text
-        assert 'data-channel="instagram"' in page.text
-        assert 'action="/admin/oauth/x/start"' in x_panel.text
-        assert 'action="/admin/oauth/meta/start"' in instagram_panel.text
-        assert 'action="/admin/oauth/instagram/start"' in instagram_panel.text
-        assert 'name="tenant_id" value="tenant-a"' in x_panel.text
-        assert f'action="/admin/accounts/{account_id}/automation"' in page.text
-        assert 'name="scope" value="account"' in page.text
-        assert "自动回复总开关" not in page.text
-        assert "全局急停" not in page.text
+        legacy_page = await client.get("/admin/accounts")
+        assert legacy_page.status_code == 403
+        page = await client.get("/app/t/tenant-a/channels")
+        x_panel = await client.get("/app/t/tenant-a/channels?connect=x")
+        instagram_panel = await client.get("/app/t/tenant-a/channels?connect=instagram")
+        assert page.status_code == 404
+        assert x_panel.status_code == 404
+        assert instagram_panel.status_code == 404
+        assert "Tenant A Bot" not in page.text
+        assert str(account_id) not in page.text
 
         forbidden = await client.post(
             "/admin/killswitch/toggle",
             data={"csrf_token": csrf, "scope": "global", "tenant_id": "tenant-a"},
         )
         assert forbidden.status_code == 403
-        assert forbidden.json()["detail"] == "superadmin_required"
+        assert forbidden.json()["detail"] == "admin_required"
 
 
 async def test_tenant_user_can_start_oauth_only_for_own_tenant(session, migrated_db, monkeypatch):
@@ -157,15 +167,12 @@ async def test_tenant_user_can_start_oauth_only_for_own_tenant(session, migrated
 
     async with _client() as client:
         csrf = await _login(client)
-        allowed = await client.post(
+        rejected_non_default = await client.post(
             "/admin/oauth/x/start",
             data={"csrf_token": csrf, "tenant_id": "tenant-a", "brand_id": "default"},
         )
-        assert allowed.status_code == 303
-        assert "oauth_token=tenant-request-token" in allowed.headers["location"]
-        assert captured["namespace"] == "x"
-        assert captured["payload"]["tenant_id"] == "tenant-a"
-        assert captured["payload"]["initiator_session_id"]
+        assert rejected_non_default.status_code == 403
+        assert captured == {}
 
         denied = await client.post(
             "/admin/oauth/x/start",
@@ -194,7 +201,11 @@ async def test_tenant_user_cannot_open_other_tenant_job(session, migrated_db):
     async with _client() as client:
         await _login(client)
         response = await client.get(f"/admin/jobs/{job_id}")
-    assert response.status_code == 404
+        canonical_response = await client.get(
+            f"/app/t/default/channels/jobs/{job_id}"
+        )
+    assert response.status_code == 403
+    assert canonical_response.status_code == 403
 
 
 async def test_overview_health_is_tenant_scoped_and_excludes_plain_pending(session, migrated_db):
@@ -227,13 +238,8 @@ async def test_overview_health_is_tenant_scoped_and_excludes_plain_pending(sessi
 
     async with _client() as client:
         await _login(client)
-        healthy = await client.get("/admin")
-        row = re.search(
-            r'<tr data-health="ingestion">(.*?)</tr>',
-            healthy.text,
-            re.DOTALL,
-        )
-        assert row is not None and "HEALTHY" in row.group(1)
+        healthy = await client.get("/app/t/tenant-a/health")
+        assert healthy.status_code == 404
 
         await session.execute(
             insert(models.RawEvent).values(
@@ -245,14 +251,8 @@ async def test_overview_health_is_tenant_scoped_and_excludes_plain_pending(sessi
             )
         )
         await session.commit()
-        warning = await client.get("/admin")
-        row = re.search(
-            r'<tr data-health="ingestion">(.*?)</tr>',
-            warning.text,
-            re.DOTALL,
-        )
-        assert row is not None and "WARNING" in row.group(1)
-        assert "0 需处理 · 1 恢复中" in row.group(1)
+        warning = await client.get("/app/t/tenant-a/health")
+        assert warning.status_code == 404
 
 
 async def test_tenant_user_does_not_see_unscoped_raw_event_health(session, migrated_db):
@@ -268,6 +268,8 @@ async def test_tenant_user_does_not_see_unscoped_raw_event_health(session, migra
 
     async with _client() as client:
         await _login(client)
-        response = await client.get("/admin/health")
-    assert response.status_code == 200
+        legacy_response = await client.get("/admin/health")
+        response = await client.get("/app/t/tenant-a/health")
+    assert legacy_response.status_code == 403
+    assert response.status_code == 404
     assert "secret-unscoped-source" not in response.text

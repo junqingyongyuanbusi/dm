@@ -7,10 +7,17 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from apps.api.main import create_app
+from social_reply.application.account_management.auth import hash_password
+from social_reply.application.account_management.jobs import (
+    submit_provisioning_job as persist_provisioning_job,
+)
 from social_reply.application.account_management.oauth import common as oauth_common
 from social_reply.application.account_management.oauth import x as oauth_connect
+from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
@@ -19,6 +26,10 @@ _REQ_TOKEN = "req-token-1"
 _REQ_SECRET = "req-secret-1"
 _ACCESS_TOKEN = "acc-token-9"
 _ACCESS_SECRET = "acc-secret-9"
+_SUPERADMIN_USERNAME = "admin"
+_SUPERADMIN_PASSWORD = "test-admin-password"
+_TENANT_USER_USERNAME = "x-oauth-tenant-user"
+_TENANT_USER_PASSWORD = "x-oauth-tenant-user-password-123"
 
 
 def _x_oauth_transport(calls: list[httpx.Request]) -> httpx.MockTransport:
@@ -95,12 +106,21 @@ class FakePipeline:
         return results
 
 
-async def _login(client: httpx.AsyncClient) -> str:
+async def _login(
+    client: httpx.AsyncClient,
+    *,
+    username: str = _SUPERADMIN_USERNAME,
+    password: str = _SUPERADMIN_PASSWORD,
+) -> str:
     await client.get("/admin/login")
     csrf = client.cookies["reply_admin_csrf"]
     await client.post(
         "/admin/login",
-        data={"csrf_token": csrf, "username": "admin", "password": "test-admin-password"},
+        data={
+            "csrf_token": csrf,
+            "username": username,
+            "password": password,
+        },
     )
     return csrf
 
@@ -135,7 +155,18 @@ def oauth_env(monkeypatch):
     return {"calls": calls, "submitted": submitted, "job_id": job_id, "redis": redis}
 
 
-async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
+async def test_full_oauth_flow_uses_env_app_credentials(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+):
+    async def persist_submit(**kwargs):
+        oauth_env["submitted"].update(kwargs)
+        job_id = await persist_provisioning_job(**kwargs)
+        oauth_env["submitted"]["job_id"] = job_id
+        return job_id
+
+    monkeypatch.setattr(oauth_connect, "submit_provisioning_job", persist_submit)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
         base_url="https://test",
@@ -143,20 +174,26 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
     ) as client:
         csrf = await _login(client)
         start = await client.post(
-            "/admin/oauth/x/start",
-            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "brand-x"},
+            "/app/t/default/channels/oauth/x/start",
+            data={"csrf_token": csrf, "brand_id": "brand-x"},
         )
         assert start.status_code == 303
         assert start.headers["location"] == (
             f"https://api.x.com/oauth/authorize?oauth_token={_REQ_TOKEN}"
         )
         assert oauth_env["redis"].values
+        stored_context = await oauth_common.peek_oauth_state("x", _REQ_TOKEN)
+        assert stored_context is not None
+        assert stored_context["surface"] == "channels"
+        assert stored_context["initiator_user_id"] is None
 
         callback = await client.get(
             f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
         )
     assert callback.status_code == 303
-    assert callback.headers["location"] == "/admin/accounts?provider=x&status=connected"
+    assert callback.headers["location"] == (
+        "/app/t/default/channels?provider=x&status=connected"
+    )
     assert callback.headers["cache-control"] == "no-store"
     assert callback.headers["pragma"] == "no-cache"
     assert callback.headers["referrer-policy"] == "no-referrer"
@@ -173,8 +210,13 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
     }
     assert submitted["request"]["name"] == "@newbot"
     assert submitted["request"]["environment"] == "oauth"
-    assert submitted["processed_job_id"] == str(oauth_env["job_id"])
+    assert submitted["processed_job_id"] == str(submitted["job_id"])
     assert oauth_env["redis"].values == {}
+
+    async with get_session_factory()() as session:
+        job = await session.get(models.ProvisioningJob, submitted["job_id"])
+    assert job is not None
+    assert job.owner_user_id is None
 
     assert [request.url.path for request in oauth_env["calls"]] == [
         "/oauth/request_token",
@@ -188,6 +230,70 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
     assert request_token_call.headers["authorization"].startswith("OAuth ")
 
 
+async def test_user_channels_oauth_job_remains_owner_scoped(
+    oauth_env,
+    migrated_db,
+    monkeypatch,
+):
+    async with get_session_factory()() as session:
+        user = await session.scalar(
+            select(models.AdminUser).where(
+                models.AdminUser.username == _TENANT_USER_USERNAME
+            )
+        )
+        if user is None:
+            user = models.AdminUser(
+                username=_TENANT_USER_USERNAME,
+                password_hash=await hash_password(_TENANT_USER_PASSWORD),
+                tenant_id="default",
+                role="USER",
+                must_change_password=False,
+                status="active",
+            )
+            session.add(user)
+            await session.commit()
+        user_id = user.id
+
+    async def persist_submit(**kwargs):
+        oauth_env["submitted"].update(kwargs)
+        job_id = await persist_provisioning_job(**kwargs)
+        oauth_env["submitted"]["job_id"] = job_id
+        return job_id
+
+    monkeypatch.setattr(oauth_connect, "submit_provisioning_job", persist_submit)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="https://test",
+        follow_redirects=False,
+    ) as client:
+        csrf = await _login(
+            client,
+            username=_TENANT_USER_USERNAME,
+            password=_TENANT_USER_PASSWORD,
+        )
+        start = await client.post(
+            "/app/t/default/channels/oauth/x/start",
+            data={"csrf_token": csrf, "brand_id": "brand-x"},
+        )
+        assert start.status_code == 303
+        stored_context = await oauth_common.peek_oauth_state("x", _REQ_TOKEN)
+        assert stored_context is not None
+        assert stored_context["initiator_user_id"] == str(user_id)
+
+        callback = await client.get(
+            f"/admin/oauth/x/callback?oauth_token={_REQ_TOKEN}&oauth_verifier=verifier-7"
+        )
+
+    assert callback.status_code == 303
+    assert callback.headers["location"] == (
+        "/app/t/default/channels?provider=x&status=connected"
+    )
+    async with get_session_factory()() as session:
+        job = await session.get(models.ProvisioningJob, oauth_env["submitted"]["job_id"])
+    assert job is not None
+    assert job.owner_user_id == user_id
+
+
 @pytest.mark.parametrize(
     "user_agent",
     [
@@ -195,7 +301,7 @@ async def test_full_oauth_flow_uses_env_app_credentials(oauth_env, migrated_db):
         "Mozilla/5.0 Version/17.5 Safari/605.1.15",
     ],
 )
-async def test_callback_without_cookie_completes_then_login_returns_to_accounts(
+async def test_callback_without_cookie_completes_then_superadmin_login_returns_to_system(
     oauth_env,
     migrated_db,
     user_agent,
@@ -247,12 +353,12 @@ async def test_callback_without_cookie_completes_then_login_returns_to_accounts(
             data={
                 "csrf_token": csrf,
                 "next": result_path,
-                "username": "admin",
-                "password": "test-admin-password",
+                "username": _SUPERADMIN_USERNAME,
+                "password": _SUPERADMIN_PASSWORD,
             },
         )
         assert login.status_code == 303
-        assert login.headers["location"] == result_path
+        assert login.headers["location"] == "/admin/system/overview"
 
 
 async def test_callback_waits_when_worker_claims_job_first(
@@ -641,10 +747,12 @@ async def test_callback_rejects_revoked_admin_session(oauth_env, migrated_db):
         assert start.status_code == 303
         logout_page = await client.get("/admin/logout")
         assert logout_page.status_code == 200
-        assert (await client.get("/admin/accounts")).status_code == 200
+        legacy_accounts = await client.get("/admin/accounts")
+        assert legacy_accounts.status_code == 303
+        assert legacy_accounts.headers["location"] == "/app/t/default/channels"
         missing_csrf = await client.post("/admin/logout")
         assert missing_csrf.status_code == 403
-        assert (await client.get("/admin/accounts")).status_code == 200
+        assert (await client.get("/admin/accounts")).status_code == 303
         logout = await client.post("/admin/logout", data={"csrf_token": csrf})
         assert logout.status_code == 303
         callback = await client.get(

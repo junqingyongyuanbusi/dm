@@ -14,6 +14,9 @@ from social_reply.application.account_management.feishu_health import (
     reconcile_feishu_account_health,
 )
 from social_reply.application.account_management.jobs import sweep_provisioning_jobs
+from social_reply.application.account_management.kill_switch_recovery import (
+    sweep_account_kill_switch_commands,
+)
 from social_reply.application.account_management.meta_health import reconcile_meta_account_health
 from social_reply.application.event_ingestion.email_poll import poll_email_messages
 from social_reply.application.event_ingestion.raw_recovery import sweep_initial_raw_events
@@ -84,6 +87,13 @@ def _build_sweep_specs(settings: Settings) -> tuple[SweepSpec, ...]:
     core_warn_after = settings.scheduler_core_warn_after_seconds
     inspection_warn_after = settings.scheduler_inspection_warn_after_seconds
     specs: list[SweepSpec] = [
+        SweepSpec(
+            "sweep_account_kill_switch_commands",
+            "core",
+            core_interval,
+            core_warn_after,
+            sweep_account_kill_switch_commands,
+        ),
         SweepSpec(
             "sweep_provisioning_jobs",
             "core",

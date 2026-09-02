@@ -4,6 +4,7 @@ from scripts.validate_railway_config import validate
 _REQUIRED = {
     "DATABASE_URL": "postgresql://db",
     "REDIS_URL": "redis://redis",
+    "TENANT_ID": "default",
     "PLATFORM_SECRET_KEYS": "Wm5wbamjBFvTmkGIU2NskIKCrJfsb4AdUBDZR-m1-CM=",
     "CONTROL_API_KEY": "control-key",
     "ADMIN_SESSION_SECRET": "session-secret-at-least-32-characters",
@@ -109,6 +110,68 @@ def test_validate_accepts_only_retrieval_and_multilingual_switches() -> None:
         for key in optional_runtime_metadata:
             service_values.pop(key, None)
     validate(values, public_base_url="https://relay.example.com")
+
+
+@pytest.mark.parametrize("service", ("api", "worker", "scheduler"))
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    (
+        ("TENANT_ID", "tenant-a", "TENANT_ID_must_equal_default"),
+        (
+            "ADMIN_ALLOWED_TENANTS",
+            "default,tenant-a",
+            "ADMIN_ALLOWED_TENANTS_must_equal_default",
+        ),
+    ),
+)
+def test_validate_enforces_single_organization_contract_for_every_role(
+    service: str,
+    key: str,
+    value: str,
+    expected: str,
+) -> None:
+    with pytest.raises(ValueError, match=rf"{service}:{expected}"):
+        validate(
+            _variables(**{service: {key: value}}),
+            public_base_url="https://relay.example.com",
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    (
+        ("TENANT_ID", "tenant-a", "TENANT_ID_must_equal_default"),
+        (
+            "ADMIN_ALLOWED_TENANTS",
+            "tenant-a",
+            "ADMIN_ALLOWED_TENANTS_must_equal_default",
+        ),
+    ),
+)
+def test_validate_rejects_consistent_but_wrong_single_organization_configuration(
+    key: str,
+    value: str,
+    expected: str,
+) -> None:
+    overrides = {
+        service: {key: value}
+        for service in ("api", "worker", "scheduler")
+    }
+
+    with pytest.raises(ValueError, match=expected):
+        validate(
+            _variables(**overrides),
+            public_base_url="https://relay.example.com",
+        )
+
+
+def test_validate_requires_explicit_tenant_id_for_every_role() -> None:
+    values = _variables()
+    for service_values in values.values():
+        service_values.pop("TENANT_ID")
+
+    with pytest.raises(ValueError, match="api:missing_TENANT_ID"):
+        validate(values, public_base_url="https://relay.example.com")
 
 
 @pytest.mark.parametrize(

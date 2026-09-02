@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from dataclasses import dataclass
 
@@ -6,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.knowledge.retrieval import chunk_embedding_values
 from social_reply.domain.knowledge.policy import knowledge_revision_hash, normalize_protected_values
+from social_reply.domain.reply.guard import has_contact_like
 from social_reply.infrastructure.database.models import AuditLog, KnowledgeChunk, KnowledgeDocument
 
 
@@ -28,6 +30,31 @@ class KnowledgeDraft:
     content: str
     embed_text: str
     content_hash: str
+
+
+def knowledge_content_hash_lock_key(tenant_id: str, content_hash: str) -> str:
+    return f"social-reply:knowledge-content:{tenant_id}:{content_hash}"
+
+
+def knowledge_document_safety_lock_key(tenant_id: str, document_id: uuid.UUID) -> str:
+    return f"social-reply:knowledge-document-safety:{tenant_id}:{document_id}"
+
+
+def audit_value_hash(value: str | None) -> str | None:
+    normalized = (value or "").strip()
+    return hashlib.sha256(normalized.encode()).hexdigest() if normalized else None
+
+
+def audit_safe_category(
+    category: str | None,
+    protected_values: tuple[str, ...] | list[str],
+) -> str | None:
+    normalized = (category or "").strip()
+    if not normalized or has_contact_like(normalized):
+        return None
+    if any(value and (value in normalized or normalized in value) for value in protected_values):
+        return None
+    return normalized
 
 
 def build_knowledge_draft(
@@ -132,6 +159,27 @@ async def persist_knowledge_draft(
             **chunk_embedding_values(embedding, embedding_version),
         )
     )
+    session.add(
+        AuditLog(
+            tenant_id=draft.tenant_id,
+            category="admin_action",
+            actor=actor,
+            action="CREATE_KNOWLEDGE_DOCUMENT",
+            subject_type="knowledge_document",
+            subject_id=str(document.id),
+            detail={
+                "content_hash": draft.content_hash,
+                "question_length": len(draft.question),
+                "reply_length": len(draft.reply),
+                "category": audit_safe_category(
+                    draft.category,
+                    draft.protected_values,
+                ),
+                "category_hash": audit_value_hash(draft.category),
+                "import_batch_id": str(draft.import_batch_id) if draft.import_batch_id else None,
+            },
+        )
+    )
     if draft.is_official_contact:
         session.add(
             AuditLog(
@@ -144,8 +192,8 @@ async def persist_knowledge_draft(
                 detail={
                     "from": False,
                     "to": True,
-                    "brand": draft.brand_id,
-                    "platform": draft.platform,
+                    "brand_hash": audit_value_hash(draft.brand_id),
+                    "platform_hash": audit_value_hash(draft.platform),
                     "status": "draft",
                     "content_hash": draft.content_hash,
                 },

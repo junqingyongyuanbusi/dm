@@ -1,5 +1,5 @@
 (() => {
-  const pollingStatuses = new Set(["PENDING", "PROCESSING", "FAILED"]);
+  const pollingStatuses = new Set(["PENDING", "PROCESSING"]);
   let dialogTrigger = null;
 
   const closeDialog = (dialog) => {
@@ -53,9 +53,13 @@
         if (!(submitButton instanceof HTMLButtonElement)) {
           return;
         }
+        const pendingLabel =
+          submitButton.dataset.pendingLabel?.trim() ||
+          form.dataset.pendingLabel?.trim() ||
+          "…";
         submitButton.disabled = true;
         submitButton.setAttribute("aria-busy", "true");
-        submitButton.textContent = "正在连接…";
+        submitButton.textContent = pendingLabel;
       });
     });
 

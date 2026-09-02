@@ -8,6 +8,7 @@ from sqlalchemy import insert, select
 
 from apps.api.main import create_app
 from social_reply.application.account_management import feishu_handoff_admin as admin_module
+from social_reply.application.account_management import feishu_handoff_service as service_module
 from social_reply.connectors.feishu.client import FeishuClient
 from social_reply.infrastructure.database import models
 
@@ -62,7 +63,7 @@ async def test_admin_configures_handoff_route_and_operator(session):
     account_id = await _seed_feishu_account(session)
     async with _client() as client:
         csrf = await _login(client)
-        page = await client.get("/admin/feishu-handoff")
+        page = await client.get("/app/t/default/channels/feishu/handoff")
         configured = await client.post(
             "/admin/feishu-handoff/config",
             data={
@@ -132,6 +133,122 @@ async def test_concurrent_first_config_writes_are_serialized(session):
     assert config.config_version == 2
 
 
+async def test_legacy_operator_status_is_idempotent_under_concurrency(session):
+    account_id = await _seed_feishu_account(session)
+    config = models.TenantFeishuHandoffConfig(
+        tenant_id="default",
+        feishu_platform_account_id=account_id,
+        destination_chat_id="oc_support",
+        enabled=True,
+        config_version=1,
+    )
+    session.add(config)
+    await session.flush()
+    operator = models.FeishuHandoffOperator(
+        tenant_id="default",
+        feishu_platform_account_id=account_id,
+        operator_open_id="ou_concurrent_toggle",
+        display_name="Concurrent Operator",
+        can_claim=True,
+        can_resolve=True,
+        status="ACTIVE",
+    )
+    session.add(operator)
+    await session.commit()
+
+    await asyncio.gather(
+        service_module.set_feishu_handoff_operator_status(
+            tenant_id="default",
+            actor="user:first",
+            operator_id=operator.id,
+            enabled=False,
+        ),
+        service_module.set_feishu_handoff_operator_status(
+            tenant_id="default",
+            actor="user:second",
+            operator_id=operator.id,
+            enabled=False,
+        ),
+    )
+
+    await session.refresh(operator)
+    assert operator.status == "DISABLED"
+    audits = list(
+        (
+            await session.execute(
+                select(models.AuditLog).where(
+                    models.AuditLog.action == "SET_FEISHU_HANDOFF_OPERATOR_STATUS",
+                    models.AuditLog.subject_id == str(operator.id),
+                )
+            )
+        ).scalars()
+    )
+    assert len(audits) == 2
+    assert sum(bool(audit.detail["changed"]) for audit in audits) == 1
+
+
+async def test_legacy_operator_status_adapter_requires_and_replays_target(session):
+    account_id = await _seed_feishu_account(session)
+    session.add(
+        models.TenantFeishuHandoffConfig(
+            tenant_id="default",
+            feishu_platform_account_id=account_id,
+            destination_chat_id="oc_support",
+            enabled=True,
+            config_version=1,
+        )
+    )
+    operator = models.FeishuHandoffOperator(
+        tenant_id="default",
+        feishu_platform_account_id=account_id,
+        operator_open_id="ou_replay_safe",
+        can_claim=True,
+        can_resolve=True,
+        status="ACTIVE",
+    )
+    session.add(operator)
+    await session.commit()
+
+    async with _client() as client:
+        csrf = await _login(client)
+        missing_target = await client.post(
+            f"/admin/feishu-handoff/operators/{operator.id}/toggle",
+            data={"csrf_token": csrf, "tenant_id": "default"},
+        )
+        first = await client.post(
+            f"/admin/feishu-handoff/operators/{operator.id}/toggle",
+            data={
+                "csrf_token": csrf,
+                "tenant_id": "default",
+                "enabled": "false",
+            },
+        )
+        replay = await client.post(
+            f"/admin/feishu-handoff/operators/{operator.id}/toggle",
+            data={
+                "csrf_token": csrf,
+                "tenant_id": "default",
+                "enabled": "false",
+            },
+        )
+
+    assert missing_target.status_code == 422
+    assert first.status_code == replay.status_code == 303
+    await session.refresh(operator)
+    assert operator.status == "DISABLED"
+    audits = list(
+        (
+            await session.execute(
+                select(models.AuditLog).where(
+                    models.AuditLog.action == "SET_FEISHU_HANDOFF_OPERATOR_STATUS",
+                    models.AuditLog.subject_id == str(operator.id),
+                )
+            )
+        ).scalars()
+    )
+    assert [audit.detail["changed"] for audit in audits] == [True, False]
+
+
 async def test_admin_config_rejects_account_from_another_tenant(session):
     foreign_account_id = await _seed_feishu_account(session, tenant_id="tenant-a")
     async with _client() as client:
@@ -185,7 +302,7 @@ async def test_admin_sends_explicit_configuration_test_card(session, monkeypatch
 
     monkeypatch.setattr(admin_module, "get_platform_sender", get_sender)
     monkeypatch.setattr(
-        admin_module,
+        service_module,
         "get_settings",
         lambda: SimpleNamespace(feishu_enabled=True),
     )
@@ -207,3 +324,31 @@ async def test_admin_sends_explicit_configuration_test_card(session, monkeypatch
     assert audit.detail["outcome"] == "test_sent"
     assert audit.detail["provider_message_id"] == "om_test"
     assert any(request.url.params.get("receive_id_type") == "chat_id" for request in requests)
+
+
+async def test_handoff_current_and_legacy_routes_are_bilingual(session):
+    await _seed_feishu_account(session)
+    async with _client() as client:
+        await _login(client)
+        legacy_chinese = await client.get("/admin/feishu-handoff")
+        current_chinese = await client.get("/admin/integrations/feishu/handoff")
+        canonical_chinese = await client.get("/app/t/default/channels/feishu/handoff")
+        client.cookies.set("reply_ui_locale", "en")
+        legacy_english = await client.get("/admin/feishu-handoff")
+        current_english = await client.get("/admin/integrations/feishu/handoff")
+        canonical_english = await client.get("/app/t/default/channels/feishu/handoff")
+
+    for response in (legacy_chinese, current_chinese, legacy_english, current_english):
+        assert response.status_code == 303
+        assert response.headers["location"] == "/app/t/default/channels/feishu/handoff"
+
+    for response in (canonical_chinese, canonical_english):
+        assert response.status_code == 200
+        assert '<aside class="saas-sidebar"' in response.text
+
+    assert "通知路由" in canonical_chinese.text
+    assert "客服权限" in canonical_chinese.text
+    assert "Notification route" in canonical_english.text
+    assert "Agent permissions" in canonical_english.text
+    assert "通知路由" not in canonical_english.text
+    assert "客服权限" not in canonical_english.text
