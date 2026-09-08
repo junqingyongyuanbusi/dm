@@ -1,6 +1,8 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from social_reply.application.account_management.auth import Principal
 from social_reply.application.account_management.oauth import common
 from social_reply.application.account_management.ui_i18n import reset_locale, set_locale, translate
@@ -238,3 +240,90 @@ def test_oauth_result_redirect_does_not_leak_sensitive_context_values() -> None:
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
     assert response.headers["referrer-policy"] == "no-referrer"
+
+
+def test_oauth_context_rejects_canonical_extra_override() -> None:
+    principal = _user_principal()
+    with pytest.raises(ValueError, match="oauth_context_reserved_field"):
+        common.build_oauth_context(
+            principal=principal,
+            provider="x",
+            tenant_id="tenant-a",
+            surface="channels",
+            extra={"provider": "facebook"},
+        )
+
+
+def test_oauth_context_binds_reauthorization_target_and_version() -> None:
+    principal = _user_principal()
+    target_id = uuid.uuid4()
+    context = common.build_oauth_context(
+        principal=principal,
+        provider="x",
+        tenant_id="tenant-a",
+        surface="channels",
+        operation="REAUTHORIZE",
+        target_account_id=target_id,
+        expected_config_version=7,
+        target_external_account_id="x-42",
+    )
+    assert context["operation"] == "REAUTHORIZE"
+    assert context["target_account_id"] == str(target_id)
+    assert context["expected_config_version"] == 7
+    assert context["target_external_account_id"] == "x-42"
+
+
+def test_oauth_context_rejects_target_canonical_override() -> None:
+    principal = _user_principal()
+    with pytest.raises(ValueError, match="oauth_context_reserved_field"):
+        common.build_oauth_context(
+            principal=principal,
+            provider="x",
+            tenant_id="tenant-a",
+            surface="channels",
+            target_account_id=uuid.uuid4(),
+            operation="REAUTHORIZE",
+            expected_config_version=4,
+            target_external_account_id="x-1",
+            extra={"target_account_id": str(uuid.uuid4())},
+        )
+
+
+async def test_admin_oauth_context_accepts_workspace_admin(monkeypatch) -> None:
+    principal = Principal(
+        session_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        username="workspace-admin",
+        actor="user:workspace-admin",
+        tenant_id="tenant-a",
+        allowed_tenants=frozenset({"tenant-a"}),
+        role="WORKSPACE_ADMIN",
+    )
+
+    async def persisted_principal(_session_id):
+        return principal
+
+    monkeypatch.setattr(common, "principal_from_session_id", persisted_principal)
+    context = common.build_oauth_context(
+        principal=principal,
+        provider="x",
+        tenant_id="tenant-a",
+        surface="admin",
+    )
+    assert await common.principal_from_oauth_context(context) == principal
+
+
+def test_oauth_provisioning_errors_are_redacted_and_stable() -> None:
+    context = {
+        "surface": "channels",
+        "tenant_id": "tenant-a",
+        "provider": "x",
+        "return_to": "/app/t/tenant-a/channels",
+    }
+    response = common.oauth_provisioning_error_response(
+        context,
+        ValueError("account_reauthorization_version_conflict"),
+    )
+    assert response.status_code == 303
+    assert "account_version_conflict" in response.headers["location"]
+    assert "secret" not in repr(dict(response.headers))

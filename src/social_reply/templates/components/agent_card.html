@@ -1,12 +1,10 @@
-<article class="saas-card saas-agent-card">
-  <div class="saas-agent-card-topline">
+<article class="saas-agent-row">
+  <div class="saas-agent-row-identity">
     <span class="saas-agent-avatar" aria-hidden="true">✦</span>
-    {{ card.status_html }}
-  </div>
-  <div class="saas-agent-card-copy">
-    <h2>{{ card.name }}</h2>
-    <p class="saas-muted">{{ card.scope_label }} <span class="saas-mono">{{ card.agent_id }}</span></p>
-    <p class="saas-agent-prompt">{{ card.prompt_text }}</p>
+    <div>
+      <div class="saas-agent-row-heading"><h2>{{ card.name }}</h2>{{ card.status_html }}</div>
+      <p class="saas-muted">{{ card.scope_label }} <span class="saas-mono">{{ card.agent_id }}</span></p>
+    </div>
   </div>
   <dl class="saas-agent-stats">
     <div>
@@ -26,15 +24,6 @@
       <dd>{{ card.release_text }}</dd>
     </div>
   </dl>
-  <div class="saas-agent-readiness">
-    <div>
-      <span>{{ card.readiness_label }}</span>
-      <strong>{{ card.readiness_percent }}%</strong>
-    </div>
-    <span class="saas-agent-readiness-track" aria-hidden="true">
-      <span style="width: {{ card.readiness_percent }}%"></span>
-    </span>
-  </div>
-  <p class="saas-agent-next"><strong>{{ card.next_step_label }}</strong>{{ card.next_step }}</p>
-  <a class="saas-agent-open" href="{{ card.open_href }}">{{ card.open_label }} <span aria-hidden="true">→</span></a>
+  <div class="saas-agent-row-next"><p><strong>{{ card.next_step_label }}</strong>{{ card.next_step }}</p>
+  <a class="saas-agent-open" href="{{ card.open_href }}">{{ card.open_label }} <span aria-hidden="true">→</span></a></div>
 </article>

@@ -376,11 +376,56 @@
     synchronizeThemeOptions();
   };
 
+  const initializeInboxKeyboardNavigation = () => {
+    const inboxWorkspace = document.querySelector("[data-inbox-workspace]");
+    if (!(inboxWorkspace instanceof HTMLElement)) {
+      return;
+    }
+
+    const searchInput = inboxWorkspace.querySelector("[data-list-search]");
+    const focusableItems = () =>
+      Array.from(inboxWorkspace.querySelectorAll(".saas-work-item")).filter(
+        (item) => item instanceof HTMLElement && !item.hidden,
+      );
+    const isTypingTarget = (target) =>
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target instanceof HTMLSelectElement ||
+      target?.isContentEditable;
+
+    document.addEventListener("keydown", (event) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || isTypingTarget(event.target)) {
+        return;
+      }
+      if (event.key === "/" && searchInput instanceof HTMLInputElement) {
+        event.preventDefault();
+        searchInput.focus({ preventScroll: true });
+        return;
+      }
+      if (event.key !== "j" && event.key !== "k") {
+        return;
+      }
+      const items = focusableItems();
+      if (items.length === 0) {
+        return;
+      }
+      event.preventDefault();
+      const currentIndex = items.indexOf(document.activeElement);
+      const delta = event.key === "j" ? 1 : -1;
+      const nextIndex =
+        currentIndex < 0
+          ? 0
+          : (currentIndex + delta + items.length) % items.length;
+      items[nextIndex].focus({ preventScroll: true });
+    });
+  };
+
   const initializeApplication = () => {
     initializeSidebarDrawer();
     initializeListSearches();
     initializeToolbarPopovers();
     initializeThemeOptions();
+    initializeInboxKeyboardNavigation();
   };
 
   if (document.readyState === "loading") {

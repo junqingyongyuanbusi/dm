@@ -9,7 +9,7 @@ import logging
 import sys
 from pathlib import Path
 
-from social_reply.application.knowledge.importer import import_knowledge_csv
+from social_reply.application.knowledge.importer import _import_knowledge_csv_system
 from social_reply.domain.knowledge.embeddings import (
     EmbeddingClient,
     FakeEmbeddingClient,
@@ -60,7 +60,7 @@ def main() -> None:
         raise SystemExit(1)
 
     report = asyncio.run(
-        import_knowledge_csv(
+        _import_knowledge_csv_system(
             args.csv_path,
             embedder=_build_embedder(args.allow_fake),
             tenant_id=args.tenant,

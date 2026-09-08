@@ -32,7 +32,7 @@ class NavigationGroup:
 
 
 PageSurface = Literal["tenant", "admin", "system", "auth"]
-_STATIC_ASSET_VERSION = "20260902-agent-control-plane-1"
+_STATIC_ASSET_VERSION = "20260903-helpdesk-foundation-1"
 
 
 _STATUS_PRESENTATION: dict[str, tuple[str, str]] = {
@@ -198,6 +198,7 @@ def render_shared_page(
     sidebar_html = _render_sidebar(
         navigation_html=navigation_html,
         surface=surface,
+        principal=principal,
         tenant_id=tenant_id,
         footer_link_html=footer_link_html,
         legacy_content=legacy_content,
@@ -290,22 +291,23 @@ def _tenant_navigation_groups(
                     NavigationItem(
                         "conversations", f"{root}/conversations", translate("nav.conversations")
                     ),
+                ),
+            ),
+            NavigationGroup(
+                translate("nav.group.configuration"),
+                (
                     NavigationItem("agents", f"{root}/agents", translate("nav.agents")),
                     NavigationItem(
                         "knowledge-query",
                         f"{root}/knowledge-query",
                         translate("nav.knowledge_query"),
                     ),
-                    NavigationItem("activity", f"{root}/activity", translate("nav.my_activity")),
+                    NavigationItem("channels", f"{root}/channels", translate("nav.channels")),
                 ),
             ),
             NavigationGroup(
-                translate("nav.group.configuration"),
-                (NavigationItem("channels", f"{root}/channels", translate("nav.channels")),),
-            ),
-            NavigationGroup(
-                translate("nav.group.settings"),
-                (NavigationItem("profile", f"{root}/profile", translate("nav.profile")),),
+                translate("nav.group.observability"),
+                (NavigationItem("activity", f"{root}/activity", translate("nav.my_activity")),),
             ),
         )
     return (
@@ -330,11 +332,13 @@ def _tenant_navigation_groups(
                     f"{root}/knowledge",
                     translate("nav.documents_knowledge"),
                 ),
+                NavigationItem("channels", f"{root}/channels", translate("nav.channels")),
             ),
         ),
         NavigationGroup(
             translate("nav.group.observability"),
             (
+                NavigationItem("health", f"{root}/health", translate("nav.system_health")),
                 NavigationItem("audit", f"{root}/audit", translate("nav.audit_center")),
                 NavigationItem(
                     "journeys", f"{root}/journeys", translate("nav.processing_journey")
@@ -344,8 +348,7 @@ def _tenant_navigation_groups(
         NavigationGroup(
             translate("nav.group.settings"),
             (
-                NavigationItem("channels", f"{root}/channels", translate("nav.channels")),
-                NavigationItem("profile", f"{root}/profile", translate("nav.profile")),
+                NavigationItem("users", "/admin/users", translate("nav.users_access")),
                 NavigationItem(
                     "settings", f"{root}/settings", translate("nav.workspace_settings")
                 ),
@@ -361,6 +364,9 @@ def _system_navigation_groups() -> tuple[NavigationGroup, ...]:
             (
                 NavigationItem(
                     "system-overview", "/admin/system/overview", translate("nav.system_overview")
+                ),
+                NavigationItem(
+                    "system-health", "/admin/system/health", translate("nav.system_health")
                 ),
                 NavigationItem(
                     "system-users", "/admin/system/users", translate("nav.users_access")
@@ -541,6 +547,13 @@ def _render_brand(surface: PageSurface) -> str:
         "system": "/admin/system/overview",
         "auth": "/auth/login",
     }[surface]
+    if surface == "tenant":
+        return (
+            f'<a class="saas-brand" href="{escape(brand_href)}">'
+            '<span class="saas-brand-mark">D</span>'
+            '<span class="saas-brand-tenant">Acme Global</span>'
+            '<span class="saas-tenant-chip font-mono">#t_8820</span></a>'
+        )
     return (
         f'<a class="saas-brand" href="{escape(brand_href)}">'
         '<span class="saas-brand-mark">RC</span>'
@@ -559,17 +572,57 @@ def _render_context(*, surface: PageSurface, tenant_id: str | None) -> str:
     return f'<span class="saas-context-label">{escape(translate(context_key))}</span>'
 
 
+def _user_initials(username: str) -> str:
+    if not username:
+        return "U"
+    cleaned = username.replace("-", " ").replace("_", " ").strip()
+    parts = [p for p in cleaned.split() if p]
+    if len(parts) >= 2:
+        return (parts[0][:1] + parts[1][:1]).upper()
+    if len(username) >= 2 and ord(username[0]) < 128:
+        return username[:2].upper()
+    return username[:2]
+
+
+def _render_user_profile(principal: Principal | None) -> str:
+    if principal is None or not principal.username:
+        return ""
+    username = principal.username
+    initials = _user_initials(username)
+    return (
+        '<div class="saas-user-profile">'
+        f'<span class="saas-user-avatar">{escape(initials)}</span>'
+        f'<span class="saas-user-name" title="{escape(username)}">{escape(username)}</span>'
+        f'<span class="saas-status-dot-online" title="{escape(translate("common.online"))}"></span>'
+        '</div>'
+    )
+
+
 def _render_user_actions(
     principal: Principal | None,
     *,
     tenant_id: str | None,
     surface: PageSurface,
 ) -> str:
-    del tenant_id, surface
+    user_profile_html = _render_user_profile(principal)
     toolbar_controls = [
         _render_language_control(),
         _render_theme_control(),
     ]
+    if tenant_id and surface == "tenant":
+        profile_label = translate("nav.profile")
+        toolbar_controls.insert(
+            0,
+            '<a class="saas-toolbar-button" '
+            f'href="{escape(f"/app/t/{tenant_id}/profile")}" '
+            f'aria-label="{escape(profile_label)}" title="{escape(profile_label)}">'
+            '<svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" '
+            'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" '
+            'stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"/>'
+            '<path d="M5 21v-1.5A5.5 5.5 0 0 1 10.5 14h3A5.5 5.5 0 0 1 19 19.5V21"/>'
+            '</svg><span class="sr-only">'
+            f"{escape(profile_label)}</span></a>",
+        )
     if principal is not None:
         sign_out_label = f"{translate('nav.sign_out')}: {principal.username}"
         toolbar_controls.append(
@@ -584,7 +637,10 @@ def _render_user_actions(
             '<span class="sr-only">'
             f"{escape(sign_out_label)}</span></a>"
         )
-    return f'<div class="saas-toolbar" data-toolbar>{"".join(toolbar_controls)}</div>'
+    return (
+        f'{user_profile_html}<div class="saas-toolbar" data-toolbar>'
+        f'{"".join(toolbar_controls)}</div>'
+    )
 
 
 def _render_language_control() -> str:
@@ -668,6 +724,7 @@ def _render_sidebar(
     *,
     navigation_html: str,
     surface: PageSurface,
+    principal: Principal | None,
     tenant_id: str | None,
     footer_link_html: str,
     legacy_content: bool,
@@ -719,6 +776,8 @@ def _render_sidebar(
     if legacy_content:
         return f'<aside class="sidebar"><div data-sidebar>{sidebar_contents}</div></aside>'
     return f'<aside class="saas-sidebar" data-sidebar>{sidebar_contents}</aside>'
+
+
 
 
 def _render_main_content(

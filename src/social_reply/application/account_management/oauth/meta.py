@@ -32,9 +32,11 @@ from social_reply.application.account_management.oauth.common import (
     build_oauth_context,
     notice,
     oauth_error_response,
+    oauth_provisioning_error_response,
     oauth_result_response,
     peek_oauth_state,
     principal_from_oauth_context,
+    resolve_oauth_target,
     store_oauth_state,
     take_oauth_state,
 )
@@ -182,6 +184,12 @@ async def _start_meta_oauth(
     if tenant_id != DEFAULT_TENANT_ID:
         raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
+    target_binding = await resolve_oauth_target(
+        request,
+        principal=principal,
+        provider=platform,
+        tenant_id=tenant_id,
+    )
     if not get_settings().platform_integration_enabled(platform):
         return oauth_error_response(
             surface=surface,
@@ -217,9 +225,15 @@ async def _start_meta_oauth(
                 return_to=(
                     f"/app/t/{tenant_id}/channels" if surface == "channels" else "/admin/accounts"
                 ),
+                operation=target_binding["operation"],
+                target_account_id=target_binding["target_account_id"],
+                expected_config_version=target_binding["expected_config_version"],
+                target_external_account_id=target_binding["target_external_account_id"],
                 extra={
-                    "platform": platform,
-                    "brand_id": ((form.get("brand_id") or "default").strip() or "default"),
+                    "brand_id": (
+                        target_binding["brand_id"]
+                        or ((form.get("brand_id") or "default").strip() or "default")
+                    ),
                 },
             ),
         )
@@ -404,6 +418,27 @@ async def _handle_meta_oauth_callback(request: Request) -> Response:
             ),
             status_code=422,
         )
+    target_external_id = state.get("target_external_account_id")
+    if target_external_id:
+        matching_candidates = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate["ig_id"] if state["platform"] == "instagram" else candidate["id"]
+            )
+            == str(target_external_id)
+        ]
+        if len(matching_candidates) != 1:
+            return oauth_error_response(
+                surface=str(state.get("surface") or "admin"),
+                tenant_id=str(state.get("tenant_id") or ""),
+                provider=str(state.get("platform") or "facebook"),
+                code="oauth_target_identity_mismatch",
+                title=translate("oauth.cannot_complete.title"),
+                message="授权账号与目标平台账号不一致。",
+                status_code=409,
+            )
+        return await _finalize(matching_candidates[0], state, app, principal)
     if len(candidates) == 1:
         return await _finalize(candidates[0], state, app, principal)
     return await _picker(request, candidates, state, principal)
@@ -688,6 +723,21 @@ async def _finalize(
     else:
         external_account_id = candidate["id"]
         display_name = candidate["name"]
+    target_external_id = context.get("target_external_account_id")
+    if target_external_id and str(target_external_id) != str(
+        candidate["ig_id"] if platform == "instagram" else candidate["id"]
+    ):
+        return oauth_error_response(
+            surface=str(context.get("surface") or "admin"),
+            tenant_id=str(context.get("tenant_id") or ""),
+            provider=platform,
+            code="oauth_target_identity_mismatch",
+            title=translate("oauth.cannot_complete.title"),
+            message="授权账号与目标平台账号不一致。",
+            status_code=409,
+        )
+    if platform == "instagram":
+        external_account_id = candidate["ig_id"]
     enable_comments = settings.meta_comment_reply_enabled
     submission = {
         "name": display_name,
@@ -705,15 +755,21 @@ async def _finalize(
         "verify_token": app.verify_token,
     }
     request_data, secrets_data = split_submission(platform, submission)
-    job_id = await submit_provisioning_job(
-        tenant_id=context["tenant_id"],
-        brand_id=context.get("brand_id", "default"),
-        platform=platform,
-        actor=principal.actor,
-        request=request_data,
-        secrets=secrets_data,
-        admin_session_id=principal.session_id,
-    )
+    try:
+        job_id = await submit_provisioning_job(
+            tenant_id=context["tenant_id"],
+            brand_id=context.get("brand_id", "default"),
+            platform=platform,
+            actor=principal.actor,
+            operation=context.get("operation", "CONNECT_ACCOUNT"),
+            target_account_id=context.get("target_account_id"),
+            expected_config_version=context.get("expected_config_version"),
+            request=request_data,
+            secrets=secrets_data,
+            admin_session_id=principal.session_id,
+        )
+    except (LookupError, PermissionError, ValueError) as exc:
+        return oauth_provisioning_error_response(context, exc)
     from social_reply.application.account_management.actors import process_platform_provisioning
     from social_reply.application.account_management.jobs import process_provisioning_job
 

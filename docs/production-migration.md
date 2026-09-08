@@ -1031,3 +1031,76 @@ expire or complete, and only then deploy the older image.
 Revision `c9e83a4d1f20` intentionally has no in-place downgrade because tenant-scoped knowledge
 allows duplicate hashes across tenants. Roll back by restoring the verified pre-upgrade database
 backup rather than running `alembic downgrade`.
+
+## Company administrator/support permission cutover (`b9e5f3a7d102`)
+
+This is a coordinated authorization cutover, not a routine rolling application update. The revision
+adds the named `WORKSPACE_ADMIN` role alongside `USER` (support), unpublished-by-default company
+channels, explicit reconnection grants, versioned provisioning authority and human-send initiators.
+No employee is promoted and no channel is published by migration. Bootstrap remains a distinct
+system identity, and business administrators cannot access `/admin/system/*`.
+
+### Data handling
+
+- Historical incomplete provisioning commands cannot be classified as machine commands from NULL
+  initiators or actor text. `PENDING`, `PROCESSING`/legacy `RUNNING`, `FAILED`, `NEEDS_ACTION` and
+  `NEEDS_REVIEW` jobs become `NEEDS_ACTION` with `PROVISIONING_AUTHORITY_RECONFIRM_REQUIRED`.
+  The migration advances attempt counters (invalidating old claims), clears locks and staging
+  credentials, and retains prior results with a quarantine marker. Completed results are untouched.
+  Operators must reauthenticate and resubmit; do not retry quarantined commands as trusted jobs.
+- Pending/failed historical human Outboxes lack verifiable authority and become `NEEDS_REVIEW`.
+  Existing `SENDING` rows are not asserted to be unsent: reconcile their external outcome under
+  the existing unknown-send protocol before allowing retry or taking over their conversations.
+- Claimed work with no stable employee ID is released to `WAITING`, with assignment/timestamp
+  cleared and work version advanced. Its AutomationState is held in `HANDOFF_PENDING`; queued Bot
+  sends are cancelled. Historical actor text is preserved in an audit, never converted into a user
+  ID. Notification card revision/nonces change; ambiguous in-flight card sends require review.
+- Legacy kill-switch release commands without a verifiable initiating session must be superseded
+  by a new authenticated command. They do not become named-admin commands. Authorization rejection
+  is terminal after safe protection is restored; failure to restore protection retries protection
+  only, never the rejected release target.
+- Feishu HTTP card actions now require valid Encrypt-Key request signatures as well as Verification
+  Token and App ID. Unsigned token-only compatibility requests are rejected; URL verification keeps
+  its token-checked challenge flow. Confirm the provider callback configuration before reopening
+  card actions. Operator creation/rebinding must explicitly select the employee; no administrator
+  or sole-employee default is inferred. Existing unbound operators require explicit repair.
+
+### Release procedure
+
+1. Obtain a PostgreSQL backup and record the current image digest/deployment IDs. Inventory
+   incomplete provisioning, human Outboxes in `SENDING`, and unbound claimed work. Do not run
+   pytest or development migration checks against production.
+2. Arrange an explicit control-plane maintenance window: stop admitting staff mutations, OAuth
+   starts/callback submissions, machine provisioning and Feishu card actions. Finish or identify
+   in-flight external operations, then quiesce the old Worker and Scheduler. An operator announcement
+   alone is not an access gate. If the deployment cannot enforce this window, do not promote this
+   release using the normal rolling script.
+3. Use the reviewed migration-specific release procedure with the CI-published immutable image.
+   API alone prepares the database under the existing advisory lock. Keep control-plane mutations
+   closed while Worker and Scheduler are moved to that same compatible image. Workers must not
+   consume new commands using the old authorization implementation.
+4. Verify all three roles run the expected digest, API health succeeds, and there are no active old
+   workers. Review quarantine counts and held external outcomes. Reopen browser administration;
+   keep Feishu card actions held until employee bindings and signed callbacks are verified.
+5. Through a freshly authenticated bootstrap session, create the first named business administrator.
+   Keep emergency credentials restricted. That administrator reviews and explicitly publishes
+   company channels, grants reconnection rights, and assigns released work; publication exposes
+   existing history and is not an automatic migration side effect.
+6. Perform bounded, authorized smoke checks of the two roles, channel publication, explicit
+   reception/transfer, and reconnection. Verify a disabled employee cannot operate through the
+   browser, old cards, queued commands, or recovered kill-switch commands. Retain the release audit.
+
+### Rollback limitations
+
+The former application has no knowledge of shared access, durable command authority or revocation
+fences. A predecessor image with only the new migration graph is schema-compatible, **not**
+authorization-compatible. Do not automatically resume old Worker/Scheduler processes against the
+new permission state. Prefer a forward repair while keeping sensitive mutations and sends held.
+Any application rollback requires a separately reviewed artifact that preserves the new authority
+checks, or a coordinated restore of the verified pre-cutover database and corresponding application
+with reconciliation of every external effect since the backup. A database restore does not undo
+messages already sent or credentials already changed at a provider.
+
+The schema downgrade refuses while named business administrators or shared channels remain, but
+passing that guard alone does not make an old runtime safe. Work released, staged credentials
+cleared and commands quarantined during upgrade are not silently resurrected by downgrade.

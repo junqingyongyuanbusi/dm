@@ -6,7 +6,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+from sqlalchemy import select
 
+from social_reply.application.account_management.access import (
+    lock_user_authority,
+    require_reauthorization,
+)
+from social_reply.application.account_management.auth import Principal, principal_from_session_row
 from social_reply.application.account_management.meta_app import provision_meta_app
 from social_reply.application.account_management.meta_subscription import (
     meta_app_subscription_fields,
@@ -15,7 +21,15 @@ from social_reply.application.account_management.meta_subscription import (
     reconcile_meta_app_subscription,
     subscribe_meta_account,
 )
-from social_reply.application.account_management.provisioning import provision_direct_account
+from social_reply.application.account_management.provisioning import (
+    _assert_provisioning_claim,
+    _validate_persist_authority,
+    bind_provisioning_external_identity,
+    checkpoint_matches_job,
+    checkpoint_output_version,
+    provision_direct_account,
+    provisioning_checkpoint,
+)
 from social_reply.application.account_management.x_app import ensure_x_platform_app
 from social_reply.application.account_management.x_credentials import x_credentials
 from social_reply.application.account_management.xchat_activation import (
@@ -24,6 +38,7 @@ from social_reply.application.account_management.xchat_activation import (
 from social_reply.application.platform_accounts import (
     get_platform_account_runtime,
     get_platform_account_runtime_by_external_id,
+    get_platform_app_runtime,
 )
 from social_reply.connectors.meta.client import MetaGraphClient
 from social_reply.connectors.telegram.client import TelegramClient
@@ -42,7 +57,7 @@ from social_reply.domain.platform_accounts import (
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
-from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
+from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -71,6 +86,15 @@ class AccountConnectionResult:
     bot_name: str | None = None
     bot_status: int | None = None
     manual_steps: tuple[str, ...] = ()
+    credential_updated: bool = False
+    connection_ready: bool = True
+    connection_status: str = "READY"
+    checkpoint_phase: str | None = None
+    input_config_version: int | None = None
+    output_config_version: int | None = None
+    observed_config_version: int | None = None
+    configuration_changed_after_provisioning: bool = False
+    next_phase: str | None = None
 
 
 def _validate_automation_default(value: str) -> None:
@@ -104,6 +128,84 @@ def _webhook_url(public_base_url: str, path: str) -> str:
     if not base_url:
         raise ValueError("missing_public_base_url")
     return f"{base_url}{path}"
+
+
+async def resume_checkpointed_provisioning(
+    *,
+    job: models.ProvisioningJob,
+    checkpoint: dict,
+    public_base_url: str,
+) -> AccountConnectionResult:
+    """Reconcile a committed stage without repeating provider or credential writes."""
+    if not checkpoint_matches_job(job, checkpoint):
+        raise ValueError("provisioning_checkpoint_invalid")
+    phase = str(checkpoint.get("phase") or "")
+    if phase not in {"CREDENTIALS_APPLIED", "SUBSCRIPTIONS_APPLIED"}:
+        raise ValueError("provisioning_checkpoint_invalid")
+    output_version = checkpoint_output_version(checkpoint)
+    account_id = uuid.UUID(str(checkpoint["account_id"]))
+    runtime = await get_platform_account_runtime(account_id)
+    if (
+        runtime.tenant_id != job.tenant_id
+        or runtime.platform != job.platform
+        or runtime.external_account_id != checkpoint.get("external_account_id")
+        or runtime.public_id != checkpoint.get("public_id")
+        or runtime.config_version < output_version
+    ):
+        raise ValueError("provisioning_checkpoint_lost")
+    app_public_id = checkpoint.get("app_public_id")
+    if app_public_id is None and runtime.platform_app_id is not None:
+        app_public_id = (await get_platform_app_runtime(runtime.platform_app_id)).public_id
+    if checkpoint.get("webhook_url"):
+        webhook_url = str(checkpoint["webhook_url"])
+    elif runtime.platform == "email":
+        webhook_url = ""
+    elif runtime.platform == "x":
+        webhook_url = _webhook_url(public_base_url, f"/webhooks/x/{app_public_id}")
+    elif runtime.platform == "feishu":
+        webhook_url = _webhook_url(public_base_url, f"/webhooks/feishu/{runtime.public_id}")
+    elif runtime.platform in {"facebook", "instagram", "whatsapp"}:
+        webhook_url = _webhook_url(public_base_url, f"/webhooks/meta/{app_public_id}")
+    else:
+        webhook_url = _webhook_url(
+            public_base_url,
+            f"/webhooks/{runtime.platform}/{runtime.public_id}",
+        )
+    changed_after_stage = runtime.config_version > output_version
+    manual_steps = tuple(checkpoint.get("manual_steps") or ())
+    if checkpoint.get("preserve_disabled_intent") or runtime.status == DISABLED_ACCOUNT_STATUS:
+        manual_steps += (
+            "The account remains manually disabled; no later configuration was overwritten.",
+        )
+    if changed_after_stage:
+        manual_steps += (
+            "The account changed after this job stage; the later configuration was preserved.",
+        )
+    reauthorize = job.operation == "REAUTHORIZE"
+    ready = phase == "SUBSCRIPTIONS_APPLIED" and runtime.status == ACTIVE_ACCOUNT_STATUS
+    return AccountConnectionResult(
+        account_id=runtime.id,
+        platform=runtime.platform,
+        external_account_id=str(runtime.external_account_id),
+        public_id=runtime.public_id,
+        webhook_url=webhook_url,
+        name=runtime.name,
+        automation_default=runtime.automation_default,
+        platform_app_id=runtime.platform_app_id,
+        app_public_id=app_public_id,
+        bot_name=(runtime.config or {}).get("feishu_bot_name"),
+        bot_status=(runtime.config or {}).get("feishu_bot_activate_status"),
+        manual_steps=manual_steps,
+        credential_updated=reauthorize,
+        connection_ready=ready,
+        connection_status="READY" if ready else "NEEDS_ACTION",
+        checkpoint_phase=phase,
+        input_config_version=checkpoint.get("input_config_version"),
+        output_config_version=output_version,
+        observed_config_version=runtime.config_version,
+        configuration_changed_after_provisioning=changed_after_stage,
+        next_phase=checkpoint.get("next_phase"),
+    )
 
 
 def _utc_now_iso() -> str:
@@ -150,15 +252,36 @@ async def connect_telegram_account(
     rotate_webhook_secret: bool = False,
     drop_pending_updates: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
+    operation: str = "CONNECT_ACCOUNT",
+    target_account_id: uuid.UUID | str | None = None,
+    expected_config_version: int | None = None,
+    initiator_user_id: uuid.UUID | None = None,
+    initiator_session_id: uuid.UUID | str | None = None,
+    authority_kind: str = "UNVERIFIED",
+    authority_version: int = 0,
+    provisioning_job_id: uuid.UUID | None = None,
+    provisioning_attempt_count: int | None = None,
+    trusted_control_api: bool = False,
 ) -> AccountConnectionResult:
     """验证 Telegram Bot、幂等落库并将平台 webhook 切到 Reply Core。"""
     _validate_automation_default(automation_default)
+    if operation == "REAUTHORIZE" and rotate_webhook_secret:
+        raise ValueError("reauthorize_webhook_rotation_forbidden")
     token = _require_secret(token, "telegram_bot_token")
     client = TelegramClient(token=token, api_base_url=api_base_url, transport=transport)
     try:
         me = await client.get_me()
         external_account_id = str(me["id"])
         webhook_secret = secrets.token_urlsafe(32).replace("-", "_")
+        if provisioning_job_id is not None:
+            await bind_provisioning_external_identity(
+                provisioning_job_id=provisioning_job_id,
+                provisioning_attempt_count=provisioning_attempt_count,
+                platform="telegram",
+                external_account_id=external_account_id,
+                credential_bundle={"bot_token": token},
+                platform_app_id=None,
+            )
         account_id, resolved_public_id = await provision_direct_account(
             platform="telegram",
             external_account_id=external_account_id,
@@ -177,7 +300,37 @@ async def connect_telegram_account(
             provider_username=str(me.get("username") or "") or None,
             profile_updated_at=datetime.now(UTC),
             preserve_existing_webhook_secret=not rotate_webhook_secret,
+            operation=operation,
+            target_account_id=target_account_id,
+            expected_config_version=expected_config_version,
+            initiator_user_id=initiator_user_id,
+            initiator_session_id=initiator_session_id,
+            authority_kind=authority_kind,
+            authority_version=authority_version,
+            provisioning_job_id=provisioning_job_id,
+            provisioning_attempt_count=provisioning_attempt_count,
+            trusted_control_api=trusted_control_api,
         )
+        if operation == "REAUTHORIZE":
+            runtime = await get_platform_account_runtime(account_id)
+            webhook_url = _webhook_url(
+                public_base_url,
+                f"/webhooks/telegram/{resolved_public_id}",
+            )
+            return AccountConnectionResult(
+                account_id=account_id,
+                platform="telegram",
+                external_account_id=external_account_id,
+                public_id=resolved_public_id,
+                webhook_url=webhook_url,
+                name=runtime.name,
+                automation_default=runtime.automation_default,
+                provider_username=str(me.get("username") or "") or None,
+                profile_updated_at=datetime.now(UTC),
+                credential_updated=True,
+                connection_ready=False,
+                connection_status="NEEDS_ACTION",
+            )
         if not rotate_webhook_secret:
             runtime = await get_platform_account_runtime(account_id)
             webhook_secret = runtime.webhook_secret_bundle["secret"]
@@ -231,12 +384,70 @@ async def connect_meta_account(
     automation_default: str = "BOT_DRAFT_ONLY",
     owner_user_id: uuid.UUID | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    operation: str = "CONNECT_ACCOUNT",
+    target_account_id: uuid.UUID | str | None = None,
+    expected_config_version: int | None = None,
+    initiator_user_id: uuid.UUID | None = None,
+    initiator_session_id: uuid.UUID | str | None = None,
+    authority_kind: str = "UNVERIFIED",
+    authority_version: int = 0,
+    provisioning_job_id: uuid.UUID | None = None,
+    provisioning_attempt_count: int | None = None,
+    trusted_control_api: bool = False,
 ) -> AccountConnectionResult:
     """连接 Facebook Page 或 Instagram 账号，并复用账号所属的 Meta App。"""
     if platform not in _META_PLATFORMS:
         raise ValueError(f"unsupported_meta_platform:{platform}")
     if not get_settings().platform_integration_enabled(platform):
         raise ValueError(f"{platform}_integration_disabled")
+    reauthorize = operation == "REAUTHORIZE"
+    target_runtime = None
+    target_app_runtime = None
+    checkpointed_connect_runtime = None
+    if operation == "CONNECT_ACCOUNT" and provisioning_job_id is not None:
+        async with get_session_factory()() as session:
+            checkpoint_job = await session.get(models.ProvisioningJob, provisioning_job_id)
+        checkpoint = provisioning_checkpoint(checkpoint_job) if checkpoint_job else None
+        if (
+            checkpoint_job is not None
+            and checkpoint is not None
+            and checkpoint.get("phase") == "ACCOUNT_PERSISTED"
+            and checkpoint_matches_job(checkpoint_job, checkpoint)
+        ):
+            checkpointed_connect_runtime = await get_platform_account_runtime(
+                uuid.UUID(str(checkpoint["account_id"]))
+            )
+    if not reauthorize:
+        if instagram_login_mode not in {"facebook_login", "instagram_login"}:
+            raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
+        if platform == "facebook" and instagram_login_mode != "facebook_login":
+            raise ValueError("facebook_requires_facebook_login")
+        if platform == "instagram" and instagram_login_mode == "facebook_login" and not page_id:
+            raise ValueError("instagram_facebook_login_requires_page_id")
+        if platform == "instagram" and instagram_login_mode == "instagram_login" and page_id:
+            raise ValueError("instagram_login_forbids_page_id")
+    if reauthorize:
+        if target_account_id is None:
+            raise ValueError("platform_account_target_required")
+        target_runtime = await get_platform_account_runtime(uuid.UUID(str(target_account_id)))
+        if (
+            target_runtime.tenant_id != tenant_id
+            or target_runtime.platform != platform
+            or target_runtime.external_account_id != external_account_id
+        ):
+            raise ValueError("platform_account_target_mismatch")
+        existing_config = dict(target_runtime.config or {})
+        graph_base_url = str(existing_config.get("graph_base_url") or graph_base_url or "")
+        api_version = str(existing_config.get("api_version") or api_version)
+        instagram_login_mode = str(
+            existing_config.get("instagram_login_mode") or instagram_login_mode
+        )
+        page_id = existing_config.get("page_id") or page_id
+        enable_dm = bool(target_runtime.capability.get("dm", True))
+        enable_comments = bool(target_runtime.capability.get("comments", False))
+        if target_runtime.platform_app_id is None:
+            raise LookupError("platform_app_not_found")
+        target_app_runtime = await get_platform_app_runtime(target_runtime.platform_app_id)
     if instagram_login_mode not in {"facebook_login", "instagram_login"}:
         raise ValueError(f"unsupported_instagram_login_mode:{instagram_login_mode}")
     if platform == "facebook" and instagram_login_mode != "facebook_login":
@@ -254,12 +465,21 @@ async def connect_meta_account(
         raise ValueError("meta_dm_required")
     if enable_comments and not get_settings().meta_comment_reply_enabled:
         raise ValueError("meta_comment_reply_disabled")
-    if automation_default != "BOT_DRAFT_ONLY":
+    if not reauthorize and automation_default != "BOT_DRAFT_ONLY":
         raise ValueError("meta_requires_bot_draft_only")
     _validate_automation_default(automation_default)
     external_account_id = _require_secret(external_account_id, "external_account_id")
     access_token = _require_secret(access_token, "meta_access_token")
     app_secret = _require_secret(app_secret, "meta_app_secret")
+    if reauthorize:
+        target_app_credentials = target_app_runtime.credential_bundle
+        if (
+            (app_id is not None and target_app_runtime.external_app_id != app_id)
+            or (app_public_id is not None and target_app_runtime.public_id != app_public_id)
+            or target_app_credentials.get("app_secret") != app_secret
+            or target_app_credentials.get("verify_token") != verify_token
+        ):
+            raise ValueError("meta_app_rotation_required")
     client = MetaGraphClient(
         platform=platform,
         access_token=access_token,
@@ -275,27 +495,52 @@ async def connect_meta_account(
         profile = await client.get_account()
         if str(profile.get("id")) != external_account_id:
             raise ValueError("meta_token_account_mismatch")
-        (
-            platform_app_id,
-            resolved_app_public_id,
-            resolved_verify_token,
-            external_app_id,
-        ) = await provision_meta_app(
-            tenant_id=tenant_id,
-            app_id=app_id,
-            app_public_id=app_public_id,
-            app_name=app_name,
-            app_secret=app_secret,
-            verify_token=verify_token,
-            secrets_root=secrets_root,
-            graph_base_url=graph_base_url,
-            api_version=api_version,
-            platform_family=(
-                "instagram"
-                if platform == "instagram" and instagram_login_mode == "instagram_login"
-                else "meta"
-            ),
-        )
+        if reauthorize:
+            platform_app_id = target_runtime.platform_app_id
+            resolved_app_public_id = target_app_runtime.public_id
+            target_app_credentials = target_app_runtime.credential_bundle
+            resolved_verify_token = target_app_credentials.get("verify_token")
+            external_app_id = target_app_runtime.external_app_id or app_id
+        else:
+            if checkpointed_connect_runtime is not None:
+                platform_app_id = checkpointed_connect_runtime.platform_app_id
+                if platform_app_id is None:
+                    raise LookupError("platform_app_not_found")
+                checkpoint_app_runtime = await get_platform_app_runtime(platform_app_id)
+                resolved_app_public_id = checkpoint_app_runtime.public_id
+                resolved_verify_token = checkpoint_app_runtime.credential_bundle.get("verify_token")
+                external_app_id = checkpoint_app_runtime.external_app_id or app_id
+            else:
+                (
+                    platform_app_id,
+                    resolved_app_public_id,
+                    resolved_verify_token,
+                    external_app_id,
+                ) = await provision_meta_app(
+                    tenant_id=tenant_id,
+                    app_id=app_id,
+                    app_public_id=app_public_id,
+                    app_name=app_name,
+                    app_secret=app_secret,
+                    verify_token=verify_token,
+                    secrets_root=secrets_root,
+                    graph_base_url=graph_base_url,
+                    api_version=api_version,
+                    platform_family=(
+                        "instagram"
+                        if platform == "instagram" and instagram_login_mode == "instagram_login"
+                        else "meta"
+                    ),
+                )
+        if provisioning_job_id is not None:
+            await bind_provisioning_external_identity(
+                provisioning_job_id=provisioning_job_id,
+                provisioning_attempt_count=provisioning_attempt_count,
+                platform=platform,
+                external_account_id=external_account_id,
+                credential_bundle={"access_token": access_token},
+                platform_app_id=platform_app_id,
+            )
         if platform == "facebook" and enable_comments:
             await client.require_facebook_comment_permissions(app_id=external_app_id)
         if platform == "instagram" and enable_comments:
@@ -346,14 +591,56 @@ async def connect_meta_account(
         },
         automation_default=automation_default,
         owner_user_id=owner_user_id,
-        provider_username=(
-            str(profile.get("username") or "") or None
-        ),
+        provider_username=(str(profile.get("username") or "") or None),
         avatar_url=_profile_avatar_url(profile),
         profile_updated_at=datetime.now(UTC),
         platform_app_id=platform_app_id,
         status=ACTIVE_ACCOUNT_STATUS,
+        operation=operation,
+        target_account_id=target_account_id,
+        expected_config_version=expected_config_version,
+        initiator_user_id=initiator_user_id,
+        initiator_session_id=initiator_session_id,
+        authority_kind=authority_kind,
+        authority_version=authority_version,
+        provisioning_job_id=provisioning_job_id,
+        provisioning_attempt_count=provisioning_attempt_count,
+        trusted_control_api=trusted_control_api,
+        derived_config_patch=(
+            {
+                "meta_health_status": "CREDENTIAL_UPDATED",
+                "meta_health_checked_at": _utc_now_iso(),
+                "meta_health_error_code": None,
+            }
+            if reauthorize
+            else None
+        ),
     )
+    if reauthorize:
+        return AccountConnectionResult(
+            account_id=account_id,
+            platform=platform,
+            external_account_id=external_account_id,
+            public_id=resolved_public_id,
+            webhook_url=webhook_url,
+            name=target_runtime.name,
+            automation_default=target_runtime.automation_default,
+            provider_username=str(profile.get("username") or "") or None,
+            avatar_url=_profile_avatar_url(profile),
+            profile_updated_at=datetime.now(UTC),
+            platform_app_id=platform_app_id,
+            app_public_id=resolved_app_public_id,
+            verify_token=resolved_verify_token,
+            credential_updated=True,
+            connection_ready=False,
+            connection_status="NEEDS_ACTION",
+        )
+    persisted_runtime = await get_platform_account_runtime(account_id)
+    account_write_version = persisted_runtime.config_version
+    preserve_disabled_intent = persisted_runtime.status == DISABLED_ACCOUNT_STATUS and not bool(
+        (persisted_runtime.config or {}).get("meta_disabled_by_provisioning")
+    )
+    final_status = DISABLED_ACCOUNT_STATUS if preserve_disabled_intent else ACTIVE_ACCOUNT_STATUS
     subscription_account_id = (
         page_id
         if platform == "instagram" and instagram_login_mode == "facebook_login"
@@ -386,9 +673,59 @@ async def connect_meta_account(
         )
     except Exception as exc:
         async with get_session_factory()() as session:
-            await session.execute(
+            await _validate_persist_authority(
+                session,
+                tenant_id=tenant_id,
+                brand_id=brand_id,
+                owner_user_id=owner_user_id,
+                platform=platform,
+                external_account_id=external_account_id,
+                credential_bundle={"access_token": access_token},
+                platform_app_id=platform_app_id,
+                operation=operation,
+                target_account_id=target_account_id,
+                expected_config_version=expected_config_version,
+                initiator_user_id=initiator_user_id,
+                initiator_session_id=initiator_session_id,
+                authority_kind=authority_kind,
+                authority_version=authority_version,
+                trusted_control_api=trusted_control_api,
+                provisioning_job_id=provisioning_job_id,
+                provisioning_attempt_count=provisioning_attempt_count,
+            )
+            await _assert_provisioning_claim(
+                session,
+                provisioning_job_id=provisioning_job_id,
+                provisioning_attempt_count=provisioning_attempt_count,
+            )
+            current_account = (
+                await session.execute(
+                    select(models.PlatformAccount)
+                    .where(
+                        models.PlatformAccount.id == account_id,
+                        models.PlatformAccount.tenant_id == tenant_id,
+                        models.PlatformAccount.platform == platform,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current_account is None:
+                raise ValueError("provisioning_claim_lost") from exc
+            if current_account.config_version != account_write_version:
+                raise ValueError("provisioning_checkpoint_superseded") from exc
+            preserve_admin_disabled = (
+                current_account.status == DISABLED_ACCOUNT_STATUS
+                and not bool((current_account.config or {}).get("meta_disabled_by_provisioning"))
+            )
+            updated = await session.execute(
                 models.PlatformAccount.__table__.update()
-                .where(models.PlatformAccount.id == account_id)
+                .where(
+                    models.PlatformAccount.id == account_id,
+                    models.PlatformAccount.tenant_id == tenant_id,
+                    models.PlatformAccount.platform == platform,
+                    models.PlatformAccount.external_account_id == external_account_id,
+                    models.PlatformAccount.config_version == account_write_version,
+                )
                 .values(
                     status=DISABLED_ACCOUNT_STATUS,
                     config=models.PlatformAccount.config.op("||")(
@@ -396,19 +733,85 @@ async def connect_meta_account(
                             "meta_health_status": "ERROR",
                             "meta_health_checked_at": _utc_now_iso(),
                             "meta_health_error_code": _meta_provider_error_code(exc),
+                            "meta_disabled_by_provisioning": not preserve_admin_disabled,
                         }
                     ),
-                    config_version=models.PlatformAccount.config_version + 1,
                 )
+                .returning(models.PlatformAccount.id)
             )
+            if updated.first() is None:
+                raise ValueError("provisioning_claim_lost") from exc
             await session.commit()
         raise
     async with get_session_factory()() as session:
-        await session.execute(
+        await _validate_persist_authority(
+            session,
+            tenant_id=tenant_id,
+            brand_id=brand_id,
+            owner_user_id=owner_user_id,
+            platform=platform,
+            external_account_id=external_account_id,
+            credential_bundle={"access_token": access_token},
+            platform_app_id=platform_app_id,
+            operation=operation,
+            target_account_id=target_account_id,
+            expected_config_version=expected_config_version,
+            initiator_user_id=initiator_user_id,
+            initiator_session_id=initiator_session_id,
+            authority_kind=authority_kind,
+            authority_version=authority_version,
+            trusted_control_api=trusted_control_api,
+            provisioning_job_id=provisioning_job_id,
+            provisioning_attempt_count=provisioning_attempt_count,
+        )
+        claim = await _assert_provisioning_claim(
+            session,
+            provisioning_job_id=provisioning_job_id,
+            provisioning_attempt_count=provisioning_attempt_count,
+        )
+        current_account = (
+            await session.execute(
+                select(models.PlatformAccount)
+                .where(
+                    models.PlatformAccount.id == account_id,
+                    models.PlatformAccount.tenant_id == tenant_id,
+                    models.PlatformAccount.platform == platform,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if current_account is None:
+            raise ValueError("provisioning_claim_lost")
+        checkpoint = provisioning_checkpoint(claim) if claim is not None else None
+        if (
+            claim is None
+            or checkpoint is None
+            or checkpoint.get("phase") != "ACCOUNT_PERSISTED"
+            or not checkpoint_matches_job(
+                claim,
+                checkpoint,
+                account_id=account_id,
+                external_account_id=external_account_id,
+            )
+            or current_account.config_version < checkpoint_output_version(checkpoint)
+        ):
+            raise ValueError("provisioning_checkpoint_lost")
+        account_write_version = current_account.config_version
+        if current_account.status == DISABLED_ACCOUNT_STATUS and not bool(
+            (current_account.config or {}).get("meta_disabled_by_provisioning")
+        ):
+            final_status = DISABLED_ACCOUNT_STATUS
+        updated = await session.execute(
             models.PlatformAccount.__table__.update()
-            .where(models.PlatformAccount.id == account_id)
+            .where(
+                models.PlatformAccount.id == account_id,
+                models.PlatformAccount.tenant_id == tenant_id,
+                models.PlatformAccount.platform == platform,
+                models.PlatformAccount.external_account_id == external_account_id,
+                models.PlatformAccount.config_version == account_write_version,
+            )
             .values(
-                status=ACTIVE_ACCOUNT_STATUS,
+                status=final_status,
                 config=models.PlatformAccount.config.op("||")(
                     {
                         "meta_subscribed_fields": list(subscribed_fields),
@@ -416,11 +819,43 @@ async def connect_meta_account(
                         "meta_health_status": "READY",
                         "meta_health_checked_at": _utc_now_iso(),
                         "meta_health_error_code": None,
+                        "meta_disabled_by_provisioning": False,
                     }
                 ),
-                config_version=models.PlatformAccount.config_version + 1,
+                config_version=account_write_version + 1,
             )
+            .returning(models.PlatformAccount.id)
         )
+        if updated.first() is None:
+            raise ValueError("provisioning_claim_lost")
+        output_config_version = account_write_version + 1
+        manual_steps = (
+            "已自动完成 App 级 Webhook 回调与字段订阅，无需在 App Dashboard 手工配置。",
+            f"账号已自动订阅 webhook 字段：{', '.join(subscribed_fields)}。",
+            "上线前完成 App Review / Advanced Access，并将 App 切换为 Live。",
+        )
+        checkpoint = {
+            **checkpoint,
+            "phase": "SUBSCRIPTIONS_APPLIED",
+            "provider_input_config_version": account_write_version,
+            "output_config_version": output_config_version,
+            "superseded_by_later_config": (
+                account_write_version > checkpoint_output_version(checkpoint)
+            ),
+            "observed_config_version": output_config_version,
+            "platform_app_id": str(platform_app_id) if platform_app_id else None,
+            "app_public_id": resolved_app_public_id,
+            "webhook_url": webhook_url,
+            "subscribed_fields": list(subscribed_fields),
+            "app_subscribed_fields": list(app_subscribed_fields),
+            "manual_steps": list(manual_steps),
+            "preserve_disabled_intent": preserve_disabled_intent,
+        }
+        claim.account_id = account_id
+        claim.platform_app_id = platform_app_id
+        claim.expected_config_version = output_config_version
+        claim.current_step = "SUBSCRIPTIONS_APPLIED"
+        claim.result = {**dict(claim.result or {}), "checkpoint": checkpoint}
         await session.commit()
     return AccountConnectionResult(
         account_id=account_id,
@@ -441,12 +876,69 @@ async def connect_meta_account(
             f"账号已自动订阅 webhook 字段：{', '.join(subscribed_fields)}。",
             "上线前完成 App Review / Advanced Access，并将 App 切换为 Live。",
         ),
+        connection_ready=final_status == ACTIVE_ACCOUNT_STATUS,
+        connection_status=("READY" if final_status == ACTIVE_ACCOUNT_STATUS else "NEEDS_ACTION"),
+        checkpoint_phase="SUBSCRIPTIONS_APPLIED",
+        input_config_version=checkpoint.get("input_config_version"),
+        output_config_version=output_config_version,
+        observed_config_version=output_config_version,
+        configuration_changed_after_provisioning=bool(checkpoint.get("superseded_by_later_config")),
     )
 
 
-async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
+async def _xchat_repair_target(
+    session, *, account_id: uuid.UUID, tenant_id: str, principal: Principal | None,
+    expected_config_version: int | None, for_update: bool,
+):
+    if principal is None or principal.session_id is None or principal.is_feishu_action:
+        raise PermissionError("xchat_repair_principal_required")
+    if for_update and principal.user_id is not None:
+        await lock_user_authority(session, principal.user_id)
+    current = await principal_from_session_row(
+        session, principal.session_id, for_update=for_update
+    )
+    if (
+        current is None or current.must_change_password or current.user_id != principal.user_id
+        or tenant_id not in current.allowed_tenants
+    ):
+        raise PermissionError("xchat_repair_authority_revoked")
+    statement = select(models.PlatformAccount).where(
+        models.PlatformAccount.id == account_id,
+        models.PlatformAccount.tenant_id == tenant_id,
+        models.PlatformAccount.platform == "x",
+        models.PlatformAccount.status == ACTIVE_ACCOUNT_STATUS,
+    ).execution_options(populate_existing=True)
+    if for_update:
+        statement = statement.with_for_update()
+    account = await session.scalar(statement)
+    if account is None:
+        raise ValueError("x_account_not_found")
+    await require_reauthorization(
+        session, principal=current, account=account, expected_config_version=expected_config_version
+    )
+    if not current.is_workspace_admin and not (account.config or {}).get("xchat_enabled"):
+        raise PermissionError("xchat_enable_admin_required")
+    return account, current
+
+
+async def enable_xchat_for_account(
+    *, account_id: uuid.UUID, pin: str, tenant_id: str,
+    principal: Principal | None = None, expected_config_version: int | None = None,
+) -> None:
+    if not get_settings().xchat_enabled:
+        raise ValueError("xchat_disabled")
+    async with get_session_factory()() as session:
+        target, _current = await _xchat_repair_target(
+            session, account_id=account_id, tenant_id=tenant_id, principal=principal,
+            expected_config_version=expected_config_version, for_update=False,
+        )
+        bound_version = target.config_version
+        bound_external_id = target.external_account_id
     account = await get_platform_account_runtime(account_id)
-    if account.platform != "x" or not account.external_account_id:
+    if (
+        account.platform != "x" or not account.external_account_id
+        or account.tenant_id != tenant_id or account.external_account_id != bound_external_id
+    ):
         raise ValueError("x_account_not_found")
     credentials = x_credentials(account)
     client = XChatClient(
@@ -457,17 +949,13 @@ async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
         api_base_url=(account.config or {}).get("api_base_url", "https://api.x.com"),
     )
     try:
-        records = await _xchat_public_keys(client, account.external_account_id)
         private_keys, key_version = await unlock_account_xchat_keys(
             client=client,
             user_id=account.external_account_id,
             pin=_require_secret(pin, "xchat_pin"),
-            records=records,
         )
     finally:
         await client.aclose()
-    credentials["xchat_private_keys_b64"] = private_keys
-    credentials["xchat_signing_key_version"] = key_version
     state_config = xchat_state_config(
         XChatState(
             key_state=XChatKeyState.READY,
@@ -477,18 +965,29 @@ async def enable_xchat_for_account(*, account_id: uuid.UUID, pin: str) -> None:
         probed_at=_utc_now_iso(),
     )
     async with get_session_factory()() as session:
-        await session.execute(
-            models.PlatformAccount.__table__.update()
-            .where(models.PlatformAccount.id == account_id)
-            .values(
-                credential_bundle=encrypt_secret_bundle(credentials),
-                config=models.PlatformAccount.config.op("||")(
-                    {"xchat_enabled": True, **state_config}
-                ),
-                capability=models.PlatformAccount.capability.op("||")({"x_chat": True}),
-                config_version=models.PlatformAccount.config_version + 1,
-            )
+        target, current = await _xchat_repair_target(
+            session, account_id=account_id, tenant_id=tenant_id, principal=principal,
+            expected_config_version=bound_version, for_update=True,
         )
+        if target.external_account_id != bound_external_id or not get_settings().xchat_enabled:
+            raise ValueError("xchat_repair_account_changed")
+        credentials_now = decrypt_secret_bundle(target.credential_bundle)
+        credentials_now["xchat_private_keys_b64"] = private_keys
+        credentials_now["xchat_signing_key_version"] = key_version
+        target.credential_bundle = encrypt_secret_bundle(credentials_now)
+        target.config = {**dict(target.config or {}), "xchat_enabled": True, **state_config}
+        target.capability = {**dict(target.capability or {}), "x_chat": True}
+        target.config_version += 1
+        session.add(models.AuditLog(
+            tenant_id=tenant_id, category="account_management", actor=current.actor,
+            action="REPAIR_XCHAT_ACCOUNT",
+            subject_type="platform_account", subject_id=str(account_id),
+            detail={
+                "input_config_version": bound_version, "config_version": target.config_version,
+                "actor_user_id": str(current.user_id) if current.user_id else None,
+                "actor_session_id": str(current.session_id), "outcome": "completed",
+            },
+        ))
         await session.commit()
 
     from social_reply.application.event_ingestion.xchat_actors import recover_xchat_account
@@ -517,9 +1016,31 @@ async def connect_x_account(
     automation_default: str = "BOT_DRAFT_ONLY",
     owner_user_id: uuid.UUID | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    operation: str = "CONNECT_ACCOUNT",
+    target_account_id: uuid.UUID | str | None = None,
+    expected_config_version: int | None = None,
+    initiator_user_id: uuid.UUID | None = None,
+    initiator_session_id: uuid.UUID | str | None = None,
+    authority_kind: str = "UNVERIFIED",
+    authority_version: int = 0,
+    provisioning_job_id: uuid.UUID | None = None,
+    provisioning_attempt_count: int | None = None,
+    trusted_control_api: bool = False,
 ) -> AccountConnectionResult:
     """验证 X OAuth 1.0a 凭证并登记 Account Activity webhook 路由。"""
     _validate_automation_default(automation_default)
+    reauthorize = operation == "REAUTHORIZE"
+    target_runtime = None
+    target_app_runtime = None
+    if reauthorize:
+        if target_account_id is None:
+            raise ValueError("platform_account_target_required")
+        target_runtime = await get_platform_account_runtime(uuid.UUID(str(target_account_id)))
+        if target_runtime.tenant_id != tenant_id or target_runtime.platform != "x":
+            raise ValueError("platform_account_target_mismatch")
+        if target_runtime.platform_app_id is None:
+            raise LookupError("platform_app_not_found")
+        target_app_runtime = await get_platform_app_runtime(target_runtime.platform_app_id)
     settings = get_settings()
     if not settings.x_integration_enabled:
         raise ValueError("x_integration_disabled")
@@ -532,6 +1053,19 @@ async def connect_x_account(
         "access_token": _require_secret(access_token, "x_access_token"),
         "access_token_secret": _require_secret(access_token_secret, "x_access_token_secret"),
     }
+    if reauthorize:
+        target_app_credentials = target_app_runtime.credential_bundle
+        if (
+            target_app_runtime.external_app_id != credentials["consumer_key"]
+            or target_app_credentials.get("consumer_secret") != credentials["consumer_secret"]
+        ):
+            raise ValueError("x_app_rotation_required")
+        stored_webhook_secret = target_runtime.webhook_secret_bundle or {}
+        if (
+            stored_webhook_secret
+            and stored_webhook_secret.get("consumer_secret") != credentials["consumer_secret"]
+        ):
+            raise ValueError("x_app_rotation_required")
     client = XClient(**credentials, api_base_url=api_base_url, transport=transport)
     dm_capable = False
     try:
@@ -555,7 +1089,9 @@ async def connect_x_account(
     finally:
         await client.aclose()
     external_account_id = str(me["id"])
-    existing_runtime = None
+    if reauthorize and target_runtime.external_account_id != external_account_id:
+        raise ValueError("platform_account_target_mismatch")
+    existing_runtime = target_runtime
     try:
         existing_runtime = await get_platform_account_runtime_by_external_id(
             tenant_id=tenant_id,
@@ -564,81 +1100,110 @@ async def connect_x_account(
         )
     except LookupError:
         pass
-    existing_xchat_credentials = (
-        existing_runtime.credential_bundle if existing_runtime is not None else {}
-    )
-    private_keys = existing_xchat_credentials.get("xchat_private_keys_b64")
-    stored_key_version = existing_xchat_credentials.get("xchat_signing_key_version")
-    if private_keys:
-        credentials["xchat_private_keys_b64"] = private_keys
-    if stored_key_version:
-        credentials["xchat_signing_key_version"] = stored_key_version
+    if reauthorize:
+        existing_xchat_credentials = target_runtime.credential_bundle
+        private_keys = existing_xchat_credentials.get("xchat_private_keys_b64")
+        stored_key_version = existing_xchat_credentials.get("xchat_signing_key_version")
+        if private_keys:
+            credentials["xchat_private_keys_b64"] = private_keys
+        if stored_key_version:
+            credentials["xchat_signing_key_version"] = stored_key_version
+        xchat_ready = bool((target_runtime.config or {}).get("xchat_enabled"))
+        xchat_config = {}
+    else:
+        existing_xchat_credentials = (
+            existing_runtime.credential_bundle if existing_runtime is not None else {}
+        )
+        private_keys = existing_xchat_credentials.get("xchat_private_keys_b64")
+        stored_key_version = existing_xchat_credentials.get("xchat_signing_key_version")
+        if private_keys:
+            credentials["xchat_private_keys_b64"] = private_keys
+        if stored_key_version:
+            credentials["xchat_signing_key_version"] = stored_key_version
 
-    if settings.xchat_enabled:
-        xchat = XChatClient(
+        if settings.xchat_enabled:
+            xchat = XChatClient(
+                consumer_key=credentials["consumer_key"],
+                consumer_secret=credentials["consumer_secret"],
+                access_token=credentials["access_token"],
+                access_token_secret=credentials["access_token_secret"],
+                api_base_url=api_base_url,
+                transport=transport,
+            )
+            try:
+                public_key_records = await _xchat_public_keys(xchat, external_account_id)
+                if xchat_pin and xchat_pin.strip():
+                    private_keys, stored_key_version = await unlock_account_xchat_keys(
+                        client=xchat,
+                        user_id=external_account_id,
+                        pin=xchat_pin.strip(),
+                        records=public_key_records,
+                    )
+                    credentials["xchat_private_keys_b64"] = private_keys
+                    credentials["xchat_signing_key_version"] = stored_key_version
+            finally:
+                await xchat.aclose()
+            if xchat_pin and xchat_pin.strip():
+                xchat_state = XChatState(
+                    key_state=XChatKeyState.READY,
+                    registered=True,
+                    public_key_version=str(stored_key_version),
+                )
+            else:
+                xchat_state = classify_xchat_state(
+                    public_key_records,
+                    private_keys_b64=private_keys,
+                )
+            if xchat_state.key_state is XChatKeyState.READY:
+                credentials["xchat_signing_key_version"] = str(xchat_state.public_key_version)
+        else:
+            existing_config = existing_runtime.config if existing_runtime is not None else {}
+            existing_state_value = existing_config.get("xchat_key_state")
+            try:
+                existing_state = XChatKeyState(str(existing_state_value))
+            except ValueError:
+                existing_state = (
+                    XChatKeyState.READY
+                    if private_keys and stored_key_version
+                    else XChatKeyState.NOT_REGISTERED
+                )
+            xchat_state = XChatState(
+                key_state=existing_state,
+                registered=bool(existing_config.get("xchat_registered", private_keys)),
+                public_key_version=existing_config.get(
+                    "xchat_public_key_version", stored_key_version
+                ),
+            )
+        xchat_ready = xchat_state.key_state is XChatKeyState.READY
+        if settings.xchat_enabled:
+            xchat_config = xchat_state_config(xchat_state, probed_at=_utc_now_iso())
+        else:
+            xchat_config = {
+                "xchat_registered": xchat_state.registered,
+                "xchat_key_state": xchat_state.key_state.value,
+                "xchat_public_key_version": xchat_state.public_key_version,
+            }
+    if reauthorize:
+        if target_runtime.platform_app_id is None:
+            raise LookupError("platform_app_not_found")
+        platform_app_id = target_runtime.platform_app_id
+        target_app_runtime = await get_platform_app_runtime(platform_app_id)
+        app_public_id = target_app_runtime.public_id
+    else:
+        platform_app_id, app_public_id = await ensure_x_platform_app(
+            tenant_id=tenant_id,
             consumer_key=credentials["consumer_key"],
             consumer_secret=credentials["consumer_secret"],
-            access_token=credentials["access_token"],
-            access_token_secret=credentials["access_token_secret"],
-            api_base_url=api_base_url,
-            transport=transport,
         )
-        try:
-            public_key_records = await _xchat_public_keys(xchat, external_account_id)
-            if xchat_pin and xchat_pin.strip():
-                private_keys, stored_key_version = await unlock_account_xchat_keys(
-                    client=xchat,
-                    user_id=external_account_id,
-                    pin=xchat_pin.strip(),
-                    records=public_key_records,
-                )
-                credentials["xchat_private_keys_b64"] = private_keys
-                credentials["xchat_signing_key_version"] = stored_key_version
-        finally:
-            await xchat.aclose()
-        if xchat_pin and xchat_pin.strip():
-            xchat_state = XChatState(
-                key_state=XChatKeyState.READY,
-                registered=True,
-                public_key_version=str(stored_key_version),
-            )
-        else:
-            xchat_state = classify_xchat_state(
-                public_key_records,
-                private_keys_b64=private_keys,
-            )
-        if xchat_state.key_state is XChatKeyState.READY:
-            credentials["xchat_signing_key_version"] = str(xchat_state.public_key_version)
-    else:
-        existing_config = existing_runtime.config if existing_runtime is not None else {}
-        existing_state_value = existing_config.get("xchat_key_state")
-        try:
-            existing_state = XChatKeyState(str(existing_state_value))
-        except ValueError:
-            existing_state = (
-                XChatKeyState.READY
-                if private_keys and stored_key_version
-                else XChatKeyState.NOT_REGISTERED
-            )
-        xchat_state = XChatState(
-            key_state=existing_state,
-            registered=bool(existing_config.get("xchat_registered", private_keys)),
-            public_key_version=existing_config.get("xchat_public_key_version", stored_key_version),
+    if provisioning_job_id is not None:
+        await bind_provisioning_external_identity(
+            provisioning_job_id=provisioning_job_id,
+            provisioning_attempt_count=provisioning_attempt_count,
+            platform="x",
+            external_account_id=external_account_id,
+            credential_bundle=credentials,
+            platform_app_id=platform_app_id,
         )
-    xchat_ready = xchat_state.key_state is XChatKeyState.READY
-    if settings.xchat_enabled:
-        xchat_config = xchat_state_config(xchat_state, probed_at=_utc_now_iso())
-    else:
-        xchat_config = {
-            "xchat_registered": xchat_state.registered,
-            "xchat_key_state": xchat_state.key_state.value,
-            "xchat_public_key_version": xchat_state.public_key_version,
-        }
-    platform_app_id, app_public_id = await ensure_x_platform_app(
-        tenant_id=tenant_id,
-        consumer_key=credentials["consumer_key"],
-        consumer_secret=credentials["consumer_secret"],
-    )
     account_id, resolved_public_id = await provision_direct_account(
         platform="x",
         external_account_id=external_account_id,
@@ -650,6 +1215,7 @@ async def connect_x_account(
         secrets_root=secrets_root,
         credential_bundle=credentials,
         webhook_secret_bundle={"consumer_secret": credentials["consumer_secret"]},
+        preserve_existing_webhook_secret=False,
         config={
             **(existing_runtime.config if existing_runtime is not None else {}),
             "api_base_url": api_base_url,
@@ -669,7 +1235,35 @@ async def connect_x_account(
         avatar_url=_profile_avatar_url(me),
         profile_updated_at=datetime.now(UTC),
         platform_app_id=platform_app_id,
+        operation=operation,
+        target_account_id=target_account_id,
+        expected_config_version=expected_config_version,
+        initiator_user_id=initiator_user_id,
+        initiator_session_id=initiator_session_id,
+        authority_kind=authority_kind,
+        authority_version=authority_version,
+        provisioning_job_id=provisioning_job_id,
+        provisioning_attempt_count=provisioning_attempt_count,
+        trusted_control_api=trusted_control_api,
     )
+    if reauthorize:
+        return AccountConnectionResult(
+            account_id=account_id,
+            platform="x",
+            external_account_id=external_account_id,
+            public_id=resolved_public_id,
+            webhook_url=_webhook_url(public_base_url, f"/webhooks/x/{app_public_id}"),
+            name=target_runtime.name,
+            automation_default=target_runtime.automation_default,
+            provider_username=str(me.get("username") or "") or None,
+            avatar_url=_profile_avatar_url(me),
+            profile_updated_at=datetime.now(UTC),
+            platform_app_id=platform_app_id,
+            app_public_id=app_public_id,
+            credential_updated=True,
+            connection_ready=False,
+            connection_status="NEEDS_ACTION",
+        )
     return AccountConnectionResult(
         account_id=account_id,
         platform="x",

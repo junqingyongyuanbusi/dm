@@ -8,7 +8,7 @@ from sqlalchemy import func, select, update
 
 from apps.api.main import create_app
 from social_reply.application.account_management import admin_console, saas_console
-from social_reply.application.account_management.auth import Principal, hash_password
+from social_reply.application.account_management.auth import Principal, authenticate, hash_password
 from social_reply.application.knowledge.commands import KnowledgeConflictError
 from social_reply.application.knowledge.publication import (
     UnpublishKnowledgeCommand,
@@ -90,6 +90,28 @@ async def _login(
     )
     assert response.status_code == 303
     return csrf_token
+
+
+@pytest.fixture
+async def knowledge_admin_principal(session):
+    username = f"knowledge-draft-admin-{uuid.uuid4().hex}"
+    password = "knowledge-draft-admin-password-123"
+    session.add(
+        models.AdminUser(
+            username=username,
+            password_hash=await hash_password(password),
+            tenant_id="default",
+            role="WORKSPACE_ADMIN",
+            must_change_password=False,
+            status="active",
+        )
+    )
+    await session.commit()
+    result = await authenticate(username, password)
+    assert result is not None
+    principal, _token = result
+    assert principal.is_workspace_admin
+    return principal
 
 
 async def _seed_draft(
@@ -678,6 +700,7 @@ async def test_tenant_draft_approval_rechecks_knowledge_document_chunk_and_hash(
 async def test_unpublish_and_draft_approval_serialize_both_race_orders(
     session,
     monkeypatch,
+    knowledge_admin_principal,
 ) -> None:
     async def suppress_dispatch(*_args, **_kwargs) -> None:
         return None
@@ -701,7 +724,7 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
             unpublish_session,
             UnpublishKnowledgeCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=unpublish_first_document.id,
             ),
         )
@@ -760,7 +783,7 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
                     concurrent_session,
                     UnpublishKnowledgeCommand(
                         required_tenant_id="default",
-                        actor="user:knowledge-admin",
+                        principal=knowledge_admin_principal,
                         document_id=approval_first_document.id,
                     ),
                 )

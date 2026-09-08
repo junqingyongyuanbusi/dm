@@ -49,6 +49,11 @@ class _MemoryRedis:
         return None
 
 
+class _UnavailableRedis(_MemoryRedis):
+    async def exists(self, _key: str) -> int:
+        raise RuntimeError("redis unavailable")
+
+
 def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()),
@@ -172,6 +177,28 @@ async def test_system_overview_and_audit_only_render_security_metadata(
     assert "TENANT_BUSINESS_ACTION_MUST_NOT_RENDER" not in audit.text
     assert "customer-secret-payload" not in audit.text
     assert "customer-secret-conversation-id" not in audit.text
+
+
+async def test_system_overview_marks_global_safety_as_degraded_when_redis_is_unavailable(
+    migrated_db,
+    monkeypatch,
+):
+    from social_reply.application.account_management import saas_console
+
+    monkeypatch.setattr(
+        saas_console.aioredis,
+        "from_url",
+        lambda _url: _UnavailableRedis(),
+    )
+
+    async with _client() as client:
+        await _login(client, "admin", "test-admin-password")
+        response = await client.get("/admin/system/overview")
+
+    assert response.status_code == 200
+    assert "全局急停状态不可用" in response.text
+    assert '<span class="saas-status warning"' in response.text
+    assert 'href="/admin/system/safety"' in response.text
 
 
 async def test_database_user_cannot_open_any_system_console_page(session, migrated_db):

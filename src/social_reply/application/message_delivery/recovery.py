@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from social_reply.application.message_delivery.outbox import materialize_sent_outbox
+from social_reply.application.account_management.access import lock_user_authority
+from social_reply.application.account_management.auth import Principal, principal_from_session_row
+from social_reply.application.message_delivery.outbox import (
+    _effective_origin_kind,
+    materialize_sent_outbox,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
     acquire_conversation_delivery_xact_lock,
@@ -95,10 +100,7 @@ class _LockedDeliveryContext:
 
 def _normalize_required_tenant_id(required_tenant_id: str) -> str:
     normalized_tenant_id = required_tenant_id.strip()
-    if (
-        not normalized_tenant_id
-        or len(normalized_tenant_id) > _MAX_TENANT_ID_LENGTH
-    ):
+    if not normalized_tenant_id or len(normalized_tenant_id) > _MAX_TENANT_ID_LENGTH:
         raise DeliveryRecoveryValidationError("delivery_tenant_invalid")
     return normalized_tenant_id
 
@@ -122,9 +124,7 @@ def _normalize_review_reason(review_reason: str) -> str:
 def _normalize_verification_source(verification_source: str) -> str:
     normalized_source = verification_source.strip().upper()
     if normalized_source not in VERIFICATION_SOURCES:
-        raise DeliveryRecoveryValidationError(
-            "delivery_verification_source_invalid"
-        )
+        raise DeliveryRecoveryValidationError("delivery_verification_source_invalid")
     return normalized_source
 
 
@@ -134,9 +134,7 @@ def _normalize_expected_attempt_count(expected_attempt_count: int) -> int:
         or not isinstance(expected_attempt_count, int)
         or expected_attempt_count < 0
     ):
-        raise DeliveryRecoveryValidationError(
-            "delivery_expected_attempt_count_invalid"
-        )
+        raise DeliveryRecoveryValidationError("delivery_expected_attempt_count_invalid")
     return expected_attempt_count
 
 
@@ -164,9 +162,7 @@ def _normalize_provider_message_id(
     normalized_message_id = raw_message_id.strip()
     if resolution == "CONFIRMED_SENT":
         if not normalized_message_id:
-            raise DeliveryRecoveryValidationError(
-                "delivery_provider_message_id_required"
-            )
+            raise DeliveryRecoveryValidationError("delivery_provider_message_id_required")
         is_email_message_id = (
             platform == "email"
             and _EMAIL_PROVIDER_MESSAGE_ID_PATTERN.fullmatch(normalized_message_id) is not None
@@ -185,14 +181,10 @@ def _normalize_provider_message_id(
             or len(normalized_message_id) > _MAX_PROVIDER_MESSAGE_ID_LENGTH
             or not (is_email_message_id or is_safe_opaque_text)
         ):
-            raise DeliveryRecoveryValidationError(
-                "delivery_provider_message_id_invalid"
-            )
+            raise DeliveryRecoveryValidationError("delivery_provider_message_id_invalid")
         return normalized_message_id
     if normalized_message_id:
-        raise DeliveryRecoveryValidationError(
-            "delivery_provider_message_id_not_allowed"
-        )
+        raise DeliveryRecoveryValidationError("delivery_provider_message_id_not_allowed")
     return None
 
 
@@ -232,8 +224,7 @@ async def _load_locked_delivery_context(
                 models.OutboxMessage.tenant_id == required_tenant_id,
                 models.Conversation.id == conversation_id,
                 models.Conversation.tenant_id == required_tenant_id,
-                models.Conversation.platform_account_id
-                == models.OutboxMessage.platform_account_id,
+                models.Conversation.platform_account_id == models.OutboxMessage.platform_account_id,
                 models.PlatformAccount.tenant_id == required_tenant_id,
             )
             .with_for_update()
@@ -382,6 +373,45 @@ async def _dispatch_pending_outbox(outbox_id: uuid.UUID) -> bool:
     return True
 
 
+async def _require_human_retry_authority(
+    session: AsyncSession, context: _LockedDeliveryContext
+) -> None:
+    outbox = context.outbox
+    origin = _effective_origin_kind(outbox, dict(outbox.payload or {}))
+    if outbox.actor_kind != "ADMIN_HUMAN" and origin not in {"MANUAL_REPLY", "DRAFT_APPROVAL"}:
+        return
+    if outbox.initiator_session_id is None:
+        raise DeliveryRecoveryConflict("human_outbox_requires_reapproval")
+    # This read does not acquire a late staff/Session lock while holding delivery rows.
+    # Recovery never changes the original authority; delivery rechecks it before I/O.
+    principal = await principal_from_session_row(session, outbox.initiator_session_id)
+    if (
+        principal is None
+        or principal.must_change_password
+        or principal.user_id != outbox.initiator_user_id
+        or not principal.can_access_account(context.account)
+    ):
+        raise DeliveryRecoveryConflict("human_outbox_authority_revoked")
+    if origin == "DRAFT_APPROVAL" and principal.is_workspace_admin:
+        return
+    if origin == "MANUAL_REPLY":
+        work = await session.scalar(
+            select(models.HumanWorkItem).where(
+                models.HumanWorkItem.conversation_id == context.conversation.id,
+                models.HumanWorkItem.tenant_id == context.account.tenant_id,
+                models.HumanWorkItem.status == "CLAIMED",
+            )
+        )
+        if (
+            work is not None
+            and work.version == outbox.human_work_item_version
+            and work.assigned_user_id == principal.user_id
+            and work.assigned_actor == principal.actor
+        ):
+            return
+    raise DeliveryRecoveryConflict("human_outbox_requires_reapproval")
+
+
 async def _apply_resolution(
     *,
     outbox_id: uuid.UUID,
@@ -393,12 +423,27 @@ async def _apply_resolution(
     verification_source: str,
     resolution: str,
     provider_message_id: str | None,
+    principal: Principal | None,
 ) -> DeliveryRecoveryResult:
     final_status = _RESOLUTION_STATUSES[resolution]
     action = _RESOLUTION_ACTIONS[resolution]
     should_dispatch = final_status == "PENDING"
 
     async with get_session_factory()() as session:
+        if principal is None:
+            raise DeliveryRecoveryConflict("delivery_admin_session_required")
+        if principal.user_id is not None:
+            await lock_user_authority(session, principal.user_id)
+        current = await principal_from_session_row(session, principal.session_id, for_update=True)
+        if (
+            current is None
+            or current.must_change_password
+            or current.user_id != principal.user_id
+            or not current.is_workspace_admin
+            or required_tenant_id not in current.allowed_tenants
+        ):
+            raise DeliveryRecoveryConflict("delivery_admin_authority_revoked")
+        actor = current.actor
         context = await _load_locked_delivery_context(
             session,
             outbox_id=outbox_id,
@@ -419,6 +464,8 @@ async def _apply_resolution(
             previous_error_code=context.outbox.last_error_code,
             final_status=final_status,
         )
+        detail["initiator_user_id"] = str(current.user_id) if current.user_id else None
+        detail["initiator_session_id"] = str(current.session_id)
         replay = await _resolve_replay(
             session,
             context=context,
@@ -432,6 +479,8 @@ async def _apply_resolution(
             expected_status=expected_status,
             expected_attempt_count=expected_attempt_count,
         )
+        if should_dispatch:
+            await _require_human_retry_authority(session, context)
         context.outbox.status = final_status
         context.outbox.next_attempt_at = None
         context.outbox.locked_at = None
@@ -440,9 +489,7 @@ async def _apply_resolution(
             context.outbox.platform_message_id = normalized_provider_message_id
             context.outbox.last_error_code = None
             context.outbox.last_error_message = None
-            context.outbox.sent_at = await session.scalar(
-                select(func.clock_timestamp())
-            )
+            context.outbox.sent_at = await session.scalar(select(func.clock_timestamp()))
             await session.flush([context.outbox])
             await materialize_sent_outbox(
                 session,
@@ -476,6 +523,7 @@ async def retry_failed_outbox(
     expected_attempt_count: int,
     review_reason: str,
     verification_source: str,
+    principal: Principal | None = None,
 ) -> DeliveryRecoveryResult:
     normalized_tenant_id = _normalize_required_tenant_id(required_tenant_id)
     normalized_actor = _normalize_actor(actor)
@@ -493,6 +541,7 @@ async def retry_failed_outbox(
         verification_source=normalized_source,
         resolution=_FAILED_RETRY_RESOLUTION,
         provider_message_id=None,
+        principal=principal,
     )
 
 
@@ -507,6 +556,7 @@ async def resolve_needs_review_outbox(
     verification_source: str,
     resolution: str,
     provider_message_id: str | None,
+    principal: Principal | None = None,
 ) -> DeliveryRecoveryResult:
     normalized_tenant_id = _normalize_required_tenant_id(required_tenant_id)
     normalized_actor = _normalize_actor(actor)
@@ -528,4 +578,5 @@ async def resolve_needs_review_outbox(
         verification_source=normalized_source,
         resolution=normalized_resolution,
         provider_message_id=provider_message_id,
+        principal=principal,
     )

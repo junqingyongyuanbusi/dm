@@ -3,7 +3,8 @@ import hashlib
 import hmac
 import secrets
 import uuid
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from argon2 import PasswordHasher
@@ -30,9 +31,28 @@ def _password_work_limit() -> asyncio.Semaphore:
     return _PASSWORD_WORK_LIMIT
 
 
+_BOOTSTRAP_MARKER = object()
+
+
+@dataclass(frozen=True)
+class FeishuActionProof:
+    """Durable identity for a callback-authenticated Feishu card action."""
+
+    receipt_id: uuid.UUID
+    tenant_id: str
+    notification_account_id: uuid.UUID
+    notification_intent_id: uuid.UUID
+    customer_account_id: uuid.UUID
+    operator_open_id: str
+    action: str
+    action_nonce: uuid.UUID
+    request_digest: str
+    provider_message_id: str
+
+
 @dataclass(frozen=True)
 class Principal:
-    session_id: uuid.UUID
+    session_id: uuid.UUID | None
     username: str
     actor: str
     allowed_tenants: frozenset[str]
@@ -40,39 +60,64 @@ class Principal:
     tenant_id: str | None = None
     must_change_password: bool = False
     role: str = "USER"
+    authentication_kind: str = "SESSION"
+    action_proof: FeishuActionProof | None = None
+    _bootstrap_marker: object | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def is_superadmin(self) -> bool:
         # SUPERADMIN is exclusively the environment-backed bootstrap identity;
-        # a database user must never gain this authority from a role string.
-        return self.user_id is None and self.role == "SUPERADMIN"
+        # a database user or callback proof must never gain this authority from a role string.
+        return (
+            self.authentication_kind == "SESSION"
+            and self.session_id is not None
+            and self.user_id is None
+            and self.action_proof is None
+            and self._bootstrap_marker is _BOOTSTRAP_MARKER
+            and self.role == "SUPERADMIN"
+        )
 
     @property
     def is_admin(self) -> bool:
-        # The database ADMIN role no longer exists. This compatibility name now
-        # means the environment-backed SUPERADMIN has Tenant-wide authority.
-        return self.is_superadmin
+        # Business capability only; system routes must require is_superadmin explicitly.
+        return self.is_workspace_admin
+
+    @property
+    def is_workspace_admin(self) -> bool:
+        return self.is_superadmin or (self.user_id is not None and self.role == "WORKSPACE_ADMIN")
+
+    @property
+    def is_feishu_action(self) -> bool:
+        return self.authentication_kind == "FEISHU_ACTION"
 
     def require_tenant(self, tenant_id: str) -> None:
         if tenant_id not in self.allowed_tenants:
             raise HTTPException(status_code=403, detail="tenant_access_denied")
 
+    def can_access_account(self, account: models.PlatformAccount) -> bool:
+        if account.tenant_id not in self.allowed_tenants:
+            return False
+        return self.is_workspace_admin or (
+            self.user_id is not None
+            and (account.owner_user_id == self.user_id or account.shared_with_support is True)
+        )
+
     def require_admin(self) -> None:
-        if not self.is_admin:
+        if not self.is_workspace_admin:
             raise HTTPException(status_code=403, detail="admin_required")
 
     def require_tenant_admin(self) -> None:
-        if not self.is_admin:
+        if not self.is_workspace_admin:
             raise HTTPException(status_code=403, detail="tenant_admin_required")
 
     def require_superadmin(self) -> None:
         if not self.is_superadmin:
             raise HTTPException(status_code=403, detail="superadmin_required")
-
-    def can_access_account(self, account: models.PlatformAccount) -> bool:
-        if account.tenant_id not in self.allowed_tenants:
-            return False
-        return self.is_admin or account.owner_user_id == self.user_id
 
     def require_account(self, account: models.PlatformAccount) -> None:
         if not self.can_access_account(account):
@@ -180,6 +225,9 @@ async def revoke_session(raw_token: str) -> None:
             subject_id = settings.admin_username
             detail = {"username": settings.admin_username, "role": "SUPERADMIN"}
         else:
+            from social_reply.application.account_management.access import lock_user_authority
+
+            await lock_user_authority(session, stored_session.user_id)
             user = await session.get(models.AdminUser, stored_session.user_id)
             if user is None:
                 return
@@ -188,6 +236,9 @@ async def revoke_session(raw_token: str) -> None:
             subject_type = "admin_user"
             subject_id = str(user.id)
             detail = {"username": user.username, "role": user.role}
+        from social_reply.application.account_management.access import lock_session_authorities
+
+        await lock_session_authorities(session, (stored_session.id,))
         await session.execute(
             delete(models.AdminSession).where(
                 models.AdminSession.token_digest == _token_digest(raw_token)
@@ -214,7 +265,7 @@ async def authenticate(username: str, password: str) -> tuple[Principal, str] | 
             await verify_dummy_password(password)
             return None
         raw_token, session_id = await issue_session()
-        return _bootstrap_principal(session_id), raw_token
+        return _bootstrap_principal(session_id, verified=True), raw_token
 
     async with get_session_factory()() as session:
         user = (
@@ -232,6 +283,9 @@ async def authenticate(username: str, password: str) -> tuple[Principal, str] | 
         return None
     verified_hash = user.password_hash
     async with get_session_factory()() as session:
+        from social_reply.application.account_management.access import lock_user_authority
+
+        await lock_user_authority(session, user.id)
         stored_user = (
             await session.execute(
                 select(models.AdminUser).where(models.AdminUser.id == user.id).with_for_update()
@@ -274,16 +328,19 @@ async def authenticate(username: str, password: str) -> tuple[Principal, str] | 
     return principal, raw_token
 
 
-def _bootstrap_principal(session_id: uuid.UUID) -> Principal:
+def _bootstrap_principal(session_id: uuid.UUID, *, verified: bool = False) -> Principal:
     settings = get_settings()
-    return Principal(
+    principal = Principal(
         session_id=session_id,
         username=settings.admin_username,
         actor=f"user:{settings.admin_username}",
         allowed_tenants=settings.allowed_admin_tenants,
-        tenant_id=DEFAULT_TENANT_ID,
+        tenant_id=None,
         role="SUPERADMIN",
     )
+    if verified:
+        object.__setattr__(principal, "_bootstrap_marker", _BOOTSTRAP_MARKER)
+    return principal
 
 
 def _user_principal(session_id: uuid.UUID, user: models.AdminUser) -> Principal:
@@ -323,7 +380,7 @@ async def principal_from_token(raw_token: str) -> Principal | None:
             stored_session.bootstrap_fingerprint or "", _bootstrap_fingerprint()
         ):
             return None
-        return _bootstrap_principal(stored_session.id)
+        return _bootstrap_principal(stored_session.id, verified=True)
     settings = get_settings()
     if (
         user is None
@@ -352,19 +409,25 @@ async def principal_from_session_row(
             models.AdminSession.id == session_uuid,
             models.AdminSession.expires_at > datetime.now(UTC),
         )
+        .execution_options(populate_existing=True)
     )
     if for_update:
+        from social_reply.application.account_management.access import lock_session_authorities
+
+        await lock_session_authorities(session, (session_uuid,))
         stmt = stmt.with_for_update(of=models.AdminSession)
     row = (await session.execute(stmt)).one_or_none()
     if row is None:
         return None
     stored_session, user = row
+    if stored_session.expires_at is None or stored_session.expires_at <= datetime.now(UTC):
+        return None
     if stored_session.user_id is None:
         if not hmac.compare_digest(
             stored_session.bootstrap_fingerprint or "", _bootstrap_fingerprint()
         ):
             return None
-        return _bootstrap_principal(stored_session.id)
+        return _bootstrap_principal(stored_session.id, verified=True)
     settings = get_settings()
     if (
         user is None
@@ -384,8 +447,21 @@ async def principal_from_session_id(session_id: uuid.UUID | str) -> Principal | 
         return await principal_from_session_row(session, session_id)
 
 
+_AUTHENTICATED_PRINCIPAL: ContextVar[Principal | None] = ContextVar(
+    "reply_authenticated_principal",
+    default=None,
+)
+
+
+def authenticated_principal_context() -> Principal | None:
+    """Return the principal authenticated by the current HTTP request task."""
+    return _AUTHENTICATED_PRINCIPAL.get()
+
+
 async def current_principal(request: Request) -> Principal | None:
-    return await principal_from_token(request.cookies.get("reply_admin_session", ""))
+    principal = await principal_from_token(request.cookies.get("reply_admin_session", ""))
+    _AUTHENTICATED_PRINCIPAL.set(principal)
+    return principal
 
 
 async def require_principal(request: Request) -> Principal:

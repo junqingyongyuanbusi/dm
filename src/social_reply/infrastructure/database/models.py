@@ -46,7 +46,7 @@ class AdminUser(Base):
     __table_args__ = (
         UniqueConstraint("username"),
         UniqueConstraint("tenant_id", "id", name="uq_admin_users_tenant_id_id"),
-        CheckConstraint("role = 'USER'", name="ck_admin_users_role"),
+        CheckConstraint("role IN ('USER', 'WORKSPACE_ADMIN')", name="ck_admin_users_role"),
         CheckConstraint("status IN ('active', 'disabled')", name="ck_admin_users_status"),
         Index("ix_admin_users_tenant_role_status", "tenant_id", "role", "status"),
     )
@@ -150,12 +150,13 @@ class PlatformAccount(Base):
     platform: Mapped[str] = mapped_column(Text)
     platform_app_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("platform_apps.id"))
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    shared_with_support: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     name: Mapped[str] = mapped_column(Text)
     provider_username: Mapped[str | None] = mapped_column(Text)
     avatar_url: Mapped[str | None] = mapped_column(Text)
-    profile_updated_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    profile_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     external_account_id: Mapped[str | None] = mapped_column(Text)
     public_id: Mapped[str | None] = mapped_column(Text)
     credential_ref: Mapped[str | None] = mapped_column(Text)
@@ -169,6 +170,32 @@ class PlatformAccount(Base):
     automation_default: Mapped[str] = mapped_column(Text, default="BOT_DRAFT_ONLY")
     status: Mapped[str] = mapped_column(Text, default=ACTIVE_ACCOUNT_STATUS)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AccountReauthorizationGrant(Base):
+    __tablename__ = "account_reauthorization_grants"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "platform_account_id", "user_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "user_id"],
+            ["admin_users.tenant_id", "admin_users.id"],
+            ondelete="CASCADE",
+        ),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Contact(Base):
@@ -523,6 +550,7 @@ class HumanWorkItem(Base):
         ForeignKey("admin_users.id", ondelete="SET NULL")
     )
     assigned_actor: Mapped[str | None] = mapped_column(Text)
+    assigned_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -814,6 +842,9 @@ class OutboxMessage(Base):
     origin_kind: Mapped[str] = mapped_column(Text, default="DECISION")
     actor_kind: Mapped[str] = mapped_column(Text, default="BOT")
     actor_id: Mapped[str | None] = mapped_column(Text)
+    initiator_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("admin_users.id"))
+    initiator_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    human_work_item_version: Mapped[int | None] = mapped_column(Integer)
     idempotency_key: Mapped[str] = mapped_column(Text, unique=True)
     status: Mapped[str] = mapped_column(Text, default="PENDING")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -866,6 +897,14 @@ class ProvisioningJob(Base):
     operation: Mapped[str] = mapped_column(Text, default="CONNECT_ACCOUNT")
     actor: Mapped[str] = mapped_column(Text)
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    initiator_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("admin_users.id"))
+    initiator_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    target_account_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("platform_accounts.id"))
+    expected_config_version: Mapped[int | None] = mapped_column(Integer)
+    authority_kind: Mapped[str] = mapped_column(
+        Text, default="UNVERIFIED", server_default=text("'UNVERIFIED'")
+    )
+    authority_version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     idempotency_key: Mapped[str] = mapped_column(Text)
     request: Mapped[dict] = mapped_column(JSONB)
     staging_secret_ref: Mapped[str] = mapped_column(Text, default="")
@@ -1205,8 +1244,7 @@ class ReplyDecision(Base):
             name="ck_reply_decisions_localization_provenance",
         ),
         CheckConstraint(
-            "rag_evidence IS NULL "
-            "OR jsonb_typeof(rag_evidence) IS NOT DISTINCT FROM 'object'",
+            "rag_evidence IS NULL OR jsonb_typeof(rag_evidence) IS NOT DISTINCT FROM 'object'",
             name="ck_reply_decisions_rag_evidence_object",
         ),
         CheckConstraint(

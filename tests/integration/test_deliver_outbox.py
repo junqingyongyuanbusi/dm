@@ -9,6 +9,7 @@ import httpx
 import pytest
 from sqlalchemy import insert, select, text, update
 
+from social_reply.application.account_management.auth import authenticate, hash_password
 from social_reply.application.account_management.reply_prompt_policy import (
     save_reply_business_prompt,
 )
@@ -164,6 +165,82 @@ async def _seed(
     )
     await session.commit()
     return conv_id, outbox_id
+
+
+async def _seed_human_delivery(session) -> tuple[uuid.UUID, uuid.UUID]:
+    conversation_id, outbox_id = await _seed(session, state="HUMAN_ACTIVE")
+    username = f"delivery-human-{uuid.uuid4().hex}"
+    password = f"human-delivery-password-{uuid.uuid4().hex}"
+    user = models.AdminUser(
+        username=username,
+        password_hash=await hash_password(password),
+        tenant_id="default",
+        role="WORKSPACE_ADMIN",
+        must_change_password=False,
+        status="active",
+    )
+    session.add(user)
+    await session.commit()
+
+    authenticated = await authenticate(username, password)
+    assert authenticated is not None
+    principal, _token = authenticated
+    assert principal.session_id is not None
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox is not None
+    session.add(
+        models.HumanWorkItem(
+            tenant_id=outbox.tenant_id,
+            conversation_id=conversation_id,
+            status="CLAIMED",
+            reason_code="TEST_MANUAL_REPLY",
+            assigned_user_id=user.id,
+            assigned_actor=principal.actor,
+            assigned_session_id=principal.session_id,
+            claimed_at=datetime.now(UTC),
+            version=1,
+        )
+    )
+    outbox.origin_kind = "MANUAL_REPLY"
+    outbox.actor_kind = "ADMIN_HUMAN"
+    outbox.actor_id = principal.actor
+    outbox.initiator_user_id = user.id
+    outbox.initiator_session_id = principal.session_id
+    outbox.human_work_item_version = 1
+    await session.commit()
+    return conversation_id, outbox_id
+
+
+async def _prompt_admin_principal(session):
+    username = f"delivery-prompt-admin-{uuid.uuid4().hex}"
+    password = f"delivery-prompt-password-{uuid.uuid4().hex}"
+    user = models.AdminUser(
+        id=uuid.uuid4(),
+        username=username,
+        password_hash=await hash_password(password),
+        tenant_id="default",
+        role="WORKSPACE_ADMIN",
+        must_change_password=False,
+        status="active",
+    )
+    session.add(user)
+    await session.commit()
+    authenticated = await authenticate(username, password)
+    assert authenticated is not None
+    principal, _token = authenticated
+    return principal
+
+
+
+
+async def _read_outbox_checkpoint(
+    outbox_id: uuid.UUID,
+) -> tuple[str, int] | None:
+    async with get_session_factory()() as observer:
+        row = await observer.get(models.OutboxMessage, outbox_id)
+        if row is None:
+            return None
+        return row.status, row.attempt_count
 
 
 async def _preflight_reason(session, outbox_id: uuid.UUID) -> str | None:
@@ -595,6 +672,7 @@ async def test_stale_business_prompt_outbox_is_cancelled_before_send(session, mo
         state="BOT_ACTIVE",
         message_type="text",
     )
+    principal = await _prompt_admin_principal(session)
     first_prompt = await save_reply_business_prompt(
         session,
         tenant_id="default",
@@ -603,6 +681,7 @@ async def test_stale_business_prompt_outbox_is_cancelled_before_send(session, mo
         expected_revision=0,
         actor="user:admin",
         change_note="Initial prompt",
+        principal=principal,
     )
     await session.execute(
         update(models.ReplyDecision)
@@ -620,6 +699,7 @@ async def test_stale_business_prompt_outbox_is_cancelled_before_send(session, mo
         content="Answer directly, then provide one practical next step.",
         expected_revision=1,
         actor="user:admin",
+        principal=principal,
         change_note="Add next step",
     )
     await session.commit()
@@ -671,6 +751,7 @@ async def test_disabled_business_prompt_gate_rejects_prompt_derived_outbox(
         state="BOT_ACTIVE",
         message_type="text",
     )
+    principal = await _prompt_admin_principal(session)
     prompt = await save_reply_business_prompt(
         session,
         tenant_id="default",
@@ -679,6 +760,7 @@ async def test_disabled_business_prompt_gate_rejects_prompt_derived_outbox(
         expected_revision=0,
         actor="user:admin",
         change_note="Initial prompt",
+        principal=principal,
     )
     await session.execute(
         update(models.ReplyDecision)
@@ -717,6 +799,7 @@ async def test_prompt_save_waits_for_provider_send_holding_the_prompt_epoch_lock
         state="BOT_ACTIVE",
         message_type="text",
     )
+    principal = await _prompt_admin_principal(session)
     first_prompt = await save_reply_business_prompt(
         session,
         tenant_id="default",
@@ -725,6 +808,7 @@ async def test_prompt_save_waits_for_provider_send_holding_the_prompt_epoch_lock
         expected_revision=0,
         actor="user:admin",
         change_note="Initial prompt",
+        principal=principal,
     )
     await session.execute(
         update(models.ReplyDecision)
@@ -758,6 +842,7 @@ async def test_prompt_save_waits_for_provider_send_holding_the_prompt_epoch_lock
                 expected_revision=1,
                 actor="user:admin",
                 change_note="Add next step",
+                principal=principal,
             )
             await save_session.commit()
 
@@ -1613,7 +1698,7 @@ async def test_takeover_waits_for_inflight_direct_send_then_commits(session, mon
     assert state.state == "HUMAN_ACTIVE"
 
 
-async def test_cancelled_direct_send_timeout_finalizes_ambiguity_and_releases_lock(
+async def test_cancelled_direct_send_timeout_finalizes_ambiguity_after_checkpoint(
     session,
     monkeypatch,
 ):
@@ -1621,9 +1706,11 @@ async def test_cancelled_direct_send_timeout_finalizes_ambiguity_and_releases_lo
     send_started = asyncio.Event()
     send_cancelled = asyncio.Event()
     never_release = asyncio.Event()
+    checkpoint_observations = []
 
     class Sender:
         async def send_text(self, *, target, text):
+            checkpoint_observations.append(await _read_outbox_checkpoint(outbox_id))
             send_started.set()
             try:
                 await never_release.wait()
@@ -1638,6 +1725,7 @@ async def test_cancelled_direct_send_timeout_finalizes_ambiguity_and_releases_lo
 
     delivery_task = asyncio.create_task(deliver_outbox(str(outbox_id)))
     await asyncio.wait_for(send_started.wait(), timeout=1)
+    assert checkpoint_observations == [("SENDING", 1)]
     delivery_task.cancel()
     assert await delivery_task == "NEEDS_REVIEW"
     await asyncio.wait_for(send_cancelled.wait(), timeout=1)
@@ -1658,8 +1746,110 @@ async def test_cancelled_direct_send_timeout_finalizes_ambiguity_and_releases_lo
     outbox = await session.get(models.OutboxMessage, outbox_id)
     state = await session.get(models.AutomationState, conversation_id)
     assert outbox.status == "NEEDS_REVIEW"
+    assert outbox.attempt_count == 1
     assert outbox.last_error_code == "AMBIGUOUS_SEND"
     assert state.state == "HUMAN_ACTIVE"
+
+
+async def test_checkpointed_bot_send_survives_provider_termination_and_stale_sweep(
+    session,
+    monkeypatch,
+):
+    _conversation_id, outbox_id = await _seed(session)
+    checkpoint_observations = []
+    provider_calls = 0
+    provider_accepted = []
+
+    class ProviderTerminated(BaseException):
+        pass
+
+    async def accepted_then_terminated(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        checkpoint_observations.append(await _read_outbox_checkpoint(outbox_id))
+        provider_accepted.append(True)
+        raise ProviderTerminated
+
+    _patch_direct_sender(monkeypatch, accepted_then_terminated)
+    with pytest.raises(ProviderTerminated):
+        await deliver_outbox(str(outbox_id))
+
+    assert checkpoint_observations == [("SENDING", 1)]
+    assert provider_accepted == [True]
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    assert outbox.status == "SENDING"
+    assert outbox.attempt_count == 1
+
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(locked_at=datetime.now(UTC) - timedelta(minutes=11))
+    )
+    await session.commit()
+
+    dispatch_calls = []
+
+    async def unexpected_dispatch(*args, **kwargs):
+        dispatch_calls.append((args, kwargs))
+    monkeypatch.setattr(sweep_module, "dispatch_actor", unexpected_dispatch)
+    assert await sweep_outbox() == []
+    assert dispatch_calls == []
+
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    stale_attempt = await session.scalar(
+        select(models.DeliveryAttempt).where(
+            models.DeliveryAttempt.outbox_id == outbox_id,
+            models.DeliveryAttempt.error_code == "STALE_SENDING",
+        )
+    )
+    assert outbox.status == "NEEDS_REVIEW"
+    assert outbox.attempt_count == 1
+    assert stale_attempt is not None
+    assert stale_attempt.attempt_no == 1
+    assert provider_calls == 1
+
+
+async def test_checkpointed_human_send_survives_provider_cancellation(
+    session,
+    monkeypatch,
+):
+    conversation_id, outbox_id = await _seed_human_delivery(session)
+    checkpoint_observations = []
+    accepted = []
+
+    async def accepted_then_cancelled(**_kwargs):
+        checkpoint_observations.append(await _read_outbox_checkpoint(outbox_id))
+        accepted.append(True)
+        raise asyncio.CancelledError
+
+    _patch_direct_sender(monkeypatch, accepted_then_cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await deliver_outbox(str(outbox_id))
+
+    assert accepted == [True]
+    assert checkpoint_observations == [("SENDING", 1)]
+    session.expire_all()
+    outbox = await session.get(models.OutboxMessage, outbox_id)
+    work = await session.scalar(
+        select(models.HumanWorkItem).where(
+            models.HumanWorkItem.conversation_id == conversation_id,
+            models.HumanWorkItem.status == "CLAIMED",
+        )
+    )
+    session_row = await session.get(models.AdminSession, outbox.initiator_session_id)
+    assert outbox.status == "SENDING"
+    assert outbox.attempt_count == 1
+    assert outbox.initiator_user_id is not None
+    assert outbox.initiator_session_id is not None
+    assert session_row is not None
+    assert session_row.user_id == outbox.initiator_user_id
+    assert work is not None
+    assert work.assigned_user_id == outbox.initiator_user_id
+    assert work.assigned_session_id == outbox.initiator_session_id
+    assert work.assigned_actor == outbox.actor_id
+
 
 async def test_defense2_direct_cancel_when_state_flips_without_defense3(session):
     # 模拟 defense 3 未覆盖的窗口：手动把 outbox 留在 PENDING 但状态已 HUMAN_ACTIVE

@@ -1,6 +1,8 @@
-{% include "components/agent_lifecycle.html" %}
+{% if show_lifecycle %}
+  {% include "components/agent_lifecycle.html" %}
+{% endif %}
 
-<div class="saas-filter-bar">
+<div class="saas-filter-toolbar">
   <span class="saas-status neutral">{{ list_summary }}</span>
   <span class="saas-muted">{{ scope_description }}</span>
 </div>

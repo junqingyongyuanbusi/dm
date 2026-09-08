@@ -7,14 +7,14 @@ import pytest
 from sqlalchemy import select
 
 from apps.api.main import create_app
-from social_reply.application.account_management.auth import hash_password
+from social_reply.application.account_management.auth import authenticate, hash_password
 from social_reply.application.knowledge.commands import (
     ConfirmKnowledgeEnglishCommand,
     CreateKnowledgeDocumentCommand,
     DeleteKnowledgeDraftCommand,
     ImportKnowledgeBatchCommand,
+    KnowledgeAuthorizationError,
     KnowledgeConflictError,
-    KnowledgeNotFoundError,
     KnowledgeValidationError,
     SetKnowledgeOfficialContactCommand,
     execute_confirm_knowledge_english,
@@ -67,6 +67,28 @@ class CoordinatedEmbeddingClient(FakeEmbeddingClient):
 
 def _content_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+@pytest.fixture
+async def knowledge_admin_principal(session):
+    username = f"knowledge-admin-{uuid.uuid4().hex}"
+    password = "knowledge-admin-password-123"
+    session.add(
+        models.AdminUser(
+            username=username,
+            password_hash=await hash_password(password),
+            tenant_id="default",
+            role="WORKSPACE_ADMIN",
+            must_change_password=False,
+            status="active",
+        )
+    )
+    await session.commit()
+    result = await authenticate(username, password)
+    assert result is not None
+    principal, _token = result
+    assert principal.is_workspace_admin
+    return principal
 
 
 async def _seed_publishable_document(
@@ -202,11 +224,13 @@ async def _seed_knowledge_decision_reference(
     await session.flush()
 
 
-async def test_typed_create_is_tenant_scoped_idempotent_and_audited(session, migrated_db):
+async def test_typed_create_is_tenant_scoped_idempotent_and_audited(
+    session, migrated_db, knowledge_admin_principal
+):
     embedder = CountingEmbeddingClient()
     command = CreateKnowledgeDocumentCommand(
         required_tenant_id="default",
-        actor="user:knowledge-admin",
+        principal=knowledge_admin_principal,
         question="How can I change my password?",
         reply="Open Settings, then choose Password.",
         brand_id="retail",
@@ -225,7 +249,7 @@ async def test_typed_create_is_tenant_scoped_idempotent_and_audited(session, mig
         select(models.AuditLog).where(models.AuditLog.action == "CREATE_KNOWLEDGE_DOCUMENT")
     )
     assert audit is not None
-    assert audit.actor == "user:knowledge-admin"
+    assert audit.actor == knowledge_admin_principal.actor
     assert audit.detail["question_length"] == len(command.question)
     assert audit.detail["reply_length"] == len(command.reply)
     assert audit.detail["content_hash"]
@@ -240,11 +264,13 @@ async def test_typed_create_is_tenant_scoped_idempotent_and_audited(session, mig
     assert embedder.calls == 1
 
 
-async def test_concurrent_typed_create_returns_one_stable_duplicate_conflict(migrated_db):
+async def test_concurrent_typed_create_returns_one_stable_duplicate_conflict(
+    migrated_db, knowledge_admin_principal
+):
     embedder = CoordinatedEmbeddingClient()
     command = CreateKnowledgeDocumentCommand(
         required_tenant_id="default",
-        actor="user:knowledge-admin",
+        principal=knowledge_admin_principal,
         question="How do concurrent creates stay idempotent?",
         reply="Serialize the tenant-scoped content hash before persistence.",
         brand_id="default",
@@ -279,7 +305,9 @@ async def test_concurrent_typed_create_returns_one_stable_duplicate_conflict(mig
     assert len(documents) == 1
 
 
-async def test_concurrent_batch_import_counts_duplicate_as_skip(migrated_db):
+async def test_concurrent_batch_import_counts_duplicate_as_skip(
+    migrated_db, knowledge_admin_principal
+):
     embedder = CoordinatedEmbeddingClient()
     csv_text = (
         "question,reply,brand_id\n"
@@ -292,7 +320,7 @@ async def test_concurrent_batch_import_counts_duplicate_as_skip(migrated_db):
                 concurrent_session,
                 ImportKnowledgeBatchCommand(
                     required_tenant_id="default",
-                    actor="user:knowledge-admin",
+                    principal=knowledge_admin_principal,
                     csv_text=csv_text,
                     source_name="concurrent.csv",
                 ),
@@ -328,14 +356,16 @@ async def test_concurrent_batch_import_counts_duplicate_as_skip(migrated_db):
         {"brand_id": "contains spaces"},
         {"platform": "Telegram!"},
         {"category": "bad/category"},
-        {"actor": ""},
+        {"principal": None},
         {"required_tenant_id": ""},
     ],
 )
-async def test_typed_create_rejects_invalid_boundary_values(session, migrated_db, changes):
+async def test_typed_create_rejects_invalid_boundary_values(
+    session, migrated_db, knowledge_admin_principal, changes
+):
     values = {
         "required_tenant_id": "default",
-        "actor": "user:knowledge-admin",
+        "principal": knowledge_admin_principal,
         "question": "Valid question",
         "reply": "Valid reply",
         "brand_id": "default",
@@ -343,7 +373,7 @@ async def test_typed_create_rejects_invalid_boundary_values(session, migrated_db
         "category": "faq",
     }
     values.update(changes)
-    with pytest.raises(KnowledgeValidationError):
+    with pytest.raises((KnowledgeValidationError, KnowledgeAuthorizationError)):
         await execute_create_knowledge_document(
             session,
             CreateKnowledgeDocumentCommand(**values),
@@ -352,7 +382,7 @@ async def test_typed_create_rejects_invalid_boundary_values(session, migrated_db
 
 
 async def test_confirm_english_handles_detection_states_reason_and_tenant_scope(
-    session, migrated_db
+    session, migrated_db, knowledge_admin_principal
 ):
     unknown_document = models.KnowledgeDocument(
         tenant_id="default",
@@ -380,7 +410,7 @@ async def test_confirm_english_handles_detection_states_reason_and_tenant_scope(
             session,
             ConfirmKnowledgeEnglishCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=unknown_document.id,
                 confirmation_reason="short",
             ),
@@ -390,17 +420,17 @@ async def test_confirm_english_handles_detection_states_reason_and_tenant_scope(
             session,
             ConfirmKnowledgeEnglishCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=mixed_document.id,
                 confirmation_reason="The complete source was manually reviewed.",
             ),
         )
-    with pytest.raises(KnowledgeNotFoundError):
+    with pytest.raises(KnowledgeAuthorizationError):
         await execute_confirm_knowledge_english(
             session,
             ConfirmKnowledgeEnglishCommand(
                 required_tenant_id="tenant-b",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=unknown_document.id,
                 confirmation_reason="The complete source was manually reviewed.",
             ),
@@ -410,7 +440,7 @@ async def test_confirm_english_handles_detection_states_reason_and_tenant_scope(
         session,
         ConfirmKnowledgeEnglishCommand(
             required_tenant_id="default",
-            actor="user:knowledge-admin",
+            principal=knowledge_admin_principal,
             document_id=unknown_document.id,
             confirmation_reason="The complete source was manually reviewed.",
         ),
@@ -420,7 +450,9 @@ async def test_confirm_english_handles_detection_states_reason_and_tenant_scope(
     assert confirmed.language_verified is True
 
 
-async def test_confirm_english_rejects_unknown_detection_status(session, migrated_db):
+async def test_confirm_english_rejects_unknown_detection_status(
+    session, migrated_db, knowledge_admin_principal
+):
     document = models.KnowledgeDocument(
         tenant_id="default",
         brand_id="default",
@@ -441,7 +473,7 @@ async def test_confirm_english_rejects_unknown_detection_status(session, migrate
             session,
             ConfirmKnowledgeEnglishCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=document.id,
                 confirmation_reason="The complete source was manually reviewed.",
             ),
@@ -507,7 +539,9 @@ async def test_review_query_uses_real_detection_states_and_preserves_filters(ses
     assert [document.question for document in documents] == ["english pending"]
 
 
-async def test_publish_safety_conflict_bulk_partial_and_delete_audit(session, migrated_db):
+async def test_publish_safety_conflict_bulk_partial_and_delete_audit(
+    session, migrated_db, knowledge_admin_principal
+):
     publishable = await _seed_publishable_document(session, question="Shared question")
     contact_like = await _seed_publishable_document(
         session,
@@ -532,7 +566,7 @@ async def test_publish_safety_conflict_bulk_partial_and_delete_audit(session, mi
         session,
         BulkPublishKnowledgeCommand(
             required_tenant_id="default",
-            actor="user:knowledge-admin",
+            principal=knowledge_admin_principal,
             document_ids=(publishable.id, contact_like.id, missing_embedding.id),
         ),
     )
@@ -556,7 +590,7 @@ async def test_publish_safety_conflict_bulk_partial_and_delete_audit(session, mi
             session,
             PublishKnowledgeCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=conflicting.id,
             ),
         )
@@ -566,7 +600,7 @@ async def test_publish_safety_conflict_bulk_partial_and_delete_audit(session, mi
             session,
             DeleteKnowledgeDraftCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=publishable.id,
             ),
         )
@@ -574,7 +608,7 @@ async def test_publish_safety_conflict_bulk_partial_and_delete_audit(session, mi
         session,
         UnpublishKnowledgeCommand(
             required_tenant_id="default",
-            actor="user:knowledge-admin",
+            principal=knowledge_admin_principal,
             document_id=publishable.id,
         ),
     )
@@ -582,7 +616,7 @@ async def test_publish_safety_conflict_bulk_partial_and_delete_audit(session, mi
         session,
         DeleteKnowledgeDraftCommand(
             required_tenant_id="default",
-            actor="user:knowledge-admin",
+            principal=knowledge_admin_principal,
             document_id=publishable.id,
         ),
     )
@@ -596,7 +630,9 @@ async def test_publish_safety_conflict_bulk_partial_and_delete_audit(session, mi
     assert "reply" not in delete_audit.detail
 
 
-async def test_publish_conflict_uses_unicode_casefold_identity(session, migrated_db):
+async def test_publish_conflict_uses_unicode_casefold_identity(
+    session, migrated_db, knowledge_admin_principal
+):
     published = await _seed_publishable_document(
         session,
         question="Straße",
@@ -612,7 +648,7 @@ async def test_publish_conflict_uses_unicode_casefold_identity(session, migrated
         session,
         PublishKnowledgeCommand(
             required_tenant_id="default",
-            actor="user:knowledge-admin",
+            principal=knowledge_admin_principal,
             document_id=published.id,
         ),
     )
@@ -623,14 +659,14 @@ async def test_publish_conflict_uses_unicode_casefold_identity(session, migrated
             session,
             PublishKnowledgeCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=conflicting.id,
             ),
         )
 
 
 async def test_publish_rejects_verified_document_with_invalid_detection_status(
-    session, migrated_db
+    session, migrated_db, knowledge_admin_principal
 ):
     document = await _seed_publishable_document(session, question="Invalid status")
     document.language_detection_status = "parser_error"
@@ -641,14 +677,16 @@ async def test_publish_rejects_verified_document_with_invalid_detection_status(
             session,
             PublishKnowledgeCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=document.id,
             ),
         )
 
 
 @pytest.mark.parametrize("hash_only", [False, True])
-async def test_unpublish_blocks_direct_knowledge_outbox_in_flight(session, migrated_db, hash_only):
+async def test_unpublish_blocks_direct_knowledge_outbox_in_flight(
+    session, migrated_db, knowledge_admin_principal, hash_only
+):
     document = await _seed_publishable_document(session)
     document.status = "published"
     await _seed_knowledge_decision_reference(
@@ -664,14 +702,16 @@ async def test_unpublish_blocks_direct_knowledge_outbox_in_flight(session, migra
             session,
             UnpublishKnowledgeCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=document.id,
             ),
         )
 
 
 @pytest.mark.parametrize("hash_only", [False, True])
-async def test_delete_blocks_direct_knowledge_decision_history(session, migrated_db, hash_only):
+async def test_delete_blocks_direct_knowledge_decision_history(
+    session, migrated_db, knowledge_admin_principal, hash_only
+):
     document = await _seed_publishable_document(session, question="Historical draft")
     await _seed_knowledge_decision_reference(session, document, hash_only=hash_only)
     await session.commit()
@@ -684,20 +724,22 @@ async def test_delete_blocks_direct_knowledge_decision_history(session, migrated
             session,
             DeleteKnowledgeDraftCommand(
                 required_tenant_id="default",
-                actor="user:knowledge-admin",
+                principal=knowledge_admin_principal,
                 document_id=document.id,
             ),
         )
 
 
-async def test_official_classification_is_draft_only_and_audited(session, migrated_db):
+async def test_official_classification_is_draft_only_and_audited(
+    session, migrated_db, knowledge_admin_principal
+):
     document = await _seed_publishable_document(session)
     await session.commit()
     classified = await execute_set_knowledge_official_contact(
         session,
         SetKnowledgeOfficialContactCommand(
             required_tenant_id="default",
-            actor="user:knowledge-admin",
+            principal=knowledge_admin_principal,
             document_id=document.id,
             is_official_contact=True,
         ),

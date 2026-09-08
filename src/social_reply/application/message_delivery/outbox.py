@@ -4,6 +4,7 @@ import logging
 import math
 import uuid
 from collections.abc import Awaitable
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -11,11 +12,14 @@ from sqlalchemy import and_, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from social_reply.application.account_management.access import session_authority_key
+from social_reply.application.account_management.auth import Principal, principal_from_session_row
 from social_reply.application.account_management.human_workflow import (
     ensure_open_human_work_item,
 )
 from social_reply.application.handoff_notifications.service import (
     ensure_handoff_notification_intent,
+    lock_handoff_notification_route,
 )
 from social_reply.application.message_delivery.contracts import (
     SendContractError,
@@ -60,9 +64,11 @@ from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import (
     hold_connection_advisory_lock,
     hold_connection_advisory_shared_lock,
+    hold_connection_advisory_shared_lock_in_transaction,
     hold_conversation_delivery_lock,
+    hold_conversation_delivery_lock_on_connection_in_transaction,
 )
-from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.database.engine import get_engine, get_session_factory
 from social_reply.infrastructure.killswitch import make_killswitch_checker
 from social_reply.shared.config import get_settings
 
@@ -97,8 +103,7 @@ def _match_only_ambiguity_provenance_is_valid(
     margin = decision.knowledge_similarity_margin
     if (
         decision.knowledge_match_status != "ambiguous"
-        or decision.knowledge_gate_version
-        != KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION
+        or decision.knowledge_gate_version != KNOWLEDGE_MATCH_AMBIGUITY_GATE_VERSION
         or minimum_similarity is None
         or minimum_margin is None
         or top1_similarity is None
@@ -117,11 +122,9 @@ def _match_only_ambiguity_provenance_is_valid(
     if (
         not isinstance(evidence, dict)
         or evidence.get("schema_version") != "rag-evidence-v2"
-        or evidence.get("selection_method")
-        != MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD
+        or evidence.get("selection_method") != MATCH_ONLY_AMBIGUITY_RESOLUTION_METHOD
         or evidence.get("selector_version") != decision.selector_version
-        or evidence.get("selected_content_hash")
-        != decision.knowledge_content_hash
+        or evidence.get("selected_content_hash") != decision.knowledge_content_hash
         or evidence.get("selector_answer_hash") is not None
         or evidence.get("selector_content_hash") is not None
     ):
@@ -132,8 +135,7 @@ def _match_only_ambiguity_provenance_is_valid(
     candidates_by_id = {
         candidate.get("candidate_id"): candidate
         for candidate in candidates
-        if isinstance(candidate, dict)
-        and isinstance(candidate.get("candidate_id"), str)
+        if isinstance(candidate, dict) and isinstance(candidate.get("candidate_id"), str)
     }
     if set(candidates_by_id) != {"candidate-1", "candidate-2"}:
         return False
@@ -196,11 +198,29 @@ async def _await_send[T](awaitable: Awaitable[T]) -> T:
             )
         except TimeoutError:
             task.cancel()
-            try:
-                await task
-            except BaseException:
-                pass
+            task.add_done_callback(_consume_send_task_result)
             raise
+
+
+def _consume_send_task_result(task: asyncio.Task[object]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _rollback_interrupted_delivery(session: AsyncSession) -> None:
+    """Close the post-checkpoint transaction without changing the durable checkpoint."""
+    if not session.in_transaction():
+        return
+    rollback_task = asyncio.create_task(session.rollback())
+    try:
+        await asyncio.shield(rollback_task)
+    except asyncio.CancelledError:
+        try:
+            await rollback_task
+        except BaseException:
+            pass
 
 
 def _safe_error(exc: Exception) -> str:
@@ -247,9 +267,7 @@ async def materialize_sent_outbox(
             id=uuid.uuid4(),
             conversation_id=finalized.conversation_id,
             direction="outbound",
-            sender_type=(
-                "agent" if finalized.actor_kind == "ADMIN_HUMAN" else "bot"
-            ),
+            sender_type=("agent" if finalized.actor_kind == "ADMIN_HUMAN" else "bot"),
             text=text,
             platform_message_id=finalized.platform_message_id,
             source_outbox_id=outbox_id,
@@ -260,9 +278,7 @@ async def materialize_sent_outbox(
         .on_conflict_do_nothing(index_elements=["source_outbox_id"])
     )
     sent_column = (
-        "last_human_message_at"
-        if finalized.actor_kind == "ADMIN_HUMAN"
-        else "last_bot_message_at"
+        "last_human_message_at" if finalized.actor_kind == "ADMIN_HUMAN" else "last_bot_message_at"
     )
     await session.execute(
         update(models.AutomationState)
@@ -396,20 +412,20 @@ async def _validate_direct_send(
     models.PlatformAccount | None,
     TextSendCommand | None,
 ]:
-    account = (
-        await session.execute(
-            select(models.PlatformAccount)
-            .where(models.PlatformAccount.id == row.platform_account_id)
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one()
-    conversation = (
-        await session.execute(
-            select(models.Conversation)
-            .where(models.Conversation.id == row.conversation_id)
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one()
+    conversation = await session.scalar(
+        select(models.Conversation)
+        .where(models.Conversation.id == row.conversation_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    account = await session.scalar(
+        select(models.PlatformAccount)
+        .where(models.PlatformAccount.id == row.platform_account_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if conversation is None or account is None:
+        return await _reject_direct_send(session, row, attempt_no, "TENANT_SCOPE_MISMATCH")
     if (
         account.tenant_id != row.tenant_id
         or conversation.tenant_id != row.tenant_id
@@ -498,11 +514,14 @@ async def _validate_direct_send(
     if row.reply_to_message_id is not None:
         source_message = (
             await session.execute(
-                select(models.Message.reply_target).where(
+                select(models.Message.reply_target)
+                .where(
                     models.Message.id == row.reply_to_message_id,
                     models.Message.conversation_id == row.conversation_id,
                     models.Message.direction == "inbound",
                 )
+                .execution_options(populate_existing=True)
+                .with_for_update()
             )
         ).first()
     else:
@@ -518,13 +537,18 @@ async def _validate_direct_send(
                     models.ReplyDecision.outbox_id == row.id,
                     models.Message.conversation_id == row.conversation_id,
                 )
+                .execution_options(populate_existing=True)
+                .with_for_update()
             )
         ).first()
     conversation_external_user_id = await session.scalar(
-        select(models.Contact.external_user_id).where(
+        select(models.Contact.external_user_id)
+        .where(
             models.Contact.id == conversation.contact_id,
             models.Contact.platform_account_id == account.id,
         )
+        .execution_options(populate_existing=True)
+        .with_for_update()
     )
     if source_message is None or not conversation_external_user_id:
         return await _reject_direct_send(
@@ -582,10 +606,7 @@ def _send_state_allowed(
     origin_kind = _effective_origin_kind(row, payload)
     return (
         (origin_kind == "DECISION" and state == "BOT_ACTIVE")
-        or (
-            origin_kind == "DRAFT_APPROVAL"
-            and state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}
-        )
+        or (origin_kind == "DRAFT_APPROVAL" and state in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"})
         or (origin_kind == "MANUAL_REPLY" and state == "HUMAN_ACTIVE")
         or (origin_kind == "SYSTEM_NOTICE" and state in {"HANDOFF_PENDING", "HUMAN_ACTIVE"})
     )
@@ -634,6 +655,191 @@ async def _email_replies_sent_in_window(
     )
 
 
+async def _validate_human_outbox_authority(
+    session: AsyncSession,
+    *,
+    outbox: models.OutboxMessage,
+    prevalidation_error: str | None = None,
+) -> str | None:
+    payload = dict(outbox.payload) if isinstance(outbox.payload, dict) else {}
+    effective_origin = _effective_origin_kind(outbox, payload)
+    requires_human = outbox.actor_kind == "ADMIN_HUMAN" or outbox.origin_kind in {
+        "MANUAL_REPLY",
+        "DRAFT_APPROVAL",
+    }
+    if not requires_human:
+        return None
+    if outbox.actor_kind != "ADMIN_HUMAN":
+        return "HUMAN_ACTOR_KIND_INVALID"
+    if effective_origin not in {"MANUAL_REPLY", "DRAFT_APPROVAL"}:
+        return "HUMAN_ORIGIN_INVALID"
+    if prevalidation_error is not None:
+        return prevalidation_error
+    if outbox.initiator_session_id is None:
+        return "HUMAN_INITIATOR_SESSION_MISSING"
+    principal = await principal_from_session_row(
+        session,
+        outbox.initiator_session_id,
+        for_update=True,
+    )
+    if (
+        principal is None
+        or principal.is_feishu_action
+        or principal.session_id != outbox.initiator_session_id
+        or principal.must_change_password
+    ):
+        return "HUMAN_INITIATOR_SESSION_INVALID"
+    if principal.actor != outbox.actor_id:
+        return "HUMAN_INITIATOR_IDENTITY_MISMATCH"
+    if principal.user_id != outbox.initiator_user_id:
+        return "HUMAN_INITIATOR_USER_MISMATCH"
+
+    conversation = await session.scalar(
+        select(models.Conversation)
+        .where(
+            models.Conversation.id == outbox.conversation_id,
+            models.Conversation.tenant_id == outbox.tenant_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    account = await session.scalar(
+        select(models.PlatformAccount)
+        .where(
+            models.PlatformAccount.id == outbox.platform_account_id,
+            models.PlatformAccount.tenant_id == outbox.tenant_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if (
+        conversation is None
+        or account is None
+        or conversation.platform_account_id != account.id
+        or not principal.can_access_account(account)
+    ):
+        return "HUMAN_ACCOUNT_ACCESS_INVALID"
+    if effective_origin == "DRAFT_APPROVAL":
+        if outbox.human_work_item_version is not None:
+            return "HUMAN_WORK_VERSION_INVALID"
+        if outbox.origin_kind == "DRAFT_APPROVAL":
+            decision_link = or_(
+                models.ReplyDecision.review_outbox_id == outbox.id,
+                and_(
+                    models.ReplyDecision.review_outbox_id.is_(None),
+                    models.ReplyDecision.outbox_id == outbox.id,
+                ),
+            )
+        else:
+            decision_link = models.ReplyDecision.outbox_id == outbox.id
+        decision = await session.scalar(
+            select(models.ReplyDecision)
+            .where(
+                decision_link,
+                models.ReplyDecision.tenant_id == outbox.tenant_id,
+                models.ReplyDecision.conversation_id == outbox.conversation_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if decision is None:
+            return "DRAFT_APPROVAL_PROVENANCE_INVALID"
+        if (
+            decision.action != "draft"
+            or decision.review_action not in {"ACCEPTED", "EDITED"}
+            or not decision.reviewed_by
+            or decision.reviewed_at is None
+            or decision.reviewed_by != principal.actor
+            or decision.final_reply_text != payload.get("text")
+        ):
+            return "DRAFT_APPROVAL_PROVENANCE_INVALID"
+        return None if principal.is_workspace_admin else "DRAFT_APPROVER_NOT_AUTHORIZED"
+    if outbox.human_work_item_version is None:
+        return "HUMAN_WORK_VERSION_MISSING"
+    work = await session.scalar(
+        select(models.HumanWorkItem)
+        .where(
+            models.HumanWorkItem.tenant_id == outbox.tenant_id,
+            models.HumanWorkItem.conversation_id == outbox.conversation_id,
+            models.HumanWorkItem.version == outbox.human_work_item_version,
+            models.HumanWorkItem.status == "CLAIMED",
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if work is None:
+        return "HUMAN_WORK_VERSION_STALE"
+    if principal.user_id is None:
+        if (
+            not principal.is_superadmin
+            or work.assigned_user_id is not None
+            or work.assigned_session_id != principal.session_id
+            or work.assigned_actor != principal.actor
+        ):
+            return "HUMAN_ASSIGNMENT_STALE"
+    elif work.assigned_user_id != principal.user_id or work.assigned_actor != principal.actor:
+        return "HUMAN_ASSIGNMENT_STALE"
+    return None
+
+
+async def _lock_public_send_route_accounts(
+    session: AsyncSession,
+    *,
+    outbox: models.OutboxMessage,
+) -> (
+    tuple[
+        dict[str, object | None],
+        dict[uuid.UUID, models.PlatformAccount],
+    ]
+    | None
+):
+    route_values = await lock_handoff_notification_route(
+        session,
+        tenant_id=outbox.tenant_id,
+    )
+    notification_account_id = route_values["feishu_platform_account_id"]
+    account_ids = {outbox.platform_account_id}
+    if isinstance(notification_account_id, uuid.UUID):
+        account_ids.add(notification_account_id)
+    locked_accounts = {
+        account_row.id: account_row
+        for account_row in (
+            await session.scalars(
+                select(models.PlatformAccount)
+                .where(
+                    models.PlatformAccount.tenant_id == outbox.tenant_id,
+                    models.PlatformAccount.id.in_(account_ids),
+                )
+                .execution_options(populate_existing=True)
+                .order_by(models.PlatformAccount.id)
+                .with_for_update()
+            )
+        ).all()
+    }
+    # The shared config guard freezes the route; validate the notification account after
+    # the ordered row lock before accepting the route snapshot as PENDING.
+    if route_values["status"] == "PENDING":
+        notification_account = (
+            locked_accounts.get(notification_account_id)
+            if isinstance(notification_account_id, uuid.UUID)
+            else None
+        )
+        if (
+            notification_account is None
+            or notification_account.platform != AccountPlatform.FEISHU
+            or not is_active_account_status(notification_account.status)
+        ):
+            route_values = {
+                "notification_config_id": None,
+                "config_version": None,
+                "feishu_platform_account_id": None,
+                "destination_chat_id": None,
+                "status": "BLOCKED_CONFIG",
+                "last_error_code": "FEISHU_HANDOFF_ACCOUNT_INVALID",
+            }
+    return (route_values, locked_accounts) if set(locked_accounts) == account_ids else None
+
+
 async def _public_bot_send_preflight(
     session: AsyncSession,
     *,
@@ -656,6 +862,24 @@ async def _public_bot_send_preflight(
         and outbox.actor_kind == "ADMIN_HUMAN"
         and payload.get("approval") == "admin"
     )
+    locked_route = await _lock_public_send_route_accounts(
+        session,
+        outbox=outbox,
+    )
+    if locked_route is None:
+        return "PUBLIC_SEND_SCOPE_INVALID"
+    route_values, locked_accounts = locked_route
+    if route_values["status"] != "PENDING":
+        return "PUBLIC_SEND_ROUTE_INVALID"
+    account = locked_accounts.get(outbox.platform_account_id)
+    conversation = await session.scalar(
+        select(models.Conversation)
+        .where(models.Conversation.id == outbox.conversation_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if conversation is None or account is None:
+        return "PUBLIC_SEND_SCOPE_INVALID"
     if authority == "DECISION":
         decision_link = models.ReplyDecision.outbox_id == outbox.id
     elif predecessor_approval:
@@ -670,7 +894,15 @@ async def _public_bot_send_preflight(
         decision_link = models.ReplyDecision.outbox_id == outbox.id
     decisions = (
         await session.scalars(
-            select(models.ReplyDecision).where(decision_link).limit(2)
+            select(models.ReplyDecision)
+            .where(
+                decision_link,
+                models.ReplyDecision.tenant_id == outbox.tenant_id,
+                models.ReplyDecision.conversation_id == outbox.conversation_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+            .limit(2)
         )
     ).all()
     if len(decisions) > 1:
@@ -678,10 +910,13 @@ async def _public_bot_send_preflight(
     decision = decisions[0] if decisions else None
     if decision is None:
         return "PUBLIC_SEND_PROVENANCE_INVALID"
-    conversation = await session.get(models.Conversation, outbox.conversation_id)
-    account = await session.get(models.PlatformAccount, outbox.platform_account_id)
     source_message = (
-        await session.get(models.Message, decision.message_id)
+        await session.scalar(
+            select(models.Message)
+            .where(models.Message.id == decision.message_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
         if decision.message_id is not None
         else None
     )
@@ -722,10 +957,7 @@ async def _public_bot_send_preflight(
         "reply_business_prompt_enabled",
         False,
     )
-    if (
-        decision.reply_business_prompt_content_hash is not None
-        and not business_prompt_enabled
-    ):
+    if decision.reply_business_prompt_content_hash is not None and not business_prompt_enabled:
         return "REPLY_BUSINESS_PROMPT_DISABLED"
     if business_prompt_enabled and decision.reply_business_prompt_content_hash is None:
         return "REPLY_BUSINESS_PROMPT_PROVENANCE_REQUIRED"
@@ -768,6 +1000,7 @@ async def _public_bot_send_preflight(
         decision.action != "draft"
         or decision.review_action not in {"ACCEPTED", "EDITED"}
         or not decision.reviewed_by
+        or decision.reviewed_by != outbox.actor_id
         or decision.reviewed_at is None
         or not (
             decision.review_outbox_id == outbox.id
@@ -788,12 +1021,9 @@ async def _public_bot_send_preflight(
         decision.multilingual_contract_version == KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION
     )
     match_only_ambiguity_contract = (
-        decision.multilingual_contract_version
-        == KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION
+        decision.multilingual_contract_version == KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION
     )
-    match_only_contract = (
-        match_only_single_contract or match_only_ambiguity_contract
-    )
+    match_only_contract = match_only_single_contract or match_only_ambiguity_contract
     if match_only_contract:
         if not getattr(settings, "knowledge_match_only_reply_enabled", False):
             return "KNOWLEDGE_MATCH_ONLY_REPLY_DISABLED"
@@ -803,8 +1033,7 @@ async def _public_bot_send_preflight(
         single_candidate_provenance_is_valid = (
             decision.knowledge_similarity is not None
             and decision.knowledge_min_similarity_threshold is not None
-            and decision.knowledge_similarity
-            >= decision.knowledge_min_similarity_threshold
+            and decision.knowledge_similarity >= decision.knowledge_min_similarity_threshold
         )
         if decision.knowledge_gate_version == "strong-gate-v1":
             single_candidate_provenance_is_valid = (
@@ -817,10 +1046,7 @@ async def _public_bot_send_preflight(
                     >= decision.knowledge_min_margin_threshold
                 )
             )
-        elif (
-            decision.knowledge_gate_version
-            == KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION
-        ):
+        elif decision.knowledge_gate_version == KNOWLEDGE_MATCH_ONLY_SIMILARITY_GATE_VERSION:
             single_candidate_provenance_is_valid = (
                 single_candidate_provenance_is_valid
                 and decision.knowledge_match_status in {"strong", "ambiguous"}
@@ -829,9 +1055,7 @@ async def _public_bot_send_preflight(
             single_candidate_provenance_is_valid = False
         if not single_candidate_provenance_is_valid:
             return "MULTILINGUAL_PROVENANCE_INVALID"
-    if match_only_ambiguity_contract and not _match_only_ambiguity_provenance_is_valid(
-        decision
-    ):
+    if match_only_ambiguity_contract and not _match_only_ambiguity_provenance_is_valid(decision):
         return "MULTILINGUAL_PROVENANCE_INVALID"
     if decision.multilingual_contract_version == MULTILINGUAL_GENERATION_CONTRACT_VERSION:
         if not settings.multilingual_knowledge_reply_enabled:
@@ -845,13 +1069,9 @@ async def _public_bot_send_preflight(
         ):
             return "MULTILINGUAL_PROVENANCE_INVALID"
         if decision.knowledge_gate_version == "strong-gate-v1":
-            if (
-                decision.knowledge_min_margin_threshold is None
-                or (
-                    decision.knowledge_similarity_margin is not None
-                    and decision.knowledge_similarity_margin
-                    < decision.knowledge_min_margin_threshold
-                )
+            if decision.knowledge_min_margin_threshold is None or (
+                decision.knowledge_similarity_margin is not None
+                and decision.knowledge_similarity_margin < decision.knowledge_min_margin_threshold
             ):
                 return "MULTILINGUAL_PROVENANCE_INVALID"
         elif decision.knowledge_gate_version not in {
@@ -865,15 +1085,11 @@ async def _public_bot_send_preflight(
         decision.knowledge_chunk_id,
         decision.knowledge_content_hash,
     )
-    if (
-        decision.multilingual_contract_version
-        in {
-            MULTILINGUAL_GENERATION_CONTRACT_VERSION,
-            KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
-            KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
-        }
-        and not any(value is not None for value in knowledge_identity)
-    ):
+    if decision.multilingual_contract_version in {
+        MULTILINGUAL_GENERATION_CONTRACT_VERSION,
+        KNOWLEDGE_MATCH_ONLY_CONTRACT_VERSION,
+        KNOWLEDGE_MATCH_AMBIGUITY_CONTRACT_VERSION,
+    } and not any(value is not None for value in knowledge_identity):
         return "MULTILINGUAL_KNOWLEDGE_IDENTITY_INVALID"
     source_row = None
     if any(value is not None for value in knowledge_identity):
@@ -924,13 +1140,15 @@ async def _public_bot_send_preflight(
             return "LOCALIZATION_PROVENANCE_INVALID"
         document, chunk = source_row
         artifact = await session.scalar(
-            select(models.KnowledgeLocalization).where(
+            select(models.KnowledgeLocalization)
+            .where(
                 models.KnowledgeLocalization.tenant_id == decision.tenant_id,
                 models.KnowledgeLocalization.id == decision.knowledge_localization_id,
                 models.KnowledgeLocalization.document_id == document.id,
                 models.KnowledgeLocalization.release_id
                 == decision.knowledge_localization_release_id,
-            ).with_for_update()
+            )
+            .with_for_update()
         )
         if artifact is None:
             return "LOCALIZATION_RELEASE_MISSING"
@@ -1046,6 +1264,7 @@ async def _deliver_outbox_locked(
     connection: AsyncConnection,
     oid: uuid.UUID,
     conversation_id: uuid.UUID,
+    human_prevalidation_error: str | None = None,
 ) -> str:
     claimed = (
         await session.execute(
@@ -1069,7 +1288,11 @@ async def _deliver_outbox_locked(
         await session.commit()
         return "SKIPPED_NOT_CLAIMABLE"
     row = (
-        await session.execute(select(models.OutboxMessage).where(models.OutboxMessage.id == oid))
+        await session.execute(
+            select(models.OutboxMessage)
+            .where(models.OutboxMessage.id == oid)
+            .execution_options(populate_existing=True)
+        )
     ).scalar_one()
     attempt_no = row.attempt_count + 1
     if not isinstance(row.payload, dict):
@@ -1098,6 +1321,19 @@ async def _deliver_outbox_locked(
             session,
             outbox=row,
             payload_text=payload["text"],
+        )
+    human_authority_error = await _validate_human_outbox_authority(
+        session,
+        outbox=row,
+        prevalidation_error=human_prevalidation_error,
+    )
+    if human_authority_error is not None:
+        return await _stop_before_send(
+            session,
+            oid,
+            "NEEDS_REVIEW",
+            human_authority_error,
+            attempt_no,
         )
     if preflight_error is not None:
         await _handoff_public_send_failure(
@@ -1159,20 +1395,166 @@ async def _deliver_outbox_locked(
         return stopped
 
     async def dispatch() -> str:
+        nonlocal row
+        expected_actor_kind = row.actor_kind
+        expected_actor_id = row.actor_id
+        expected_initiator_user_id = row.initiator_user_id
+        expected_initiator_session_id = row.initiator_session_id
         dispatch_claim = (
             await session.execute(
                 update(models.OutboxMessage)
                 .where(
                     models.OutboxMessage.id == oid,
                     models.OutboxMessage.status == "SENDING",
+                    models.OutboxMessage.attempt_count == attempt_no - 1,
                 )
-                .values(attempt_count=attempt_no)
+                .values(
+                    status="SENDING",
+                    attempt_count=attempt_no,
+                    locked_at=datetime.now(UTC),
+                    locked_by="deliver",
+                )
                 .returning(models.OutboxMessage.id)
             )
         ).first()
-        await session.commit()
         if dispatch_claim is None:
+            await session.rollback()
             return "SKIPPED_NOT_CLAIMABLE"
+
+        # Durable checkpoint: after this commit, any provider call is represented as SENDING
+        # with its attempt number even if the worker is cancelled or terminated.
+        await session.commit()
+
+        final_principal: Principal | None = None
+        if expected_actor_kind == "ADMIN_HUMAN":
+            final_principal = (
+                await principal_from_session_row(
+                    session,
+                    expected_initiator_session_id,
+                    for_update=True,
+                )
+                if expected_initiator_session_id is not None
+                else None
+            )
+        final_row = (
+            await session.execute(
+                select(models.OutboxMessage)
+                .where(models.OutboxMessage.id == oid)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            final_row is None
+            or final_row.status != "SENDING"
+            or final_row.attempt_count != attempt_no
+        ):
+            await session.rollback()
+            return "SKIPPED_NOT_CLAIMABLE"
+        row = final_row
+
+        if expected_actor_kind == "ADMIN_HUMAN":
+            if (
+                row.actor_kind != expected_actor_kind
+                or row.actor_id != expected_actor_id
+                or row.initiator_user_id != expected_initiator_user_id
+                or row.initiator_session_id != expected_initiator_session_id
+                or final_principal is None
+                or final_principal.must_change_password
+                or final_principal.is_feishu_action
+                or final_principal.session_id != row.initiator_session_id
+                or final_principal.user_id != row.initiator_user_id
+                or final_principal.actor != row.actor_id
+            ):
+                return await _record_outcome(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    attempt_no=attempt_no,
+                    error_code="HUMAN_AUTHORITY_CHANGED",
+                )
+        final_is_public = row.message_type != "private_note"
+        if not final_is_public:
+            if expected_actor_kind == "ADMIN_HUMAN":
+                final_authority_error = await _validate_human_outbox_authority(
+                    session,
+                    outbox=row,
+                )
+                if final_authority_error is not None:
+                    return await _record_outcome(
+                        session,
+                        oid,
+                        "NEEDS_REVIEW",
+                        attempt_no=attempt_no,
+                        error_code=final_authority_error,
+                    )
+            return await _stop_before_send(
+                session,
+                oid,
+                "CANCELLED",
+                "DIRECT_DRAFT_BLOCKED",
+                attempt_no,
+            )
+        if not isinstance(row.payload, dict):
+            return await _stop_before_send(
+                session,
+                oid,
+                "NEEDS_REVIEW",
+                "DELIVERY_PAYLOAD_INVALID",
+                attempt_no,
+                count_attempt=False,
+            )
+        final_payload = dict(row.payload)
+        if not isinstance(final_payload.get("text"), str) or not final_payload["text"].strip():
+            return await _stop_before_send(
+                session,
+                oid,
+                "NEEDS_REVIEW",
+                "DELIVERY_TEXT_INVALID",
+                attempt_no,
+                count_attempt=False,
+            )
+        final_command: TextSendCommand | None
+        final_preflight_error = await _public_bot_send_preflight(
+            session,
+            outbox=row,
+            payload_text=final_payload["text"],
+        )
+        if expected_actor_kind == "ADMIN_HUMAN":
+            final_authority_error = await _validate_human_outbox_authority(
+                session,
+                outbox=row,
+            )
+            if final_authority_error is not None:
+                return await _record_outcome(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    attempt_no=attempt_no,
+                    error_code=final_authority_error,
+                )
+        if final_preflight_error is not None:
+            await _handoff_public_send_failure(
+                session,
+                outbox=row,
+                reason_code=final_preflight_error,
+            )
+            return await _stop_before_send(
+                session,
+                oid,
+                "CANCELLED",
+                final_preflight_error,
+                attempt_no,
+                count_attempt=False,
+            )
+        final_stopped, _final_account, final_command = await _validate_direct_send(
+            session,
+            row,
+            final_payload,
+            attempt_no,
+        )
+        if final_stopped is not None:
+            return final_stopped
 
         async def fail_retryable(exc: Exception) -> str:
             if attempt_no >= _MAX_ATTEMPTS:
@@ -1221,13 +1603,16 @@ async def _deliver_outbox_locked(
             sender = await get_platform_sender(row.platform_account_id)
         except Exception as exc:  # noqa: BLE001 - sender resolution happens before dispatch
             return await fail_retryable(exc)
+        except BaseException:
+            await _rollback_interrupted_delivery(session)
+            raise
 
         try:
-            assert direct_command is not None
+            assert final_command is not None
             platform_message_id = await _await_send(
                 sender.send_text(
-                    target=direct_command.target,
-                    text=direct_command.text,
+                    target=final_command.target,
+                    text=final_command.text,
                 )
             )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -1246,6 +1631,11 @@ async def _deliver_outbox_locked(
             )
         except Exception as exc:  # noqa: BLE001 - unknown post-dispatch failures are ambiguous
             return await ambiguous(exc)
+        except BaseException:
+            # The checkpoint is intentionally left SENDING.  Roll back only the transaction
+            # holding revalidation row locks so connection-level locks can be released cleanly.
+            await _rollback_interrupted_delivery(session)
+            raise
 
         return await _record_outcome(
             session,
@@ -1259,6 +1649,9 @@ async def _deliver_outbox_locked(
         assert direct_account is not None and direct_command is not None
         locked_account_id = direct_account.id
         locked_sender = email_address_identity_key(direct_command.target["to"])
+        # Conversation serialization is already held on this connection.  Commit the read-only
+        # preflight before waiting for the per-sender lock so the sender lock can span the
+        # attempt checkpoint and provider I/O.
         await session.commit()
         async with hold_connection_advisory_lock(
             connection,
@@ -1273,7 +1666,7 @@ async def _deliver_outbox_locked(
                 )
             ).scalar_one_or_none()
             if fresh_row is None or fresh_row.status != "SENDING":
-                await session.commit()
+                await session.rollback()
                 return "SKIPPED_NOT_CLAIMABLE"
             row = fresh_row
             attempt_no = row.attempt_count + 1
@@ -1295,6 +1688,19 @@ async def _deliver_outbox_locked(
                     "DELIVERY_TEXT_INVALID",
                     attempt_no,
                     count_attempt=False,
+                )
+            human_authority_error = await _validate_human_outbox_authority(
+                session,
+                outbox=row,
+                prevalidation_error=human_prevalidation_error,
+            )
+            if human_authority_error is not None:
+                return await _stop_before_send(
+                    session,
+                    oid,
+                    "NEEDS_REVIEW",
+                    human_authority_error,
+                    attempt_no,
                 )
             preflight_error = await _public_bot_send_preflight(
                 session,
@@ -1371,44 +1777,233 @@ async def _deliver_outbox_locked(
     return await dispatch()
 
 
+async def _prompt_lock_key_for_outbox(
+    session: AsyncSession,
+    outbox: models.OutboxMessage,
+) -> str | None:
+    if outbox.message_type == "private_note":
+        return None
+    payload = dict(outbox.payload) if isinstance(outbox.payload, dict) else {}
+    if _effective_origin_kind(outbox, payload) not in {"DECISION", "DRAFT_APPROVAL"}:
+        return None
+    account = await session.get(models.PlatformAccount, outbox.platform_account_id)
+    if account is None:
+        return None
+    return business_prompt_lock_key(account.tenant_id, account.brand_id)
+
+
+def _staff_authority_key(user_id: uuid.UUID) -> str:
+    return f"social-reply:staff-authority:{user_id}"
+
+
+async def _deliver_with_connection(
+    connection: AsyncConnection,
+    *,
+    oid: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> str:
+    prompt_lock_key: str | None = None
+    async with AsyncSession(bind=connection, expire_on_commit=False) as scope_session:
+        outbox = await scope_session.get(models.OutboxMessage, oid)
+        if outbox is not None:
+            prompt_lock_key = await _prompt_lock_key_for_outbox(scope_session, outbox)
+        await scope_session.commit()
+    if prompt_lock_key is not None:
+        # Keep prompt activation and provider I/O linearly ordered while the human
+        # authority locks acquired by the caller remain held on this connection.
+        async with hold_connection_advisory_shared_lock(connection, prompt_lock_key):
+            async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+                return await _deliver_outbox_locked(
+                    session,
+                    connection,
+                    oid,
+                    conversation_id,
+                )
+    async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+        return await _deliver_outbox_locked(
+            session,
+            connection,
+            oid,
+            conversation_id,
+        )
+
+
+async def _deliver_prelocked_with_connection(
+    connection: AsyncConnection,
+    *,
+    oid: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> str:
+    async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+        outbox = await session.get(models.OutboxMessage, oid)
+        if outbox is None:
+            return "SKIPPED_NOT_CLAIMABLE"
+        async with AsyncExitStack() as locks:
+            # Match callbacks and checkpoint rechecks: conversation before route/accounts.
+            # A blocked route also mutates conversation work and needs serialization.
+            await locks.enter_async_context(
+                hold_conversation_delivery_lock_on_connection_in_transaction(
+                    connection,
+                    conversation_id,
+                )
+            )
+            route_lock = await _lock_public_send_route_accounts(session, outbox=outbox)
+            if route_lock is None:
+                await session.rollback()
+                return "SKIPPED_NOT_CLAIMABLE"
+            prompt_lock_key = await _prompt_lock_key_for_outbox(session, outbox)
+            if prompt_lock_key is not None:
+                await locks.enter_async_context(
+                    hold_connection_advisory_shared_lock_in_transaction(
+                        connection,
+                        prompt_lock_key,
+                    )
+                )
+            return await _deliver_outbox_locked(
+                session,
+                connection,
+                oid,
+                conversation_id,
+            )
+
+
 async def deliver_outbox(outbox_id: str) -> str:
     """Serialize takeover with one durable send attempt for the conversation."""
     oid = uuid.UUID(outbox_id)
     async with get_session_factory()() as lookup_session:
-        conversation_id = await lookup_session.scalar(
-            select(models.OutboxMessage.conversation_id).where(models.OutboxMessage.id == oid)
+        outbox = await lookup_session.get(models.OutboxMessage, oid)
+        if outbox is None:
+            return "SKIPPED_NOT_CLAIMABLE"
+        conversation_id = outbox.conversation_id
+        requires_human = outbox.actor_kind == "ADMIN_HUMAN" or outbox.origin_kind in {
+            "MANUAL_REPLY",
+            "DRAFT_APPROVAL",
+        }
+        initiator_session_id = outbox.initiator_session_id
+        work = None
+        if requires_human:
+            work = await lookup_session.scalar(
+                select(models.HumanWorkItem)
+                .where(
+                    models.HumanWorkItem.tenant_id == outbox.tenant_id,
+                    models.HumanWorkItem.conversation_id == conversation_id,
+                    models.HumanWorkItem.status.in_(["WAITING", "CLAIMED"]),
+                )
+                .execution_options(populate_existing=True)
+            )
+            staff_ids = {
+                value
+                for value in (
+                    outbox.initiator_user_id,
+                    work.assigned_user_id if work is not None else None,
+                )
+                if value is not None
+            }
+            if initiator_session_id is not None:
+                discovered_principal = await principal_from_session_row(
+                    lookup_session,
+                    initiator_session_id,
+                )
+                if discovered_principal is not None and discovered_principal.user_id is not None:
+                    staff_ids.add(discovered_principal.user_id)
+        assigned_session_id = work.assigned_session_id if work is not None else None
+        session_ids = sorted(
+            {value for value in (initiator_session_id, assigned_session_id) if value is not None},
+            key=str,
         )
-    if conversation_id is None:
-        return "SKIPPED_NOT_CLAIMABLE"
+        prompt_lock_key = None
+        initial_payload = dict(outbox.payload) if isinstance(outbox.payload, dict) else {}
+        requires_public_route = outbox.message_type != "private_note" and _effective_origin_kind(
+            outbox, initial_payload
+        ) in {"DECISION", "DRAFT_APPROVAL"}
+        if requires_human and requires_public_route:
+            account = await lookup_session.get(
+                models.PlatformAccount,
+                outbox.platform_account_id,
+            )
+            if account is not None:
+                prompt_lock_key = business_prompt_lock_key(account.tenant_id, account.brand_id)
+    if not requires_human:
+        if requires_public_route:
+            async with get_engine().connect() as connection:
+                return await _deliver_prelocked_with_connection(
+                    connection,
+                    oid=oid,
+                    conversation_id=conversation_id,
+                )
+        async with hold_conversation_delivery_lock(conversation_id) as connection:
+            return await _deliver_with_connection(
+                connection,
+                oid=oid,
+                conversation_id=conversation_id,
+            )
 
-    async with hold_conversation_delivery_lock(conversation_id) as connection:
-        prompt_lock_key: str | None = None
-        async with AsyncSession(bind=connection, expire_on_commit=False) as scope_session:
-            outbox = await scope_session.get(models.OutboxMessage, oid)
-            if outbox is not None and outbox.message_type != "private_note":
-                payload = dict(outbox.payload) if isinstance(outbox.payload, dict) else {}
-                if _effective_origin_kind(outbox, payload) in {"DECISION", "DRAFT_APPROVAL"}:
-                    account = await scope_session.get(
-                        models.PlatformAccount,
-                        outbox.platform_account_id,
+    # Human delivery has the same lock acquisition order as claim/transfer/start/send:
+    # discover assignment and initiator without locks, acquire every staff authority lock
+    # in stable order, revalidate the session, then acquire delivery and business locks.
+    async with get_engine().connect() as connection:
+        async with AsyncExitStack() as locks:
+            for staff_id in sorted(staff_ids, key=str):
+                await locks.enter_async_context(
+                    hold_connection_advisory_lock(connection, _staff_authority_key(staff_id))
+                )
+            for session_id in session_ids:
+                await locks.enter_async_context(
+                    hold_connection_advisory_lock(connection, session_authority_key(session_id))
+                )
+            async with AsyncSession(bind=connection, expire_on_commit=False) as authority_session:
+                human_principal: Principal | None = None
+                if session_ids:
+                    await authority_session.execute(
+                        select(models.AdminSession)
+                        .where(models.AdminSession.id.in_(session_ids))
+                        .execution_options(populate_existing=True)
+                        .order_by(models.AdminSession.id)
+                        .with_for_update()
                     )
-                    if account is not None:
-                        prompt_lock_key = business_prompt_lock_key(
-                            account.tenant_id,
-                            account.brand_id,
-                        )
-            await scope_session.commit()
-        if prompt_lock_key is not None:
-            # Keep Prompt activation and provider I/O linearly ordered. A save that wins this
-            # lock makes preflight observe the new version; a send that wins completes before
-            # the Admin save can commit and report the new version as active.
-            async with hold_connection_advisory_shared_lock(connection, prompt_lock_key):
-                async with AsyncSession(bind=connection, expire_on_commit=False) as session:
-                    return await _deliver_outbox_locked(
-                        session,
+                human_prevalidation_error: str | None = None
+                if initiator_session_id is None:
+                    human_prevalidation_error = "HUMAN_INITIATOR_SESSION_MISSING"
+                else:
+                    human_principal = await principal_from_session_row(
+                        authority_session,
+                        initiator_session_id,
+                        for_update=True,
+                    )
+                    if human_principal is None:
+                        human_prevalidation_error = "HUMAN_INITIATOR_SESSION_INVALID"
+                await locks.enter_async_context(
+                    hold_conversation_delivery_lock_on_connection_in_transaction(
                         connection,
-                        oid,
                         conversation_id,
                     )
-        async with AsyncSession(bind=connection, expire_on_commit=False) as session:
-            return await _deliver_outbox_locked(session, connection, oid, conversation_id)
+                )
+                if requires_public_route:
+                    route_lock_outbox = await authority_session.get(
+                        models.OutboxMessage,
+                        oid,
+                    )
+                    if route_lock_outbox is None:
+                        await authority_session.rollback()
+                        return "SKIPPED_NOT_CLAIMABLE"
+                    route_lock = await _lock_public_send_route_accounts(
+                        authority_session,
+                        outbox=route_lock_outbox,
+                    )
+                    if route_lock is None:
+                        await authority_session.rollback()
+                        return "SKIPPED_NOT_CLAIMABLE"
+                if prompt_lock_key is not None:
+                    await locks.enter_async_context(
+                        hold_connection_advisory_shared_lock_in_transaction(
+                            connection,
+                            prompt_lock_key,
+                        )
+                    )
+                return await _deliver_outbox_locked(
+                    authority_session,
+                    connection,
+                    oid,
+                    conversation_id,
+                    human_prevalidation_error=human_prevalidation_error,
+                )

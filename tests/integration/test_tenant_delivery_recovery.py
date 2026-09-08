@@ -7,13 +7,25 @@ import pytest
 from sqlalchemy import func, select
 
 from apps.api.main import create_app
-from social_reply.application.account_management.auth import hash_password
+from social_reply.application.account_management.auth import (
+    hash_password,
+    issue_session,
+    principal_from_session_id,
+)
 from social_reply.application.message_delivery import recovery
 from social_reply.infrastructure.database import models
 
 pytestmark = pytest.mark.integration
 
 _PASSWORD = "delivery-recovery-password-123"
+
+
+@pytest.fixture
+async def recovery_principal(session):
+    _token, session_id = await issue_session()
+    principal = await principal_from_session_id(session_id)
+    assert principal is not None and principal.is_superadmin
+    return principal
 
 
 @dataclass(frozen=True)
@@ -193,6 +205,7 @@ def _install_dispatch_spy(monkeypatch) -> list[str]:
 async def test_retry_failed_outbox_is_fenced_audited_dispatched_and_idempotent(
     session,
     monkeypatch,
+    recovery_principal,
 ) -> None:
     context = await _seed_delivery(session, status="FAILED", attempt_count=3)
     dispatched = _install_dispatch_spy(monkeypatch)
@@ -201,6 +214,7 @@ async def test_retry_failed_outbox_is_fenced_audited_dispatched_and_idempotent(
         outbox_id=context.outbox_id,
         required_tenant_id="default",
         actor="user:delivery-admin",
+        principal=recovery_principal,
         expected_status="FAILED",
         expected_attempt_count=3,
         review_reason="Provider dashboard confirms the request was rejected.",
@@ -210,6 +224,7 @@ async def test_retry_failed_outbox_is_fenced_audited_dispatched_and_idempotent(
         outbox_id=context.outbox_id,
         required_tenant_id="default",
         actor="user:delivery-admin",
+        principal=recovery_principal,
         expected_status="FAILED",
         expected_attempt_count=3,
         review_reason="Provider dashboard confirms the request was rejected.",
@@ -259,6 +274,7 @@ async def test_retry_failed_outbox_is_fenced_audited_dispatched_and_idempotent(
 
 async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_input_errors(
     session,
+    recovery_principal,
 ) -> None:
     context = await _seed_delivery(session, status="FAILED", attempt_count=4)
     cross_scope = await _seed_delivery(
@@ -273,6 +289,7 @@ async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_in
             outbox_id=cross_scope.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="FAILED",
             expected_attempt_count=1,
             review_reason="Confirmed failure.",
@@ -285,6 +302,7 @@ async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_in
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="FAILED",
             expected_attempt_count=3,
             review_reason="Confirmed failure.",
@@ -297,6 +315,7 @@ async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_in
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="NEEDS_REVIEW",
             expected_attempt_count=4,
             review_reason="Confirmed failure.",
@@ -309,6 +328,7 @@ async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_in
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="FAILED",
             expected_attempt_count=4,
             review_reason=" ",
@@ -321,6 +341,7 @@ async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_in
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="FAILED",
             expected_attempt_count=4,
             review_reason="x" * 501,
@@ -333,6 +354,7 @@ async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_in
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="FAILED",
             expected_attempt_count=4,
             review_reason="Confirmed failure.",
@@ -344,6 +366,7 @@ async def test_retry_failed_outbox_hides_scope_and_rejects_status_attempt_and_in
 async def test_retry_failed_outbox_does_not_overwrite_worker_claim_and_dispatch_failure_is_durable(
     session,
     monkeypatch,
+    recovery_principal,
 ) -> None:
     claimed = await _seed_delivery(session, status="SENDING", attempt_count=5)
     with pytest.raises(recovery.DeliveryRecoveryConflict) as claimed_conflict:
@@ -351,6 +374,7 @@ async def test_retry_failed_outbox_does_not_overwrite_worker_claim_and_dispatch_
             outbox_id=claimed.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="FAILED",
             expected_attempt_count=5,
             review_reason="Confirmed failure.",
@@ -372,6 +396,7 @@ async def test_retry_failed_outbox_does_not_overwrite_worker_claim_and_dispatch_
         outbox_id=durable.outbox_id,
         required_tenant_id="default",
         actor="user:delivery-admin",
+        principal=recovery_principal,
         expected_status="FAILED",
         expected_attempt_count=2,
         review_reason="Provider confirms failure.",
@@ -406,6 +431,7 @@ async def test_retry_failed_outbox_does_not_overwrite_worker_claim_and_dispatch_
 async def test_resolve_needs_review_supports_retry_and_cancel(
     session,
     monkeypatch,
+    recovery_principal,
     resolution: str,
     expected_status: str,
     expected_action: str,
@@ -423,6 +449,7 @@ async def test_resolve_needs_review_supports_retry_and_cancel(
         outbox_id=context.outbox_id,
         required_tenant_id="default",
         actor="user:delivery-admin",
+        principal=recovery_principal,
         expected_status="NEEDS_REVIEW",
         expected_attempt_count=3,
         review_reason="Provider outcome verified by an administrator.",
@@ -453,6 +480,7 @@ async def test_resolve_needs_review_supports_retry_and_cancel(
 async def test_confirmed_sent_materializes_message_once_without_provider_call_and_fences_replay(
     session,
     monkeypatch,
+    recovery_principal,
 ) -> None:
     context = await _seed_delivery(
         session,
@@ -468,6 +496,7 @@ async def test_confirmed_sent_materializes_message_once_without_provider_call_an
         outbox_id=context.outbox_id,
         required_tenant_id="default",
         actor="user:delivery-admin",
+        principal=recovery_principal,
         expected_status="NEEDS_REVIEW",
         expected_attempt_count=6,
         review_reason="Provider dashboard shows a successful send.",
@@ -479,6 +508,7 @@ async def test_confirmed_sent_materializes_message_once_without_provider_call_an
         outbox_id=context.outbox_id,
         required_tenant_id="default",
         actor="user:delivery-admin",
+        principal=recovery_principal,
         expected_status="NEEDS_REVIEW",
         expected_attempt_count=6,
         review_reason="Provider dashboard shows a successful send.",
@@ -532,6 +562,7 @@ async def test_confirmed_sent_materializes_message_once_without_provider_call_an
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="NEEDS_REVIEW",
             expected_attempt_count=6,
             review_reason="Provider dashboard shows a successful send.",
@@ -544,6 +575,7 @@ async def test_confirmed_sent_materializes_message_once_without_provider_call_an
 
 async def test_confirmed_sent_accepts_email_sender_message_id_without_angle_brackets(
     session,
+    recovery_principal,
 ) -> None:
     context = await _seed_delivery(
         session,
@@ -558,6 +590,7 @@ async def test_confirmed_sent_accepts_email_sender_message_id_without_angle_brac
         outbox_id=context.outbox_id,
         required_tenant_id="default",
         actor="user:delivery-admin",
+        principal=recovery_principal,
         expected_status="NEEDS_REVIEW",
         expected_attempt_count=2,
         review_reason="SMTP logs confirm the message was accepted.",
@@ -572,7 +605,9 @@ async def test_confirmed_sent_accepts_email_sender_message_id_without_angle_brac
     assert outbox.platform_message_id == provider_message_id
 
 
-async def test_confirmed_sent_email_rejects_crlf_around_rfc_message_id(session) -> None:
+async def test_confirmed_sent_email_rejects_crlf_around_rfc_message_id(
+    session, recovery_principal
+) -> None:
     context = await _seed_delivery(
         session,
         platform="email",
@@ -586,14 +621,13 @@ async def test_confirmed_sent_email_rejects_crlf_around_rfc_message_id(session) 
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="NEEDS_REVIEW",
             expected_attempt_count=2,
             review_reason="Provider dashboard shows a successful send.",
             verification_source="PROVIDER_DASHBOARD",
             resolution="CONFIRMED_SENT",
-            provider_message_id=(
-                "<20260901.104512.abc123@mail.delivery.example>\r\n"
-            ),
+            provider_message_id=("<20260901.104512.abc123@mail.delivery.example>\r\n"),
         )
 
     assert invalid.value.code == "delivery_provider_message_id_invalid"
@@ -633,6 +667,7 @@ async def test_confirmed_sent_email_rejects_crlf_around_rfc_message_id(session) 
 )
 async def test_resolve_needs_review_validates_resolution_and_provider_message_id(
     session,
+    recovery_principal,
     resolution: str,
     provider_message_id: str | None,
     expected_code: str,
@@ -644,6 +679,7 @@ async def test_resolve_needs_review_validates_resolution_and_provider_message_id
             outbox_id=context.outbox_id,
             required_tenant_id="default",
             actor="user:delivery-admin",
+            principal=recovery_principal,
             expected_status="NEEDS_REVIEW",
             expected_attempt_count=1,
             review_reason="Verified provider outcome.",
@@ -667,9 +703,7 @@ async def test_tenant_delivery_panel_and_retry_route_are_safe_fenced_and_prg(
             username="admin",
             password="test-admin-password",
         )
-        page = await client.get(
-            f"/app/t/default/inbox?queue=delivery&item_id={context.outbox_id}"
-        )
+        page = await client.get(f"/app/t/default/inbox?queue=delivery&item_id={context.outbox_id}")
         response = await client.post(
             f"/app/t/default/delivery/{context.outbox_id}/retry",
             data={
@@ -717,9 +751,7 @@ async def test_tenant_needs_review_panel_resolves_cancel_with_prg_without_dispat
             username="admin",
             password="test-admin-password",
         )
-        page = await client.get(
-            f"/app/t/default/inbox?queue=delivery&item_id={context.outbox_id}"
-        )
+        page = await client.get(f"/app/t/default/inbox?queue=delivery&item_id={context.outbox_id}")
         response = await client.post(
             f"/app/t/default/delivery/{context.outbox_id}/resolve",
             data={
@@ -739,9 +771,7 @@ async def test_tenant_needs_review_panel_resolves_cancel_with_prg_without_dispat
         "CANCEL",
     ):
         assert f'name="resolution" value="{resolution}"' in page.text
-    assert page.text.count(
-        f'action="/app/t/default/delivery/{context.outbox_id}/resolve"'
-    ) == 3
+    assert page.text.count(f'action="/app/t/default/delivery/{context.outbox_id}/resolve"') == 3
     assert response.status_code == 303
     assert response.headers["location"] == "/app/t/default/inbox?queue=delivery"
     assert dispatched == []

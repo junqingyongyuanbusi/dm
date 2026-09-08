@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlencode, urlsplit
@@ -12,6 +13,7 @@ from markupsafe import Markup
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import aliased
 
+from social_reply.application.account_management.access import account_read_condition
 from social_reply.application.account_management.admin import (
     _csrf,
     _ensure_csrf,
@@ -47,6 +49,8 @@ from social_reply.application.account_management.channel_management import (
     set_channel_account_automation,
     set_channel_account_kill_switch,
     set_channel_account_status,
+    set_channel_account_support_visibility,
+    set_channel_reauthorization_grant,
     submit_channel_provisioning,
 )
 from social_reply.application.account_management.feishu_handoff_service import (
@@ -59,11 +63,19 @@ from social_reply.application.account_management.feishu_handoff_service import (
     set_feishu_handoff_operator_status,
     upsert_feishu_handoff_operator,
 )
+from social_reply.application.account_management.home_overview import (
+    HomeBusinessActivity,
+    HomeChannelAlert,
+    load_home_overview,
+)
 from social_reply.application.account_management.human_workflow import (
     HumanWorkflowError,
     claim_human_work_item,
+    has_unfinished_human_send,
     resolve_human_work_item,
     send_human_reply,
+    start_human_reception,
+    transfer_human_work_item,
 )
 from social_reply.application.account_management.jobs import (
     provisioning_job_is_in_flight,
@@ -121,6 +133,7 @@ from social_reply.application.account_management.ui_i18n import (
 )
 from social_reply.application.account_management.x_app import x_app_credentials
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.application.knowledge.authorization import KnowledgeAuthorizationError
 from social_reply.application.knowledge.commands import (
     ConfirmKnowledgeEnglishBatchCommand,
     ConfirmKnowledgeEnglishCommand,
@@ -263,6 +276,7 @@ class InboxItem:
     status: str
     reason: str
     created_at: datetime
+    assigned_actor: str | None = None
     work_item_version: int | None = None
     draft_text: str | None = None
     decision_generation: int | None = None
@@ -365,13 +379,7 @@ def _agent_root(tenant_id: str, agent_id: str) -> str:
 
 
 def _account_scope_condition(principal: Principal, tenant_id: str):
-    tenant_condition = models.PlatformAccount.tenant_id == tenant_id
-    if principal.is_admin:
-        return tenant_condition
-    return and_(
-        tenant_condition,
-        models.PlatformAccount.owner_user_id == principal.user_id,
-    )
+    return account_read_condition(principal, tenant_id)
 
 
 async def _load_inbox_summary(
@@ -463,7 +471,7 @@ async def _load_agent_ids(
         ).scalars()
     )
     if not principal.is_admin:
-        return sorted(account_brands) if account_brands else [DEFAULT_TENANT_ID]
+        return sorted(account_brands)
     prompt_brands = set(
         (
             await session.execute(
@@ -618,11 +626,18 @@ def _agent_lifecycle_context(
         "lifecycle_description": translate("agent.lifecycle.description"),
         "lifecycle_stages": (
             {
-                "key": "train",
-                "label": translate("agent.lifecycle.train"),
-                "description": translate("agent.lifecycle.train_description"),
+                "key": "define",
+                "label": translate("agent.lifecycle.define"),
+                "description": translate("agent.lifecycle.define_description"),
+                "href": f"{agent_root}/overview",
+                "current": current_stage == "define",
+            },
+            {
+                "key": "behavior",
+                "label": translate("agent.lifecycle.behavior"),
+                "description": translate("agent.lifecycle.behavior_description"),
                 "href": f"{agent_root}/instructions",
-                "current": current_stage == "train",
+                "current": current_stage in {"train", "behavior"},
             },
             {
                 "key": "test",
@@ -632,11 +647,11 @@ def _agent_lifecycle_context(
                 "current": current_stage == "test",
             },
             {
-                "key": "deploy",
-                "label": translate("agent.lifecycle.deploy"),
-                "description": translate("agent.lifecycle.deploy_description"),
+                "key": "channels",
+                "label": translate("agent.lifecycle.channels"),
+                "description": translate("agent.lifecycle.channels_description"),
                 "href": f"{agent_root}/channels",
-                "current": current_stage == "deploy",
+                "current": current_stage in {"deploy", "channels"},
             },
             {
                 "key": "analyze",
@@ -724,261 +739,181 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
                 models.Message.created_at >= today_start,
             )
         )
-        account_count = await session.scalar(
-            select(func.count()).where(_account_scope_condition(principal, tenant_id))
+        overview = await load_home_overview(session, principal, tenant_id, settings=get_settings())
+    active_queue_count = sum(
+        count > 0
+        for count in (
+            inbox_summary.human_count,
+            inbox_summary.draft_count,
+            inbox_summary.delivery_count,
         )
-        active_account_count = await session.scalar(
-            select(func.count()).where(
-                _account_scope_condition(principal, tenant_id),
-                models.PlatformAccount.status == "active",
-            )
-        )
-        published_knowledge_count = await session.scalar(
-            select(func.count()).where(
-                models.KnowledgeDocument.tenant_id == tenant_id,
-                models.KnowledgeDocument.status == "published",
-            )
-        )
-        recent_audits = (
-            (
-                await session.execute(
-                    select(models.AuditLog)
-                    .where(
-                        models.AuditLog.tenant_id == tenant_id,
-                        *(
-                            ()
-                            if principal.is_admin
-                            else (models.AuditLog.actor == principal.actor,)
-                        ),
-                    )
-                    .order_by(models.AuditLog.created_at.desc())
-                    .limit(5)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        agent_ids = await _load_agent_ids(session, principal, tenant_id)
+    )
+    next_action = _home_next_action(tenant_id, inbox_summary) if active_queue_count > 1 else ""
+    queue_summary = _home_queue_summary_grid(tenant_id, inbox_summary)
 
-    next_action = _home_next_action(
-        principal,
-        tenant_id,
-        inbox_summary,
-        int(account_count or 0),
-    )
-    if principal.is_admin:
-        attention_cards = "".join(
-            (
-                metric_card(
-                    inbox_summary.human_count,
-                    translate("home.metric.human"),
-                    detail=translate(
-                        "home.oldest_wait",
-                        age=format_age(inbox_summary.oldest_human_at),
-                    ),
-                ),
-                metric_card(
-                    inbox_summary.draft_count,
-                    translate("home.metric.drafts"),
-                    detail=translate(
-                        "home.oldest_wait",
-                        age=format_age(inbox_summary.oldest_draft_at),
-                    ),
-                ),
-                metric_card(
-                    inbox_summary.delivery_count,
-                    translate("home.metric.delivery"),
-                    detail=translate(
-                        "home.oldest_wait",
-                        age=format_age(inbox_summary.oldest_delivery_at),
-                    ),
-                ),
-            )
-        )
-        attention_description = translate("home.attention_admin_description")
-    else:
-        attention_cards = "".join(
-            (
-                metric_card(
-                    int(account_count or 0),
-                    translate("home.metric.my_accounts"),
-                    detail=translate(
-                        "home.accounts_available",
-                        count=int(active_account_count or 0),
-                    ),
-                ),
-                metric_card(
-                    inbox_summary.human_count,
-                    translate("home.metric.human"),
-                    detail=translate(
-                        "home.oldest_wait",
-                        age=format_age(inbox_summary.oldest_human_at),
-                    ),
-                ),
-                metric_card(
-                    int(message_count or 0),
-                    translate("home.metric.today_messages"),
-                    detail=translate("home.own_accounts_only"),
-                ),
-            )
-        )
-        attention_description = translate("home.attention_user_description")
-    readiness_rows = "".join(
-        (
-            _progress_row(
-                True,
-                translate("home.agent_scope_count", count=len(agent_ids)),
-            ),
-            _progress_row(
-                bool(published_knowledge_count),
-                translate(
-                    "home.knowledge_published_count",
-                    count=int(published_knowledge_count or 0),
-                ),
-            ),
-            _progress_row(
-                int(active_account_count or 0) == int(account_count or 0) and bool(account_count),
-                translate(
-                    "home.channel_availability",
-                    active=int(active_account_count or 0),
-                    total=int(account_count or 0),
-                ),
-                warning=bool(account_count),
-            ),
-            _progress_row(True, translate("home.safety_path")),
-        )
-    )
-    lifecycle_agent_id = agent_ids[0] if agent_ids else DEFAULT_TENANT_ID
     body = render_template(
         "tenant/home.html",
-        **_agent_lifecycle_context(tenant_id, lifecycle_agent_id),
-        next_action_html=trusted_html(next_action),
+        channel_alerts=_home_alert_views(tenant_id, overview.alerts),
+        alerts_title=translate("home.alerts_title"),
+        alerts_description=translate("home.alerts_description"),
+        view_channel_label=translate("home.view_channel"),
         attention_title=translate("home.attention_title"),
-        attention_description=attention_description,
-        attention_cards_html=trusted_html(attention_cards),
-        readiness_title=translate("home.readiness_title"),
-        readiness_description=translate("home.readiness_description"),
-        view_agents_action_html=trusted_html(
-            secondary_action(
-                f"{_tenant_root(tenant_id)}/agents",
-                translate("home.view_agents"),
-                small=True,
-            )
-        ),
-        readiness_rows_html=trusted_html(readiness_rows),
+        next_action_html=trusted_html(next_action),
+        queue_summary_html=trusted_html(queue_summary),
         today_title=translate("home.today_overview"),
-        today_description=translate("home.today_overview_description"),
-        today_messages_html=trusted_html(
-            metric_card(int(message_count or 0), translate("home.metric.today_messages"))
-        ),
-        published_knowledge_html=trusted_html(
-            metric_card(
-                int(published_knowledge_count or 0),
-                translate("home.metric.published_knowledge"),
-            )
-        ),
-        recent_activity_title=translate("home.recent_activity"),
-        recent_activity_description=translate("home.recent_activity_description"),
-        view_all_action_html=trusted_html(
-            secondary_action(
-                (
-                    f"{_tenant_root(tenant_id)}/audit"
-                    if principal.is_admin
-                    else f"{_tenant_root(tenant_id)}/activity"
-                ),
-                translate("home.view_all"),
-                small=True,
-            )
-        ),
-        recent_activity_rows=tuple(
-            {
-                "time": format_datetime(audit.created_at),
-                "actor": audit.actor,
-                "action": audit.action,
-                "subject_type": audit.subject_type,
-            }
-            for audit in recent_audits
-        ),
-        recent_activity_empty_html=trusted_html(
-            empty_state(
-                translate("home.empty_activity_title"),
-                translate("home.empty_activity_description"),
-            )
-        ),
-        time_label=translate("common.time"),
-        action_label=translate("common.action"),
-        resource_label=translate("common.resource"),
+        today_description=translate("home.today_message_scope"),
+        message_count=int(message_count or 0),
+        message_count_label=translate("home.metric.today_messages"),
+        business_activity_title=translate("home.business_activity_title"),
+        business_activity_description=translate("home.business_activity_description"),
+        business_activities=_home_activity_views(tenant_id, overview.activities),
+        view_conversation_label=translate("home.view_conversation"),
     )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
         title=translate("home.title"),
-        description=translate(
-            "home.description",
-            tenant_id=tenant_id,
-            count=inbox_summary.total,
+        description=(
+            translate("home.description", tenant_id=tenant_id, count=inbox_summary.total)
+            if inbox_summary.total
+            else ""
         ),
         body=body,
         active_navigation="home",
         inbox_count=inbox_summary.total,
+        breadcrumbs=((translate("nav.home"), None), (translate("home.workspace_overview"), None)),
     )
 
 
 def _home_next_action(
-    principal: Principal,
     tenant_id: str,
     summary: InboxSummary,
-    account_count: int,
 ) -> str:
     inbox_href = f"{_tenant_root(tenant_id)}/inbox"
     if summary.delivery_count:
-        title = translate("next.delivery_title")
-        description = translate(
-            "next.delivery_description",
-            count=summary.delivery_count,
-            age=format_age(summary.oldest_delivery_at),
-        )
-        href = f"{inbox_href}?queue=delivery"
-        action_label = translate("next.delivery_action")
+        queue, kind = "delivery", "delivery"
+        count, oldest_at = summary.delivery_count, summary.oldest_delivery_at
     elif summary.human_count:
-        title = translate("next.human_title")
-        description = translate(
-            "next.human_description",
-            count=summary.human_count,
-            age=format_age(summary.oldest_human_at),
-        )
-        href = f"{inbox_href}?queue=human"
-        action_label = translate("next.human_action")
+        queue, kind = "human", "human"
+        count, oldest_at = summary.human_count, summary.oldest_human_at
     elif summary.draft_count:
-        title = translate("next.draft_title")
-        description = translate(
-            "next.draft_description",
-            count=summary.draft_count,
-            age=format_age(summary.oldest_draft_at),
-        )
-        href = f"{inbox_href}?queue=drafts"
-        action_label = translate("next.draft_action")
-    elif not account_count:
-        if principal.is_admin:
-            title = translate("next.admin_account_title")
-            description = translate("next.admin_account_description")
-            href = f"{_tenant_root(tenant_id)}/agents/default/channels"
-            action_label = translate("next.admin_account_action")
-        else:
-            title = translate("next.user_account_title")
-            description = translate("next.user_account_description")
-            href = f"{_tenant_root(tenant_id)}/channels"
-            action_label = translate("next.user_account_action")
+        queue, kind = "drafts", "draft"
+        count, oldest_at = summary.draft_count, summary.oldest_draft_at
     else:
-        title = translate("next.clear_title")
-        description = translate("next.clear_description")
-        href = f"{_tenant_root(tenant_id)}/agents"
-        action_label = translate("next.clear_action")
+        return ""
+    if queue == "delivery":
+        title = translate("home.delivery_action_title")
+        description = translate("home.delivery_action_description", count=count)
+    else:
+        title = translate(f"next.{kind}_title")
+        description = (
+            translate(f"next.{kind}_description", count=count, age=format_age(oldest_at))
+            if oldest_at is not None
+            else ""
+        )
+    description_html = (
+        f'<p class="saas-nextup-desc">{escape(description)}</p>' if description else ""
+    )
     return (
-        '<section class="saas-next-action"><div><div class="saas-eyebrow">'
-        f"{escape(translate('next.eyebrow'))}</div>"
-        f"<h2>{escape(title)}</h2><p>{escape(description)}</p></div>"
-        f"{primary_action(href, action_label)}</section>"
+        '<section class="saas-next-action saas-home-nextup">'
+        '<div class="saas-nextup-info">'
+        '<div class="saas-nextup-eyebrow">'
+        '<span class="saas-dot-amber"></span>'
+        f"<span>{escape(translate('next.eyebrow'))}</span>"
+        "</div>"
+        f'<h3 class="saas-nextup-title">{escape(title)}</h3>'
+        f"{description_html}"
+        "</div>"
+        f'<div class="saas-nextup-action">'
+        f'<a class="saas-button-nextup" href="{inbox_href}?queue={queue}">'
+        f"<span>{escape(translate(f'next.{kind}_action'))}</span></a>"
+        "</div>"
+        "</section>"
+    )
+
+
+def _home_queue_summary_grid(
+    tenant_id: str,
+    summary: InboxSummary,
+) -> str:
+    if not summary.total:
+        return ""
+    root = _tenant_root(tenant_id)
+    queues = (
+        ("human", "home.metric.human", summary.human_count, summary.oldest_human_at),
+        ("drafts", "home.metric.drafts", summary.draft_count, summary.oldest_draft_at),
+        ("delivery", "home.metric.delivery", summary.delivery_count, summary.oldest_delivery_at),
+    )
+    cards: list[str] = []
+    for queue, label_key, count, oldest_at in queues:
+        if not count:
+            continue
+        wait_html = (
+            '<span class="saas-metric-sub font-mono">'
+            f"{escape(translate('home.oldest_wait', age=format_age(oldest_at)))}</span>"
+            if oldest_at is not None and queue != "delivery"
+            else ""
+        )
+        cards.append(
+            f'<a href="{root}/inbox?queue={queue}" class="saas-home-metric-card">'
+            f'<span class="saas-metric-label">{escape(translate(label_key))}</span>'
+            '<div class="saas-metric-row">'
+            f'<span class="saas-metric-num font-mono">{count}</span>'
+            f"{wait_html}</div>"
+            f'<span class="saas-home-record-action">{escape(translate("home.open_queue"))}</span></a>'
+        )
+    return '<section class="saas-status-summary saas-home-metrics">' + "".join(cards) + "</section>"
+
+
+def _home_alert_views(
+    tenant_id: str, alerts: Sequence[HomeChannelAlert]
+) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "account_name": alert.account_name,
+            "platform": alert.platform,
+            "description": translate(f"home.alert.{alert.health_status.lower()}"),
+            "href": f"{_tenant_root(tenant_id)}/channels/accounts/{alert.account_id}",
+            "checked_at": alert.checked_at.isoformat() if alert.checked_at else "",
+            "checked_label": (
+                translate(
+                    "home.last_checked", time=format_datetime(alert.checked_at, include_year=True)
+                )
+                if alert.checked_at
+                else ""
+            ),
+        }
+        for alert in alerts
+    )
+
+
+def _home_activity_views(
+    tenant_id: str, activities: Sequence[HomeBusinessActivity]
+) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "title": translate(f"home.business.{activity.kind}"),
+            "account_name": activity.account_name,
+            "href": f"{_tenant_root(tenant_id)}/conversations/{activity.conversation_id}",
+            "occurred_at": activity.occurred_at.isoformat(),
+            "time_label": f"{format_datetime(activity.occurred_at, include_year=True)} UTC",
+        }
+        for activity in activities
+    )
+
+
+def _home_queue_summary_item(
+    *,
+    href: str,
+    status: str,
+    count: int,
+    oldest_at: datetime | None,
+) -> str:
+    oldest_wait = translate("home.oldest_wait", age=format_age(oldest_at))
+    return (
+        f'<a class="saas-summary-link" href="{escape(href)}">'
+        f"{status_badge(status)}"
+        f"<strong>{escape(count)}</strong><span>{escape(oldest_wait)}</span></a>"
     )
 
 
@@ -1053,6 +988,7 @@ async def agent_list(request: Request, tenant_id: str) -> Response:
     body = render_template(
         "tenant/agent_list.html",
         **_agent_lifecycle_context(tenant_id, lifecycle_agent_id),
+        show_lifecycle=any(card.readiness_percent < 100 for card in cards),
         list_summary=translate("agent.list_summary", count=len(agent_ids)),
         scope_description=translate("agent.list_scope_description"),
         cards=cards,
@@ -1181,6 +1117,7 @@ async def create_tenant_agent(request: Request, tenant_id: str) -> Response:
                 name=name,
                 description=description,
                 actor=principal.actor,
+                principal=principal,
             )
             await session.commit()
     except AgentControlPlaneConflict:
@@ -1253,8 +1190,7 @@ def _build_agent_card_view(
         bool(accounts) and len(active_accounts) == len(accounts),
         (
             control_plane is None
-            or control_plane.deployed_version_revision
-            == control_plane.version_revision
+            or control_plane.deployed_version_revision == control_plane.version_revision
         ),
     )
     readiness_percent = round(sum(readiness_checks) / len(readiness_checks) * 100)
@@ -1351,17 +1287,19 @@ def _agent_section_tabs(tenant_id: str, agent_id: str, section: str) -> str:
             (
                 "instructions",
                 f"{agent_base}/instructions",
-                translate("agent.tab.instructions"),
+                translate("agent.tab.behavior"),
             ),
-            ("model", f"{agent_base}/model", translate("agent.tab.model")),
-            ("channels", f"{agent_base}/channels", translate("agent.tab.channels")),
+            (
+                "channels",
+                f"{agent_base}/channels",
+                translate("agent.tab.channels_release"),
+            ),
             (
                 "knowledge",
                 f"{agent_base}/knowledge",
                 translate("agent.tab.knowledge"),
             ),
             ("test", f"{agent_base}/test", translate("agent.tab.test")),
-            ("flow", f"{agent_base}/flow", translate("agent.tab.flow")),
             ("activity", f"{agent_base}/activity", translate("agent.tab.activity")),
         ),
         section,
@@ -1745,7 +1683,7 @@ async def create_tenant_knowledge_document(request: Request, tenant_id: str) -> 
                 session,
                 CreateKnowledgeDocumentCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     question=form.get("question", ""),
                     reply=form.get("reply", ""),
                     brand_id=form.get("brand_id", "") or "default",
@@ -1791,7 +1729,7 @@ async def import_tenant_knowledge_batch(request: Request, tenant_id: str) -> Res
                 session,
                 ImportKnowledgeBatchCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     csv_text=csv_text,
                     source_name=source_name,
                     brand_id_default=str(form.get("brand_id") or "default"),
@@ -1833,7 +1771,7 @@ async def confirm_tenant_knowledge_batch(request: Request, tenant_id: str) -> Re
                 session,
                 ConfirmKnowledgeEnglishBatchCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     import_batch_id=import_batch_id,
                 ),
             )
@@ -1859,7 +1797,7 @@ async def publish_tenant_knowledge_batch(request: Request, tenant_id: str) -> Re
                 session,
                 BulkPublishKnowledgeCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                 ),
             )
             await session.commit()
@@ -1894,7 +1832,7 @@ async def _execute_tenant_knowledge_document_command(
                     session,
                     ConfirmKnowledgeEnglishCommand(
                         required_tenant_id=tenant_id,
-                        actor=principal.actor,
+                        principal=principal,
                         document_id=document_id,
                         confirmation_reason=form.get("confirmation_reason", ""),
                     ),
@@ -1910,7 +1848,7 @@ async def _execute_tenant_knowledge_document_command(
                     session,
                     SetKnowledgeOfficialContactCommand(
                         required_tenant_id=tenant_id,
-                        actor=principal.actor,
+                        principal=principal,
                         document_id=document_id,
                         is_official_contact=target == "true",
                     ),
@@ -1920,7 +1858,7 @@ async def _execute_tenant_knowledge_document_command(
                     session,
                     PublishKnowledgeCommand(
                         required_tenant_id=tenant_id,
-                        actor=principal.actor,
+                        principal=principal,
                         document_id=document_id,
                     ),
                 )
@@ -1929,7 +1867,7 @@ async def _execute_tenant_knowledge_document_command(
                     session,
                     UnpublishKnowledgeCommand(
                         required_tenant_id=tenant_id,
-                        actor=principal.actor,
+                        principal=principal,
                         document_id=document_id,
                     ),
                 )
@@ -1938,7 +1876,7 @@ async def _execute_tenant_knowledge_document_command(
                     session,
                     DeleteKnowledgeDraftCommand(
                         required_tenant_id=tenant_id,
-                        actor=principal.actor,
+                        principal=principal,
                         document_id=document_id,
                     ),
                 )
@@ -2055,6 +1993,7 @@ async def save_agent_instructions(
             expected_revision=_prompt_expected_revision(form),
             actor=principal.actor,
             change_note=form.get("change_note"),
+            principal=principal,
         )
         async with get_session_factory()() as session:
             await execute_save_reply_business_prompt(session, command)
@@ -2073,9 +2012,7 @@ async def save_agent_instructions(
     )
 
 
-@router.post(
-    "/app/t/{tenant_id}/agents/{agent_id}/instructions/releases/{agent_version_id}/deploy"
-)
+@router.post("/app/t/{tenant_id}/agents/{agent_id}/instructions/releases/{agent_version_id}/deploy")
 async def deploy_agent_instructions(
     request: Request,
     tenant_id: str,
@@ -2103,6 +2040,7 @@ async def deploy_agent_instructions(
             agent_version_id=agent_version_id,
             expected_deployment_revision=_deployment_expected_revision(form),
             actor=principal.actor,
+            principal=principal,
         )
         async with get_session_factory()() as session:
             await execute_deploy_agent_version(session, command)
@@ -2150,6 +2088,7 @@ async def rollback_agent_instructions(
             source_version_id=version_id,
             expected_revision=_prompt_expected_revision(form),
             actor=principal.actor,
+            principal=principal,
         )
         async with get_session_factory()() as session:
             await execute_rollback_reply_business_prompt(session, command)
@@ -2257,7 +2196,6 @@ def _render_agent_test_workspace(
     return (
         render_template(
             "tenant/agent_test.html",
-            **_agent_lifecycle_context(tenant_id, agent_id, current_stage="test"),
             playground_title=translate("agent.test.title"),
             playground_description=translate("agent.test.description"),
             sandbox_label=translate("agent.test.sandbox"),
@@ -2545,9 +2483,9 @@ async def agent_detail(
                     models.ReplyBusinessPromptVersion.brand_id == agent_id,
                 )
             )
-        control_plane = (
-            await _load_agent_control_plane_views(session, tenant_id, [agent_id])
-        ).get(agent_id)
+        control_plane = (await _load_agent_control_plane_views(session, tenant_id, [agent_id])).get(
+            agent_id
+        )
         knowledge_counts = dict(
             (
                 await session.execute(
@@ -2701,9 +2639,7 @@ def _render_agent_overview(
         control_plane.deployed_version_revision if control_plane is not None else None
     )
     latest_revision = control_plane.version_revision if control_plane is not None else None
-    release_is_current = (
-        deployed_revision is not None and deployed_revision == latest_revision
-    )
+    release_is_current = deployed_revision is not None and deployed_revision == latest_revision
     if not accounts:
         next_title = translate("agent.connect_first_channel")
         next_description = translate("agent.overview.framework_description")
@@ -3016,9 +2952,12 @@ def _render_agent_activity(audits: list[models.AuditLog]) -> str:
 def _render_inbox_workspace(
     *,
     queue_tabs: str,
+    filter_placeholder: str,
     item_list: str,
     thread: str,
-    action_panel: str,
+    inspector_content: str,
+    has_mobile_selection: bool,
+    back_to_list_href: str,
     item_count: int = 0,
 ) -> str:
     return render_template(
@@ -3029,13 +2968,18 @@ def _render_inbox_workspace(
         search_label=translate("inbox.search_label"),
         search_placeholder=translate("inbox.search_placeholder"),
         queue_tabs_html=trusted_html(queue_tabs),
+        filter_placeholder_html=trusted_html(filter_placeholder),
         item_list_html=trusted_html(item_list),
         search_empty_title=translate("inbox.search_empty_title"),
         search_empty_description=translate("inbox.search_empty_description"),
         workspace_label=translate("conversations.workspace_label"),
         thread_html=trusted_html(thread),
-        current_action_label=translate("inbox.current_action"),
-        action_panel_html=trusted_html(action_panel) if action_panel else "",
+        has_mobile_selection=has_mobile_selection,
+        back_to_list_href=back_to_list_href,
+        back_to_list_label=translate("inbox.back_to_list"),
+        inspector_title=translate("inbox.inspector_title"),
+        inspector_description=translate("inbox.inspector_description"),
+        inspector_content_html=trusted_html(inspector_content),
     )
 
 
@@ -3066,6 +3010,8 @@ async def tenant_inbox(
             (item for item in items if item.item_id == selected_item_uuid),
             None,
         )
+        if selected_item is None and items:
+            selected_item = items[0]
         messages: list[models.Message] = []
         if selected_item and selected_item.queue != "delivery":
             newest_messages = list(
@@ -3106,11 +3052,21 @@ async def tenant_inbox(
         selected_item,
         csrf_token=_csrf(request),
     )
+    filter_placeholder = (
+        '<span class="saas-inbox-filter-placeholder" aria-disabled="true">'
+        f"{escape(translate('inbox.filter_placeholder'))}</span>"
+    )
+    inspector_content = action_panel or (
+        f'<p class="saas-muted">{escape(translate("inbox.inspector_empty"))}</p>'
+    )
     body = _render_inbox_workspace(
         queue_tabs=queue_tabs,
+        filter_placeholder=filter_placeholder,
         item_list=item_list,
         thread=thread,
-        action_panel=action_panel,
+        inspector_content=inspector_content,
+        has_mobile_selection=selected_item_uuid is not None,
+        back_to_list_href=f"{_tenant_root(tenant_id)}/inbox?queue={queue}",
         item_count=len(items),
     )
     return _render_page(
@@ -3176,6 +3132,7 @@ async def tenant_approve_draft(
             final_reply_text=form.get("final_reply_text"),
             expected_generation=_required_draft_generation(form),
             expected_review_action=_required_draft_review_action(form),
+            principal=principal,
         )
     except (DraftReviewNotFound, DraftReviewConflict, DraftReviewValidationError) as exc:
         raise _tenant_draft_review_http_error(exc) from exc
@@ -3204,6 +3161,7 @@ async def tenant_discard_draft(
             review_reason=form.get("review_reason", ""),
             expected_generation=_required_draft_generation(form),
             expected_review_action=_required_draft_review_action(form),
+            principal=principal,
         )
     except (DraftReviewNotFound, DraftReviewConflict, DraftReviewValidationError) as exc:
         raise _tenant_draft_review_http_error(exc) from exc
@@ -3267,6 +3225,7 @@ async def tenant_retry_failed_delivery(
             expected_attempt_count=_required_delivery_attempt_count(form),
             review_reason=form.get("review_reason", ""),
             verification_source=form.get("verification_source", ""),
+            principal=principal,
         )
     except (
         DeliveryRecoveryNotFound,
@@ -3302,6 +3261,7 @@ async def tenant_resolve_reviewed_delivery(
             verification_source=form.get("verification_source", ""),
             resolution=form.get("resolution", ""),
             provider_message_id=form.get("provider_message_id"),
+            principal=principal,
         )
     except (
         DeliveryRecoveryNotFound,
@@ -3370,6 +3330,7 @@ async def _load_inbox_items(
                 status=work_item.status,
                 reason=work_item.reason_code,
                 created_at=work_item.created_at,
+                assigned_actor=work_item.assigned_actor,
                 work_item_version=work_item.version,
             )
             for work_item, conversation, contact, account in rows
@@ -3533,17 +3494,21 @@ def _render_inbox_item_list(
     for item in items:
         is_selected = selected_item is not None and item.item_id == selected_item.item_id
         filter_text = f"{item.title} {item.account_name} {item.platform}"
+        assignee = item.assigned_actor or translate("inbox.unassigned")
         rendered_items.append(
             f'<a class="saas-work-item{" active" if is_selected else ""}" '
             f'href="{root}&amp;item_id={item.item_id}" '
             f'data-filter-text="{escape(filter_text)}"'
             f"{" aria-current='true'" if is_selected else ''}>"
-            f'<div class="saas-work-item-title"><span>{escape(item.title)}</span>'
+            f'<div class="saas-work-item-title"><span class="saas-work-item-identity">'
+            f'<img src="{_channel_icon_path(item.platform)}" alt="">{escape(item.title)}</span>'
             f"<span>{format_age(item.created_at)}</span></div>"
             f"<p>{escape(item.platform)} · {escape(item.channel_type)} · "
             f"{escape(item.account_name)}</p>"
             f'<div class="saas-work-item-meta"><span>{status_badge(item.status)}</span>'
-            f"<span>{escape(item.reason)}</span></div></a>"
+            f'<span class="saas-work-item-reason">{escape(item.reason)}</span></div>'
+            f'<div class="saas-work-item-owner"><span>{escape(translate("inbox.assignee"))}</span>'
+            f"<strong>{escape(assignee)}</strong></div></a>"
         )
     return "".join(rendered_items)
 
@@ -4009,6 +3974,42 @@ async def tenant_conversation_detail(
             .order_by(models.HumanWorkItem.created_at.desc())
             .limit(1)
         )
+        pending_human_send = await has_unfinished_human_send(
+            session, tenant_id=tenant_id, conversation_id=conversation_id
+        )
+        owns_work = work_item is not None and (
+            (principal.user_id is not None and work_item.assigned_user_id == principal.user_id)
+            or (
+                principal.is_superadmin
+                and work_item.assigned_user_id is None
+                and work_item.assigned_session_id == principal.session_id
+            )
+        )
+        transfer_candidates = []
+        if (
+            work_item is not None
+            and work_item.status == "CLAIMED"
+            and (principal.is_admin or owns_work)
+        ):
+            transfer_candidates = list(
+                (
+                    await session.execute(
+                        select(models.AdminUser)
+                        .where(
+                            models.AdminUser.tenant_id == tenant_id,
+                            models.AdminUser.status == "active",
+                            models.AdminUser.role.in_(("USER", "WORKSPACE_ADMIN")),
+                            models.AdminUser.id != work_item.assigned_user_id,
+                            or_(
+                                models.AdminUser.role == "WORKSPACE_ADMIN",
+                                models.AdminUser.id == account.owner_user_id,
+                                account.shared_with_support is True,
+                            ),
+                        )
+                        .order_by(models.AdminUser.username)
+                    )
+                ).scalars()
+            )
     csrf = _csrf(request)
     reply_target = next(
         (message for message in newest_messages if message.direction == "inbound"),
@@ -4022,29 +4023,60 @@ async def tenant_conversation_detail(
         for message in reversed(newest_messages)
     )
     work_actions = ""
-    if work_item is not None and work_item.status == "WAITING":
+    if work_item is None:
+        work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/conversations/{conversation_id}/start-reception">
+<input type="hidden" name="csrf_token" value="{csrf}">
+<button class="saas-button primary" type="submit">{escape(translate("conversation.start_reception"))}</button></form>
+<p class="saas-muted">{escape(translate("conversation.start_reception_description"))}</p>"""
+    elif work_item.status == "WAITING":
         work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/claim">
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_version" value="{work_item.version}">
 <button class="saas-button primary" type="submit">{escape(translate("conversation.claim"))}</button></form>"""
-    elif work_item is not None and work_item.assigned_actor == principal.actor:
-        work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/resolve">
+    elif work_item is not None and work_item.status == "CLAIMED":
+        if owns_work and not pending_human_send:
+            work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/resolve">
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_version" value="{work_item.version}">
 <button class="saas-button" type="submit">{escape(translate("conversation.resolve"))}</button></form>"""
-    reply_form = ""
-    if reply_target is not None:
-        work_fields = ""
-        if work_item is not None:
-            work_fields = (
-                f'<input type="hidden" name="work_item_id" value="{work_item.id}">'
-                f'<input type="hidden" name="expected_version" value="{work_item.version}">'
+        if principal.is_admin and not owns_work:
+            work_actions += f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/conversations/{conversation_id}/start-reception">
+<input type="hidden" name="csrf_token" value="{csrf}"><button class="saas-button" type="submit">{escape(translate("conversation.take_over"))}</button></form>"""
+        if transfer_candidates:
+            transfer_options = "".join(
+                f'<option value="{candidate.id}">{escape(candidate.username)}</option>'
+                for candidate in transfer_candidates
             )
+            work_actions += f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/work-items/{work_item.id}/transfer">
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_version" value="{work_item.version}">
+<label for="conversation-transfer">{escape(translate("conversation.transfer"))}</label><select id="conversation-transfer" name="target_user_id" required>{transfer_options}</select>
+<button class="saas-button" type="submit">{escape(translate("conversation.transfer"))}</button></form>"""
+    if pending_human_send:
+        work_actions += (
+            f'<p class="saas-alert" role="status">{escape(translate("conversation.delivery_pending"))}</p>'
+            + secondary_action(
+                f"{_tenant_root(tenant_id)}/conversations/{conversation_id}",
+                translate("conversation.refresh_delivery"),
+                small=True,
+            )
+        )
+    reply_form = ""
+    can_reply = (
+        reply_target is not None
+        and work_item is not None
+        and work_item.status == "CLAIMED"
+        and owns_work
+    )
+    if can_reply:
         reply_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("conversation.reply_title"))}</h2>
 <p>{escape(translate("conversation.reply_description"))}</p></div></div><div class="saas-card-body">
 <form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/conversations/{conversation_id}/reply">
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="reply_to_message_id" value="{reply_target.id}">
-<input type="hidden" name="idempotency_key" value="{uuid.uuid4()}">{work_fields}
+<input type="hidden" name="idempotency_key" value="{uuid.uuid4()}"><input type="hidden" name="work_item_id" value="{work_item.id}"><input type="hidden" name="expected_version" value="{work_item.version}">
 <label for="manual-reply">{escape(translate("conversation.reply_label"))}</label><textarea id="manual-reply" name="text" rows="5" maxlength="10000" required></textarea>
 <button class="saas-button primary" type="submit">{escape(translate("conversation.send_reply"))}</button></form></div></section>"""
+    elif reply_target is not None:
+        reply_form = (
+            f'<p class="saas-muted">{escape(translate("conversation.reception_required"))}</p>'
+        )
     body = (
         '<section class="saas-card"><div class="saas-card-body">'
         f"{definition_list(((translate('common.contact'), contact.display_name or translate('common.anonymous_contact')), (translate('common.account'), account.name), (translate('common.platform'), conversation.platform), (translate('common.channel'), conversation.channel_type), ('Conversation ID', conversation.id)))}"
@@ -4078,6 +4110,54 @@ async def tenant_conversation_detail(
     return response
 
 
+@router.post("/app/t/{tenant_id}/conversations/{conversation_id}/start-reception")
+async def start_tenant_human_reception(
+    request: Request, tenant_id: str, conversation_id: uuid.UUID
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await start_human_reception(conversation_id=conversation_id, principal=principal)
+    except (TypeError, ValueError, HumanWorkflowError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/conversations/{conversation_id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/app/t/{tenant_id}/work-items/{work_item_id}/transfer")
+async def transfer_tenant_work_item(
+    request: Request, tenant_id: str, work_item_id: uuid.UUID
+) -> Response:
+    principal = await _require_tenant_principal(request, tenant_id)
+    if isinstance(principal, Response):
+        return principal
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        target_user_id = uuid.UUID(form.get("target_user_id") or "")
+        expected_version = int(form.get("expected_version") or "")
+        await transfer_human_work_item(
+            work_item_id=work_item_id,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            user_id=principal.user_id,
+            target_user_id=target_user_id,
+            expected_version=expected_version,
+            principal=principal,
+        )
+    except (TypeError, ValueError, HumanWorkflowError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RedirectResponse(
+        f"{_tenant_root(tenant_id)}/inbox?queue=human",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @router.post("/app/t/{tenant_id}/work-items/{work_item_id}/claim")
 async def claim_tenant_work_item(
     request: Request,
@@ -4097,7 +4177,7 @@ async def claim_tenant_work_item(
             actor=principal.actor,
             user_id=principal.user_id,
             expected_version=expected_version,
-            owner_user_id=None if principal.is_admin else principal.user_id,
+            principal=principal,
         )
     except (TypeError, ValueError, HumanWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -4126,7 +4206,8 @@ async def resolve_tenant_work_item(
             actor=principal.actor,
             expected_version=expected_version,
             allow_override=principal.is_admin,
-            owner_user_id=None if principal.is_admin else principal.user_id,
+            user_id=principal.user_id,
+            principal=principal,
         )
     except (TypeError, ValueError, HumanWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -4153,6 +4234,8 @@ async def reply_to_tenant_conversation(
     try:
         work_item_id = uuid.UUID(form["work_item_id"]) if form.get("work_item_id") else None
         expected_version = int(form["expected_version"]) if form.get("expected_version") else None
+        if work_item_id is None or expected_version is None:
+            raise HTTPException(status_code=409, detail="human_reception_required")
         await send_human_reply(
             conversation_id=conversation_id,
             reply_to_message_id=uuid.UUID(form.get("reply_to_message_id", "")),
@@ -4161,10 +4244,10 @@ async def reply_to_tenant_conversation(
             allowed_tenants=principal.allowed_tenants,
             actor=principal.actor,
             user_id=principal.user_id,
-            allow_override=principal.is_admin,
+            allow_override=False,
             work_item_id=work_item_id,
             expected_version=expected_version,
-            owner_user_id=None if principal.is_admin else principal.user_id,
+            principal=principal,
         )
     except (TypeError, ValueError, HumanWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -4198,17 +4281,14 @@ async def tenant_knowledge_query(request: Request, tenant_id: str) -> Response:
         if query:
             allowed_brand_ids: tuple[str, ...] | None = None
             if not principal.is_admin:
-                owned_brand_ids = set(
+                visible_brand_ids = set(
                     await session.scalars(
                         select(models.PlatformAccount.brand_id)
-                        .where(
-                            models.PlatformAccount.tenant_id == tenant_id,
-                            models.PlatformAccount.owner_user_id == principal.user_id,
-                        )
+                        .where(_account_scope_condition(principal, tenant_id))
                         .distinct()
                     )
                 )
-                allowed_brand_ids = tuple(sorted({"default", *owned_brand_ids}))
+                allowed_brand_ids = tuple(sorted(visible_brand_ids))
             documents = await execute_search_published_knowledge(
                 session,
                 SearchPublishedKnowledgeQuery(
@@ -4421,11 +4501,28 @@ def _channel_job_action(
     *,
     tenant_id: str,
     csrf: str,
+    principal: Principal,
 ) -> str:
     if job.status not in {"NEEDS_ACTION", "FAILED"}:
         return ""
+    target_account_id = getattr(job, "target_account_id", None)
+    reauthorization = getattr(job, "operation", "CONNECT_ACCOUNT") in {
+        "REAUTHORIZE",
+        "REAUTHORIZE_ACCOUNT",
+    }
+    if (
+        not principal.is_admin
+        and job.owner_user_id != principal.user_id
+        and not (target_account_id is not None and reauthorization)
+    ):
+        return ""
     if job.status == "FAILED" and provisioning_job_is_in_flight(job):
         return f'<span class="saas-muted">{escape(translate("channels.job.waiting_retry"))}</span>'
+    if target_account_id is not None and reauthorization:
+        return (
+            f'<a class="saas-button small" href="{_tenant_root(tenant_id)}/channels/accounts/'
+            f'{target_account_id}">{escape(translate("channels.job.reauthorize"))}</a>'
+        )
     if requires_secret_resubmission(job) and job.platform in {"telegram", "email"}:
         return (
             '<button class="saas-button small" type="button" '
@@ -4461,7 +4558,7 @@ def _render_connected_channel(
     kill_switch_label = translate(
         "channels.kill_switch.enabled" if kill_switch_enabled else "channels.kill_switch.disabled"
     )
-    return f"""<article class="saas-connected-channel">
+    return f"""<article class="saas-connected-channel" data-channel-health="{escape(health_tone)}">
 <div class="saas-connected-identity">{_channel_avatar(account)}<div>
 <h3>{escape(account.name)}</h3><p>{escape(profile_line)}</p></div></div>
 <div class="saas-connected-meta"><span class="saas-platform-label">
@@ -4497,6 +4594,302 @@ def _channel_oauth_form(
 </form>"""
 
 
+async def _load_reauthorization_form_values(
+    *,
+    session,
+    tenant_id: str,
+    platform: str,
+    account_id: uuid.UUID,
+    form: dict[str, str],
+) -> tuple[models.PlatformAccount, dict[str, str]]:
+    account = await session.scalar(
+        select(models.PlatformAccount).where(
+            models.PlatformAccount.id == account_id,
+            models.PlatformAccount.tenant_id == tenant_id,
+            models.PlatformAccount.platform == platform,
+        )
+    )
+    if account is None:
+        raise HTTPException(status_code=404, detail="platform_account_not_found")
+    if not account.external_account_id:
+        raise HTTPException(status_code=409, detail="target_account_identity_missing")
+    values = dict(form)
+    values.update(
+        {
+            "tenant_id": tenant_id,
+            "brand_id": account.brand_id,
+            "name": account.name,
+            "public_id": account.public_id or "",
+            "automation_default": "BOT_DRAFT_ONLY",
+        }
+    )
+    config = dict(account.config or {})
+    if platform == "email":
+        values.update(
+            {
+                "email_address": account.external_account_id,
+                "imap_host": str(config.get("imap_host") or ""),
+                "imap_port": str(config.get("imap_port") or 993),
+                "mailbox": str(config.get("mailbox") or "INBOX"),
+                "smtp_host": str(config.get("smtp_host") or ""),
+                "smtp_port": str(config.get("smtp_port") or 465),
+                "smtp_security": str(config.get("smtp_security") or "ssl"),
+                "from_name": str(config.get("from_name") or ""),
+                "internal_domain_policy": str(config.get("internal_domain_policy") or "ignore"),
+            }
+        )
+    elif platform == "whatsapp":
+        values["external_account_id"] = account.external_account_id
+        if account.platform_app_id is not None:
+            app = await session.get(models.PlatformApp, account.platform_app_id)
+            if app is not None:
+                values.update(
+                    {
+                        "app_id": app.external_app_id or "",
+                        "app_public_id": app.public_id,
+                        "app_name": app.name,
+                    }
+                )
+        values.update(
+            {
+                "api_version": str(config.get("api_version") or "v23.0"),
+            }
+        )
+    elif platform == "feishu":
+        values.update(
+            {
+                "app_id": account.external_account_id,
+                "api_base_url": str(
+                    config.get("api_base_url") or "https://open.feishu.cn/open-apis"
+                ),
+                "group_mode": str(config.get("feishu_group_mode") or "mentions_only"),
+            }
+        )
+    elif platform in {"facebook", "instagram"}:
+        values["external_account_id"] = account.external_account_id
+    return account, values
+
+
+def _channel_reauthorization_query(account: models.PlatformAccount) -> str:
+    return urlencode(
+        {
+            "target_account_id": str(account.id),
+            "expected_config_version": account.config_version,
+        }
+    )
+
+
+def _reauthorization_input(
+    name: str,
+    label: str,
+    *,
+    value: object = "",
+    input_type: str = "text",
+    required: bool = True,
+    readonly: bool = False,
+    autocomplete: str = "",
+) -> str:
+    required_attribute = " required" if required else ""
+    readonly_attribute = " readonly" if readonly else ""
+    autocomplete_attribute = f' autocomplete="{escape(autocomplete)}"' if autocomplete else ""
+    return (
+        f'<label for="reauth-{escape(name)}"><span>{escape(label)}</span></label>'
+        f'<input id="reauth-{escape(name)}" name="{escape(name)}" '
+        f'type="{escape(input_type)}" value="{escape(str(value if value is not None else ""))}"'
+        f"{required_attribute}{readonly_attribute}{autocomplete_attribute}>"
+    )
+
+
+def _channel_oauth_reauthorization_form(
+    *,
+    tenant_id: str,
+    account: models.PlatformAccount,
+    csrf: str,
+) -> str:
+    provider = account.platform
+    if account.platform == "facebook":
+        provider = "meta"
+    elif account.platform == "instagram":
+        provider = (
+            "instagram"
+            if (account.config or {}).get("instagram_login_mode") == "instagram_login"
+            else "meta"
+        )
+    action = (
+        f"{_tenant_root(tenant_id)}/channels/oauth/{provider}/start?"
+        f"{_channel_reauthorization_query(account)}"
+    )
+    platform = account.platform if provider == "meta" else None
+    return _channel_oauth_form(
+        action=action,
+        csrf=csrf,
+        tenant_id=tenant_id,
+        label=translate("channels.account.reauthorize"),
+        brand_id=account.brand_id,
+        platform=platform,
+        available=True,
+    )
+
+
+def _channel_direct_reauthorization_form(
+    *,
+    tenant_id: str,
+    account: models.PlatformAccount,
+    csrf: str,
+) -> str:
+    config = dict(account.config or {})
+    action = (
+        f"{_tenant_root(tenant_id)}/channels/accounts/{account.platform}?"
+        f"{_channel_reauthorization_query(account)}"
+    )
+    hidden = "".join(
+        f'<input type="hidden" name="{escape(name)}" value="{escape(value)}">'
+        for name, value in (
+            ("csrf_token", csrf),
+            ("tenant_id", tenant_id),
+            ("brand_id", account.brand_id),
+            ("name", account.name),
+            ("public_id", account.public_id or ""),
+            ("automation_default", "BOT_DRAFT_ONLY"),
+        )
+    )
+    if account.platform == "telegram":
+        fields = _reauthorization_input(
+            "token",
+            "Bot Token",
+            input_type="password",
+            autocomplete="new-password",
+        )
+    elif account.platform == "email":
+        fields = "".join(
+            (
+                _reauthorization_input(
+                    "email_address",
+                    "Email address",
+                    value=account.external_account_id,
+                    input_type="email",
+                    readonly=True,
+                ),
+                _reauthorization_input(
+                    "username",
+                    translate("channels.login_username"),
+                    autocomplete="username",
+                ),
+                _reauthorization_input(
+                    "password",
+                    translate("channels.password"),
+                    input_type="password",
+                    autocomplete="new-password",
+                ),
+                _reauthorization_input(
+                    "imap_host", "IMAP host", value=config.get("imap_host"), readonly=True
+                ),
+                _reauthorization_input(
+                    "imap_port", "IMAP port", value=config.get("imap_port") or 993, readonly=True
+                ),
+                _reauthorization_input(
+                    "mailbox", "Mailbox", value=config.get("mailbox") or "INBOX", readonly=True
+                ),
+                _reauthorization_input(
+                    "smtp_host", "SMTP host", value=config.get("smtp_host"), readonly=True
+                ),
+                _reauthorization_input(
+                    "smtp_port", "SMTP port", value=config.get("smtp_port") or 465, readonly=True
+                ),
+                _reauthorization_input(
+                    "smtp_security",
+                    "SMTP security",
+                    value=config.get("smtp_security") or "ssl",
+                    readonly=True,
+                ),
+                _reauthorization_input(
+                    "from_name",
+                    translate("channels.display_name"),
+                    value=config.get("from_name") or "",
+                    required=False,
+                    readonly=True,
+                ),
+                _reauthorization_input(
+                    "internal_domain_policy",
+                    translate("channels.internal_domain_policy"),
+                    value=config.get("internal_domain_policy") or "ignore",
+                    readonly=True,
+                ),
+            )
+        )
+    elif account.platform == "whatsapp":
+        fields = "".join(
+            (
+                _reauthorization_input(
+                    "external_account_id",
+                    "WhatsApp Business Account ID",
+                    value=account.external_account_id,
+                    readonly=True,
+                ),
+                _reauthorization_input(
+                    "access_token",
+                    "Access Token",
+                    input_type="password",
+                    autocomplete="new-password",
+                ),
+                _reauthorization_input(
+                    "app_secret",
+                    "App Secret",
+                    input_type="password",
+                    autocomplete="new-password",
+                ),
+                _reauthorization_input(
+                    "verify_token",
+                    "Verify Token",
+                    input_type="password",
+                    autocomplete="new-password",
+                ),
+                _reauthorization_input(
+                    "app_public_id",
+                    "Meta App",
+                    value="",
+                    required=False,
+                    readonly=True,
+                ),
+            )
+        )
+    elif account.platform == "feishu":
+        fields = "".join(
+            (
+                _reauthorization_input(
+                    "app_id", "App ID", value=account.external_account_id, readonly=True
+                ),
+                _reauthorization_input(
+                    "app_secret",
+                    "App Secret",
+                    input_type="password",
+                    autocomplete="new-password",
+                ),
+                _reauthorization_input(
+                    "verification_token",
+                    "Verification Token",
+                    input_type="password",
+                    autocomplete="new-password",
+                ),
+                _reauthorization_input(
+                    "encrypt_key",
+                    "Encrypt Key",
+                    input_type="password",
+                    autocomplete="new-password",
+                ),
+            )
+        )
+    else:
+        return ""
+    return (
+        f'<details class="saas-create-disclosure"><summary>{escape(translate("channels.account.reauthorize"))}</summary>'
+        f'<div class="saas-card-body"><p class="saas-muted">{escape(translate("channels.account.reauthorize_notice"))}</p>'
+        f'<form class="saas-form" method="post" action="{escape(action)}">{hidden}{fields}'
+        f'<button class="saas-button primary" type="submit">{escape(translate("channels.account.reauthorize"))}</button>'
+        "</form></div></details>"
+    )
+
+
 def _channel_provider_card(
     *,
     platform: str,
@@ -4510,7 +4903,7 @@ def _channel_provider_card(
         translate("channels.available") if available else translate("channels.admin_configuration")
     )
     state_class = "ready" if available else "managed"
-    return f"""<article class="saas-provider-card{" disabled" if not available else ""}">
+    return f"""<article class="saas-provider-card state-{state_class}{" disabled" if not available else ""}" data-channel-state="{state_class}">
 <div class="saas-provider-heading"><span class="saas-provider-icon">
 <img src="{_channel_icon_path(platform)}" alt=""></span>
 <span class="saas-provider-state {state_class}">{escape(state_label)}</span></div>
@@ -4558,6 +4951,29 @@ async def tenant_channels(
             .scalars()
             .all()
         )
+        maintenance_accounts = []
+        if not principal.is_admin and principal.user_id is not None:
+            maintenance_accounts = list(
+                await session.scalars(
+                    select(models.PlatformAccount)
+                    .join(
+                        models.AccountReauthorizationGrant,
+                        and_(
+                            models.AccountReauthorizationGrant.platform_account_id
+                            == models.PlatformAccount.id,
+                            models.AccountReauthorizationGrant.tenant_id
+                            == models.PlatformAccount.tenant_id,
+                        ),
+                    )
+                    .where(
+                        models.PlatformAccount.tenant_id == tenant_id,
+                        models.AccountReauthorizationGrant.user_id == principal.user_id,
+                        models.AccountReauthorizationGrant.active.is_(True),
+                        _account_scope_condition(principal, tenant_id).is_not(True),
+                    )
+                    .order_by(models.PlatformAccount.name)
+                )
+            )
         owner_names = dict(
             (
                 await session.execute(
@@ -4569,9 +4985,19 @@ async def tenant_channels(
         )
         job_scope = models.ProvisioningJob.tenant_id == tenant_id
         if not principal.is_admin:
+            reauth_account_ids = select(
+                models.AccountReauthorizationGrant.platform_account_id
+            ).where(
+                models.AccountReauthorizationGrant.tenant_id == tenant_id,
+                models.AccountReauthorizationGrant.user_id == principal.user_id,
+                models.AccountReauthorizationGrant.active.is_(True),
+            )
             job_scope = and_(
                 job_scope,
-                models.ProvisioningJob.owner_user_id == principal.user_id,
+                or_(
+                    models.ProvisioningJob.owner_user_id == principal.user_id,
+                    models.ProvisioningJob.target_account_id.in_(reauth_account_ids),
+                ),
             )
         jobs = list(
             (
@@ -4629,7 +5055,7 @@ data-job-status="{escape(job.status)}">
 <div><img src="{_channel_icon_path(job.platform)}" alt=""><strong>{escape(job.platform.title())}</strong>
 <span>{format_datetime(job.created_at, include_year=True)}</span>
 <span>{escape(translate("channels.owner", owner=owner_names.get(job.owner_user_id) or translate("channels.organization_account")))}</span></div>
-<div>{status_badge(job.status)}<span data-job-step>{escape(job.current_step)}</span>{_channel_job_action(job, tenant_id=tenant_id, csrf=csrf)}</div>
+<div>{status_badge(job.status)}<span data-job-step>{escape(job.current_step)}</span>{_channel_job_action(job, tenant_id=tenant_id, csrf=csrf, principal=principal)}</div>
 {f'<p class="saas-job-error">{escape(_channel_job_error_message(job))}</p>' if job.last_error_code else ""}
 </article>"""
             for job in jobs
@@ -4835,14 +5261,31 @@ data-job-status="{escape(job.status)}">
 <label for="feishu-encrypt-key">Encrypt Key</label><input id="feishu-encrypt-key" name="encrypt_key" type="password" autocomplete="new-password" required>
 <div class="saas-dialog-actions"><button class="saas-button" type="button" data-close-channel-dialog>{escape(translate("button.cancel"))}</button>
 <button class="saas-button primary" type="submit" data-pending-label="{pending_label}">{escape(translate("channels.validate_connect"))}</button></div></form></dialog>"""
-    body = f"""{banner}<section><div class="saas-section-title"><div><h2>{escape(translate("channels.connected_title"))}</h2>
+    maintenance_section = ""
+    if maintenance_accounts:
+        maintenance_rows = "".join(
+            f"<li><strong>{escape(item.name)}</strong> · {escape(item.platform.title())} "
+            f"{secondary_action(f'{_tenant_root(tenant_id)}/channels/accounts/{item.id}', translate('channels.maintain_connection'), small=True)}</li>"
+            for item in maintenance_accounts
+        )
+        maintenance_section = (
+            '<section id="maintenance-channels" class="saas-card"><div class="saas-card-header"><div>'
+            f"<h2>{escape(translate('channels.maintenance_title'))}</h2>"
+            f"<p>{escape(translate('channels.maintenance_description'))}</p></div></div>"
+            f'<div class="saas-card-body"><ul>{maintenance_rows}</ul></div></section>'
+        )
+    active_channel_count = sum(account.status == "active" for account in accounts)
+    pending_job_count = sum(job.status in {"PENDING", "PROCESSING", "RETRY"} for job in jobs)
+    body = f"""{banner}<section><div class="saas-section-header"><div class="saas-section-header-copy"><span class="saas-eyebrow">{escape(translate("nav.group.configuration"))}</span><h2>{escape(translate("channels.connected_title"))}</h2>
 <p>{escape(translate("channels.connected_description"))}</p></div></div>
-<div class="saas-connected-grid">{connected_channels}</div></section>
-<section id="add-channels"><div class="saas-section-title"><div><h2>{escape(translate("channels.add_title"))}</h2>
+<div class="saas-status-summary"><span class="saas-status-summary-label">{escape(translate("common.status"))}</span><div class="saas-status-summary-items">{status_badge("active", label=translate("channels.summary.connected", count=active_channel_count))}</div></div>
+<div class="saas-connected-grid">{connected_channels}</div></section>{maintenance_section}
+<section id="add-channels"><div class="saas-section-header"><div class="saas-section-header-copy"><span class="saas-eyebrow">{escape(translate("nav.channels"))}</span><h2>{escape(translate("channels.add_title"))}</h2>
 <p>{escape(translate("channels.add_description"))}</p></div></div>
 <div class="saas-provider-grid">{provider_cards}</div></section>
-<section><div class="saas-section-title"><div><h2>{escape(translate("channels.progress_title"))}</h2>
+<section><div class="saas-section-header"><div class="saas-section-header-copy"><span class="saas-eyebrow">{escape(translate("common.details"))}</span><h2>{escape(translate("channels.progress_title"))}</h2>
 <p>{escape(translate("channels.progress_description"))}</p></div></div>
+<div class="saas-status-summary"><span class="saas-status-summary-label">{escape(translate("common.status"))}</span><div class="saas-status-summary-items">{status_badge("processing" if pending_job_count else "healthy", label=translate("channels.summary.pending_jobs", count=pending_job_count))}</div></div>
 <div class="saas-channel-jobs">{job_cards}</div></section>{dialogs}
 <script src="/static/channels.js" defer></script>"""
     response = _render_page(
@@ -4940,18 +5383,45 @@ async def connect_channel_account(
     request: Request,
     tenant_id: str,
     platform: str,
+    target_account_id: uuid.UUID | None = None,
+    expected_config_version: int | None = None,
 ) -> Response:
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     form = await _form(request)
     _require_csrf(request, form)
+    if target_account_id is None and expected_config_version is not None:
+        raise HTTPException(status_code=422, detail="expected_config_version_requires_target")
+    operation = "CONNECT_ACCOUNT"
+    command_values = form
+    target_brand_id: str | None = None
+    target_external_account_id: str | None = None
+    if target_account_id is not None:
+        if expected_config_version is None:
+            raise HTTPException(status_code=422, detail="expected_config_version_required")
+        operation = "REAUTHORIZE_ACCOUNT"
+        async with get_session_factory()() as session:
+            target_account, command_values = await _load_reauthorization_form_values(
+                session=session,
+                tenant_id=tenant_id,
+                platform=platform,
+                account_id=target_account_id,
+                form=form,
+            )
+        target_brand_id = target_account.brand_id
+        target_external_account_id = target_account.external_account_id
     try:
         command = build_provisioning_command(
             route_tenant_id=tenant_id,
             platform=platform,
             actor=_channel_actor(principal),
-            values=form,
+            values=command_values,
+            operation=operation,
+            target_account_id=target_account_id,
+            expected_config_version=expected_config_version,
+            target_brand_id=target_brand_id,
+            target_external_account_id=target_external_account_id,
         )
         job_id = await submit_channel_provisioning(command)
     except ChannelManagementError as exc:
@@ -4969,8 +5439,16 @@ async def connect_personal_account_compatibility(
     request: Request,
     tenant_id: str,
     platform: str,
+    target_account_id: uuid.UUID | None = None,
+    expected_config_version: int | None = None,
 ) -> Response:
-    return await connect_channel_account(request, tenant_id, platform)
+    return await connect_channel_account(
+        request,
+        tenant_id,
+        platform,
+        target_account_id=target_account_id,
+        expected_config_version=expected_config_version,
+    )
 
 
 @router.get(
@@ -4987,15 +5465,32 @@ async def channel_account_detail(
         return principal
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-        statement = select(models.PlatformAccount).where(
-            models.PlatformAccount.id == account_id,
-            _account_scope_condition(principal, tenant_id),
+        account = await session.scalar(
+            select(models.PlatformAccount).where(
+                models.PlatformAccount.id == account_id,
+                or_(
+                    _account_scope_condition(principal, tenant_id),
+                    select(models.AccountReauthorizationGrant.id)
+                    .where(
+                        models.AccountReauthorizationGrant.tenant_id == tenant_id,
+                        models.AccountReauthorizationGrant.platform_account_id
+                        == models.PlatformAccount.id,
+                        models.AccountReauthorizationGrant.user_id == principal.user_id,
+                        models.AccountReauthorizationGrant.active.is_(True),
+                    )
+                    .exists(),
+                ),
+            )
         )
-        account = await session.scalar(statement)
         if account is None:
             raise HTTPException(status_code=404, detail="platform_account_not_found")
         owner = (
-            await session.get(models.AdminUser, account.owner_user_id)
+            await session.scalar(
+                select(models.AdminUser).where(
+                    models.AdminUser.id == account.owner_user_id,
+                    models.AdminUser.tenant_id == tenant_id,
+                )
+            )
             if account.owner_user_id is not None
             else None
         )
@@ -5006,7 +5501,7 @@ async def channel_account_detail(
                         select(models.AdminUser)
                         .where(
                             models.AdminUser.tenant_id == tenant_id,
-                            models.AdminUser.role == "USER",
+                            models.AdminUser.role.in_(("USER", "WORKSPACE_ADMIN")),
                             models.AdminUser.status == "active",
                         )
                         .order_by(models.AdminUser.username)
@@ -5015,6 +5510,15 @@ async def channel_account_detail(
             )
             if principal.is_admin
             else []
+        )
+        active_grant_user_ids = set(
+            await session.scalars(
+                select(models.AccountReauthorizationGrant.user_id).where(
+                    models.AccountReauthorizationGrant.tenant_id == tenant_id,
+                    models.AccountReauthorizationGrant.platform_account_id == account_id,
+                    models.AccountReauthorizationGrant.active.is_(True),
+                )
+            )
         )
     redis = aioredis.from_url(get_settings().redis_url)
     try:
@@ -5046,24 +5550,68 @@ async def channel_account_detail(
         if principal.is_admin
         else ""
     )
+    shared_label = translate(
+        "channels.account.support_shared"
+        if account.shared_with_support
+        else "channels.account.support_private"
+    )
+    support_visibility_form = (
+        f"""<form class="saas-form" method="post" action="{account_path}/support-visibility">
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}">
+<input type="hidden" name="shared" value="{"false" if account.shared_with_support else "true"}">
+<p class="saas-muted">{escape(translate("channels.account.support_visibility_notice"))}</p>
+<button class="saas-button" type="submit">{escape(translate("channels.account.disable_support_sharing" if account.shared_with_support else "channels.account.enable_support_sharing"))}</button></form>"""
+        if principal.is_admin
+        else ""
+    )
+    grant_controls = ""
+    if principal.is_admin:
+        grant_rows = "".join(
+            f"""<div class="saas-form-row"><span>{escape(candidate.username)}</span><span class="saas-muted">{escape(translate("channels.account.grant_active") if candidate.id in active_grant_user_ids else translate("channels.account.grant_inactive"))}</span>
+<form method="post" action="{account_path}/reauthorization-grants/{candidate.id}"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="enabled" value="{"false" if candidate.id in active_grant_user_ids else "true"}"><button class="saas-button small" type="submit">{escape(translate("channels.account.grant_disable" if candidate.id in active_grant_user_ids else "channels.account.grant_enable"))}</button></form></div>"""
+            for candidate in assignable_owners
+            if candidate.role == "USER"
+        )
+        grant_controls = f"""<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.reauthorization_grants"))}</h2></div><div class="saas-card-body"><p class="saas-muted">{escape(translate("channels.account.reauthorization_grants_notice"))}</p>{grant_rows or f'<p class="saas-muted">{escape(translate("channels.account.no_support_agents"))}</p>'}</div></section>"""
+    can_reauthorize = principal.is_admin or principal.user_id in active_grant_user_ids
+    reauthorization_form = ""
+    if can_reauthorize:
+        if account.platform in {"x", "facebook", "instagram"}:
+            reauthorization_form = _channel_oauth_reauthorization_form(
+                tenant_id=tenant_id,
+                account=account,
+                csrf=csrf,
+            )
+        else:
+            reauthorization_form = _channel_direct_reauthorization_form(
+                tenant_id=tenant_id,
+                account=account,
+                csrf=csrf,
+            )
     xchat_form = ""
-    if account.platform == "x" and get_settings().xchat_enabled:
+    if (
+        can_reauthorize and account.platform == "x" and get_settings().xchat_enabled
+        and (principal.is_admin or (account.config or {}).get("xchat_enabled"))
+    ):
         xchat_form = f"""<form class="saas-form" method="post" action="{account_path}/xchat/repair">
-<input type="hidden" name="csrf_token" value="{csrf}"><label for="channel-xchat-pin">XChat PIN</label>
-<input id="channel-xchat-pin" name="xchat_pin" type="password" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" autocomplete="new-password" required>
+<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}">
+<label for="channel-xchat-pin">XChat PIN</label><input id="channel-xchat-pin" name="xchat_pin" type="password" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" autocomplete="new-password" required>
 <button class="saas-button" type="submit">{escape(translate("channels.account.repair_xchat"))}</button></form>"""
+    admin_lifecycle = ""
+    admin_controls = ""
+    if principal.is_admin:
+        admin_lifecycle = f"""<form class="saas-form" method="post" action="{account_path}/rename"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}">
+<label for="channel-account-name">{escape(translate("channels.display_name"))}</label><input id="channel-account-name" name="name" value="{escape(account.name)}" maxlength="255" required><button class="saas-button" type="submit">{escape(translate("channels.account.rename"))}</button></form>
+<form class="saas-form" method="post" action="{account_path}/status"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="expected_status" value="{escape(account.status)}"><input type="hidden" name="enabled" value="{"true" if next_status_enabled else "false"}"><button class="saas-button" type="submit">{escape(next_status_label)}</button></form>{reauthorization_form}"""
+        admin_controls = f"""<form class="saas-form" method="post" action="{account_path}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="target" value="{next_automation_target}"><button class="saas-button" type="submit">{escape(translate("channels.account.set_automation", target=next_automation_target))}</button></form>
+<form class="saas-form" method="post" action="{account_path}/kill-switch"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="enabled" value="{"false" if kill_switch_enabled else "true"}"><button class="saas-button" type="submit">{escape(translate("channels.account.set_kill_switch", enabled=not kill_switch_enabled))}</button></form>{owner_form}{support_visibility_form}{xchat_form}"""
+    elif reauthorization_form:
+        admin_lifecycle = reauthorization_form + xchat_form
     body = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(account.name)}</h2>
 <p>{escape(account.platform.title())} · {escape(account.public_id or str(account.id))}</p></div>{status_badge(account.status)}</div>
-<div class="saas-card-body">{definition_list(((translate("channels.account.owner"), owner.username if owner else translate("channels.organization_account")), (translate("channels.account.health"), _channel_account_health(account)[1]), (translate("channels.account.automation"), account.automation_default), (translate("channels.account.kill_switch"), translate("channels.kill_switch.enabled") if kill_switch_enabled else translate("channels.kill_switch.disabled")), ("Config version", account.config_version)))}</div></section>
-<div class="saas-grid two"><section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.lifecycle"))}</h2></div><div class="saas-card-body">
-<form class="saas-form" method="post" action="{account_path}/rename"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}">
-<label for="channel-account-name">{escape(translate("channels.display_name"))}</label><input id="channel-account-name" name="name" value="{escape(account.name)}" maxlength="255" required><button class="saas-button" type="submit">{escape(translate("channels.account.rename"))}</button></form>
-<form class="saas-form" method="post" action="{account_path}/status"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="expected_status" value="{escape(account.status)}"><input type="hidden" name="enabled" value="{"true" if next_status_enabled else "false"}"><button class="saas-button" type="submit">{escape(next_status_label)}</button></form>
-<p><a class="saas-button" href="{_tenant_root(tenant_id)}/channels#add-channels">{escape(translate("channels.account.reauthorize"))}</a></p></div></section>
-<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.controls"))}</h2></div><div class="saas-card-body">
-<form class="saas-form" method="post" action="{account_path}/automation"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="target" value="{next_automation_target}"><button class="saas-button" type="submit">{escape(translate("channels.account.set_automation", target=next_automation_target))}</button></form>
-<form class="saas-form" method="post" action="{account_path}/kill-switch"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="enabled" value="{"false" if kill_switch_enabled else "true"}"><button class="saas-button" type="submit">{escape(translate("channels.account.set_kill_switch", enabled=not kill_switch_enabled))}</button></form>
-{owner_form}{xchat_form}</div></section></div>"""
+<div class="saas-card-body">{definition_list(((translate("channels.account.owner"), owner.username if owner else translate("channels.organization_account")), (translate("channels.account.health"), _channel_account_health(account)[1]), (translate("channels.account.automation"), account.automation_default), (translate("channels.account.kill_switch"), translate("channels.kill_switch.enabled") if kill_switch_enabled else translate("channels.kill_switch.disabled")), (translate("channels.account.support_visibility"), shared_label), ("Config version", account.config_version)))}</div></section>
+<div class="saas-grid two"><section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.lifecycle"))}</h2></div><div class="saas-card-body">{admin_lifecycle or f'<p class="saas-muted">{escape(translate("channels.account.read_only_notice"))}</p>'}</div></section>
+<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.controls"))}</h2></div><div class="saas-card-body">{admin_controls or f'<p class="saas-muted">{escape(translate("channels.account.admin_only_notice"))}</p>'}</div></section></div>{grant_controls}"""
     response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
@@ -5215,6 +5763,52 @@ async def assign_channel_account_owner_route(
     return _channel_redirect(tenant_id, account_id)
 
 
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/support-visibility")
+async def set_channel_account_support_visibility_route(
+    request: Request, tenant_id: str, account_id: uuid.UUID
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    try:
+        await set_channel_account_support_visibility(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            shared=_required_form_bool(form, "shared"),
+            expected_config_version=_required_form_int(form, "expected_config_version"),
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id, account_id)
+
+
+@router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/reauthorization-grants/{user_id}")
+async def set_channel_reauthorization_grant_route(
+    request: Request,
+    tenant_id: str,
+    account_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> Response:
+    context = await _channel_mutation_principal_and_form(request, tenant_id)
+    if isinstance(context, Response):
+        return context
+    principal, form = context
+    try:
+        await set_channel_reauthorization_grant(
+            tenant_id=tenant_id,
+            account_id=account_id,
+            actor=_channel_actor(principal),
+            user_id=user_id,
+            enabled=_required_form_bool(form, "enabled"),
+            expected_config_version=_required_form_int(form, "expected_config_version"),
+        )
+    except ChannelManagementError as exc:
+        raise _channel_management_http_error(exc) from exc
+    return _channel_redirect(tenant_id, account_id)
+
+
 @router.post("/app/t/{tenant_id}/channels/accounts/{account_id}/xchat/repair")
 async def repair_channel_xchat_route(
     request: Request, tenant_id: str, account_id: uuid.UUID
@@ -5223,17 +5817,24 @@ async def repair_channel_xchat_route(
     if isinstance(context, Response):
         return context
     principal, form = context
+    expected_config_version = _required_form_int(form, "expected_config_version")
+    if expected_config_version < 1:
+        raise HTTPException(status_code=422, detail="invalid_integer:expected_config_version")
     try:
         await repair_channel_xchat(
             tenant_id=tenant_id,
             account_id=account_id,
             actor=_channel_actor(principal),
             pin=form.get("xchat_pin") or "",
+            expected_config_version=expected_config_version,
         )
     except ChannelManagementError as exc:
         raise _channel_management_http_error(exc) from exc
     except XChatActivationError as exc:
-        raise HTTPException(status_code=422, detail=exc.code) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.operator_message, "retryable": exc.retryable},
+        ) from exc
     return _channel_redirect(tenant_id, account_id)
 
 
@@ -5253,7 +5854,19 @@ async def channel_job_status(
             models.ProvisioningJob.tenant_id == tenant_id,
         )
         if not principal.is_admin:
-            statement = statement.where(models.ProvisioningJob.owner_user_id == principal.user_id)
+            reauth_account_ids = select(
+                models.AccountReauthorizationGrant.platform_account_id
+            ).where(
+                models.AccountReauthorizationGrant.tenant_id == tenant_id,
+                models.AccountReauthorizationGrant.user_id == principal.user_id,
+                models.AccountReauthorizationGrant.active.is_(True),
+            )
+            statement = statement.where(
+                or_(
+                    models.ProvisioningJob.owner_user_id == principal.user_id,
+                    models.ProvisioningJob.target_account_id.in_(reauth_account_ids),
+                )
+            )
         job = (await session.execute(statement)).scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=404, detail="provisioning_job_not_found")
@@ -5278,7 +5891,7 @@ async def retry_channel_job_route(
         await retry_channel_job(
             tenant_id=tenant_id,
             job_id=job_id,
-            actor=_channel_actor(principal),
+            principal=principal,
         )
     except ChannelManagementError as exc:
         raise _channel_management_http_error(exc) from exc
@@ -5298,6 +5911,32 @@ def _feishu_handoff_redirect(tenant_id: str, notice: str) -> RedirectResponse:
         f"{_tenant_root(tenant_id)}/channels/feishu/handoff?{urlencode({'notice': notice})}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
+
+
+def _feishu_employee_options(staff, selected=None) -> str:
+    options = f'<option value="">{escape(translate("admin.handoff.choose_employee"))}</option>'
+    return options + "".join(
+        f'<option value="{user.id}"{" selected" if user.id == selected else ""}>'
+        f"{escape(user.username)}</option>"
+        for user in staff
+        if user.status == "active"
+    )
+
+
+def _feishu_operator_edit_form(operator, staff, tenant_id: str, csrf: str) -> str:
+    options = _feishu_employee_options(staff, operator.admin_user_id)
+    return f"""<details class="saas-danger-action"><summary>{escape(translate("admin.users.manage"))}</summary>
+<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/feishu/handoff/operators">
+<input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="operator_open_id" value="{escape(operator.operator_open_id)}">
+<input type="hidden" name="expected_admin_user_id" value="{operator.admin_user_id or ""}">
+<label>{escape(translate("admin.handoff.employee"))}<select name="admin_user_id" required>{options}</select></label>
+<label>{escape(translate("admin.handoff.display_name"))}<input name="display_name" value="{escape(operator.display_name or "")}" maxlength="100"></label>
+<label><input type="checkbox" name="can_claim" value="true"{" checked" if operator.can_claim else ""}> {escape(translate("admin.handoff.can_claim"))}</label>
+<label><input type="checkbox" name="can_resolve" value="true"{" checked" if operator.can_resolve else ""}> {escape(translate("admin.handoff.can_resolve"))}</label>
+<label><input type="checkbox" name="confirm_rebind" value="true"> {escape(translate("admin.handoff.confirm_rebind"))}</label>
+<button class="saas-button" type="submit">{escape(translate("admin.handoff.save_operator"))}</button>
+</form></details>"""
 
 
 @router.get(
@@ -5321,17 +5960,21 @@ async def tenant_feishu_handoff_page(request: Request, tenant_id: str) -> Respon
     )
     if not account_options:
         account_options = '<option value="">Connect a Feishu account first</option>'
+    staff_options = _feishu_employee_options(snapshot.staff)
+    employee_names = {user.id: user.username for user in snapshot.staff}
     config = snapshot.config
     operator_rows = (
         "".join(
             f"<tr><td>{escape(operator.display_name or '—')}</td>"
-            f"<td><code>{escape(operator.operator_open_id)}</code></td>"
+            f"<td><code>{escape(operator.operator_open_id)}</code>"
+            f"<div>{escape(employee_names.get(operator.admin_user_id, str(operator.admin_user_id or '—')))}</div></td>"
             f"<td>{status_badge(operator.status)}</td><td>"
             f'<form method="post" action="{_tenant_root(tenant_id)}/channels/feishu/handoff/operators/{operator.id}/status">'
             f'<input type="hidden" name="csrf_token" value="{csrf}">'
             f'<input type="hidden" name="enabled" value="{"false" if operator.status == "ACTIVE" else "true"}">'
             f'<button class="saas-button small" type="submit">{escape(translate("admin.handoff.disable") if operator.status == "ACTIVE" else translate("admin.handoff.enable"))}</button>'
-            "</form></td></tr>"
+            "</form>"
+            f"{_feishu_operator_edit_form(operator, snapshot.staff, tenant_id, csrf)}</td></tr>"
             for operator in snapshot.operators
         )
         or '<tr><td colspan="4">—</td></tr>'
@@ -5358,6 +6001,7 @@ async def tenant_feishu_handoff_page(request: Request, tenant_id: str) -> Respon
 <form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/channels/feishu/handoff/operators"><input type="hidden" name="csrf_token" value="{csrf}">
 <label for="operator-open-id">Operator Open ID</label><input id="operator-open-id" name="operator_open_id" maxlength="128" required>
 <label for="operator-name">{escape(translate("admin.handoff.display_name"))}</label><input id="operator-name" name="display_name" maxlength="100">
+<label for="operator-employee">{escape(translate("admin.handoff.employee"))}</label><select id="operator-employee" name="admin_user_id" required>{staff_options}</select>
 <label><input type="checkbox" name="can_claim" value="true" checked> {escape(translate("admin.handoff.can_claim"))}</label>
 <label><input type="checkbox" name="can_resolve" value="true" checked> {escape(translate("admin.handoff.can_resolve"))}</label>
 <button class="saas-button primary" type="submit">{escape(translate("admin.handoff.save_operator"))}</button></form></div></section></div>
@@ -5397,6 +6041,7 @@ async def save_tenant_feishu_handoff_config(request: Request, tenant_id: str) ->
             account_id=account_id,
             destination_chat_id=form.get("destination_chat_id") or "",
             enabled=form.get("enabled") == "true",
+            principal=principal,
         )
     except FeishuHandoffError as exc:
         raise _feishu_handoff_http_error(exc) from exc
@@ -5411,6 +6056,15 @@ async def save_tenant_feishu_handoff_operator(request: Request, tenant_id: str) 
     form = await _form(request)
     _require_csrf(request, form)
     try:
+        employee_id = uuid.UUID(form["admin_user_id"]) if form.get("admin_user_id") else None
+        previous_id = (
+            uuid.UUID(form["expected_admin_user_id"])
+            if form.get("expected_admin_user_id")
+            else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_feishu_operator_staff_id") from exc
+    try:
         await upsert_feishu_handoff_operator(
             tenant_id=tenant_id,
             actor=principal.actor,
@@ -5418,6 +6072,10 @@ async def save_tenant_feishu_handoff_operator(request: Request, tenant_id: str) 
             display_name=form.get("display_name") or "",
             can_claim=form.get("can_claim") == "true",
             can_resolve=form.get("can_resolve") == "true",
+            admin_user_id=employee_id,
+            expected_admin_user_id=previous_id,
+            confirm_rebind=form.get("confirm_rebind") == "true",
+            principal=principal,
         )
     except FeishuHandoffError as exc:
         raise _feishu_handoff_http_error(exc) from exc
@@ -5441,6 +6099,7 @@ async def set_tenant_feishu_handoff_operator_status(
             actor=principal.actor,
             operator_id=operator_id,
             enabled=_required_form_bool(form, "enabled"),
+            principal=principal,
         )
     except FeishuHandoffError as exc:
         raise _feishu_handoff_http_error(exc) from exc
@@ -5457,6 +6116,7 @@ async def send_tenant_feishu_handoff_test(request: Request, tenant_id: str) -> R
     outcome = await send_feishu_handoff_test_card(
         tenant_id=tenant_id,
         actor=principal.actor,
+        principal=principal,
         title=translate("admin.handoff.test_card_title"),
         content=(
             translate("admin.handoff.test_card_connected", tenant_id=tenant_id)
@@ -5491,8 +6151,9 @@ def _knowledge_location(
     root = f"{_tenant_root(tenant_id)}/knowledge"
     return f"{root}?{urlencode(query)}" if query else root
 
-
 def _knowledge_http_error(exc: KnowledgeApplicationError) -> HTTPException:
+    if isinstance(exc, KnowledgeAuthorizationError):
+        return HTTPException(status_code=403, detail=exc.code)
     if isinstance(exc, KnowledgeNotFoundError):
         return HTTPException(status_code=404, detail=exc.code)
     if isinstance(exc, KnowledgeConflictError):
@@ -5642,14 +6303,15 @@ async def tenant_knowledge(
         status_filter,
     )
     safe_brand_prefill = safe_brand_filter or "default"
-    filters = f"""<form class="saas-filter-bar" method="get">
+    filters = f"""<form class="saas-filter-toolbar" method="get">
 <input type="hidden" name="status_filter" value="{escape(status_filter)}">
+<div class="saas-filter-toolbar-controls">
 {_knowledge_filter_select("brand_id", "Brand", brands, safe_brand_filter)}
 {_knowledge_filter_select("platform", "Platform", platforms, safe_platform_filter)}
-{_knowledge_filter_select("category", translate("common.category"), categories, safe_category_filter)}
-<button class="saas-button" type="submit">{escape(translate("common.apply_filters"))}</button></form>"""
+{_knowledge_filter_select("category", translate("common.category"), categories, safe_category_filter)}</div>
+<div class="saas-filter-toolbar-actions"><button class="saas-button" type="submit">{escape(translate("common.apply_filters"))}</button></div></form>"""
     csrf = _csrf(request)
-    add_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("knowledge.add_document"))}</h2></div></div>
+    add_form = f"""<details class="saas-create-disclosure"><summary>{escape(translate("knowledge.add_document"))}</summary>
 <div class="saas-card-body"><form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/knowledge/documents">
 <input type="hidden" name="csrf_token" value="{escape(csrf)}">
 <label>Question<input name="question" maxlength="2000" required></label>
@@ -5659,22 +6321,22 @@ async def tenant_knowledge(
 <label>{escape(translate("common.category"))}<input name="category" maxlength="64" value="{escape(safe_category_filter)}"></label></div>
 <label>Protected values JSON<input name="protected_values_json" placeholder='["Acme Portal"]'></label>
 <label><input type="checkbox" name="is_official_contact" value="true"> Official/contact-only content</label>
-<button class="saas-button primary" type="submit">{escape(translate("knowledge.add_document"))}</button></form></div></section>"""
-    import_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>CSV Import</h2></div></div>
+<button class="saas-button primary" type="submit">{escape(translate("knowledge.add_document"))}</button></form></div></details>"""
+    import_form = f"""<details class="saas-create-disclosure"><summary>CSV Import</summary>
 <div class="saas-card-body"><form class="saas-form" method="post" enctype="multipart/form-data" action="{_tenant_root(tenant_id)}/knowledge/import">
 <input type="hidden" name="csrf_token" value="{escape(csrf)}"><label>Default brand<input name="brand_id" value="{escape(safe_brand_prefill)}" required></label>
 <label>UTF-8 CSV (max 2 MiB / 2000 rows)<input type="file" name="file" accept=".csv" required></label>
-<button class="saas-button primary" type="submit">Import</button></form></div></section>"""
+<button class="saas-button primary" type="submit">Import</button></form></div></details>"""
     batch_options = "".join(
         f'<option value="{escape(row.import_batch_id)}">CSV batch · {escape(row[2])}</option>'
         for row in batch_rows
     )
-    batch_forms = f"""<div class="saas-grid two"><section class="saas-card"><div class="saas-card-body">
+    batch_forms = f"""<section class="saas-batch-toolbar"><div>
 <form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/knowledge/bulk-confirm-english"><input type="hidden" name="csrf_token" value="{escape(csrf)}">
 <label>English import batch<select name="import_batch_id" required>{batch_options or '<option value="">No pending batch</option>'}</select></label>
-<button class="saas-button" type="submit">Confirm English batch</button></form></div></section>
-<section class="saas-card"><div class="saas-card-body"><form method="post" action="{_tenant_root(tenant_id)}/knowledge/bulk-publish">
-<input type="hidden" name="csrf_token" value="{escape(csrf)}"><button class="saas-button" type="submit">Publish safe drafts</button></form></div></section></div>"""
+<button class="saas-button" type="submit">Confirm English batch</button></form></div>
+<div><p class="saas-muted">{escape(translate("knowledge.filter.draft", count=int(counts.get("draft", 0))))}</p>
+<form method="post" action="{_tenant_root(tenant_id)}/knowledge/bulk-publish"><input type="hidden" name="csrf_token" value="{escape(csrf)}"><button class="saas-button" type="submit">Publish safe drafts</button></form></div></section>"""
     next_review = next(
         (
             document
@@ -5721,7 +6383,14 @@ async def tenant_knowledge(
             tenant_id=tenant_id,
             title=translate("knowledge.title"),
             description=translate("knowledge.description"),
-            body=f'{filter_tabs}{filters}{next_review_html}<div class="saas-grid two">{add_form}{import_form}</div>{batch_forms}{table}',
+            body=(
+                f"{filter_tabs}{filters}{next_review_html}"
+                f'<div class="saas-section-header"><div class="saas-section-header-copy">'
+                f'<span class="saas-eyebrow">{escape(translate("nav.group.content_ai"))}</span>'
+                f"<h2>{escape(translate('knowledge.title'))}</h2>"
+                f"<p>{escape(translate('knowledge.description'))}</p></div></div>{table}"
+                f'<div class="saas-grid two saas-low-frequency-tools">{add_form}{import_form}</div>{batch_forms}'
+            ),
             active_navigation="knowledge",
             inbox_count=inbox_summary.total,
         )
@@ -6669,22 +7338,39 @@ async def system_overview(request: Request) -> Response:
         f"<td>{escape(audit.actor)}</td><td>{escape(audit.action)}</td></tr>"
         for audit in recent_audits
     )
-    body = f"""<section class="saas-alert warning">
-{escape(translate("system.overview.security_notice"))}</section>
-<div class="saas-grid three">
-{metric_card(summary["active_user_count"], translate("system.overview.active_users"))}
-{metric_card(summary["disabled_user_count"], translate("system.overview.disabled_users"))}
-{metric_card(summary["active_session_count"], translate("system.overview.active_sessions"))}</div>
-<div class="saas-grid three">
-{metric_card(summary["expired_session_count"], translate("system.overview.expired_sessions"))}
-{metric_card(summary["global_kill_switch_state"], translate("system.overview.global_kill_switch"))}
-{metric_card(translate("common.complete") if summary["security_configuration_complete"] else translate("common.incomplete"), translate("system.overview.security_configuration"))}</div>
-<div class="saas-section-title"><div><h2>{escape(translate("system.overview.operations"))}</h2>
-<p>{escape(translate("system.overview.operations_description"))}</p></div></div>
-<div class="saas-action-row">{secondary_action("/admin/system/users", translate("system.overview.access"))}{secondary_action("/admin/system/safety", translate("system.overview.safety"))}{secondary_action("/admin/system/audit", translate("home.view_all"))}</div>
-<div class="saas-section-title"><div><h2>{escape(translate("system.overview.recent_activity"))}</h2></div>
-{secondary_action("/admin/system/audit", translate("home.view_all"), small=True)}</div>
-{f'<div class="saas-table-wrap"><table class="saas-table"><tbody>{audit_rows}</tbody></table></div>' if audit_rows else f'<p class="saas-muted">{escape(translate("system.overview.no_audit"))}</p>'}"""
+    kill_switch_enabled = summary["global_kill_switch_state"] == "enabled"
+    kill_switch_unavailable = summary["global_kill_switch_state"] == "unavailable"
+    kill_switch_label = translate(
+        "system.overview.global_kill_switch_unavailable"
+        if kill_switch_unavailable
+        else "system.overview.global_kill_switch"
+    )
+    configuration_complete = bool(summary["security_configuration_complete"])
+    system_requires_action = (
+        kill_switch_enabled or kill_switch_unavailable or not configuration_complete
+    )
+    primary_href = "/admin/system/safety" if system_requires_action else "/admin/system/health"
+    primary_label = (
+        translate("system.overview.safety")
+        if system_requires_action
+        else translate("nav.system_health")
+    )
+    body = f"""<section class="saas-next-action"><div><div class="saas-eyebrow">{escape(translate("nav.group.system"))}</div>
+<h2>{escape(translate("status.needs_action") if system_requires_action else translate("status.healthy"))}</h2>
+<p>{escape(translate("system.overview.security_notice"))}</p></div>{secondary_action(primary_href, primary_label, small=True)}</section>
+<div class="saas-status-summary"><span class="saas-status-summary-label">{escape(translate("common.status"))}</span>
+<div class="saas-status-summary-items">{status_badge("degraded" if system_requires_action else "healthy")}
+{status_badge("degraded" if kill_switch_unavailable else "enabled" if kill_switch_enabled else "disabled", label=kill_switch_label)}
+{status_badge("active" if configuration_complete else "degraded", label=translate("system.overview.security_configuration"))}</div></div>
+<div class="saas-section-header"><div class="saas-section-header-copy"><h2>{escape(translate("system.overview.operations"))}</h2>
+<p>{escape(translate("system.overview.operations_description"))}</p></div>
+<div class="saas-section-header-actions">{secondary_action("/admin/system/health", translate("nav.system_health"), small=True)}{secondary_action("/admin/system/safety", translate("system.overview.safety"), small=True)}{secondary_action("/admin/system/users", translate("system.overview.access"), small=True)}</div></div>
+<div class="saas-grid three">{metric_card(summary["active_user_count"], translate("system.overview.active_users"))}
+{metric_card(summary["active_session_count"], translate("system.overview.active_sessions"))}
+{metric_card(summary["disabled_user_count"], translate("system.overview.disabled_users"), detail=translate("system.overview.expired_sessions", count=summary["expired_session_count"]))}</div>
+<div class="saas-section-header"><div class="saas-section-header-copy"><h2>{escape(translate("system.overview.recent_activity"))}</h2>
+<p>{escape(translate("system.audit.description"))}</p></div>{secondary_action("/admin/system/audit", translate("home.view_all"), small=True)}</div>
+{f'<div class="saas-table-wrap"><table class="saas-table"><thead><tr><th>{escape(translate("common.time"))}</th><th>{escape(translate("common.category"))}</th><th>Actor</th><th>{escape(translate("common.action"))}</th></tr></thead><tbody>{audit_rows}</tbody></table></div>' if audit_rows else f'<p class="saas-muted">{escape(translate("system.overview.no_audit"))}</p>'}"""
     return _render_system_page(
         principal=principal,
         title=translate("system.overview.title"),

@@ -7,8 +7,12 @@ from sqlalchemy import distinct, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.account_management.agent_control_plane import (
+    AgentControlPlaneValidationError,
     append_agent_version_for_business_prompt,
+    authorize_agent_control_plane_write,
+    normalize_agent_tenant_id,
 )
+from social_reply.application.account_management.auth import Principal
 from social_reply.application.reply_decision.business_prompt import (
     ResolvedBusinessPrompt,
     acquire_business_prompt_xact_lock,
@@ -29,6 +33,32 @@ class ReplyBusinessPromptConflict(RuntimeError):
 
 class ReplyBusinessPromptScopeError(ValueError):
     pass
+
+
+async def _authorize_prompt_write(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    principal: Principal | None,
+) -> str:
+    try:
+        current_principal = await authorize_agent_control_plane_write(
+            session,
+            tenant_id=tenant_id,
+            principal=principal,
+        )
+    except AgentControlPlaneValidationError as exc:
+        raise ReplyBusinessPromptScopeError(
+            "reply_business_prompt_authorization_denied"
+        ) from exc
+    return current_principal.actor
+
+
+def _normalize_prompt_tenant_id(value: str) -> str:
+    try:
+        return normalize_agent_tenant_id(value)
+    except AgentControlPlaneValidationError as exc:
+        raise ReplyBusinessPromptScopeError("invalid_agent_tenant_id") from exc
 
 
 @dataclass(frozen=True)
@@ -254,9 +284,16 @@ async def save_reply_business_prompt(
     expected_revision: int,
     actor: str,
     change_note: str | None,
+    principal: Principal | None = None,
 ) -> ResolvedBusinessPrompt:
     if expected_revision < 0:
         raise ReplyBusinessPromptConflict("reply_business_prompt_revision_conflict")
+    tenant_id = _normalize_prompt_tenant_id(tenant_id)
+    actor = await _authorize_prompt_write(
+        session,
+        tenant_id=tenant_id,
+        principal=principal,
+    )
     normalized_brand_id = await require_reply_prompt_brand(session, tenant_id, brand_id)
     instructions = BusinessPromptInstructions(content)
     normalized_change_note = normalize_business_prompt_change_note(change_note)
@@ -281,7 +318,14 @@ async def rollback_reply_business_prompt(
     source_version_id: uuid.UUID,
     expected_revision: int,
     actor: str,
+    principal: Principal | None = None,
 ) -> ResolvedBusinessPrompt:
+    tenant_id = _normalize_prompt_tenant_id(tenant_id)
+    actor = await _authorize_prompt_write(
+        session,
+        tenant_id=tenant_id,
+        principal=principal,
+    )
     normalized_brand_id = await require_reply_prompt_brand(session, tenant_id, brand_id)
     await acquire_business_prompt_xact_lock(session, tenant_id, normalized_brand_id)
     source = await session.scalar(

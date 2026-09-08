@@ -86,8 +86,16 @@ async def create_or_get_outbox_intent(
     visibility: str = "public",
     message_type: str = "text",
     payload_metadata: dict | None = None,
+    initiator_user_id: uuid.UUID | None = None,
+    initiator_session_id: uuid.UUID | None = None,
+    human_work_item_version: int | None = None,
 ) -> uuid.UUID:
     """Create an immutable delivery intent inside the caller's transaction."""
+    if actor_kind == OutboxActor.ADMIN_HUMAN:
+        if initiator_session_id is None:
+            raise OutboxIntentError("human_initiator_session_required")
+        if origin_kind == OutboxOrigin.MANUAL_REPLY and human_work_item_version is None:
+            raise OutboxIntentError("human_work_item_version_required")
     reply_text = text.strip()
     if not reply_text:
         raise OutboxIntentError("reply_text_required")
@@ -178,6 +186,9 @@ async def create_or_get_outbox_intent(
                 origin_kind=origin_kind,
                 actor_kind=actor_kind,
                 actor_id=actor_id,
+                initiator_user_id=initiator_user_id,
+                initiator_session_id=initiator_session_id,
+                human_work_item_version=human_work_item_version,
                 idempotency_key=stored_key,
                 status="PENDING",
                 valid_until=valid_until,
@@ -202,6 +213,9 @@ async def create_or_get_outbox_intent(
         existing.origin_kind == origin_kind,
         existing.actor_kind == actor_kind,
         existing.actor_id == actor_id,
+        existing.initiator_user_id == initiator_user_id,
+        existing.initiator_session_id == initiator_session_id,
+        existing.human_work_item_version == human_work_item_version,
         existing.message_type == message_type,
         existing.destination_type == destination_type,
         existing.destination_id == conversation.conversation_key,

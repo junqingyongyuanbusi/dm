@@ -9,6 +9,8 @@ import redis.asyncio as aioredis
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.account_management.access import lock_user_authority
+from social_reply.application.account_management.auth import principal_from_session_row
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import get_settings
@@ -18,7 +20,7 @@ logger = logging.getLogger(__name__)
 ACCOUNT_KILL_SWITCH_ACTION = "SET_PLATFORM_ACCOUNT_KILL_SWITCH"
 ACCOUNT_KILL_SWITCH_SUBJECT_TYPE = "platform_account"
 
-_RECONCILABLE_STATUSES = frozenset({"PENDING", "UNKNOWN"})
+_RECONCILABLE_STATUSES = frozenset({"PENDING", "UNKNOWN", "FAIL_CLOSED_PENDING"})
 _DEFAULT_BATCH_SIZE = 100
 _MAX_BATCH_SIZE = 500
 _REDIS_OPERATION_TIMEOUT_SECONDS = 5.0
@@ -131,6 +133,8 @@ def build_pending_account_kill_switch_detail(
     account_sequence: int,
     actor_role: str,
     owner_user_id: uuid.UUID | None,
+    actor_user_id: uuid.UUID | None = None,
+    actor_session_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     return {
         "operation_id": str(operation_id),
@@ -141,6 +145,10 @@ def build_pending_account_kill_switch_detail(
         # Retain the original field for existing audit readers while making the target explicit.
         "enabled": target_enabled,
         "actor_role": actor_role,
+        "authority_version": 2 if actor_session_id is not None else 1,
+        "actor_user_id": str(actor_user_id) if actor_user_id else None,
+        "actor_session_id": str(actor_session_id) if actor_session_id else None,
+        "actor_kind": "STAFF" if actor_user_id else "BOOTSTRAP",
         "owner_user_id": str(owner_user_id) if owner_user_id else None,
         "status": "PENDING",
         "outcome": "PENDING",
@@ -215,16 +223,40 @@ def _scope_validation_error(
         return "KILL_SWITCH_SCOPE_MISMATCH"
     if account is None:
         return "ACCOUNT_SCOPE_NOT_FOUND"
-    actor_role = detail.get("actor_role")
-    if actor_role == "ADMIN":
+    if detail.get("authority_version") == 2:
         return None
-    if actor_role != "USER":
-        return "KILL_SWITCH_AUTHORITY_UNCERTAIN"
-    expected_owner_user_id = detail.get("owner_user_id")
-    current_owner_user_id = str(account.owner_user_id) if account.owner_user_id else None
-    has_expected_owner = isinstance(expected_owner_user_id, str)
-    if not has_expected_owner or expected_owner_user_id != current_owner_user_id:
+    # Legacy ADMIN meant bootstrap, not a named business administrator. An old
+    # string cannot authorize restoring sends; a fresh authenticated command must supersede it.
+    if _target_enabled(detail) is False:
+        return "LEGACY_KILL_SWITCH_RECONFIRM_REQUIRED"
+    if detail.get("actor_role") == "ADMIN":
+        return None
+    expected_owner = detail.get("owner_user_id")
+    if not expected_owner or expected_owner != str(account.owner_user_id):
         return "ACCOUNT_OWNERSHIP_CHANGED"
+    return None
+
+
+async def _authority_validation_error(
+    session: AsyncSession, detail: dict[str, Any], tenant_id: str
+) -> str | None:
+    if detail.get("authority_version") != 2:
+        return None  # The scope check only admits protective legacy enable commands.
+    principal = await principal_from_session_row(
+        session, detail.get("actor_session_id"), for_update=True
+    )
+    if principal is None or principal.must_change_password:
+        return "KILL_SWITCH_ACTOR_REVOKED"
+    if tenant_id not in principal.allowed_tenants or not principal.is_workspace_admin:
+        return "KILL_SWITCH_ADMIN_AUTHORITY_REVOKED"
+    if detail.get("actor_kind") == "BOOTSTRAP":
+        if not principal.is_superadmin or detail.get("actor_user_id") is not None:
+            return "KILL_SWITCH_AUTHORITY_UNCERTAIN"
+    elif detail.get("actor_kind") == "STAFF":
+        if principal.user_id is None or str(principal.user_id) != detail.get("actor_user_id"):
+            return "KILL_SWITCH_AUTHORITY_UNCERTAIN"
+    else:
+        return "KILL_SWITCH_AUTHORITY_UNCERTAIN"
     return None
 
 
@@ -276,24 +308,14 @@ async def _reconcile_account_scope(
             tenant_id=tenant_id,
             account_id=account_id,
         )
-        account = await session.scalar(
-            select(models.PlatformAccount)
-            .where(
-                models.PlatformAccount.tenant_id == tenant_id,
-                models.PlatformAccount.id == account_id,
-            )
-            .with_for_update()
-        )
         audits = list(
             await session.scalars(
-                select(models.AuditLog)
-                .where(
+                select(models.AuditLog).where(
                     models.AuditLog.tenant_id == tenant_id,
                     models.AuditLog.action == ACCOUNT_KILL_SWITCH_ACTION,
                     models.AuditLog.subject_type == ACCOUNT_KILL_SWITCH_SUBJECT_TYPE,
                     models.AuditLog.subject_id == str(account_id),
                 )
-                .with_for_update()
             )
         )
         if not audits:
@@ -305,6 +327,21 @@ async def _reconcile_account_scope(
             latest_audit,
             tenant_id=tenant_id,
             account_id=account_id,
+        )
+        staff_id = latest_detail.get("actor_user_id")
+        if latest_detail.get("authority_version") == 2 and staff_id:
+            try:
+                await lock_user_authority(session, uuid.UUID(staff_id))
+            except (TypeError, ValueError, AttributeError):
+                latest_detail["actor_session_id"] = None
+        authority_error = await _authority_validation_error(session, latest_detail, tenant_id)
+        account = await session.scalar(
+            select(models.PlatformAccount)
+            .where(
+                models.PlatformAccount.tenant_id == tenant_id,
+                models.PlatformAccount.id == account_id,
+            )
+            .with_for_update()
         )
         latest_audit.detail = latest_detail
         for audit in audits:
@@ -337,19 +374,31 @@ async def _reconcile_account_scope(
             tenant_id=tenant_id,
             account_id=account_id,
         )
+        if scope_error is None:
+            scope_error = authority_error
         target_enabled = _target_enabled(latest_detail)
-        if scope_error is not None or target_enabled is None:
-            error_code = scope_error or "KILL_SWITCH_TARGET_UNCERTAIN"
+        rejected_reason = latest_detail.get("authorization_rejected_reason")
+        if rejected_reason or scope_error is not None or target_enabled is None:
+            error_code = rejected_reason or scope_error or "KILL_SWITCH_TARGET_UNCERTAIN"
             fail_closed = await _force_fail_closed(redis, redis_key)
+            terminal_status = (
+                "RECONFIRM_REQUIRED"
+                if error_code == "LEGACY_KILL_SWITCH_RECONFIRM_REQUIRED"
+                else "REJECTED"
+            )
+            command_status = terminal_status if fail_closed else "FAIL_CLOSED_PENDING"
             latest_audit.detail = _detail_with_status(
                 latest_detail,
-                "UNKNOWN",
+                command_status,
                 error_code=error_code,
+                authorization_rejected_reason=error_code,
                 fail_closed=fail_closed,
                 attempt_count=int(latest_detail.get("attempt_count", 0)) + 1,
             )
+            if fail_closed:
+                resolved_operation_ids.append(latest_audit.id)
             if requested_operation_id == latest_audit.id:
-                requested_status = "UNKNOWN"
+                requested_status = command_status
             await session.commit()
             return _ScopeReconciliationResult(
                 tuple(resolved_operation_ids),
@@ -431,6 +480,38 @@ async def reconcile_account_kill_switch_command(
     return result.requested_status
 
 
+async def _quarantine_invalid_account_scope(tenant_id: str, subject_id: str) -> list[uuid.UUID]:
+    async with get_session_factory()() as session, session.begin():
+        rows = list(
+            await session.scalars(
+                select(models.AuditLog)
+                .where(
+                    models.AuditLog.tenant_id == tenant_id,
+                    models.AuditLog.action == ACCOUNT_KILL_SWITCH_ACTION,
+                    models.AuditLog.subject_type == ACCOUNT_KILL_SWITCH_SUBJECT_TYPE,
+                    models.AuditLog.subject_id == subject_id,
+                    func.coalesce(
+                        models.AuditLog.detail["status"].astext,
+                        models.AuditLog.detail["outcome"].astext,
+                    ).in_(_RECONCILABLE_STATUSES),
+                )
+                .order_by(models.AuditLog.id)
+                .with_for_update()
+            )
+        )
+        for row in rows:
+            detail = dict(row.detail) if isinstance(row.detail, dict) else {}
+            row.detail = _detail_with_status(
+                detail,
+                "QUARANTINED",
+                error_code="KILL_SWITCH_ACCOUNT_ID_INVALID",
+                authorization_rejected_reason="KILL_SWITCH_ACCOUNT_ID_INVALID",
+                fail_closed=False,
+                manual_review_required=True,
+            )
+        return [row.id for row in rows]
+
+
 async def sweep_account_kill_switch_commands(
     *,
     batch_size: int = _DEFAULT_BATCH_SIZE,
@@ -446,7 +527,15 @@ async def sweep_account_kill_switch_commands(
                 select(
                     models.AuditLog.tenant_id,
                     models.AuditLog.subject_id,
-                    func.min(models.AuditLog.created_at).label("oldest_pending_at"),
+                    func.min(
+                        func.coalesce(
+                            models.AuditLog.detail["last_attempt_at"].astext,
+                            func.to_char(
+                                func.timezone("UTC", models.AuditLog.created_at),
+                                'YYYY-MM-DD"T"HH24:MI:SS.US',
+                            ),
+                        )
+                    ).label("oldest_pending_at"),
                 )
                 .where(
                     models.AuditLog.action == ACCOUNT_KILL_SWITCH_ACTION,
@@ -466,8 +555,11 @@ async def sweep_account_kill_switch_commands(
             try:
                 account_id = uuid.UUID(subject_id)
             except ValueError:
+                resolved_operation_ids.extend(
+                    await _quarantine_invalid_account_scope(tenant_id, subject_id)
+                )
                 logger.error(
-                    "account kill switch audit has invalid account id",
+                    "account kill switch audit quarantined: invalid account id",
                     extra={"tenant_id": tenant_id, "subject_id": subject_id},
                 )
                 continue

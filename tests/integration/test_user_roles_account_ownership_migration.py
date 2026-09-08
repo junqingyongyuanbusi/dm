@@ -14,7 +14,7 @@ pytestmark = pytest.mark.integration
 
 _PREVIOUS_REVISION = "b9d5e2f7c314"
 _OWNERSHIP_REVISION = "c8f1a4d7e203"
-_HEAD_REVISION = "a8f4d2c6e901"
+_HEAD_REVISION = "b9e5f3a7d102"
 
 
 async def test_role_and_account_ownership_migration_enforces_tenant_scope():

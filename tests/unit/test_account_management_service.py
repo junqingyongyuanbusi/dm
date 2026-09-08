@@ -1,5 +1,6 @@
 import json
 import uuid
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -650,91 +651,164 @@ async def test_connect_x_skips_legacy_probe_when_disabled(monkeypatch, tmp_path)
 
 
 async def test_enable_xchat_updates_existing_account_without_persisting_pin(monkeypatch):
-    existing = PlatformAccountRuntime(
-        id=uuid.uuid4(),
+    account_id = uuid.uuid4()
+    principal = SimpleNamespace(
+        session_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        actor="user:operator",
+    )
+    current = SimpleNamespace(
+        session_id=principal.session_id,
+        user_id=principal.user_id,
+        actor=principal.actor,
+    )
+    runtime = SimpleNamespace(
         tenant_id="default",
-        brand_id="default",
         platform="x",
-        platform_app_id=None,
-        name="x-bot",
         external_account_id="x-1",
-        public_id="primary",
-        credential_bundle_data={},
-        webhook_secret_bundle_data=None,
-        config={"delivery_mode": "direct"},
-        capability={"dm": True},
+        config={"api_base_url": "https://api.example.test"},
+        credential_bundle={
+            "consumer_key": "ck",
+            "consumer_secret": "cs",
+            "access_token": "at",
+            "access_token_secret": "ats",
+        },
+    )
+    target = SimpleNamespace(
+        external_account_id="x-1",
+        credential_bundle={"__encrypted__": "old"},
+        config={"delivery_mode": "direct", "operator_choice": "keep", "xchat_enabled": True},
+        capability={"dm": True, "x_chat": False, "marker": "preserve"},
         config_version=1,
-        automation_default="BOT_ACTIVE",
-        status="active",
     )
-    monkeypatch.setattr(
-        type(existing),
-        "credential_bundle",
-        property(
-            lambda self: {
-                "consumer_key": "ck",
-                "consumer_secret": "cs",
-                "access_token": "at",
-                "access_token_secret": "ats",
-            }
-        ),
-    )
+    target_calls = []
+    events = []
+    audits = []
+    encrypted_inputs = []
+    unlock_calls = []
+    clients = []
+    dispatched = []
+
+    async def fake_target(session, **kwargs):
+        target_calls.append(kwargs)
+        return (target, current) if kwargs["for_update"] else (target, None)
+
+    async def fake_runtime(account_id_arg):
+        assert account_id_arg == account_id
+        return runtime
 
     class FakeXChatClient:
         def __init__(self, **kwargs):
-            pass
-
-        async def get_user_public_keys(self, user_id):
-            return [{"public_key_version": "7"}]
+            clients.append(kwargs)
 
         async def aclose(self):
-            pass
-
-    async def fake_runtime(account_id):
-        return existing
+            events.append("client:closed")
 
     async def fake_unlock(**kwargs):
         assert kwargs["pin"] == "1234"
+        unlock_calls.append(kwargs)
         return "private", "7"
 
-    class FakeResult:
-        pass
-
     class FakeSession:
+        def __init__(self, index):
+            self.index = index
+
         async def __aenter__(self):
+            events.append(f"session:{self.index}:enter")
             return self
 
         async def __aexit__(self, *args):
-            pass
+            events.append(f"session:{self.index}:exit")
 
-        async def execute(self, statement):
-            self.statement = statement
-            return FakeResult()
+        def add(self, value):
+            audits.append(value)
+            events.append("audit:add")
 
         async def commit(self):
-            pass
+            events.append(f"session:{self.index}:commit")
 
-    fake_session = FakeSession()
+    sessions = []
+
+    def new_session():
+        session = FakeSession(len(sessions))
+        sessions.append(session)
+        return session
+
+    oauth_credentials = dict(runtime.credential_bundle)
+
+    def fake_decrypt(bundle):
+        assert bundle == {"__encrypted__": "old"}
+        return dict(oauth_credentials)
+
+    def fake_encrypt(values):
+        encrypted_inputs.append(dict(values))
+        return {"__encrypted__": "new"}
+
+    async def fake_dispatch(actor, *args, **kwargs):
+        events.append("dispatch")
+        dispatched.append((actor.__name__, args, kwargs))
+
+    # The repair target is stubbed deliberately: this test covers merge/CAS/audit
+    # behavior only and is not evidence for live session or grant authorization.
+    monkeypatch.setattr(service, "_xchat_repair_target", fake_target)
     monkeypatch.setattr(service, "get_platform_account_runtime", fake_runtime)
     monkeypatch.setattr(service, "XChatClient", FakeXChatClient)
     monkeypatch.setattr(service, "unlock_account_xchat_keys", fake_unlock)
-    monkeypatch.setattr(service, "get_session_factory", lambda: lambda: fake_session)
-    dispatched = []
-
-    async def fake_dispatch(actor, *args, **kwargs):
-        dispatched.append((actor.actor_name, args))
-
+    monkeypatch.setattr(service, "get_session_factory", lambda: new_session)
+    monkeypatch.setattr(service, "decrypt_secret_bundle", fake_decrypt)
+    monkeypatch.setattr(service, "encrypt_secret_bundle", fake_encrypt)
     monkeypatch.setattr(service, "dispatch_actor", fake_dispatch)
-    encrypted = {}
-    monkeypatch.setattr(
-        service,
-        "encrypt_secret_bundle",
-        lambda value: encrypted.update(value) or {"__encrypted__": "cipher"},
+
+    await service.enable_xchat_for_account(
+        account_id=account_id,
+        pin="1234",
+        tenant_id="default",
+        principal=principal,
+        expected_config_version=1,
     )
 
-    await service.enable_xchat_for_account(account_id=existing.id, pin="1234")
-    assert encrypted["xchat_private_keys_b64"] == "private"
-    assert encrypted["xchat_signing_key_version"] == "7"
-    assert "1234" not in encrypted.values()
-    assert str(fake_session.statement).count("||") == 2
-    assert dispatched == [("recover_xchat_account", (str(existing.id),))]
+    assert [call["for_update"] for call in target_calls] == [False, True]
+    assert all(call["account_id"] == account_id for call in target_calls)
+    assert all(call["tenant_id"] == "default" for call in target_calls)
+    assert all(call["principal"] is principal for call in target_calls)
+    assert [call["expected_config_version"] for call in target_calls] == [1, 1]
+    assert clients == [
+        {
+            "consumer_key": "ck",
+            "consumer_secret": "cs",
+            "access_token": "at",
+            "access_token_secret": "ats",
+            "api_base_url": "https://api.example.test",
+        }
+    ]
+    assert unlock_calls[0]["pin"] == "1234"
+    assert isinstance(unlock_calls[0]["pin"], str)
+    assert encrypted_inputs == [
+        {
+            **oauth_credentials,
+            "xchat_private_keys_b64": "private",
+            "xchat_signing_key_version": "7",
+        }
+    ]
+    assert target.credential_bundle == {"__encrypted__": "new"}
+    assert target.config["delivery_mode"] == "direct"
+    assert target.config["operator_choice"] == "keep"
+    assert target.config["xchat_enabled"] is True
+    assert target.capability == {"dm": True, "x_chat": True, "marker": "preserve"}
+    assert target.config_version == 2
+    assert "1234" not in str(encrypted_inputs)
+    assert audits and audits[0].action == "REPAIR_XCHAT_ACCOUNT"
+    assert audits[0].tenant_id == "default"
+    assert audits[0].subject_id == str(account_id)
+    assert audits[0].detail == {
+        "input_config_version": 1,
+        "config_version": 2,
+        "actor_user_id": str(principal.user_id),
+        "actor_session_id": str(principal.session_id),
+        "outcome": "completed",
+    }
+    assert "1234" not in str(audits[0].detail)
+    assert dispatched == [("recover_xchat_account", (str(account_id),), {})]
+    assert events.index("audit:add") < events.index("session:1:commit")
+    assert events.index("session:1:commit") < events.index("session:1:exit")
+    assert events.index("session:1:exit") < events.index("dispatch")

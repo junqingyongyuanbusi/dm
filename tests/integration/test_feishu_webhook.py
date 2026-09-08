@@ -762,11 +762,24 @@ async def _seed_card_work(session, feishu_account_id, *operator_open_ids):
     for open_id in operator_open_ids:
         operator_id = uuid.uuid4()
         operator_ids.append(operator_id)
+        admin_user_id = uuid.uuid4()
+        await session.execute(
+            insert(models.AdminUser).values(
+                id=admin_user_id,
+                username=open_id,
+                password_hash="test-only",
+                tenant_id="tenant-feishu",
+                role="WORKSPACE_ADMIN",
+                status="active",
+                must_change_password=False,
+            )
+        )
         await session.execute(
             insert(models.FeishuHandoffOperator).values(
                 id=operator_id,
                 tenant_id="tenant-feishu",
                 feishu_platform_account_id=feishu_account_id,
+                admin_user_id=admin_user_id,
                 operator_open_id=open_id,
                 display_name=f"Agent {open_id}",
                 can_claim=True,
@@ -848,7 +861,7 @@ async def test_card_action_claim_is_atomic_and_duplicate_event_is_idempotent(ses
     state = await session.get(models.AutomationState, work.conversation_id)
     assert work.status == "CLAIMED"
     assert work.version == 2
-    assert work.assigned_actor == f"feishu_operator:{operator_ids[0]}"
+    assert work.assigned_actor == "user:ou_agent"
     assert state.state == "HUMAN_ACTIVE"
     assert intent.status == "PENDING"
     assert intent.desired_card_state == "CLAIMED"
@@ -861,12 +874,10 @@ async def test_card_action_claim_is_atomic_and_duplicate_event_is_idempotent(ses
     ).scalar_one() == 0
 
 
-async def test_plaintext_card_action_is_authenticated_by_verification_token(session):
-    # Feishu delivers interactive-card actions as plain JSON authenticated by the
-    # Verification Token (header.token), without an encrypt wrapper or X-Lark
-    # signature. A plaintext claim must be accepted on both callback routes.
+async def test_card_action_requires_signature_and_verification_token(session):
+    # Card HTTP callbacks with an Encrypt Key must authenticate the raw request body.
     feishu_account_id = await _seed_account(session)
-    _, work_id, public_id, nonce, operator_ids = await _seed_card_work(
+    _, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
         session,
         feishu_account_id,
         "ou_agent",
@@ -881,16 +892,14 @@ async def test_plaintext_card_action_is_authenticated_by_verification_token(sess
         card_revision=1,
     )
     app = _app(handoff_notifications_enabled=True)
-    by_base = await _post(app, "/webhooks/feishu/fs_primary", json_body=payload)
+    response = await _post(app, "/webhooks/feishu/fs_primary", json_body=payload)
+
+    assert response.status_code == 401
     session.expire_all()
     work = await session.get(models.HumanWorkItem, work_id)
-    assert by_base.status_code == 200
-    assert by_base.json()["toast"]["type"] == "success"
-    assert work.status == "CLAIMED"
-    assert work.assigned_actor == f"feishu_operator:{operator_ids[0]}"
+    assert work is not None and work.status == "WAITING"
+    assert work.assigned_user_id is None
 
-    # A plaintext card action with a mismatched Verification Token is rejected
-    # at verification, before any receipt is written or state is changed.
     bad_payload = _card_action_payload(
         event_id="evt_plain_bad",
         operator_open_id="ou_agent",
@@ -901,11 +910,38 @@ async def test_plaintext_card_action_is_authenticated_by_verification_token(sess
         card_revision=1,
     )
     bad_payload["header"]["token"] = "not-the-token"
-    bad = await _post(app, "/webhooks/feishu/fs_primary/card-actions", json_body=bad_payload)
+    bad_body, bad_headers = _encrypted_request(bad_payload)
+    bad = await _post(
+        app,
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=bad_body,
+        headers=bad_headers,
+    )
     assert bad.status_code == 401
     assert (
         await session.execute(select(func.count()).select_from(models.FeishuCardActionReceipt))
-    ).scalar_one() == 1
+    ).scalar_one() == 0
+
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    timestamp, request_nonce = str(int(time.time())), "signed-plaintext"
+    signature = hashlib.sha256(
+        (timestamp + request_nonce + _ENCRYPT_KEY).encode() + body
+    ).hexdigest()
+    signed = await _post(
+        app,
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Lark-Request-Timestamp": timestamp,
+            "X-Lark-Request-Nonce": request_nonce,
+            "X-Lark-Signature": signature,
+        },
+    )
+    assert signed.status_code == 200
+    assert signed.json()["toast"]["type"] == "success"
+    await session.refresh(work)
+    assert work.status == "CLAIMED"
 
 
 async def test_card_action_accepts_json_string_encoded_button_value(session):
@@ -930,10 +966,12 @@ async def test_card_action_accepts_json_string_encoded_button_value(session):
     payload["event"]["action"]["value"] = json.dumps(
         payload["event"]["action"]["value"], ensure_ascii=False
     )
+    body, headers = _encrypted_request(payload)
     response = await _post(
         _app(handoff_notifications_enabled=True),
         "/webhooks/feishu/fs_primary/card-actions",
-        json_body=payload,
+        content=body,
+        headers=headers,
     )
     assert response.status_code == 200
     assert response.json()["toast"]["type"] == "success"

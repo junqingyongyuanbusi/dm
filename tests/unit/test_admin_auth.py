@@ -40,25 +40,36 @@ def test_principal_tenant_scope():
         principal.require_tenant("tenant-b")
 
 
-def test_bootstrap_principal_has_explicit_superadmin_role(monkeypatch):
+def test_bootstrap_principal_requires_verified_marker(monkeypatch):
     monkeypatch.setattr(
         auth,
         "get_settings",
         lambda: SimpleNamespace(
             admin_username="bootstrap-admin",
-            allowed_admin_tenants=frozenset({"default"}),
+            allowed_admin_tenants=frozenset({"default", "tenant-a"}),
         ),
     )
 
-    principal = auth._bootstrap_principal(uuid.uuid4())
+    unverified = auth._bootstrap_principal(uuid.uuid4())
+    verified = auth._bootstrap_principal(uuid.uuid4(), verified=True)
 
-    assert principal.role == "SUPERADMIN"
-    assert principal.tenant_id == "default"
-    assert principal.is_superadmin is True
-    assert principal.is_admin is True
-    principal.require_superadmin()
-    principal.require_admin()
-    principal.require_tenant_admin()
+    callback_shape = Principal(
+        session_id=None,
+        username="callback",
+        actor="user:callback",
+        allowed_tenants=frozenset({"default"}),
+        role="SUPERADMIN",
+        authentication_kind="FEISHU_ACTION",
+    )
+    assert unverified.is_superadmin is False
+    assert callback_shape.is_superadmin is False
+    assert verified.role == "SUPERADMIN"
+    assert verified.tenant_id is None
+    assert verified.is_superadmin is True
+    assert verified.is_admin is True
+    verified.require_superadmin()
+    verified.require_admin()
+    verified.require_tenant_admin()
 
 
 @pytest.mark.parametrize("role", ["ADMIN", "SUPERADMIN"])
@@ -104,7 +115,7 @@ def test_principal_default_role_does_not_grant_admin_to_database_user():
         principal.require_superadmin()
 
 
-def test_superadmin_can_access_accounts_across_owners_in_allowed_tenant():
+def test_unverified_superadmin_shape_cannot_access_accounts_across_owners():
     principal = Principal(
         session_id=uuid.uuid4(),
         username="system-admin",
@@ -116,20 +127,12 @@ def test_superadmin_can_access_accounts_across_owners_in_allowed_tenant():
         tenant_id="default",
         owner_user_id=None,
     )
-    user_owned_account = SimpleNamespace(
-        tenant_id="default",
-        owner_user_id=uuid.uuid4(),
-    )
-    other_tenant_account = SimpleNamespace(
-        tenant_id="tenant-b",
-        owner_user_id=None,
-    )
 
-    assert principal.can_access_account(unowned_account) is True
-    assert principal.can_access_account(user_owned_account) is True
-    assert principal.can_access_account(other_tenant_account) is False
-    principal.require_account(unowned_account)
-    principal.require_account(user_owned_account)
+    assert principal.is_superadmin is False
+    assert principal.is_admin is False
+    assert principal.can_access_account(unowned_account) is False
+    with pytest.raises(HTTPException, match="platform_account_not_found"):
+        principal.require_account(unowned_account)
 
 
 def test_database_user_account_access_remains_owner_scoped():

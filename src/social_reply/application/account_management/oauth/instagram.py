@@ -23,8 +23,10 @@ from social_reply.application.account_management.oauth.common import (
     build_oauth_context,
     notice,
     oauth_error_response,
+    oauth_provisioning_error_response,
     oauth_result_response,
     principal_from_oauth_context,
+    resolve_oauth_target,
     store_oauth_state,
     take_oauth_state,
 )
@@ -98,6 +100,12 @@ async def _start_instagram_oauth(
     if tenant_id != DEFAULT_TENANT_ID:
         raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
+    target_binding = await resolve_oauth_target(
+        request,
+        principal=principal,
+        provider="instagram",
+        tenant_id=tenant_id,
+    )
     if not get_settings().instagram_messaging_enabled:
         return oauth_error_response(
             surface=surface,
@@ -133,8 +141,15 @@ async def _start_instagram_oauth(
                 return_to=(
                     f"/app/t/{tenant_id}/channels" if surface == "channels" else "/admin/accounts"
                 ),
+                operation=target_binding["operation"],
+                target_account_id=target_binding["target_account_id"],
+                expected_config_version=target_binding["expected_config_version"],
+                target_external_account_id=target_binding["target_external_account_id"],
                 extra={
-                    "brand_id": ((form.get("brand_id") or "default").strip() or "default"),
+                    "brand_id": (
+                        target_binding["brand_id"]
+                        or ((form.get("brand_id") or "default").strip() or "default")
+                    ),
                 },
             ),
         )
@@ -351,6 +366,17 @@ async def _handle_instagram_oauth_callback(request: Request) -> Response:
             translate("oauth.instagram.account_missing"),
             status_code=502,
         )
+    target_external_id = context.get("target_external_account_id")
+    if target_external_id and str(target_external_id) != external_account_id:
+        return oauth_error_response(
+            surface=str(context.get("surface") or "admin"),
+            tenant_id=str(context.get("tenant_id") or ""),
+            provider="instagram",
+            code="oauth_target_identity_mismatch",
+            title=translate("oauth.cannot_complete.title"),
+            message="授权账号与目标平台账号不一致。",
+            status_code=409,
+        )
     username = str(profile.get("username") or "")
     settings = get_settings()
     enable_comments = settings.meta_comment_reply_enabled
@@ -369,15 +395,21 @@ async def _handle_instagram_oauth_callback(request: Request) -> Response:
         "verify_token": app.verify_token,
     }
     request_data, secrets_data = split_submission("instagram", submission)
-    job_id = await submit_provisioning_job(
-        tenant_id=context["tenant_id"],
-        brand_id=context.get("brand_id", "default"),
-        platform="instagram",
-        actor=principal.actor,
-        request=request_data,
-        secrets=secrets_data,
-        admin_session_id=principal.session_id,
-    )
+    try:
+        job_id = await submit_provisioning_job(
+            tenant_id=context["tenant_id"],
+            brand_id=context.get("brand_id", "default"),
+            platform="instagram",
+            actor=principal.actor,
+            operation=context.get("operation", "CONNECT_ACCOUNT"),
+            target_account_id=context.get("target_account_id"),
+            expected_config_version=context.get("expected_config_version"),
+            request=request_data,
+            secrets=secrets_data,
+            admin_session_id=principal.session_id,
+        )
+    except (LookupError, PermissionError, ValueError) as exc:
+        return oauth_provisioning_error_response(context, exc)
     from social_reply.application.account_management.actors import process_platform_provisioning
     from social_reply.application.account_management.jobs import process_provisioning_job
 

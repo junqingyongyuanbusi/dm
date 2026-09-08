@@ -3,9 +3,14 @@ import json
 import re
 import uuid
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.account_management.access import lock_user_authority
+from social_reply.application.account_management.auth import (
+    Principal,
+    principal_from_session_row,
+)
 from social_reply.application.reply_decision.business_prompt import (
     acquire_business_prompt_xact_lock,
 )
@@ -20,15 +25,77 @@ class AgentControlPlaneValidationError(ValueError):
     pass
 
 
+class AgentControlPlaneAuthorizationError(AgentControlPlaneValidationError):
+    pass
+
+
 class AgentControlPlaneConflict(RuntimeError):
     pass
 
 
+async def authorize_agent_control_plane_write(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    principal: Principal | None,
+) -> Principal:
+    """Reload an interactive admin identity before acquiring prompt or Agent locks.
+
+    ``principal`` is only an identity hint from the request.  The session row and, for a
+    database user, the staff authority advisory lock are the transaction's source of truth.
+    The bootstrap session uses its own advisory key because it has no ``AdminUser`` row.
+    """
+    candidate = principal
+    if (
+        candidate is None
+        or candidate.session_id is None
+        or candidate.authentication_kind != "SESSION"
+        or candidate.action_proof is not None
+    ):
+        raise AgentControlPlaneAuthorizationError("agent_control_plane_principal_required")
+    try:
+        session_id = uuid.UUID(str(candidate.session_id))
+    except (TypeError, ValueError) as exc:
+        raise AgentControlPlaneAuthorizationError("agent_control_plane_session_invalid") from exc
+    normalized_tenant_id = _normalize_tenant_id(tenant_id)
+    if candidate.user_id is None:
+        if not candidate.is_superadmin:
+            raise AgentControlPlaneAuthorizationError("agent_control_plane_principal_invalid")
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": "social-reply:bootstrap-authority"},
+        )
+    else:
+        await lock_user_authority(session, candidate.user_id)
+    current = await principal_from_session_row(session, session_id, for_update=True)
+    if (
+        current is None
+        or current.session_id != session_id
+        or current.user_id != candidate.user_id
+        or current.must_change_password
+        or not current.is_workspace_admin
+        or normalized_tenant_id not in current.allowed_tenants
+        or (
+            current.user_id is not None
+            and current.tenant_id != normalized_tenant_id
+        )
+        or (current.user_id is None and not current.is_superadmin)
+    ):
+        raise AgentControlPlaneAuthorizationError("agent_control_plane_authorization_denied")
+    return current
+
+
 def _normalize_tenant_id(value: str) -> str:
+    if not isinstance(value, str):
+        raise AgentControlPlaneValidationError("invalid_agent_tenant_id")
     tenant_id = value.strip()
     if not tenant_id or len(tenant_id) > 64:
         raise AgentControlPlaneValidationError("invalid_agent_tenant_id")
     return tenant_id
+
+
+def normalize_agent_tenant_id(value: str) -> str:
+    return _normalize_tenant_id(value)
 
 
 def normalize_agent_slug(value: str) -> str:
@@ -187,14 +254,19 @@ async def create_agent(
     name: str,
     description: str | None,
     actor: str,
+    principal: Principal | None = None,
 ) -> models.Agent:
     """Create a stable Agent identity and its immutable draft v1 snapshot."""
     tenant_id = _normalize_tenant_id(tenant_id)
     slug = normalize_agent_slug(slug)
     name = normalize_agent_name(name)
     description = normalize_agent_description(description)
-    if not actor.strip():
-        raise AgentControlPlaneValidationError("invalid_agent_actor")
+    current_principal = await authorize_agent_control_plane_write(
+        session,
+        tenant_id=tenant_id,
+        principal=principal,
+    )
+    actor = current_principal.actor
 
     await acquire_business_prompt_xact_lock(session, tenant_id, slug)
     existing = await session.scalar(
@@ -307,6 +379,7 @@ async def deploy_agent_version(
     agent_version_id: uuid.UUID,
     expected_deployment_revision: int,
     actor: str,
+    principal: Principal | None = None,
 ) -> models.AgentDeployment:
     """Promote one immutable Agent version to production.
 
@@ -317,8 +390,12 @@ async def deploy_agent_version(
     brand_id = normalize_agent_slug(brand_id)
     if expected_deployment_revision < 0:
         raise AgentControlPlaneConflict("agent_deployment_revision_conflict")
-    if not actor.strip():
-        raise AgentControlPlaneValidationError("invalid_agent_actor")
+    current_principal = await authorize_agent_control_plane_write(
+        session,
+        tenant_id=tenant_id,
+        principal=principal,
+    )
+    actor = current_principal.actor
 
     await acquire_business_prompt_xact_lock(session, tenant_id, brand_id)
     agent = await _load_agent_for_update(

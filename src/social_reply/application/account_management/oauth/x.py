@@ -37,6 +37,7 @@ from social_reply.application.account_management.oauth.common import (
     notice,
     oauth_error_response,
     principal_from_oauth_context,
+    resolve_oauth_target,
     store_oauth_state,
     take_oauth_state,
 )
@@ -319,6 +320,12 @@ async def _start_x_oauth(
     if tenant_id != DEFAULT_TENANT_ID:
         raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
+    target_binding = await resolve_oauth_target(
+        request,
+        principal=principal,
+        provider="x",
+        tenant_id=tenant_id,
+    )
     return_to = f"/app/t/{tenant_id}/channels" if surface == "channels" else _X_RETURN_TO
     settings = get_settings()
     if not settings.x_integration_enabled:
@@ -388,11 +395,18 @@ async def _start_x_oauth(
                 tenant_id=tenant_id,
                 surface=surface,
                 return_to=return_to,
+                operation=target_binding["operation"],
+                target_account_id=target_binding["target_account_id"],
+                expected_config_version=target_binding["expected_config_version"],
+                target_external_account_id=target_binding["target_external_account_id"],
                 extra={
                     "request_token_secret": token["oauth_token_secret"],
                     "oauth_token_hash": _oauth_token_hash(token["oauth_token"]),
                     "organization_id": tenant_id,
-                    "brand_id": ((form.get("brand_id") or "default").strip() or "default"),
+                    "brand_id": (
+                        target_binding["brand_id"]
+                        or ((form.get("brand_id") or "default").strip() or "default")
+                    ),
                     "created_at": datetime.now(UTC).isoformat(),
                     "status": "pending",
                     "xchat_pin": form.get("xchat_pin", ""),
@@ -610,6 +624,24 @@ async def x_oauth_callback(request: Request) -> Response:
             return_to=state.get("return_to"),
         )
 
+    provider_user_id = str(token.get("user_id") or "")
+    target_external_id = state.get("target_external_account_id")
+    if target_external_id and (
+        not provider_user_id or provider_user_id != str(target_external_id)
+    ):
+        _log_callback(
+            request,
+            stage="validate_target_identity",
+            oauth_token=oauth_token,
+            http_status=303,
+            code="oauth_target_identity_mismatch",
+        )
+        return await _result_redirect(
+            request,
+            status_value="error",
+            code="oauth_target_identity_mismatch",
+            return_to=state.get("return_to"),
+        )
     screen_name = token.get("screen_name", "")
     submission = {
         "name": f"@{screen_name}" if screen_name else "x-oauth",
@@ -627,6 +659,9 @@ async def x_oauth_callback(request: Request) -> Response:
             tenant_id=state["tenant_id"],
             brand_id=state.get("brand_id", "default"),
             platform="x",
+            operation=state.get("operation", "CONNECT_ACCOUNT"),
+            target_account_id=state.get("target_account_id"),
+            expected_config_version=state.get("expected_config_version"),
             actor=principal.actor,
             request=request_data,
             secrets=secrets_data,

@@ -1,4 +1,5 @@
 import imaplib
+import inspect
 import ssl
 
 import httpx
@@ -101,6 +102,11 @@ async def test_provisioning_execution_rechecks_platform_flag_before_decrypting_s
     settings = jobs.get_settings().model_copy(update=settings_update)
     monkeypatch.setattr(jobs, "get_settings", lambda: settings)
 
+    async def fake_validate(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(jobs, "_validate_job_authority", fake_validate)
+
     def unexpected_decrypt(_value):
         raise AssertionError("disabled platform must not decrypt staging credentials")
 
@@ -122,6 +128,11 @@ async def test_provisioning_execution_rejects_historical_user_policy_before_decr
     platform,
     request_values,
 ):
+    async def fake_validate(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(jobs, "_validate_job_authority", fake_validate)
+
     def unexpected_decrypt(_value):
         raise AssertionError("retired user job must fail before decrypting credentials")
 
@@ -555,3 +566,109 @@ def test_email_provisioning_errors_are_stable_and_sanitized(exception, expected,
     assert "banner" not in actual[1]
     assert "body" not in actual[1]
     assert "SECRET BANNER" not in caplog.text
+
+
+def test_provisioning_job_contract_exposes_reauthorization_identity_fields():
+    parameters = inspect.signature(jobs.submit_provisioning_job).parameters
+    assert parameters["operation"].default == "CONNECT_ACCOUNT"
+    assert "target_account_id" in parameters
+    assert "expected_config_version" in parameters
+    assert "admin_session_id" in parameters
+
+
+def test_direct_account_contract_exposes_cas_and_claim_fence():
+    from social_reply.application.account_management import provisioning
+
+    parameters = inspect.signature(provisioning.provision_direct_account).parameters
+    for name in (
+        "operation",
+        "target_account_id",
+        "expected_config_version",
+        "initiator_user_id",
+        "initiator_session_id",
+        "provisioning_job_id",
+        "provisioning_attempt_count",
+        "trusted_control_api",
+    ):
+        assert name in parameters
+    assert parameters["trusted_control_api"].default is False
+
+
+def test_connector_trust_defaults_are_fail_closed():
+    from social_reply.application.account_management import email, feishu, service, whatsapp
+
+    functions = (
+        service.connect_telegram_account,
+        service.connect_meta_account,
+        service.connect_x_account,
+        email.connect_email_account,
+        feishu.connect_feishu_account,
+        whatsapp.connect_whatsapp_account,
+    )
+    for connector in functions:
+        parameter = inspect.signature(connector).parameters["trusted_control_api"]
+        assert parameter.default is False
+
+
+def test_claimed_job_lock_helper_uses_identity_snapshot_before_job_refresh():
+    helper_source = inspect.getsource(jobs._lock_claimed_processing_job)
+    lock_position = helper_source.index("await _lock_staff_and_sessions")
+    job_position = helper_source.index("select(models.ProvisioningJob)")
+    assert helper_source.index("claimed_job.initiator_user_id") < lock_position
+    assert helper_source.index("claimed_job.initiator_session_id") < lock_position
+    assert lock_position < job_position
+    assert ".with_for_update()" in helper_source
+    assert ".execution_options(populate_existing=True)" in helper_source
+    assert "live_job.status != claim_status" in helper_source
+    assert "live_job.attempt_count != claim_attempt_count" in helper_source
+    assert "_job_authority_snapshot(live_job) != claim_authority" in helper_source
+
+    staff_lock_source = inspect.getsource(jobs._lock_staff_and_sessions)
+    assert staff_lock_source.index("sorted(staff_ids") < staff_lock_source.index(
+        "ordered_sessions"
+    )
+    assert staff_lock_source.index("ordered_sessions") < staff_lock_source.index(
+        "with_for_update()"
+    )
+
+
+def test_claimed_job_write_entries_recheck_before_checkpoint_account_access():
+    connect_source = inspect.getsource(jobs._connect)
+    recovery_source = connect_source[connect_source.index("recovery_session") :]
+    lock_position = recovery_source.index("await _lock_claimed_processing_job")
+    validate_position = recovery_source.index("await _validate_job_authority", lock_position)
+    proof_position = recovery_source.index("await _checkpoint_recovery_proof", validate_position)
+    resume_position = recovery_source.index(
+        "await resume_checkpointed_provisioning", proof_position
+    )
+    assert lock_position < validate_position < proof_position < resume_position
+    assert "authority_locks_held=True" in recovery_source[validate_position:proof_position]
+
+    process_source = inspect.getsource(jobs.process_provisioning_job)
+    assert process_source.count("await _lock_claimed_processing_job(session, job)") == 3
+    assert process_source.count('models.ProvisioningJob.status == "PROCESSING"') >= 2
+    assert process_source.count("models.ProvisioningJob.attempt_count == latest.attempt_count") >= 2
+    assert "failure_result = dict(latest.result or {})" in process_source
+    assert "_email_terminal_values(latest.result, latest.staging_secret)" in process_source
+    assert process_source.index("await _lock_claimed_processing_job") < process_source.index(
+        "await _checkpoint_recovery_proof"
+    )
+
+    completion_source = inspect.getsource(jobs.process_provisioning_job)
+    completion_start = completion_source.index("payload = _result_payload")
+    completion_source = completion_source[completion_start:]
+    assert "await _lock_claimed_processing_job(session, job)" in completion_source
+    assert completion_source.index("await _lock_claimed_processing_job") < completion_source.index(
+        "await _checkpoint_recovery_proof"
+    )
+    assert 'models.ProvisioningJob.status == "PROCESSING"' in completion_source
+    assert "models.ProvisioningJob.attempt_count == latest.attempt_count" in completion_source
+    assert "{**dict(latest.result or {}), **merged_result}" in completion_source
+
+
+def test_checkpoint_resume_service_remains_read_only():
+    from social_reply.application.account_management import service
+
+    source = inspect.getsource(service.resume_checkpointed_provisioning)
+    assert "get_platform_account_runtime" in source
+    assert ".with_for_update" not in source

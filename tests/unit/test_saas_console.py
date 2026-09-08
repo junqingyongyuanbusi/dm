@@ -213,7 +213,7 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
 
     assert "/app/t/tenant-a/agents" in tenant_html
     assert "跨租户审计" not in tenant_html
-    for group_label in ("工作区", "AI Studio", "洞察", "管理"):
+    for group_label in ("处理", "自动化", "观察", "更多"):
         assert f">{group_label}<" in tenant_html
     assert "href=\"/app/t/tenant-a\" aria-current='page'" in tenant_html
     assert '<script src="/static/theme.js?v=' in tenant_html
@@ -228,8 +228,13 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
     tenant_sidebar_end = tenant_html.index("</aside>", tenant_sidebar_start)
     tenant_topbar_start = tenant_html.index('<header class="saas-topbar')
     tenant_topbar_end = tenant_html.index("</header>", tenant_topbar_start)
+    tenant_sidebar_html = tenant_html[tenant_sidebar_start:tenant_sidebar_end]
+    tenant_topbar_html = tenant_html[tenant_topbar_start:tenant_topbar_end]
     assert tenant_sidebar_start < tenant_html.index('class="saas-brand"') < tenant_sidebar_end
-    assert "saas-brand" not in tenant_html[tenant_topbar_start:tenant_topbar_end]
+    assert "saas-brand" not in tenant_topbar_html
+    assert "saas-toolbar" in tenant_topbar_html
+    assert "system-admin" in tenant_topbar_html
+    assert "saas-sidebar-actions" not in tenant_sidebar_html
     assert '<svg class="saas-nav-icon" aria-hidden="true"' in tenant_html
     assert tenant_html.count('class="saas-nav-icon"') >= 8
     assert 'data-popover-trigger="language-menu"' in tenant_html
@@ -249,12 +254,12 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
     assert "系统管理员" in system_html
     for system_path in (
         "/admin/system/overview",
+        "/admin/system/health",
         "/admin/system/users",
         "/admin/system/safety",
         "/admin/system/audit",
     ):
         assert system_path in system_html
-    assert "/admin/system/health" not in system_html
     assert 'href="/app"' in system_html
     assert "进入租户工作区" in system_html
     assert "/app/t/tenant-a/agents" not in system_html
@@ -285,12 +290,13 @@ def test_tenant_topbar_uses_neutral_workspace_context_without_selector() -> None
     topbar_html = html[topbar_start:topbar_end]
 
     assert "工作区" in topbar_html
-    assert "default" not in topbar_html
     assert "Tenant" not in topbar_html
     assert "saas-tenant-switcher" not in topbar_html
     assert 'href="/app"' not in topbar_html
     assert 'data-popover-trigger="language-menu"' in topbar_html
     assert 'data-popover-trigger="theme-menu"' in topbar_html
+    assert 'href="/auth/logout"' in topbar_html
+    assert "workspace-user" in topbar_html
 
 
 class _ScalarResult:
@@ -494,7 +500,7 @@ def test_saas_shell_uses_request_locale_without_translating_identity_data() -> N
         reset_locale(locale_token)
 
     assert '<html lang="en">' in html
-    for group_label in ("Workspace", "AI Studio", "Insights", "Manage"):
+    for group_label in ("Work", "Automation", "Observe", "More"):
         assert f">{group_label}<" in html
     assert 'href="?ui_lang=zh-CN"' in html
     assert "system-admin" in html
@@ -640,7 +646,7 @@ def test_admin_agent_instruction_editor_is_path_scoped_and_complete() -> None:
     assert "/admin/content/reply-prompt" not in editor_html
 
 
-def test_inbox_workbench_has_two_panes_search_and_nested_selected_action() -> None:
+def test_inbox_workbench_has_three_panes_search_and_selected_inspector() -> None:
     from social_reply.application.account_management import saas_console
 
     item = saas_console.InboxItem(
@@ -684,9 +690,12 @@ def test_inbox_workbench_has_two_panes_search_and_nested_selected_action() -> No
     )
     empty_workspace = saas_console._render_inbox_workspace(
         queue_tabs=queue_tabs,
+        filter_placeholder='<span class="saas-inbox-filter-placeholder">Filters soon</span>',
         item_list=selected_list,
         thread=empty_thread,
-        action_panel=saas_console._render_inbox_action_panel("tenant-a", None),
+        inspector_content="No selected work",
+        has_mobile_selection=False,
+        back_to_list_href="/app/t/tenant-a/inbox?queue=human",
         item_count=1,
     )
 
@@ -695,8 +704,8 @@ def test_inbox_workbench_has_two_panes_search_and_nested_selected_action() -> No
     assert '<main class="saas-inbox-column ' not in empty_workspace
     assert "data-inbox-list" in empty_workspace
     assert "data-inbox-thread" in empty_workspace
-    assert "data-inbox-actions" not in empty_workspace
-    assert "<aside" not in empty_workspace
+    assert 'class="saas-detail-inspector"' in empty_workspace
+    assert "Filters soon" in empty_workspace
     assert 'aria-label="工作队列"' in empty_workspace
     assert "1 个工作项" in empty_workspace
     assert "data-list-search" in empty_workspace
@@ -716,19 +725,24 @@ def test_inbox_workbench_has_two_panes_search_and_nested_selected_action() -> No
     selected_action = saas_console._render_inbox_action_panel("tenant-a", item)
     selected_workspace = saas_console._render_inbox_workspace(
         queue_tabs=queue_tabs,
+        filter_placeholder='<span class="saas-inbox-filter-placeholder">Filters soon</span>',
         item_list=selected_list,
         thread=selected_thread,
-        action_panel=selected_action,
+        inspector_content=selected_action,
+        has_mobile_selection=True,
+        back_to_list_href="/app/t/tenant-a/inbox?queue=human",
         item_count=1,
     )
     workspace_start = selected_workspace.index(
         '<section class="saas-inbox-column saas-workspace-pane"'
     )
     workspace_end = selected_workspace.rindex("</section>\n</div>")
-    action_start = selected_workspace.index("data-inbox-actions")
+    action_start = selected_workspace.index('class="saas-detail-inspector"')
 
     assert workspace_start < action_start < workspace_end
-    assert selected_workspace.count("data-inbox-actions") == 1
+    assert selected_workspace.count('class="saas-detail-inspector"') == 1
+    assert 'data-has-selection="true"' in selected_workspace
+    assert "返回工作列表" in selected_workspace
     assert selected_workspace.count('<section class="saas-inbox-column ') == 2
     assert '<main class="saas-inbox-column ' not in selected_workspace
 
@@ -1022,7 +1036,7 @@ def test_ordinary_user_repairs_unavailable_accounts_from_channels() -> None:
     assert "/app/t/tenant-a/profile" not in html
 
 
-def test_ordinary_user_without_accounts_gets_direct_authorization_action() -> None:
+def test_home_without_work_does_not_show_a_permanent_configuration_prompt() -> None:
     from social_reply.application.account_management import saas_console
 
     summary = saas_console.InboxSummary(
@@ -1035,15 +1049,11 @@ def test_ordinary_user_without_accounts_gets_direct_authorization_action() -> No
     )
 
     html = saas_console._home_next_action(
-        _ordinary_user_principal(),
         "tenant-a",
         summary,
-        0,
     )
 
-    assert "授权你的第一个平台账号" in html
-    assert "/app/t/tenant-a/channels" in html
-    assert "授权新账号" in html
+    assert html == ""
 
 
 def test_channel_avatar_only_accepts_known_https_provider_hosts() -> None:

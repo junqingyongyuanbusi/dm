@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 # SENDING 滞留阈值：超过视为 worker 崩溃/丢失，转人工（不自动重发，防歧义重复）
 _STALE_SENDING = timedelta(minutes=10)
+_SWEEP_BATCH_SIZE = 100
+
+# Rebuildable process-local traversal hint, never a reservation or business fact.
+# Restarting from the beginning cannot lose work: eligibility remains in PostgreSQL.
+_dispatch_cursor: uuid.UUID | None = None
 
 
 def _direct_recovery_route(
@@ -37,6 +42,8 @@ def _direct_recovery_route(
 async def sweep_outbox() -> list[uuid.UUID]:
     """补扫：滞留 SENDING 转 NEEDS_REVIEW（不自动重发，防重复）；
     PENDING / 退避到期 FAILED 重新入队。返回本轮入队的 outbox id。"""
+    global _dispatch_cursor
+
     now = datetime.now(UTC)
     settings = get_settings()
     recoverable_routes = []
@@ -228,55 +235,72 @@ async def sweep_outbox() -> list[uuid.UUID]:
                 last_error_message=None,
             )
         )
-        stale_rows = (
-            await session.execute(
-                update(models.OutboxMessage)
-                .where(
-                    models.OutboxMessage.status == "SENDING",
-                    models.OutboxMessage.locked_at < now - _STALE_SENDING,
-                )
-                .values(status="NEEDS_REVIEW", last_error_code="STALE_SENDING")
-                .returning(models.OutboxMessage.id, models.OutboxMessage.attempt_count)
+        stale_predicates = (
+            models.OutboxMessage.status == "SENDING",
+            models.OutboxMessage.locked_at < now - _STALE_SENDING,
+        )
+        stale_candidates = (
+            select(models.OutboxMessage.id)
+            .where(*stale_predicates)
+            .order_by(models.OutboxMessage.locked_at, models.OutboxMessage.id)
+            .limit(_SWEEP_BATCH_SIZE)
+            .with_for_update(skip_locked=True)
+        )
+        stale_rows = await session.execute(
+            update(models.OutboxMessage)
+            .where(
+                models.OutboxMessage.id.in_(stale_candidates),
+                *stale_predicates,
             )
-        ).all()
+            .values(status="NEEDS_REVIEW", last_error_code="STALE_SENDING")
+            .returning(models.OutboxMessage.id, models.OutboxMessage.attempt_count)
+            .execution_options(synchronize_session=False)
+        )
         # 与 deliver_outbox 的终态一致：每条转 NEEDS_REVIEW 的行补一条审计
-        for sid, attempt_count in stale_rows:
+        for stale_id, attempt_count in stale_rows:
             await session.execute(
                 insert(models.DeliveryAttempt).values(
-                    outbox_id=sid,
+                    outbox_id=stale_id,
                     attempt_no=attempt_count,
                     outcome="NEEDS_REVIEW",
                     error_code="STALE_SENDING",
                     error_message="stale SENDING swept (worker lost)",
                 )
             )
-        rows = (
-            (
-                await session.execute(
-                    select(models.OutboxMessage.id).where(
-                        or_(
-                            models.OutboxMessage.status == "PENDING",
-                            (models.OutboxMessage.status == "FAILED")
-                            & (models.OutboxMessage.next_attempt_at <= now),
-                        )
-                    )
+        eligible_statement = (
+            select(models.OutboxMessage.id)
+            .where(
+                or_(
+                    models.OutboxMessage.status == "PENDING",
+                    (models.OutboxMessage.status == "FAILED")
+                    & (models.OutboxMessage.next_attempt_at <= now),
                 )
             )
-            .scalars()
-            .all()
+            .order_by(models.OutboxMessage.id)
+            .limit(_SWEEP_BATCH_SIZE)
         )
-        enqueued = list(rows)
+        after_id = _dispatch_cursor
+        batch_statement = eligible_statement
+        if after_id is not None:
+            batch_statement = batch_statement.where(models.OutboxMessage.id > after_id)
+        enqueued = (await session.execute(batch_statement)).scalars().all()
+        if not enqueued and after_id is not None:
+            # Wrap in this sweep so newly inserted low UUIDs and failed dispatches recover.
+            enqueued = (await session.execute(eligible_statement)).scalars().all()
         await session.commit()
 
     # 延迟导入：避免模块加载时初始化 broker
     from social_reply.application.message_delivery.actors import deliver_outbox_message
 
     dispatched: list[uuid.UUID] = []
-    for oid in enqueued:
+    for outbox_id in enqueued:
         try:
-            await dispatch_actor(deliver_outbox_message, str(oid))
+            await dispatch_actor(deliver_outbox_message, str(outbox_id))
         except Exception:  # noqa: BLE001 - the durable row remains eligible for recovery
-            logger.exception("outbox dispatch failed outbox_id=%s", oid)
+            logger.exception("outbox dispatch failed outbox_id=%s", outbox_id)
         else:
-            dispatched.append(oid)
+            dispatched.append(outbox_id)
+        finally:
+            # Advance even on failure/cancellation, including after wrapping to a lower ID.
+            _dispatch_cursor = outbox_id
     return dispatched

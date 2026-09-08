@@ -8,6 +8,7 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.account_management import human_workflow
+from social_reply.application.account_management.auth import authenticate, hash_password
 from social_reply.application.account_management.human_workflow import (
     resolve_human_work_item,
     resume_bot,
@@ -37,6 +38,26 @@ from social_reply.infrastructure.database.engine import get_engine
 pytestmark = pytest.mark.integration
 
 
+
+async def _prompt_admin_principal(session):
+    username = f"decision-prompt-admin-{uuid.uuid4().hex}"
+    password = f"decision-prompt-password-{uuid.uuid4().hex}"
+    session.add(
+        models.AdminUser(
+            id=uuid.uuid4(),
+            username=username,
+            password_hash=await hash_password(password),
+            tenant_id="default",
+            role="WORKSPACE_ADMIN",
+            must_change_password=False,
+            status="active",
+        )
+    )
+    await session.commit()
+    authenticated = await authenticate(username, password)
+    assert authenticated is not None
+    principal, _token = authenticated
+    return principal
 async def _seed_conversation(session):
     account_id = uuid.uuid4()
     contact_id = uuid.uuid4()
@@ -227,6 +248,7 @@ async def test_stale_business_prompt_cannot_create_decision_or_outbox(session):
         account_id,
         conversation_id,
     )
+    principal = await _prompt_admin_principal(session)
     first_prompt = await save_reply_business_prompt(
         session,
         tenant_id="default",
@@ -235,6 +257,7 @@ async def test_stale_business_prompt_cannot_create_decision_or_outbox(session):
         expected_revision=0,
         actor="user:admin",
         change_note="Initial prompt",
+        principal=principal,
     )
     await session.commit()
     await save_reply_business_prompt(
@@ -245,6 +268,7 @@ async def test_stale_business_prompt_cannot_create_decision_or_outbox(session):
         expected_revision=1,
         actor="user:admin",
         change_note="Add next step",
+        principal=principal,
     )
     await session.commit()
 
@@ -296,6 +320,7 @@ async def test_runner_persists_active_prompt_epoch_for_deterministic_decision(
     account.config = {"delivery_mode": "direct"}
     state = await session.get(models.AutomationState, conversation_id)
     state.state = "BOT_DRAFT_ONLY"
+    principal = await _prompt_admin_principal(session)
     await save_reply_business_prompt(
         session,
         tenant_id="default",
@@ -304,6 +329,7 @@ async def test_runner_persists_active_prompt_epoch_for_deterministic_decision(
         expected_revision=0,
         actor="user:admin",
         change_note="Initial prompt",
+        principal=principal,
     )
     await session.commit()
 
@@ -356,6 +382,7 @@ async def test_runner_keeps_legacy_prompt_provenance_empty_when_gate_is_disabled
     account.config = {"delivery_mode": "direct"}
     state = await session.get(models.AutomationState, conversation_id)
     state.state = "BOT_DRAFT_ONLY"
+    principal = await _prompt_admin_principal(session)
     await save_reply_business_prompt(
         session,
         tenant_id="default",
@@ -364,6 +391,7 @@ async def test_runner_keeps_legacy_prompt_provenance_empty_when_gate_is_disabled
         expected_revision=0,
         actor="user:admin",
         change_note="Staged prompt",
+        principal=principal,
     )
     await session.commit()
 

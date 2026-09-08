@@ -1,0 +1,8 @@
+<section class="saas-section-header">
+  <div class="saas-section-header-copy">
+    {% if eyebrow %}<span class="saas-eyebrow">{{ eyebrow }}</span>{% endif %}
+    <h2>{{ title }}</h2>
+    {% if description %}<p>{{ description }}</p>{% endif %}
+  </div>
+  {% if actions_html %}<div class="saas-section-header-actions">{{ actions_html }}</div>{% endif %}
+</section>

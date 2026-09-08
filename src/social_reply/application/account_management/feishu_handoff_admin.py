@@ -83,6 +83,7 @@ async def save_feishu_handoff_config_compatibility(request: Request) -> Response
             account_id=account_id,
             destination_chat_id=form.get("destination_chat_id") or "",
             enabled=form.get("enabled") == "true",
+            principal=principal,
         )
     except FeishuHandoffError as exc:
         raise _service_http_error(exc) from exc
@@ -96,6 +97,15 @@ async def save_feishu_handoff_operator_compatibility(request: Request) -> Respon
         return context
     principal, form, tenant_id = context
     try:
+        employee_id = uuid.UUID(form["admin_user_id"]) if form.get("admin_user_id") else None
+        previous_id = (
+            uuid.UUID(form["expected_admin_user_id"])
+            if form.get("expected_admin_user_id")
+            else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_feishu_operator_staff_id") from exc
+    try:
         await upsert_feishu_handoff_operator(
             tenant_id=tenant_id,
             actor=principal.actor,
@@ -103,6 +113,10 @@ async def save_feishu_handoff_operator_compatibility(request: Request) -> Respon
             display_name=form.get("display_name") or "",
             can_claim=form.get("can_claim") == "true",
             can_resolve=form.get("can_resolve") == "true",
+            admin_user_id=employee_id,
+            expected_admin_user_id=previous_id,
+            confirm_rebind=form.get("confirm_rebind") == "true",
+            principal=principal,
         )
     except FeishuHandoffError as exc:
         raise _service_http_error(exc) from exc
@@ -127,6 +141,7 @@ async def toggle_feishu_handoff_operator_compatibility(
             actor=principal.actor,
             operator_id=operator_id,
             enabled=enabled_value == "true",
+            principal=principal,
         )
     except FeishuHandoffError as exc:
         raise _service_http_error(exc) from exc
@@ -148,5 +163,6 @@ async def send_feishu_handoff_test_card_compatibility(request: Request) -> Respo
             + translate("admin.handoff.test_card_safe")
         ),
         sender_factory=get_platform_sender,
+        principal=principal,
     )
     return _redirect(tenant_id, outcome)

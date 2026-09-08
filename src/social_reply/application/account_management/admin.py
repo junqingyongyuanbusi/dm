@@ -10,6 +10,10 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import delete, select
 
+from social_reply.application.account_management.access import (
+    lock_session_authorities,
+    lock_user_authority,
+)
 from social_reply.application.account_management.auth import (
     Principal,
     _credential_fingerprint,
@@ -17,6 +21,7 @@ from social_reply.application.account_management.auth import (
     authenticate,
     current_principal,
     hash_password,
+    principal_from_session_row,
     revoke_session,
     verify_password,
 )
@@ -35,6 +40,7 @@ from social_reply.application.account_management.jobs import (
 from social_reply.application.account_management.saas_ui import (
     NavigationGroup,
     NavigationItem,
+    _tenant_navigation_groups,
     navigation_icon,
     render_shared_page,
 )
@@ -123,6 +129,7 @@ async def _web_principal(
     if (
         not request.url.path.startswith("/admin/system/")
         and principal.is_admin
+        and not principal.is_superadmin
         and principal.tenant_id != DEFAULT_TENANT_ID
     ):
         raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
@@ -172,7 +179,12 @@ def tenant_id_or_default(principal: Principal, requested: str) -> str:
     return tenant
 
 
-def _admin_navigation_groups(show_system_controls: bool) -> tuple[NavigationGroup, ...]:
+def _admin_navigation_groups(
+    show_system_controls: bool,
+    *,
+    principal: Principal | None = None,
+    tenant_id: str | None = None,
+) -> tuple[NavigationGroup, ...]:
     if show_system_controls:
         return (
             NavigationGroup(
@@ -195,6 +207,8 @@ def _admin_navigation_groups(show_system_controls: bool) -> tuple[NavigationGrou
                 ),
             ),
         )
+    if principal is not None and principal.is_admin and tenant_id:
+        return _tenant_navigation_groups(principal, tenant_id, 0)
     return ()
 
 
@@ -221,7 +235,15 @@ def _page(
         title=title,
         body=body,
         surface="admin" if show_logout else "auth",
-        navigation_groups=_admin_navigation_groups(show_users) if show_logout else (),
+        navigation_groups=(
+            _admin_navigation_groups(
+                bool(current_principal is not None and current_principal.is_superadmin),
+                principal=current_principal,
+                tenant_id=current_principal.tenant_id if current_principal else None,
+            )
+            if show_logout
+            else ()
+        ),
         active_navigation=active,
         principal=current_principal,
         tenant_id=current_principal.tenant_id if current_principal else None,
@@ -441,17 +463,36 @@ async def change_password(request: Request) -> Response:
     if new_password != (form.get("confirm_password") or ""):
         raise HTTPException(status_code=422, detail="password_confirmation_mismatch")
     async with get_session_factory()() as session:
+        await lock_user_authority(session, principal.user_id)
+        session_ids = set(
+            await session.scalars(
+                select(models.AdminSession.id).where(
+                    models.AdminSession.user_id == principal.user_id
+                )
+            )
+        )
+        session_ids.add(principal.session_id)
+        await lock_session_authorities(session, session_ids)
+        current = await principal_from_session_row(session, principal.session_id, for_update=True)
+        if current is None or current.user_id != principal.user_id or current.is_feishu_action:
+            raise HTTPException(status_code=401, detail="password_change_session_revoked")
+        principal = current
         user = (
             await session.execute(
                 select(models.AdminUser)
-                .where(models.AdminUser.id == principal.user_id)
+                .where(
+                    models.AdminUser.id == principal.user_id,
+                    models.AdminUser.tenant_id == principal.tenant_id,
+                    models.AdminUser.status == "active",
+                )
+                .execution_options(populate_existing=True)
                 .with_for_update()
             )
         ).scalar_one_or_none()
         current_password = form.get("current_password") or ""
         if user is None or not await verify_password(user.password_hash, current_password):
             raise HTTPException(status_code=401, detail="current_password_invalid")
-        if secrets.compare_digest(new_password, current_password):
+        if secrets.compare_digest(new_password.encode(), current_password.encode()):
             raise HTTPException(status_code=422, detail="new_password_must_be_different")
         try:
             user.password_hash = await hash_password(new_password)
@@ -487,7 +528,9 @@ async def change_password(request: Request) -> Response:
         )
         await session.commit()
     default_target = "/admin" if principal.is_admin else "/app"
-    response = RedirectResponse(next_target or default_target, status_code=status.HTTP_303_SEE_OTHER)
+    response = RedirectResponse(
+        next_target or default_target, status_code=status.HTTP_303_SEE_OTHER
+    )
     response.set_cookie(
         _SESSION_COOKIE,
         raw_token,
@@ -734,8 +777,12 @@ async def admin_retry_job(request: Request, job_id: uuid.UUID) -> Response:
         await retry_provisioning_job(
             job_id,
             tenant_id=job.tenant_id,
-            actor=principal.actor,
+            caller=principal,
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="provisioning_job_not_found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     from social_reply.application.account_management.actors import process_platform_provisioning

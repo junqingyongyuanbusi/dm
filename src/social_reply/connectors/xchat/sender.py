@@ -6,6 +6,7 @@ from authlib.oauth1 import ClientAuth
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
 from social_reply.connectors.xchat.crypto import import_private_key_b64
 from social_reply.connectors.xchat.key_cache import canonical_conversation_id
+from social_reply.connectors.xchat.key_event_memory import ConversationKeyEventCache
 
 
 class XChatSender:
@@ -29,10 +30,9 @@ class XChatSender:
         self._external_account_id = external_account_id
         self._private_keys_b64 = private_keys_b64
         self._signing_key_version = signing_key_version
-        self._conversation_key_events = {
-            canonical_conversation_id(key): list(value)
-            for key, value in (conversation_key_events or {}).items()
-        }
+        self._conversation_key_events = ConversationKeyEventCache()
+        for conversation_id, events in (conversation_key_events or {}).items():
+            self._conversation_key_events.store(canonical_conversation_id(conversation_id), events)
         self._auth = ClientAuth(
             consumer_key,
             consumer_secret,
@@ -50,13 +50,13 @@ class XChatSender:
         if target.get("kind") != "x_chat":
             raise ValueError(f"unsupported_xchat_target:{target.get('kind')}")
         conversation_id = canonical_conversation_id(str(target["conversation_id"]))
-        events = list(self._conversation_key_events.get(conversation_id) or [])
+        events = self._conversation_key_events.get(conversation_id)
         if not events:
             events = await self._load_persisted_key_events(conversation_id)
         if not events:
             events = await self._read_history(conversation_id)
             if events:
-                self._conversation_key_events[conversation_id] = events
+                self._conversation_key_events.store(conversation_id, events)
         chat = import_private_key_b64(self._private_keys_b64)
         # import_keys restores private material but not the public signing-key
         # version required when creating a signed outgoing event.
@@ -123,7 +123,7 @@ class XChatSender:
         }
         events = [str(item) for item in cached.get(conversation_id) or [] if item]
         if events:
-            self._conversation_key_events[conversation_id] = events
+            self._conversation_key_events.store(conversation_id, events)
         return events
 
     async def _read_history(self, conversation_id: str) -> list[str]:

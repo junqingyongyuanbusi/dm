@@ -6,6 +6,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.domain.platform_accounts import ACTIVE_ACCOUNT_STATUS, AccountPlatform
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.database.advisory_locks import acquire_shared_xact_lock
+
+_HANDOFF_NOTIFICATION_ROUTE_LOCK_PREFIX = "social-reply:feishu-handoff-config:"
+
+
+def handoff_notification_route_lock_key(tenant_id: str) -> str:
+    return f"{_HANDOFF_NOTIFICATION_ROUTE_LOCK_PREFIX}{tenant_id}"
+
+
+async def lock_handoff_notification_route(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+) -> dict[str, object | None]:
+    """Read a stable notification route while holding its config shared lock.
+
+    Callers that also lock a source account must use the returned route account ID to
+    lock the source and notification accounts together in UUID order before proceeding.
+    """
+    await acquire_shared_xact_lock(session, handoff_notification_route_lock_key(tenant_id))
+    return await _route_values(session, tenant_id=tenant_id)
 
 
 class HandoffNotificationError(ValueError):
@@ -24,9 +45,9 @@ async def _route_values(
     tenant_id: str,
 ) -> dict[str, object | None]:
     config = await session.scalar(
-        select(models.TenantFeishuHandoffConfig).where(
-            models.TenantFeishuHandoffConfig.tenant_id == tenant_id
-        )
+        select(models.TenantFeishuHandoffConfig)
+        .where(models.TenantFeishuHandoffConfig.tenant_id == tenant_id)
+        .execution_options(populate_existing=True)
     )
     if config is None:
         return {
@@ -46,7 +67,14 @@ async def _route_values(
             "status": "BLOCKED_CONFIG",
             "last_error_code": "FEISHU_HANDOFF_ROUTE_DISABLED",
         }
-    account = await session.get(models.PlatformAccount, config.feishu_platform_account_id)
+    account = await session.scalar(
+        select(models.PlatformAccount)
+        .where(
+            models.PlatformAccount.id == config.feishu_platform_account_id,
+            models.PlatformAccount.tenant_id == tenant_id,
+        )
+        .execution_options(populate_existing=True)
+    )
     if (
         account is None
         or account.tenant_id != tenant_id
@@ -101,10 +129,12 @@ async def advance_handoff_notification_for_work(
     session: AsyncSession,
     *,
     work: models.HumanWorkItem,
+    force_refresh: bool = False,
 ) -> models.HandoffNotificationIntent | None:
     intent = await session.scalar(
         select(models.HandoffNotificationIntent)
         .where(models.HandoffNotificationIntent.human_work_item_id == work.id)
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     if intent is None:
@@ -112,7 +142,7 @@ async def advance_handoff_notification_for_work(
     if intent.tenant_id != work.tenant_id or intent.conversation_id != work.conversation_id:
         raise HandoffNotificationError("handoff_notification_intent_scope_mismatch")
     card_state = _card_state(work.status)
-    if card_state == intent.desired_card_state:
+    if card_state == intent.desired_card_state and not force_refresh:
         return intent
     intent.desired_card_state = card_state
     intent.desired_revision += 1
@@ -133,7 +163,7 @@ async def refresh_handoff_notification_route(
 ) -> bool:
     if intent.provider_message_id is not None:
         return False
-    route_values = await _route_values(session, tenant_id=intent.tenant_id)
+    route_values = await lock_handoff_notification_route(session, tenant_id=intent.tenant_id)
     for field, value in route_values.items():
         setattr(intent, field, value)
     if route_values["status"] == "PENDING":
@@ -156,6 +186,9 @@ async def ensure_handoff_notification_intent(
     if work.tenant_id != conversation_tenant:
         raise HandoffNotificationError("human_work_item_tenant_mismatch")
 
+    # Keep this helper free of a late route lock: outbox failure paths already hold the
+    # source and notification-account locks. Those callers must acquire the route guard
+    # before taking either account row lock.
     route_values = await _route_values(session, tenant_id=work.tenant_id)
     candidate_id = uuid.uuid4()
     inserted_id = (

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -5,6 +7,11 @@ from datetime import UTC, datetime
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.account_management.access import lock_user_authority
+from social_reply.application.account_management.auth import (
+    Principal,
+    principal_from_session_row,
+)
 from social_reply.application.knowledge.drafts import knowledge_document_safety_lock_key
 from social_reply.application.message_delivery.intents import (
     OutboxActor,
@@ -66,6 +73,8 @@ class _LockedDraftContext:
     message: models.Message
     original_text: str
     current_review_action: str
+    current_principal: Principal | None
+    staff_user: models.AdminUser | None
 
 
 def _normalize_actor(actor: str) -> str:
@@ -73,6 +82,44 @@ def _normalize_actor(actor: str) -> str:
     if not normalized_actor or len(normalized_actor) > 255:
         raise DraftReviewValidationError("draft_review_actor_invalid")
     return normalized_actor
+
+
+async def _authorize_reviewer(
+    *,
+    principal: Principal | None,
+    current_principal: Principal | None,
+    staff_user: models.AdminUser | None,
+    account: models.PlatformAccount,
+    tenant_id: str,
+    actor: str,
+) -> Principal:
+    if principal is None or current_principal is None:
+        raise DraftReviewConflict("draft_approver_principal_required")
+    current = current_principal
+    if (
+        not current.is_workspace_admin
+        or tenant_id not in current.allowed_tenants
+        or current.tenant_id not in {None, tenant_id}
+        or current.must_change_password
+        or not current.can_access_account(account)
+    ):
+        raise DraftReviewConflict("draft_approver_not_authorized")
+    if current.user_id is not None:
+        if (
+            staff_user is None
+            or staff_user.id != current.user_id
+            or staff_user.tenant_id != tenant_id
+            or staff_user.username != current.username
+            or staff_user.status != "active"
+            or staff_user.role != "WORKSPACE_ADMIN"
+            or staff_user.must_change_password
+        ):
+            raise DraftReviewConflict("draft_approver_not_authorized")
+    elif not current.is_superadmin:
+        raise DraftReviewConflict("draft_approver_not_authorized")
+    if actor != current.actor:
+        raise DraftReviewConflict("draft_approver_identity_mismatch")
+    return current
 
 
 def _normalize_tenant_id(required_tenant_id: str) -> str:
@@ -115,6 +162,7 @@ async def _load_locked_draft_context(
     decision_id: uuid.UUID,
     required_tenant_id: str,
     expected_generation: int | None,
+    principal: Principal | None,
 ) -> _LockedDraftContext:
     identity = (
         await session.execute(
@@ -129,61 +177,80 @@ async def _load_locked_draft_context(
     ).one_or_none()
     if identity is None:
         raise DraftReviewNotFound("decision_not_found")
+    if principal is None or principal.session_id is None:
+        raise DraftReviewConflict("draft_approver_principal_required")
+    if principal.user_id is not None:
+        await lock_user_authority(session, principal.user_id)
+    current_principal = await principal_from_session_row(
+        session,
+        principal.session_id,
+        for_update=True,
+    )
+    if current_principal is None:
+        raise DraftReviewConflict("draft_approver_session_invalid")
 
     await acquire_conversation_delivery_xact_lock(session, identity.conversation_id)
-    conversation = (
-        await session.execute(
-            select(models.Conversation)
+    conversation = await session.scalar(
+        select(models.Conversation)
+        .where(
+            models.Conversation.id == identity.conversation_id,
+            models.Conversation.tenant_id == required_tenant_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if conversation is None:
+        raise DraftReviewConflict("decision_tenant_scope_mismatch")
+    account = await session.scalar(
+        select(models.PlatformAccount)
+        .where(
+            models.PlatformAccount.id == conversation.platform_account_id,
+            models.PlatformAccount.tenant_id == required_tenant_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    staff_user = None
+    if current_principal.user_id is not None:
+        staff_user = await session.scalar(
+            select(models.AdminUser)
             .where(
-                models.Conversation.id == identity.conversation_id,
-                models.Conversation.tenant_id == required_tenant_id,
+                models.AdminUser.id == current_principal.user_id,
+                models.AdminUser.tenant_id == required_tenant_id,
             )
+            .execution_options(populate_existing=True)
             .with_for_update()
         )
-    ).scalar_one_or_none()
-    decision = (
-        await session.execute(
-            select(models.ReplyDecision)
-            .where(
-                models.ReplyDecision.id == decision_id,
-                models.ReplyDecision.tenant_id == required_tenant_id,
-                models.ReplyDecision.conversation_id == identity.conversation_id,
-            )
-            .with_for_update()
+    decision = await session.scalar(
+        select(models.ReplyDecision)
+        .where(
+            models.ReplyDecision.id == decision_id,
+            models.ReplyDecision.tenant_id == required_tenant_id,
+            models.ReplyDecision.conversation_id == identity.conversation_id,
         )
-    ).scalar_one_or_none()
-    if conversation is None or decision is None:
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if account is None or decision is None:
         raise DraftReviewConflict("decision_tenant_scope_mismatch")
     if decision.action != "draft":
         raise DraftReviewConflict("decision_not_pending_draft")
-
-    account = (
-        await session.execute(
-            select(models.PlatformAccount).where(
-                models.PlatformAccount.id == conversation.platform_account_id,
-                models.PlatformAccount.tenant_id == required_tenant_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if (
-        account is None
-        or account.brand_id != conversation.brand_id
-        or account.platform != conversation.platform
-    ):
+    if account.brand_id != conversation.brand_id or account.platform != conversation.platform:
         raise DraftReviewConflict("decision_tenant_scope_mismatch")
     if account.status not in LEGACY_ACTIVE_ACCOUNT_STATUSES:
         raise DraftReviewConflict("draft_account_not_active")
 
     if decision.message_id is None:
         raise DraftReviewConflict("draft_message_provenance_invalid")
-    message = (
-        await session.execute(
-            select(models.Message).where(
-                models.Message.id == decision.message_id,
-                models.Message.conversation_id == conversation.id,
-            )
+    message = await session.scalar(
+        select(models.Message)
+        .where(
+            models.Message.id == decision.message_id,
+            models.Message.conversation_id == conversation.id,
         )
-    ).scalar_one_or_none()
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
     if message is None or message.direction != "inbound":
         raise DraftReviewConflict("draft_message_provenance_invalid")
     if (
@@ -204,10 +271,9 @@ async def _load_locked_draft_context(
         session,
         decision=decision,
     )
-    original_text = (
-        (decision.original_reply_text or "").strip()
-        or (decision.reply_text or "").strip()
-    )
+    original_text = (decision.original_reply_text or "").strip() or (
+        decision.reply_text or ""
+    ).strip()
     if not original_text:
         raise DraftReviewConflict("draft_reply_text_missing")
     return _LockedDraftContext(
@@ -217,6 +283,8 @@ async def _load_locked_draft_context(
         message=message,
         original_text=original_text,
         current_review_action=decision.review_action or "PENDING",
+        current_principal=current_principal,
+        staff_user=staff_user,
     )
 
 
@@ -281,8 +349,7 @@ async def _validate_knowledge_provenance(
             .join(
                 models.KnowledgeChunk,
                 and_(
-                    models.KnowledgeChunk.tenant_id
-                    == models.KnowledgeDocument.tenant_id,
+                    models.KnowledgeChunk.tenant_id == models.KnowledgeDocument.tenant_id,
                     models.KnowledgeChunk.document_id == models.KnowledgeDocument.id,
                 ),
             )
@@ -331,6 +398,7 @@ async def approve_draft(
     final_reply_text: str | None,
     expected_generation: int | None,
     expected_review_action: str | None,
+    principal: Principal | None = None,
 ) -> DraftReviewResult:
     normalized_tenant_id = _normalize_tenant_id(required_tenant_id)
     normalized_actor = _normalize_actor(actor)
@@ -344,7 +412,22 @@ async def approve_draft(
             decision_id=decision_id,
             required_tenant_id=normalized_tenant_id,
             expected_generation=expected_generation,
+            principal=principal,
         )
+        reviewer = await _authorize_reviewer(
+            principal=principal,
+            current_principal=context.current_principal,
+            staff_user=context.staff_user,
+            account=context.account,
+            tenant_id=normalized_tenant_id,
+            actor=normalized_actor,
+        )
+        effective_actor = reviewer.actor
+        if (
+            context.current_review_action in {"ACCEPTED", "EDITED"}
+            and context.decision.reviewed_by != effective_actor
+        ):
+            raise DraftReviewConflict("draft_approval_identity_conflict")
         final_text = _normalize_final_reply_text(
             final_reply_text,
             original_text=context.original_text,
@@ -377,13 +460,16 @@ async def approve_draft(
                     text=final_text,
                     origin_kind=OutboxOrigin.DRAFT_APPROVAL,
                     actor_kind=OutboxActor.ADMIN_HUMAN,
-                    actor_id=normalized_actor,
+                    actor_id=effective_actor,
                     idempotency_key=f"draft-approval:{decision_id}",
                     visibility=context.decision.reply_visibility,
                     payload_metadata={
                         "approval": "admin",
-                        "approved_by": normalized_actor,
+                        "approved_by": effective_actor,
                     },
+                    initiator_user_id=reviewer.user_id,
+                    initiator_session_id=reviewer.session_id,
+                    human_work_item_version=None,
                 )
             except OutboxIdempotencyConflict as exc:
                 raise DraftReviewConflict("draft_approval_conflict") from exc
@@ -393,7 +479,7 @@ async def approve_draft(
             context.decision.original_reply_text = context.original_text
             context.decision.final_reply_text = final_text
             context.decision.review_action = review_action
-            context.decision.reviewed_by = normalized_actor
+            context.decision.reviewed_by = effective_actor
             context.decision.reviewed_at = datetime.now(UTC)
             context.decision.review_reason = None
             context.decision.review_outbox_id = outbox_id
@@ -401,7 +487,7 @@ async def approve_draft(
                 models.AuditLog(
                     tenant_id=normalized_tenant_id,
                     category="admin_action",
-                    actor=normalized_actor,
+                    actor=effective_actor,
                     action="APPROVE_DRAFT",
                     subject_type="reply_decision",
                     subject_id=str(decision_id),
@@ -439,6 +525,7 @@ async def reject_draft(
     review_reason: str,
     expected_generation: int | None,
     expected_review_action: str | None,
+    principal: Principal | None = None,
 ) -> DraftReviewResult:
     normalized_tenant_id = _normalize_tenant_id(required_tenant_id)
     normalized_actor = _normalize_actor(actor)
@@ -452,7 +539,22 @@ async def reject_draft(
             decision_id=decision_id,
             required_tenant_id=normalized_tenant_id,
             expected_generation=expected_generation,
+            principal=principal,
         )
+        reviewer = await _authorize_reviewer(
+            principal=principal,
+            current_principal=context.current_principal,
+            staff_user=context.staff_user,
+            account=context.account,
+            tenant_id=normalized_tenant_id,
+            actor=normalized_actor,
+        )
+        effective_actor = reviewer.actor
+        if (
+            context.current_review_action == "REJECTED"
+            and context.decision.reviewed_by != effective_actor
+        ):
+            raise DraftReviewConflict("draft_rejection_identity_conflict")
         if context.current_review_action == "REJECTED":
             if (
                 context.decision.review_outbox_id is not None
@@ -474,7 +576,7 @@ async def reject_draft(
             context.decision.original_reply_text = context.original_text
             context.decision.final_reply_text = None
             context.decision.review_action = "REJECTED"
-            context.decision.reviewed_by = normalized_actor
+            context.decision.reviewed_by = effective_actor
             context.decision.reviewed_at = datetime.now(UTC)
             context.decision.review_reason = normalized_reason
             context.decision.reason_codes = reason_codes
@@ -482,7 +584,7 @@ async def reject_draft(
                 models.AuditLog(
                     tenant_id=normalized_tenant_id,
                     category="admin_action",
-                    actor=normalized_actor,
+                    actor=effective_actor,
                     action="REJECT_DRAFT",
                     subject_type="reply_decision",
                     subject_id=str(decision_id),

@@ -34,7 +34,7 @@ async def test_telegram_account_api_submits_durable_job(monkeypatch):
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
@@ -64,7 +64,7 @@ async def test_messenger_account_api_defaults_to_dm_only_draft_mode(monkeypatch)
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
@@ -100,7 +100,7 @@ async def test_messenger_account_api_keeps_draft_mode_when_comments_enabled(monk
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
@@ -219,7 +219,7 @@ async def test_instagram_account_api_keeps_draft_mode_when_comments_enabled(monk
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
@@ -344,7 +344,7 @@ async def test_future_platform_account_api_rejects_disabled_integrations(
     async def unexpected_submit(**_kwargs):
         raise AssertionError("disabled platform must not submit a provisioning job")
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", unexpected_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", unexpected_submit)
     async with await _client() as client:
         response = await client.post(
             endpoint,
@@ -365,7 +365,7 @@ async def test_whatsapp_account_api_submits_phone_number_job(monkeypatch):
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
@@ -441,7 +441,7 @@ async def test_feishu_account_api_splits_public_and_secret_fields(monkeypatch):
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
@@ -477,8 +477,7 @@ async def test_feishu_account_api_enforces_gate_before_submission(monkeypatch):
 
     async def unexpected_submit(**_kwargs):
         raise AssertionError("disabled Feishu must not submit")
-
-    monkeypatch.setattr(account_router, "submit_provisioning_job", unexpected_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", unexpected_submit)
     async with await _client() as client:
         response = await client.post(
             "/api/v1/platform-accounts/feishu",
@@ -536,7 +535,7 @@ async def test_email_account_api_splits_canonical_public_fields_and_preserves_se
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     async with await _client() as client:
         response = await client.post(
@@ -599,7 +598,7 @@ async def test_email_account_api_defaults_smtp_port_from_security_and_preserves_
     async def fake_enqueue(_job_id):
         return None
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", fake_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", fake_submit)
     monkeypatch.setattr(account_router, "_enqueue", fake_enqueue)
     payload = {
         "email_address": "support@example.com",
@@ -673,7 +672,7 @@ async def test_email_account_api_allowlist_runs_after_auth_tenant_and_feature_ga
     async def unexpected_submit(**_kwargs):
         raise AssertionError("rejected Email request must not create a job")
 
-    monkeypatch.setattr(account_router, "submit_provisioning_job", unexpected_submit)
+    monkeypatch.setattr(account_router, "submit_control_provisioning_job", unexpected_submit)
     payload = {
         "email_address": "support@example.com",
         "username": "mail-user",

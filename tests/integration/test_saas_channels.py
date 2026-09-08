@@ -7,7 +7,8 @@ import redis.asyncio as aioredis
 from sqlalchemy import select
 
 from apps.api.main import create_app
-from social_reply.application.account_management.auth import hash_password
+from social_reply.application.account_management import jobs
+from social_reply.application.account_management.auth import authenticate, hash_password
 from social_reply.application.account_management.meta_credentials import (
     MetaAppCredentials,
 )
@@ -555,21 +556,27 @@ async def test_kill_switch_and_job_retry_are_idempotent_scoped_and_audited(
         automation_default="BOT_DRAFT_ONLY",
         status="active",
     )
-    job = models.ProvisioningJob(
+    session.add(account)
+    await session.commit()
+    authenticated = await authenticate(first_user.username, _USER_PASSWORD)
+    assert authenticated is not None
+    principal, _raw_token = authenticated
+    job_id = await jobs.submit_provisioning_job(
         tenant_id="default",
         brand_id="default",
         platform="telegram",
-        actor=first_user.username,
-        owner_user_id=first_user.id,
-        idempotency_key="channel-retry-audit",
-        request={"name": "Kill switch account"},
-        status="FAILED",
-        current_step="FAILED",
-        result={},
-        last_error_code="PLATFORM_UNAVAILABLE",
-        last_error_message="provider details stay private",
+        actor=principal.actor,
+        request={"name": "Kill switch account", "idempotency_key": "channel-retry-audit"},
+        secrets={"token": "channel-retry-token"},
+        admin_session_id=principal.session_id,
     )
-    session.add_all([account, job])
+    job = await session.get(models.ProvisioningJob, job_id)
+    assert job is not None
+    job.status = "FAILED"
+    job.current_step = "FAILED"
+    job.next_attempt_at = None
+    job.last_error_code = "PLATFORM_UNAVAILABLE"
+    job.last_error_message = "provider details stay private"
     await session.commit()
 
     async def ignore_dispatch(*_args, **_kwargs):

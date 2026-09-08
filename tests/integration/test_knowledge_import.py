@@ -7,8 +7,12 @@ from sqlalchemy import select
 
 from social_reply.application.knowledge.importer import (
     MAX_IMPORT_ROWS,
-    import_knowledge_csv,
-    import_knowledge_rows,
+)
+from social_reply.application.knowledge.importer import (
+    _import_knowledge_csv_system as import_knowledge_csv,
+)
+from social_reply.application.knowledge.importer import (
+    _import_knowledge_rows_system as import_knowledge_rows,
 )
 from social_reply.application.knowledge.upload import (
     MAX_KNOWLEDGE_UPLOAD_BYTES,
@@ -114,7 +118,7 @@ async def test_官方联系方式布尔列严格解析(migrated_db, session, val
         official_audit = next(
             audit for audit in audits if audit.action == "SET_KNOWLEDGE_OFFICIAL_CONTACT"
         )
-        assert official_audit.actor == "knowledge-import"
+        assert official_audit.actor == "system:knowledge-import"
         assert official_audit.detail["content_hash"]
     else:
         assert "SET_KNOWLEDGE_OFFICIAL_CONTACT" not in {audit.action for audit in audits}
@@ -235,7 +239,6 @@ async def test_csv_manual_symmetric_scope_fields_are_persisted(migrated_db, sess
         io.StringIO(csv_text),
         source_name="symmetric.csv",
         embedder=FakeEmbeddingClient(),
-        actor="user:knowledge-admin",
     )
     assert report.inserted == 1
     document = (await session.execute(select(KnowledgeDocument))).scalar_one()

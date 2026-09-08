@@ -72,12 +72,16 @@ a disabled polling stack performs no provider reconciliation until it is re-enab
 
 ## Browser role and route contract
 
-Production is single-organization and uses `default` as the only browser Tenant. Database users
-persist only `role="USER"` and remain owner-scoped. Bootstrap `SUPERADMIN` comes exclusively from
-`ADMIN_USERNAME` / `ADMIN_PASSWORD`, has `user_id=None`, and can use both `/admin/system/*` and the
-canonical Tenant workspace with Tenant-wide authority. Do not configure a non-default browser
-Tenant as a way to create another organization; canonical `/app/t/<non-default>` requests fail
-closed with 404.
+Production is single-organization and uses `default` as the only browser Tenant. Database roles are
+`USER` (support agent) and `WORKSPACE_ADMIN` (business administrator); no other database role is
+accepted. Support agents read their owned accounts and company channels explicitly published by an
+administrator. Shared visibility grants neither credential writes nor administrative actions.
+Bootstrap `SUPERADMIN` comes exclusively from `ADMIN_USERNAME` / `ADMIN_PASSWORD`, has `user_id=None`,
+and is the only identity allowed into `/admin/system/*`. Named business administrators manage staff
+at `/admin/users` using their own password for sensitive confirmations. Bootstrap can perform
+emergency removal of the sole business administrator only with password reconfirmation and a reason.
+Do not configure another browser Tenant to represent an employee: `/app/t/<non-default>` fails
+closed with 404. Role, publication and reconnection grants are PostgreSQL facts, not service variables.
 
 This intentionally makes the environment credential a direct entry point to customer business
 data: anyone who can read `.env` or Railway service variables can access all configured Tenant

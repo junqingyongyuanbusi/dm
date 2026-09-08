@@ -34,20 +34,44 @@ credential envelopes can be read. Worker process and thread counts are explicitl
 All three roles, PostgreSQL, and Redis must run in one infrastructure region because every durable
 reply crosses multiple broker, transaction, and advisory-lock boundaries.
 
+### Memory bounds
+
+Each XChat sender keeps at most 128 conversations in its disposable key-event cache, with a
+1 MiB budget for retained conversation IDs, event tuples and event strings. Cache bookkeeping is
+additional but bounded by the conversation limit. Oversized histories remain complete for the
+current send without being cached; eviction never deletes PostgreSQL key history. A cache miss
+reloads persisted events, falling back to provider history when needed. This bounds retained
+per-sender events, not account configuration loading, global sender count or process RSS.
+
+Outbox recovery reads at most 100 dispatch candidates and reviews at most 100 stale sends per
+sweep. A process-local UUID cursor advances through dispatch candidates and wraps at the end,
+including after individual broker failures. It is only a reconstructable traversal hint;
+PostgreSQL statuses remain authoritative and a restart starts scanning from the beginning.
+Platform-gate and account-health recovery updates are not capped by these read limits.
+
+Knowledge imports retain generated vectors in packed double-precision arrays between embedding
+and persistence, converting only the current vector back to a list for storage. All embedding
+batches still complete before content-hash locks and writes, preserving atomic import and
+concurrent deduplication semantics. CLI CSV reads are bounded before opening a database session;
+both character count and UTF-8 byte size must fit the existing upload limit.
+
 ## Browser surfaces and Channels ownership
 
 The deployed product is a single-organization installation. `default` is the only canonical
 Tenant exposed by browser routes; an authenticated request for `/app/t/{tenant_id}` with any other
 Tenant returns not-found before a business query runs. Browser authority is role-separated:
 
-- `USER` uses `/app/t/default` and sees only owned platform accounts and account-derived Agent/Brand
-  scopes;
+- `USER` is the support-agent role. It uses `/app/t/default` and reads owned accounts plus
+  accounts explicitly published to the company inbox (`shared_with_support=true`). Account-derived
+  views use the same scope; sharing never grants credential, automation or employee-management rights.
+- `WORKSPACE_ADMIN` is a named database business administrator. It manages the default Workspace,
+  staff, channel publication, reconnection grants, conversation handoffs and draft review.
 - bootstrap `SUPERADMIN` comes from `ADMIN_USERNAME` / `ADMIN_PASSWORD`, has no database user row,
-  and uses both `/admin/system/*` and the canonical Tenant workspace with Tenant-wide visibility
-  and mutations;
-- database users persist only `USER`. The database `ADMIN` role has been removed. Compatibility
-  names such as `is_admin`, `admin_required`, and internal `ChannelActor(role="ADMIN")` describe
-  Tenant-wide SUPERADMIN capability rather than a third login role.
+  and remains the system/recovery identity. `/admin/system/*` explicitly requires SUPERADMIN;
+  database business administrators never inherit system access.
+- Database roles are exactly `USER` and `WORKSPACE_ADMIN`. The old `ADMIN` role remains invalid.
+  `is_admin`, `admin_required` and internal `ChannelActor(role="ADMIN")` denote business capability,
+  not system authority. Sensitive commands reload the persisted authenticated identity.
 
 Canonical Tenant pages include inbox/draft/delivery work, conversations, Channels and provisioning
 jobs, business Prompt, Knowledge, health, audit, journeys, settings, and profile. Historical
@@ -57,11 +81,26 @@ adapters over the same command services during the compatibility window. OAuth c
 stable at `/admin/oauth/x/callback`, `/admin/oauth/meta/callback`, and
 `/admin/oauth/instagram/callback`.
 
-The Channels page queries `PlatformAccount.owner_user_id` and
-`ProvisioningJob.owner_user_id` using the persisted authenticated Principal; owner identity is never
-accepted from form data. SUPERADMIN continues to use `/admin/integrations/accounts` for Tenant
-shared accounts only as a compatibility redirect; canonical repair and control live under
-`/app/t/default/channels`.
+The Tenant home is a work overview, not a configuration or login-audit dashboard. It conditionally
+shows recorded channel issues, actionable queues, the current UTC day's stored message count
+(inbound and outbound), and up to five business events. Empty sections are omitted. Channel notices
+cover enabled, active Meta/Feishu accounts with explicitly recorded health failures; they link to
+account details and are not live probes. Business activity comes from human work-item creation,
+confirmed Outbox sends and recorded failed/review-required delivery attempts whose Outboxes are
+still in an issue state. It never loads the general audit stream. Support agents see accessible
+account notices and human-work events; Outbox and delivery-attempt activity is administrator-only.
+Each event source is limited before merging the latest five, with only display columns selected.
+Historical business events link to their conversations rather than assuming they remain in the
+current actionable inbox. Login and configuration changes remain available on the audit pages.
+
+Channels use persisted account publication and employee identity for access. Existing accounts
+remain unpublished on upgrade; publication is an explicit administrator action exposing history to
+all support agents. Jobs remain scoped to their initiating employee or administrators, not to every
+reader of the resulting account. `owner_user_id` records responsibility and is not an OAuth actor
+or a credential-write permission. Business staff management lives at `/admin/users`; the system
+entry remains `/admin/system/users`. Both use the same command services, CSRF, persisted identity
+and current-password confirmation. Named administrators cannot remove the last active business
+administrator; a reauthenticated bootstrap operator can do so with a recorded emergency reason.
 
 X, Facebook and both Instagram login modes use one versioned encrypted Redis OAuth context that
 binds provider, Tenant, initiating user, initiating PostgreSQL session, surface, safe return path,
@@ -70,6 +109,45 @@ expiry, Tenant loss or initiator mismatch before a durable provisioning job is c
 multi-Page candidates and access tokens remain in a second encrypted, one-use picker context.
 Redis is still transient coordination: the durable job, account owner and encrypted final provider
 credentials remain in PostgreSQL.
+
+New connections and reauthorization are separate command operations. Reauthorization binds a target
+account, stable provider identity, current account version and initiating session; only business
+administrators or explicitly granted support agents may perform it. Execution and persistence both
+recheck authority. A successful reconnect does not change owner, publication, brand, history or
+operator-selected automation. New accounts retain `BOT_DRAFT_ONLY`. Machine commands require an
+explicit, versioned Control API authority marker; NULL initiators never prove machine authority.
+
+Human conversation access and assignment are independent. Support agents explicitly start reception
+or claim waiting work before replying; only the current assignee may reply/resolve. Administrators
+can explicitly take over or reassign. Transfers validate the target employee and account scope and
+invalidate old pending manual sends. Pending human sends retain their initiating identity and work
+version and are reauthorized before external I/O. Revoking staff access clears sessions, releases
+owned work, withdraws reconnection grants and blocks not-yet-executed sensitive commands, without
+removing company accounts or historical messages. Already-started external I/O is not represented
+as cancelled or safely retryable merely because authority was subsequently revoked.
+
+All staff-scoped operations acquire staff advisory locks in sorted UUID order before Session/user,
+conversation and work row locks. Actor, current assignee and target IDs are read without locks first;
+changed snapshots conflict instead of acquiring additional out-of-order locks. Lifecycle traversal
+reads work candidates without row locks, then follows the same conversation-to-work lock order.
+
+Public Outbox delivery takes conversation delivery serialization before the shared notification
+route guard and UUID-ordered source/notification account row locks, including blocked-route paths.
+The conversation lock survives the durable `SENDING` checkpoint; each subsequent preflight reloads
+the route and reacquires account locks. A duplicate delivery must wait for the conversation without
+holding account rows, so it cannot deadlock either a callback or the checkpoint owner's recheck.
+
+Feishu bot and operator checks authenticate the notification path; customer data permission is
+checked against the conversation's source platform account, not the notification bot's inbox.
+Resource denial rejects only that operation. Group cards omit customer message content; action
+callbacks require a bound active employee and the same account/assignment checks as the browser.
+
+Account kill-switch commands retain versioned staff/session or bootstrap identity and the existing
+sequence/supersede protocol. Revoked or unverifiable release commands are permanently rejected:
+once fail-closed Redis protection succeeds they become `REJECTED` or `RECONFIRM_REQUIRED`. If the
+protective write fails, `FAIL_CLOSED_PENDING` retries only protection, never the rejected release.
+Redis ambiguity without an authorization rejection remains retryable. Batches prioritize least
+recently attempted account scopes to prevent permanently failing commands starving later work.
 
 Connected account profile metadata (`provider_username`, `avatar_url`, `profile_updated_at`) is
 advisory display data. Provider fetches and Meta health reconciliation may refresh it. Rendering
@@ -411,11 +489,21 @@ Outbox recovery.
 
 Handoff cards use the same enterprise self-built application credentials but a separate
 `/webhooks/feishu/{public_id}/card-actions` protocol and `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED`
-gate. Card callbacks repeat signature, encryption, Verification Token, App ID, timestamp and body
-size validation, then perform only a bounded PostgreSQL transaction. They do not call Feishu, Redis
+gate. HTTP card callbacks require Encrypt-Key request signatures, Verification Token, App ID,
+timestamp and body-size validation; encrypted envelopes are decrypted before event parsing. Signed
+plaintext card payloads are supported, but unsigned token-only callbacks are rejected. A verified
+callback proof binds the account, tenant, provider event ID and event digest, then permits only a
+bounded PostgreSQL transaction. They do not call Feishu, Redis
 or the LLM on the three-second acknowledgement path. Card creation uses a stable UUID, but ambiguous
 creation after Feishu's one-hour deduplication window becomes `NEEDS_REVIEW`; deterministic updates
 by provider message ID remain retryable.
+
+A Feishu operator must explicitly bind to a same-tenant active employee. Creation never defaults to
+the configuring administrator or guesses a sole employee. Ordinary metadata/permission edits retain
+the current binding and status; replacing an existing employee requires confirmation against the
+previous employee ID and records both IDs in audit. The callback identity is the verified Feishu
+receipt plus this binding, not a borrowed browser Session. Data access is checked on the customer
+source channel independently of the notification bot's inbox.
 
 ## Scheduler lanes
 

@@ -839,7 +839,8 @@ async def test_draft_queue_only_includes_reviewable_drafts(session, migrated_db)
 
     assert page.status_code == 200
     assert counts.json()["drafts"] == 1
-    assert page.text.count('class="saas-work-item"') == 1
+    assert page.text.count('<a class="saas-work-item') == 1
+    assert 'class="saas-work-item active"' in page.text
 
 
 async def test_inbox_rejects_cross_tenant_join_mismatches(session, migrated_db):

@@ -9,6 +9,10 @@ from sqlalchemy import insert, select
 from apps.api.main import create_app
 from social_reply.application.account_management import feishu_handoff_admin as admin_module
 from social_reply.application.account_management import feishu_handoff_service as service_module
+from social_reply.application.account_management.auth import (
+    issue_session,
+    principal_from_session_id,
+)
 from social_reply.connectors.feishu.client import FeishuClient
 from social_reply.infrastructure.database import models
 
@@ -61,6 +65,18 @@ async def _seed_feishu_account(session, *, tenant_id="default") -> uuid.UUID:
 
 async def test_admin_configures_handoff_route_and_operator(session):
     account_id = await _seed_feishu_account(session)
+    session.add(
+        models.AdminUser(
+            id=uuid.uuid4(),
+            username="configured-operator-employee",
+            password_hash="test-only",
+            tenant_id="default",
+            role="USER",
+            status="active",
+            must_change_password=False,
+        )
+    )
+    await session.commit()
     async with _client() as client:
         csrf = await _login(client)
         page = await client.get("/app/t/default/channels/feishu/handoff")
@@ -155,6 +171,9 @@ async def test_legacy_operator_status_is_idempotent_under_concurrency(session):
     )
     session.add(operator)
     await session.commit()
+    _token, session_id = await issue_session()
+    principal = await principal_from_session_id(session_id)
+    assert principal is not None and principal.is_superadmin
 
     await asyncio.gather(
         service_module.set_feishu_handoff_operator_status(
@@ -162,12 +181,14 @@ async def test_legacy_operator_status_is_idempotent_under_concurrency(session):
             actor="user:first",
             operator_id=operator.id,
             enabled=False,
+            principal=principal,
         ),
         service_module.set_feishu_handoff_operator_status(
             tenant_id="default",
             actor="user:second",
             operator_id=operator.id,
             enabled=False,
+            principal=principal,
         ),
     )
 

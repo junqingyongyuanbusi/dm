@@ -15,6 +15,7 @@ from social_reply.application.event_ingestion.raw_recovery import (
 )
 from social_reply.application.handoff_notifications.callbacks import (
     FeishuCardActionError,
+    VerifiedFeishuCallback,
     callback_request_digest,
     handle_feishu_card_action,
 )
@@ -38,7 +39,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _verified_payload(account, request: Request) -> tuple[dict[str, Any], bytes]:
+async def _verified_payload(
+    account, request: Request
+) -> tuple[dict[str, Any], bytes, VerifiedFeishuCallback | None]:
     secrets_bundle = account.webhook_secret_bundle
     verification_token = secrets_bundle["verification_token"]
     encrypt_key = secrets_bundle["encrypt_key"]
@@ -54,7 +57,7 @@ async def _verified_payload(account, request: Request) -> tuple[dict[str, Any], 
 
     if _is_url_verification(payload):
         verify_token(payload.get("token"), expected=verification_token)
-        return payload, body
+        return payload, body, None
 
     header = payload.get("header")
     if not isinstance(header, dict):
@@ -64,18 +67,25 @@ async def _verified_payload(account, request: Request) -> tuple[dict[str, Any], 
             isinstance(encrypted, str),
         )
         raise FeishuSecurityError()
-    # Event-subscription callbacks (e.g. im.message.receive_v1) are delivered
-    # encrypted and authenticated via the X-Lark-Signature over the raw body.
-    # Interactive-card action callbacks (card.action.trigger) carry no X-Lark
-    # signature even when the body is encrypted; Feishu authenticates them with
-    # the Verification Token only.
+    # HTTP card callbacks follow the same Encrypt-Key signature contract as the official SDK.
     is_card_action = header.get("event_type") == "card.action.trigger"
     timestamp = request.headers.get("X-Lark-Request-Timestamp")
     nonce = request.headers.get("X-Lark-Request-Nonce")
     signature = request.headers.get("X-Lark-Signature")
     signed = bool(timestamp and nonce and signature)
     if is_card_action:
-        pass  # no signature required for card actions
+        proof = callback_request_digest(
+            body,
+            account_id=account.id,
+            tenant_id=account.tenant_id,
+            app_id=app_id,
+            verification_token=verification_token,
+            encrypt_key=encrypt_key,
+            timestamp=timestamp,
+            nonce=nonce,
+            signature=signature,
+        )
+        return payload, body, proof
     elif isinstance(encrypted, str) and signed:
         verify_signature(
             timestamp=timestamp,
@@ -127,7 +137,7 @@ async def _verified_payload(account, request: Request) -> tuple[dict[str, Any], 
             header.get("event_type"),
         )
         raise FeishuSecurityError()
-    return payload, body
+    return payload, body, None
 
 
 async def _account_payload(public_id: str, request: Request):
@@ -135,20 +145,20 @@ async def _account_payload(public_id: str, request: Request):
     if account is None:
         raise HTTPException(status_code=404, detail="feishu_account_not_found")
     try:
-        payload, body = await _verified_payload(account, request)
+        payload, body, proof = await _verified_payload(account, request)
     except FeishuSecurityError as exc:
         status_code = 413 if exc.code == "feishu_request_too_large" else 401
         detail = "feishu_request_too_large" if status_code == 413 else "invalid_feishu_request"
         raise HTTPException(status_code=status_code, detail=detail) from None
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=404, detail="feishu_account_not_found") from None
-    return account, payload, body
+    return account, payload, body, proof
 
 
 async def _card_action_response(
     account,
     payload: dict[str, Any],
-    body: bytes,
+    proof: VerifiedFeishuCallback | None,
     *,
     feature_enabled: bool,
 ) -> JSONResponse:
@@ -156,7 +166,7 @@ async def _card_action_response(
     if not isinstance(header, dict) or header.get("event_type") != "card.action.trigger":
         return JSONResponse({"toast": {"type": "error", "content": "不支持的飞书卡片回调"}})
     provider_event_id = nonblank_string_or_none(header.get("event_id"))
-    if provider_event_id is None:
+    if provider_event_id is None or proof is None:
         raise HTTPException(status_code=401, detail="invalid_feishu_request")
     try:
         async with asyncio.timeout(2.5):
@@ -164,7 +174,7 @@ async def _card_action_response(
                 account_id=account.id,
                 tenant_id=account.tenant_id,
                 provider_event_id=provider_event_id,
-                request_digest=callback_request_digest(body),
+                request_digest=proof,
                 event=payload.get("event"),
                 feature_enabled=feature_enabled,
             )
@@ -197,7 +207,7 @@ async def _card_action_response(
 
 @router.post("/webhooks/feishu/{public_id}")
 async def feishu_webhook(public_id: str, request: Request) -> Response:
-    account, payload, body = await _account_payload(public_id, request)
+    account, payload, body, proof = await _account_payload(public_id, request)
     if _is_url_verification(payload):
         return JSONResponse({"challenge": payload["challenge"]})
     header = payload.get("header")
@@ -206,7 +216,7 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
         return await _card_action_response(
             account,
             payload,
-            body,
+            proof,
             feature_enabled=(
                 settings.feishu_enabled and settings.feishu_handoff_notifications_enabled
             ),
@@ -272,14 +282,14 @@ async def feishu_webhook(public_id: str, request: Request) -> Response:
 
 @router.post("/webhooks/feishu/{public_id}/card-actions")
 async def feishu_card_actions(public_id: str, request: Request) -> Response:
-    account, payload, body = await _account_payload(public_id, request)
+    account, payload, _body, proof = await _account_payload(public_id, request)
     if _is_url_verification(payload):
         return JSONResponse({"challenge": payload["challenge"]})
     settings = request.app.state.settings
     return await _card_action_response(
         account,
         payload,
-        body,
+        proof,
         feature_enabled=(settings.feishu_enabled and settings.feishu_handoff_notifications_enabled),
     )
 

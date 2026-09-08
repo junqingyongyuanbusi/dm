@@ -1,7 +1,6 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.handoff_notifications.cards import (
@@ -21,21 +20,10 @@ async def render_current_handoff_card(
     state: models.AutomationState,
 ) -> dict[str, object]:
     customer_account = await session.get(models.PlatformAccount, conversation.platform_account_id)
-    contact = await session.get(models.Contact, conversation.contact_id)
-    latest_message = await session.scalar(
-        select(models.Message.text)
-        .where(
-            models.Message.conversation_id == conversation.id,
-            models.Message.direction == "inbound",
-        )
-        .order_by(models.Message.history_seq.desc())
-        .limit(1)
-    )
     if (
         customer_account is None
         or customer_account.tenant_id != intent.tenant_id
-        or contact is None
-        or contact.tenant_id != intent.tenant_id
+        or customer_account.status != "active"
     ):
         raise ValueError("handoff_card_scope_mismatch")
     assigned_actor = work.assigned_actor
@@ -54,12 +42,12 @@ async def render_current_handoff_card(
         work_version=work.version,
         card_revision=intent.desired_revision,
         card_state=intent.desired_card_state,
-        platform=conversation.platform,
-        account_name=customer_account.name,
-        channel_type=conversation.channel_type,
-        contact_label=contact.display_name or contact.external_user_id,
+        platform="reply_core",
+        account_name="人工工单",
+        channel_type="站内会话",
+        contact_label="仅站内可见",
         reason_code=work.reason_code,
-        latest_message=latest_message or "",
+        latest_message="",
         work_created_at=work.created_at,
         due_at=work.due_at,
         rendered_at=datetime.now(UTC),
@@ -68,7 +56,7 @@ async def render_current_handoff_card(
         resolved_at=work.resolved_at,
         restored_automation_state=state.state if work.status == "RESOLVED" else None,
         conversation_url=(
-            f"{settings.public_base_url.rstrip('/')}/admin/conversations/{conversation.id}"
+            f"{settings.public_base_url.rstrip('/')}/app/t/{intent.tenant_id}/conversations/{conversation.id}"
         ),
     )
     return render_handoff_card(snapshot)

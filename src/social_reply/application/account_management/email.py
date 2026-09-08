@@ -7,8 +7,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from social_reply.application.account_management.provisioning import provision_direct_account
+from social_reply.application.account_management.provisioning import (
+    bind_provisioning_external_identity,
+    provision_direct_account,
+)
 from social_reply.application.account_management.service import AccountConnectionResult
+from social_reply.application.platform_accounts import get_platform_account_runtime
 from social_reply.connectors.email.client import EmailClient
 from social_reply.connectors.email.contracts import (
     MAX_EMAIL_CREDENTIAL_CHARS,
@@ -99,8 +103,16 @@ async def connect_email_account(
     owner_user_id: uuid.UUID | None = None,
     imap_client_factory: EmailImapClientFactory = EmailImapClient,
     smtp_client_factory: EmailSmtpClientFactory = EmailClient,
+    operation: str = "CONNECT_ACCOUNT",
+    target_account_id: uuid.UUID | str | None = None,
+    expected_config_version: int | None = None,
+    initiator_user_id: uuid.UUID | None = None,
+    initiator_session_id: uuid.UUID | str | None = None,
+    authority_kind: str = "UNVERIFIED",
+    authority_version: int = 0,
     provisioning_job_id: uuid.UUID | None = None,
     provisioning_attempt_count: int | None = None,
+    trusted_control_api: bool = False,
 ) -> AccountConnectionResult:
     """Probe read-only IMAP and SMTP auth before atomically provisioning an email account."""
 
@@ -108,7 +120,7 @@ async def connect_email_account(
     settings = get_settings()
     if not settings.email_enabled:
         raise ValueError("email_integration_disabled")
-    if automation_default != "BOT_DRAFT_ONLY":
+    if operation != "REAUTHORIZE" and automation_default != "BOT_DRAFT_ONLY":
         raise ValueError("email_requires_bot_draft_only")
     if smtp_security not in {"ssl", "starttls"}:
         raise ValueError("smtp_security_invalid")
@@ -173,6 +185,18 @@ async def connect_email_account(
             await smtp_client.aclose()
         await imap_client.aclose()
 
+    if provisioning_job_id is not None:
+        await bind_provisioning_external_identity(
+            provisioning_job_id=provisioning_job_id,
+            provisioning_attempt_count=provisioning_attempt_count,
+            platform="email",
+            external_account_id=canonical_address,
+            credential_bundle={
+                "username": canonical_username,
+                "password": canonical_password,
+            },
+            platform_app_id=None,
+        )
     resolved_name = name or canonical_from_name or canonical_address
     account_id, resolved_public_id = await provision_direct_account(
         platform="email",
@@ -205,9 +229,31 @@ async def connect_email_account(
         provider_username=canonical_address,
         profile_updated_at=datetime.now(UTC),
         status="active",
+        derived_config_patch={
+            "email_health_status": "READY",
+            "email_health_checked_at": _utc_now_iso(),
+            "email_health_error_code": None,
+        }
+        if operation == "REAUTHORIZE"
+        else None,
+        target_account_id=target_account_id,
+        expected_config_version=expected_config_version,
+        initiator_user_id=initiator_user_id,
+        initiator_session_id=initiator_session_id,
+        authority_kind=authority_kind,
+        authority_version=authority_version,
         provisioning_job_id=provisioning_job_id,
         provisioning_attempt_count=provisioning_attempt_count,
+        trusted_control_api=trusted_control_api,
     )
+    result_automation = automation_default
+    connection_ready = True
+    connection_status = "READY"
+    if operation == "REAUTHORIZE":
+        runtime = await get_platform_account_runtime(account_id)
+        result_automation = runtime.automation_default
+        connection_ready = False
+        connection_status = "NEEDS_ACTION"
     return AccountConnectionResult(
         account_id=account_id,
         platform="email",
@@ -215,11 +261,14 @@ async def connect_email_account(
         public_id=resolved_public_id,
         webhook_url="",
         name=resolved_name,
-        automation_default=automation_default,
+        automation_default=result_automation,
         provider_username=canonical_address,
         profile_updated_at=datetime.now(UTC),
         manual_steps=(
             "确认邮箱仅由 Reply Core 以只读 IMAP 方式收取新邮件。",
             "在启用自动发送前先保持 BOT_DRAFT_ONLY，并由人工审核草稿。",
         ),
+        credential_updated=operation == "REAUTHORIZE",
+        connection_ready=connection_ready,
+        connection_status=connection_status,
     )

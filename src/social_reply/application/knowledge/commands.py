@@ -4,12 +4,24 @@ import hashlib
 import io
 import re
 import uuid
+from array import array
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.account_management.auth import Principal
+from social_reply.application.knowledge.authorization import (
+    AuthorizedKnowledgeWrite,
+    KnowledgeApplicationError,
+    KnowledgeAuthorizationError,
+    KnowledgeValidationError,
+    authorize_knowledge_import,
+    authorize_knowledge_write,
+    validate_knowledge_import_input,
+    validate_knowledge_principal_input,
+)
 from social_reply.application.knowledge.drafts import (
     KnowledgeDraft,
     audit_safe_category,
@@ -17,8 +29,10 @@ from social_reply.application.knowledge.drafts import (
     build_knowledge_draft,
     existing_content_hashes,
     knowledge_content_hash_lock_key,
+    knowledge_document_safety_lock_key,
     persist_knowledge_draft,
 )
+from social_reply.application.knowledge.retrieval import normalize_question
 from social_reply.application.knowledge.upload import (
     MAX_KNOWLEDGE_UPLOAD_BYTES,
     parse_knowledge_csv_rows,
@@ -27,6 +41,30 @@ from social_reply.domain.knowledge.embeddings import EmbeddingClient
 from social_reply.domain.reply.language import assess_knowledge_language
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.advisory_locks import acquire_xact_lock
+
+__all__ = [
+    "KnowledgeApplicationError",
+    "KnowledgeAuthorizationError",
+    "KnowledgeValidationError",
+    "KnowledgeNotFoundError",
+    "KnowledgeConflictError",
+    "CreateKnowledgeDocumentCommand",
+    "ImportKnowledgeBatchCommand",
+    "KnowledgeImportReport",
+    "ConfirmKnowledgeEnglishCommand",
+    "ConfirmKnowledgeEnglishBatchCommand",
+    "SetKnowledgeOfficialContactCommand",
+    "DeleteKnowledgeDraftCommand",
+    "execute_create_knowledge_document",
+    "execute_import_knowledge_batch",
+    "execute_confirm_knowledge_english",
+    "execute_confirm_knowledge_english_batch",
+    "execute_set_knowledge_official_contact",
+    "execute_delete_knowledge_draft",
+    "decision_references_knowledge",
+    "validate_knowledge_actor_scope",
+]
+
 
 MAX_KNOWLEDGE_QUESTION_LENGTH = 2000
 MAX_KNOWLEDGE_REPLY_LENGTH = 10000
@@ -45,14 +83,6 @@ _CONTENT_HASH_UNIQUE_CONSTRAINTS = frozenset(
 )
 
 
-class KnowledgeApplicationError(ValueError):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-
-class KnowledgeValidationError(KnowledgeApplicationError):
-    pass
 
 
 class KnowledgeNotFoundError(KnowledgeApplicationError):
@@ -94,7 +124,7 @@ def decision_references_knowledge(
 @dataclass(frozen=True)
 class CreateKnowledgeDocumentCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     question: str
     reply: str
     brand_id: str = "default"
@@ -108,10 +138,11 @@ class CreateKnowledgeDocumentCommand:
 @dataclass(frozen=True)
 class ImportKnowledgeBatchCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     csv_text: str
     source_name: str
     brand_id_default: str = "default"
+    system_import_capability: object | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +157,7 @@ class KnowledgeImportReport:
 @dataclass(frozen=True)
 class ConfirmKnowledgeEnglishCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     document_id: uuid.UUID
     confirmation_reason: str = ""
 
@@ -134,14 +165,14 @@ class ConfirmKnowledgeEnglishCommand:
 @dataclass(frozen=True)
 class ConfirmKnowledgeEnglishBatchCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     import_batch_id: uuid.UUID
 
 
 @dataclass(frozen=True)
 class SetKnowledgeOfficialContactCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     document_id: uuid.UUID
     is_official_contact: bool
 
@@ -149,9 +180,8 @@ class SetKnowledgeOfficialContactCommand:
 @dataclass(frozen=True)
 class DeleteKnowledgeDraftCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     document_id: uuid.UUID
-
 
 def _required_text(value: str, *, field_name: str, maximum: int) -> str:
     normalized = value.strip()
@@ -164,15 +194,22 @@ def _required_text(value: str, *, field_name: str, maximum: int) -> str:
     return normalized
 
 
-def validate_knowledge_actor_scope(required_tenant_id: str, actor: str) -> tuple[str, str]:
+def validate_knowledge_tenant_scope(required_tenant_id: str) -> str:
     tenant_id = _required_text(
         required_tenant_id,
         field_name="required_tenant_id",
         maximum=64,
     )
-    normalized_actor = _required_text(actor, field_name="actor", maximum=256)
     if not _SCOPE_IDENTIFIER.fullmatch(tenant_id):
         raise KnowledgeValidationError("required_tenant_id_invalid")
+    return tenant_id
+
+
+def validate_knowledge_actor_scope(required_tenant_id: str, actor: str) -> tuple[str, str]:
+    """Validate legacy read-scope inputs; write commands use a reloaded Principal instead."""
+
+    tenant_id = validate_knowledge_tenant_scope(required_tenant_id)
+    normalized_actor = _required_text(actor, field_name="actor", maximum=256)
     return tenant_id, normalized_actor
 
 
@@ -202,13 +239,9 @@ def _validate_category(value: str | None) -> str | None:
 
 
 def _validated_create_values(command: CreateKnowledgeDocumentCommand) -> dict[str, object]:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
-    )
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
     return {
         "tenant_id": tenant_id,
-        "actor": actor,
         "question": _required_text(
             command.question,
             field_name="question",
@@ -290,6 +323,7 @@ async def execute_create_knowledge_document(
     *,
     embedder: EmbeddingClient,
 ) -> models.KnowledgeDocument:
+    validate_knowledge_principal_input(command.principal)
     values = _validated_create_values(command)
     detected_language, detection_status = assess_knowledge_language(
         str(values["question"]),
@@ -321,6 +355,11 @@ async def execute_create_knowledge_document(
     embeddings = await embedder.embed([draft.embed_text])
     if len(embeddings) != 1:
         raise KnowledgeValidationError("knowledge_embedding_count_invalid")
+    authorized = await authorize_knowledge_write(
+        session,
+        principal=command.principal,
+        tenant_id=draft.tenant_id,
+    )
     await _acquire_content_hash_locks(
         session,
         tenant_id=draft.tenant_id,
@@ -338,7 +377,7 @@ async def execute_create_knowledge_document(
         draft,
         embedding_version=embedder.version,
         embedding=embeddings[0],
-        actor=str(values["actor"]),
+        actor=authorized.actor,
     )
 
 
@@ -348,9 +387,10 @@ async def execute_import_knowledge_batch(
     *,
     embedder: EmbeddingClient,
 ) -> KnowledgeImportReport:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    validate_knowledge_import_input(
+        principal=command.principal,
+        system_import_capability=command.system_import_capability,
     )
     brand_id_default = _validate_brand_id(command.brand_id_default)
     source_name = _required_text(
@@ -373,7 +413,7 @@ async def execute_import_knowledge_batch(
             _validated_create_values(
                 CreateKnowledgeDocumentCommand(
                     required_tenant_id=tenant_id,
-                    actor=actor,
+                    principal=command.principal,
                     question=draft.question,
                     reply=draft.reply,
                     brand_id=draft.brand_id,
@@ -402,13 +442,22 @@ async def execute_import_knowledge_batch(
         seen.add(draft.content_hash)
         new_rows.append(draft)
 
-    embeddings: list[list[float]] = []
+    # Preserve Python float precision without retaining boxed floats across batches.
+    packed_embeddings: list[array] = []
     for offset in range(0, len(new_rows), _EMBED_BATCH_SIZE):
         batch = new_rows[offset : offset + _EMBED_BATCH_SIZE]
-        embeddings.extend(await embedder.embed([draft.embed_text for draft in batch]))
-    if len(embeddings) != len(new_rows):
-        raise KnowledgeValidationError("knowledge_embedding_count_invalid")
+        batch_embeddings = await embedder.embed([draft.embed_text for draft in batch])
+        if len(batch_embeddings) != len(batch):
+            raise KnowledgeValidationError("knowledge_embedding_count_invalid")
+        packed_embeddings.extend(array("d", embedding) for embedding in batch_embeddings)
+        del batch_embeddings
 
+    authorized = await authorize_knowledge_import(
+        session,
+        principal=command.principal,
+        tenant_id=tenant_id,
+        system_import_capability=command.system_import_capability,
+    )
     await _acquire_content_hash_locks(
         session,
         tenant_id=tenant_id,
@@ -420,7 +469,7 @@ async def execute_import_knowledge_batch(
         content_hashes=[draft.content_hash for draft in new_rows],
     )
     inserted = 0
-    for draft, embedding in zip(new_rows, embeddings, strict=True):
+    for draft, packed_embedding in zip(new_rows, packed_embeddings, strict=True):
         if draft.content_hash in concurrent_existing:
             skipped += 1
             continue
@@ -429,8 +478,8 @@ async def execute_import_knowledge_batch(
                 session,
                 draft,
                 embedding_version=embedder.version,
-                embedding=embedding,
-                actor=actor,
+                embedding=packed_embedding.tolist(),
+                actor=authorized.actor,
             )
         except KnowledgeConflictError as exc:
             if exc.code != "knowledge_document_duplicate":
@@ -442,7 +491,7 @@ async def execute_import_knowledge_batch(
         models.AuditLog(
             tenant_id=tenant_id,
             category="admin_action",
-            actor=actor,
+            actor=authorized.actor,
             action="IMPORT_KNOWLEDGE_BATCH",
             subject_type="knowledge_import_batch",
             subject_id=str(batch_id),
@@ -477,12 +526,80 @@ async def _locked_document(
                 models.KnowledgeDocument.tenant_id == tenant_id,
                 models.KnowledgeDocument.id == document_id,
             )
+            .execution_options(populate_existing=True)
             .with_for_update()
         )
     ).scalar_one_or_none()
     if document is None:
         raise KnowledgeNotFoundError("knowledge_document_not_found")
     return document
+
+
+async def _document_for_lock(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    document_id: uuid.UUID,
+) -> models.KnowledgeDocument:
+    document = await session.scalar(
+        select(models.KnowledgeDocument)
+        .where(
+            models.KnowledgeDocument.tenant_id == tenant_id,
+            models.KnowledgeDocument.id == document_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if document is None:
+        raise KnowledgeNotFoundError("knowledge_document_not_found")
+    return document
+
+
+def _publication_lock_key(document: models.KnowledgeDocument) -> str:
+    normalized_question = normalize_question(document.question)
+    return f"knowledge-publish:{document.tenant_id}:{document.brand_id}:{normalized_question}"
+
+
+async def _acquire_publication_lock(
+    session: AsyncSession,
+    document: models.KnowledgeDocument,
+) -> None:
+    await session.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                func.hashtextextended(_publication_lock_key(document), 0)
+            )
+        )
+    )
+
+
+async def _authorize_and_lock_document(
+    session: AsyncSession,
+    *,
+    principal: Principal | None,
+    tenant_id: str,
+    document_id: uuid.UUID,
+) -> tuple[AuthorizedKnowledgeWrite, models.KnowledgeDocument]:
+    authorized = await authorize_knowledge_write(
+        session,
+        principal=principal,
+        tenant_id=tenant_id,
+    )
+    await acquire_xact_lock(
+        session,
+        knowledge_document_safety_lock_key(tenant_id, document_id),
+    )
+    document = await _document_for_lock(
+        session,
+        tenant_id=tenant_id,
+        document_id=document_id,
+    )
+    await _acquire_publication_lock(session, document)
+    document = await _locked_document(
+        session,
+        tenant_id=tenant_id,
+        document_id=document_id,
+    )
+    return authorized, document
 
 
 def _validated_confirmation_reason(document: models.KnowledgeDocument, value: str) -> str:
@@ -504,12 +621,10 @@ async def execute_confirm_knowledge_english(
     session: AsyncSession,
     command: ConfirmKnowledgeEnglishCommand,
 ) -> models.KnowledgeDocument:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
-    )
-    document = await _locked_document(
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    authorized, document = await _authorize_and_lock_document(
         session,
+        principal=command.principal,
         tenant_id=tenant_id,
         document_id=command.document_id,
     )
@@ -527,7 +642,7 @@ async def execute_confirm_knowledge_english(
         models.AuditLog(
             tenant_id=tenant_id,
             category="admin_action",
-            actor=actor,
+            actor=authorized.actor,
             action="CONFIRM_KNOWLEDGE_ENGLISH",
             subject_type="knowledge_document",
             subject_id=str(document.id),
@@ -550,10 +665,51 @@ async def execute_confirm_knowledge_english_batch(
     session: AsyncSession,
     command: ConfirmKnowledgeEnglishBatchCommand,
 ) -> int:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    authorized = await authorize_knowledge_write(
+        session,
+        principal=command.principal,
+        tenant_id=tenant_id,
     )
+    candidate_ids = tuple(
+        (
+            await session.execute(
+                select(models.KnowledgeDocument.id)
+                .where(
+                    models.KnowledgeDocument.tenant_id == tenant_id,
+                    models.KnowledgeDocument.import_batch_id == command.import_batch_id,
+                    models.KnowledgeDocument.status == "draft",
+                    models.KnowledgeDocument.language_detection_status == "english",
+                    models.KnowledgeDocument.language_verified.is_(False),
+                )
+                .order_by(models.KnowledgeDocument.id)
+            )
+        ).scalars()
+    )
+    for document_id in candidate_ids:
+        await acquire_xact_lock(
+            session,
+            knowledge_document_safety_lock_key(tenant_id, document_id),
+        )
+    documents_for_lock = list(
+        (
+            await session.execute(
+                select(models.KnowledgeDocument)
+                .where(
+                    models.KnowledgeDocument.tenant_id == tenant_id,
+                    models.KnowledgeDocument.import_batch_id == command.import_batch_id,
+                    models.KnowledgeDocument.status == "draft",
+                    models.KnowledgeDocument.language_detection_status == "english",
+                    models.KnowledgeDocument.language_verified.is_(False),
+                    models.KnowledgeDocument.id.in_(candidate_ids),
+                )
+                .order_by(models.KnowledgeDocument.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    for document in documents_for_lock:
+        await _acquire_publication_lock(session, document)
     documents = list(
         (
             await session.execute(
@@ -564,7 +720,10 @@ async def execute_confirm_knowledge_english_batch(
                     models.KnowledgeDocument.status == "draft",
                     models.KnowledgeDocument.language_detection_status == "english",
                     models.KnowledgeDocument.language_verified.is_(False),
+                    models.KnowledgeDocument.id.in_(candidate_ids),
                 )
+                .order_by(models.KnowledgeDocument.id)
+                .execution_options(populate_existing=True)
                 .with_for_update()
             )
         ).scalars()
@@ -589,7 +748,7 @@ async def execute_confirm_knowledge_english_batch(
             models.AuditLog(
                 tenant_id=tenant_id,
                 category="admin_action",
-                actor=actor,
+                actor=authorized.actor,
                 action="CONFIRM_KNOWLEDGE_ENGLISH",
                 subject_type="knowledge_document",
                 subject_id=str(document.id),
@@ -609,12 +768,10 @@ async def execute_set_knowledge_official_contact(
     session: AsyncSession,
     command: SetKnowledgeOfficialContactCommand,
 ) -> models.KnowledgeDocument:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
-    )
-    document = await _locked_document(
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    authorized, document = await _authorize_and_lock_document(
         session,
+        principal=command.principal,
         tenant_id=tenant_id,
         document_id=command.document_id,
     )
@@ -636,7 +793,7 @@ async def execute_set_knowledge_official_contact(
         models.AuditLog(
             tenant_id=tenant_id,
             category="admin_action",
-            actor=actor,
+            actor=authorized.actor,
             action="SET_KNOWLEDGE_OFFICIAL_CONTACT",
             subject_type="knowledge_document",
             subject_id=str(document.id),
@@ -657,12 +814,10 @@ async def execute_delete_knowledge_draft(
     session: AsyncSession,
     command: DeleteKnowledgeDraftCommand,
 ) -> None:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
-    )
-    document = await _locked_document(
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    authorized, document = await _authorize_and_lock_document(
         session,
+        principal=command.principal,
         tenant_id=tenant_id,
         document_id=command.document_id,
     )
@@ -717,7 +872,7 @@ async def execute_delete_knowledge_draft(
         models.AuditLog(
             tenant_id=tenant_id,
             category="admin_action",
-            actor=actor,
+            actor=authorized.actor,
             action="DELETE_KNOWLEDGE_DOCUMENT",
             subject_type="knowledge_document",
             subject_id=str(document.id),

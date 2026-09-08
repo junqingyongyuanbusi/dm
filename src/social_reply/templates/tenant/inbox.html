@@ -1,4 +1,4 @@
-<div class="saas-inbox-layout" data-inbox-workspace>
+<div class="saas-inbox-layout" data-inbox-workspace data-has-selection="{{ has_mobile_selection|lower }}">
   <section class="saas-inbox-column saas-list-pane" aria-label="{{ queue_label }}" data-inbox-list data-list-filter>
     <header class="saas-inbox-column-header saas-list-pane-header">
       <div class="saas-list-pane-title">
@@ -9,6 +9,7 @@
       <input id="inbox-list-search" type="search" autocomplete="off" data-list-search
              placeholder="{{ search_placeholder }}">
       {{ queue_tabs_html }}
+      {{ filter_placeholder_html }}
     </header>
     <div data-list-items>{{ item_list_html }}</div>
     <div class="saas-empty" data-search-empty hidden>
@@ -17,11 +18,10 @@
     </div>
   </section>
   <section class="saas-inbox-column saas-workspace-pane" aria-label="{{ workspace_label }}" data-inbox-thread>
+    <a class="saas-inbox-mobile-back" href="{{ back_to_list_href }}">{{ back_to_list_label }}</a>
     {{ thread_html }}
-    {% if action_panel_html %}
-      <aside class="saas-inbox-action" aria-label="{{ current_action_label }}" data-inbox-actions>
-        {{ action_panel_html }}
-      </aside>
-    {% endif %}
+    {% with title=inspector_title, description=inspector_description, content_html=inspector_content_html %}
+      {% include "components/detail_inspector.html" %}
+    {% endwith %}
   </section>
 </div>

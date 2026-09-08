@@ -1,69 +1,74 @@
-{{ next_action_html }}
-
-{% include "components/agent_lifecycle.html" %}
-
-<div class="saas-section-title">
-  <div>
-    <h2>{{ attention_title }}</h2>
-    <p>{{ attention_description }}</p>
-  </div>
-</div>
-<div class="saas-grid three">{{ attention_cards_html }}</div>
-
-<section class="saas-card">
-  <div class="saas-card-header">
-    <div>
-      <h2>{{ readiness_title }}</h2>
-      <p>{{ readiness_description }}</p>
+<div class="saas-home-workspace">
+  {% if channel_alerts %}
+  <section class="saas-home-alerts" aria-labelledby="home-alerts-title">
+    <div class="saas-home-heading">
+      <h2 id="home-alerts-title" class="saas-home-section-title">{{ alerts_title }}</h2>
+      <p class="saas-home-section-desc">{{ alerts_description }}</p>
     </div>
-    {{ view_agents_action_html }}
-  </div>
-  <div class="saas-card-body">
-    <ul class="saas-progress-list">{{ readiness_rows_html }}</ul>
-  </div>
-</section>
+    <ul class="saas-home-alert-list">
+      {% for alert in channel_alerts %}
+      <li class="saas-home-alert">
+        <div class="saas-home-record-content">
+          <strong>{{ alert.account_name }}</strong>
+          <span>{{ alert.platform }} · {{ alert.description }}</span>
+          {% if alert.checked_at %}
+          <time datetime="{{ alert.checked_at }}">{{ alert.checked_label }}</time>
+          {% endif %}
+        </div>
+        <a class="saas-home-record-action" href="{{ alert.href }}">{{ view_channel_label }}</a>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
 
-<div class="saas-section-title">
-  <div>
-    <h2>{{ today_title }}</h2>
-    <p>{{ today_description }}</p>
-  </div>
-</div>
-<div class="saas-grid two">
-  {{ today_messages_html }}
-  {{ published_knowledge_html }}
-</div>
+  {% if next_action_html or queue_summary_html %}
+  <section class="saas-home-attention" aria-labelledby="home-attention-title">
+    <h2 id="home-attention-title" class="saas-home-section-title">{{ attention_title }}</h2>
+    {% if next_action_html %}{{ next_action_html }}{% endif %}
+    {% if queue_summary_html %}{{ queue_summary_html }}{% endif %}
+  </section>
+  {% endif %}
 
-<div class="saas-section-title">
-  <div>
-    <h2>{{ recent_activity_title }}</h2>
-    <p>{{ recent_activity_description }}</p>
-  </div>
-  {{ view_all_action_html }}
+  {% if message_count %}
+  <section class="saas-card saas-home-section saas-home-today" aria-labelledby="home-today-title">
+    <div class="saas-home-section-head">
+      <div class="saas-home-heading">
+        <h2 id="home-today-title" class="saas-home-section-title">{{ today_title }}</h2>
+        <p class="saas-home-section-desc">{{ today_description }}</p>
+      </div>
+    </div>
+    <div class="saas-home-today-grid">
+      <div class="saas-today-card">
+        <span class="saas-today-label">{{ message_count_label }}</span>
+        <span class="saas-today-val font-mono">{{ message_count }}</span>
+      </div>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if business_activities %}
+  <section class="saas-card saas-home-section saas-home-stream" aria-labelledby="home-activity-title">
+    <div class="saas-home-section-head">
+      <div class="saas-home-heading">
+        <h2 id="home-activity-title" class="saas-home-section-title">{{ business_activity_title }}</h2>
+        <p class="saas-home-section-desc">{{ business_activity_description }}</p>
+      </div>
+    </div>
+    <ol class="saas-home-activity-list">
+      {% for activity in business_activities %}
+      <li class="saas-home-business-event">
+        <div class="saas-home-record-content">
+          <strong>{{ activity.title }}</strong>
+          <span>{{ activity.account_name }}</span>
+        </div>
+        <div class="saas-home-record-meta">
+          <time datetime="{{ activity.occurred_at }}">{{ activity.time_label }}</time>
+          <a class="saas-home-record-action" href="{{ activity.href }}">{{ view_conversation_label }}</a>
+        </div>
+      </li>
+      {% endfor %}
+    </ol>
+  </section>
+  {% endif %}
 </div>
-{% if recent_activity_rows %}
-  <div class="saas-table-wrap">
-    <table class="saas-table">
-      <thead>
-        <tr>
-          <th>{{ time_label }}</th>
-          <th>Actor</th>
-          <th>{{ action_label }}</th>
-          <th>{{ resource_label }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in recent_activity_rows %}
-          <tr>
-            <td>{{ row.time }}</td>
-            <td>{{ row.actor }}</td>
-            <td>{{ row.action }}</td>
-            <td>{{ row.subject_type }}</td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-{% else %}
-  {{ recent_activity_empty_html }}
-{% endif %}

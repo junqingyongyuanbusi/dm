@@ -6,9 +6,12 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from social_reply.application.account_management.agent_control_plane import (
+    AgentControlPlaneAuthorizationError,
     deploy_agent_version,
 )
+from social_reply.application.account_management.auth import Principal
 from social_reply.application.account_management.reply_prompt_policy import (
+    ReplyBusinessPromptScopeError,
     ReplyBusinessPromptVersionSummary,
     list_reply_prompt_versions,
     load_current_reply_business_prompt,
@@ -46,6 +49,7 @@ class SaveReplyBusinessPromptCommand:
     expected_revision: int
     actor: str
     change_note: str | None
+    principal: Principal | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,7 @@ class RollbackReplyBusinessPromptCommand:
     source_version_id: uuid.UUID
     expected_revision: int
     actor: str
+    principal: Principal | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +69,14 @@ class DeployAgentVersionCommand:
     agent_version_id: uuid.UUID
     expected_deployment_revision: int
     actor: str
+    principal: Principal | None = None
+
+
+def _command_principal(principal: Principal | None) -> Principal:
+    """Require the command to carry the authenticated request identity explicitly."""
+    if principal is None:
+        raise AgentControlPlaneAuthorizationError("agent_control_plane_principal_required")
+    return principal
 
 
 async def load_reply_business_prompt_editor_view(
@@ -213,6 +226,12 @@ async def execute_save_reply_business_prompt(
     session: AsyncSession,
     command: SaveReplyBusinessPromptCommand,
 ) -> ResolvedBusinessPrompt:
+    try:
+        principal = _command_principal(command.principal)
+    except AgentControlPlaneAuthorizationError as exc:
+        raise ReplyBusinessPromptScopeError(
+            "reply_business_prompt_authorization_denied"
+        ) from exc
     return await save_reply_business_prompt(
         session,
         tenant_id=command.tenant_id,
@@ -221,6 +240,7 @@ async def execute_save_reply_business_prompt(
         expected_revision=command.expected_revision,
         actor=command.actor,
         change_note=command.change_note,
+        principal=principal,
     )
 
 
@@ -228,6 +248,12 @@ async def execute_rollback_reply_business_prompt(
     session: AsyncSession,
     command: RollbackReplyBusinessPromptCommand,
 ) -> ResolvedBusinessPrompt:
+    try:
+        principal = _command_principal(command.principal)
+    except AgentControlPlaneAuthorizationError as exc:
+        raise ReplyBusinessPromptScopeError(
+            "reply_business_prompt_authorization_denied"
+        ) from exc
     return await rollback_reply_business_prompt(
         session,
         tenant_id=command.tenant_id,
@@ -235,6 +261,7 @@ async def execute_rollback_reply_business_prompt(
         source_version_id=command.source_version_id,
         expected_revision=command.expected_revision,
         actor=command.actor,
+        principal=principal,
     )
 
 
@@ -242,6 +269,7 @@ async def execute_deploy_agent_version(
     session: AsyncSession,
     command: DeployAgentVersionCommand,
 ) -> models.AgentDeployment:
+    principal = _command_principal(command.principal)
     return await deploy_agent_version(
         session,
         tenant_id=command.tenant_id,
@@ -249,4 +277,5 @@ async def execute_deploy_agent_version(
         agent_version_id=command.agent_version_id,
         expected_deployment_revision=command.expected_deployment_revision,
         actor=command.actor,
+        principal=principal,
     )

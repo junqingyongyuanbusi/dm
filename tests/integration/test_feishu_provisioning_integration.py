@@ -53,7 +53,7 @@ async def test_feishu_job_stages_secrets_and_clears_them_on_completion(migrated_
         )
 
     monkeypatch.setattr(jobs, "_connect", fake_connect)
-    job_id = await jobs.submit_provisioning_job(
+    job_id = await jobs.submit_control_provisioning_job(
         tenant_id="tenant-a",
         brand_id="brand-a",
         platform="feishu",
@@ -80,10 +80,12 @@ async def test_feishu_job_stages_secrets_and_clears_them_on_completion(migrated_
         "group_mode": "mentions_only",
         "automation_default": "BOT_DRAFT_ONLY",
     }
-    assert decrypt_secret_bundle(staged.staging_secret) == {
+    staged_secrets = decrypt_secret_bundle(staged.staging_secret)
+    assert staged_secrets == {
         "app_secret": "app-secret",
         "verification_token": "verification-secret",
         "encrypt_key": "encrypt-secret",
+        jobs._CONTROL_API_SECRET_KEY: "v1",
     }
 
     assert await jobs.process_provisioning_job(str(job_id)) == "COMPLETED"

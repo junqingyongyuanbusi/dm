@@ -19,8 +19,8 @@ from sqlalchemy import select
 
 from social_reply.application.account_management.jobs import (
     public_job,
-    retry_provisioning_job,
-    submit_provisioning_job,
+    retry_control_provisioning_job,
+    submit_control_provisioning_job,
 )
 from social_reply.application.account_management.submissions import split_submission
 from social_reply.connectors.email.contracts import (
@@ -326,7 +326,7 @@ async def create_or_update_telegram_account(
 ) -> ProvisioningJobResponse:
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request("telegram", request)
-    job_id = await submit_provisioning_job(
+    job_id = await submit_control_provisioning_job(
         tenant_id=request.tenant_id,
         brand_id=request.brand_id,
         platform="telegram",
@@ -346,7 +346,7 @@ async def create_or_update_meta_account(
     _require_platform_enabled(request.platform)
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request(request.platform, request)
-    job_id = await submit_provisioning_job(
+    job_id = await submit_control_provisioning_job(
         tenant_id=request.tenant_id,
         brand_id=request.brand_id,
         platform=request.platform,
@@ -366,7 +366,7 @@ async def create_or_update_whatsapp_account(
     _require_platform_enabled("whatsapp")
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request("whatsapp", request)
-    job_id = await submit_provisioning_job(
+    job_id = await submit_control_provisioning_job(
         tenant_id=request.tenant_id,
         brand_id=request.brand_id,
         platform="whatsapp",
@@ -405,7 +405,7 @@ async def create_or_update_email_account(
         allowed_hosts=settings.email_allowed_hosts,
     )
     payload, secrets_bundle = _split_request("email", email_request)
-    job_id = await submit_provisioning_job(
+    job_id = await submit_control_provisioning_job(
         tenant_id=email_request.tenant_id,
         brand_id=email_request.brand_id,
         platform="email",
@@ -425,7 +425,7 @@ async def create_or_update_feishu_account(
     principal.require_tenant(request.tenant_id)
     _require_platform_enabled("feishu")
     payload, secrets_bundle = _split_request("feishu", request)
-    job_id = await submit_provisioning_job(
+    job_id = await submit_control_provisioning_job(
         tenant_id=request.tenant_id,
         brand_id=request.brand_id,
         platform="feishu",
@@ -449,7 +449,7 @@ async def create_or_update_x_account(
         raise HTTPException(status_code=422, detail="xchat_disabled")
     principal.require_tenant(request.tenant_id)
     payload, secrets_bundle = _split_request("x", request)
-    job_id = await submit_provisioning_job(
+    job_id = await submit_control_provisioning_job(
         tenant_id=request.tenant_id,
         brand_id=request.brand_id,
         platform="x",
@@ -522,7 +522,11 @@ async def retry_job(
     _require_platform_enabled(job.platform)
     principal.require_tenant(job.tenant_id)
     try:
-        await retry_provisioning_job(job_id)
+        await retry_control_provisioning_job(job_id, tenant_id=job.tenant_id, actor=principal.actor)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="provisioning_job_not_found") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="provisioning_authority_invalid") from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     await _enqueue(job_id)
@@ -533,11 +537,20 @@ async def _set_account_status(
     account_id: uuid.UUID, principal: ControlPrincipal, target_status: str
 ) -> str:
     async with get_session_factory()() as session:
-        row = await session.get(models.PlatformAccount, account_id)
+        row = (
+            await session.execute(
+                select(models.PlatformAccount)
+                .where(models.PlatformAccount.id == account_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if row is None:
             raise HTTPException(status_code=404, detail="platform_account_not_found")
         principal.require_tenant(row.tenant_id)
         row.status = target_status
+        row.config = models.PlatformAccount.config.op("||")(
+            {"meta_disabled_by_provisioning": False}
+        )
         row.config_version += 1
         await session.commit()
     return target_status

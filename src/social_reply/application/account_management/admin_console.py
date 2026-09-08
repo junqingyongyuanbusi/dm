@@ -6,7 +6,6 @@
 import json
 import logging
 import uuid
-from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import NoReturn
@@ -15,8 +14,9 @@ from urllib.parse import quote, urlencode
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from sqlalchemy import and_, desc, func, or_, select, update
+from sqlalchemy import and_, desc, func, or_, select
 
+from social_reply.application.account_management.access import account_read_condition
 from social_reply.application.account_management.admin import (
     _csrf,
     _ensure_csrf,
@@ -44,11 +44,12 @@ from social_reply.application.account_management.human_workflow import (
     HumanWorkflowConflict,
     HumanWorkflowError,
     claim_human_work_item,
-    ensure_open_human_work_item,
     require_work_conversation_tenant,
     resolve_human_work_item,
     resume_bot,
     send_human_reply,
+    start_human_reception,
+    transfer_human_work_item,
 )
 from social_reply.application.account_management.jobs import provisioning_job_is_in_flight
 from social_reply.application.account_management.oauth.common import notice
@@ -69,6 +70,12 @@ from social_reply.application.account_management.reply_prompt_web import (
     execute_rollback_reply_business_prompt,
     execute_save_reply_business_prompt,
 )
+from social_reply.application.account_management.saas_ui import (
+    escape,
+    render_saas_page,
+    secondary_action,
+    status_badge,
+)
 from social_reply.application.account_management.system_user_management import (
     SystemUserAuthenticationError,
     SystemUserValidationError,
@@ -76,22 +83,12 @@ from social_reply.application.account_management.system_user_management import (
 )
 from social_reply.application.account_management.ui_i18n import translate
 from social_reply.application.account_management.xchat_activation import XChatActivationError
+from social_reply.application.knowledge.authorization import KnowledgeAuthorizationError
 from social_reply.application.knowledge.commands import (
     KnowledgeApplicationError,
     KnowledgeConflictError,
     KnowledgeNotFoundError,
 )
-from social_reply.application.knowledge.drafts import (
-    build_knowledge_draft,
-    existing_content_hashes,
-    persist_knowledge_draft,
-)
-from social_reply.application.knowledge.importer import import_knowledge_rows
-from social_reply.application.knowledge.localizations import (
-    LocalizationValidationError,
-    revoke_document_localizations,
-)
-from social_reply.application.knowledge.retrieval import normalize_question
 from social_reply.application.message_delivery.contracts import (
     build_direct_reply_destination,
 )
@@ -121,12 +118,9 @@ from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL, FEISHU
 from social_reply.domain.automation.state_machine import (
     AutomationStateEnum,
     can_transition,
-    flip_to_human_active,
 )
 from social_reply.domain.platform_accounts import capability_text_limit
 from social_reply.domain.reply.business_prompt import BusinessPromptValidationError
-from social_reply.domain.reply.guard import has_contact_like
-from social_reply.domain.reply.language import assess_knowledge_language
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
@@ -317,6 +311,16 @@ def _channel_condition(channel: str):
     return None
 
 
+def _account_read_scope(
+    principal: Principal,
+    tenants: frozenset[str],
+    tenant_id: str = "",
+):
+    scope_tenants = (tenant_id,) if tenant_id else tuple(sorted(tenants))
+    conditions = tuple(account_read_condition(principal, tenant) for tenant in scope_tenants)
+    return or_(*conditions) if conditions else models.PlatformAccount.id.is_(None)
+
+
 def _scope_inbox_statement(
     statement,
     *,
@@ -326,12 +330,15 @@ def _scope_inbox_statement(
     account_id: uuid.UUID | None,
     platform: str,
     channel: str,
+    principal: Principal | None = None,
 ):
     statement = statement.where(
         tenant_column.in_(tenants),
         models.Conversation.tenant_id == tenant_column,
         models.PlatformAccount.tenant_id == tenant_column,
     )
+    if principal is not None:
+        statement = statement.where(_account_read_scope(principal, tenants, tenant_id))
     if tenant_id:
         statement = statement.where(tenant_column == tenant_id)
     if account_id is not None:
@@ -352,6 +359,7 @@ async def _load_inbox_summary(
     account_id: uuid.UUID | None = None,
     platform: str = "",
     channel: str = "all",
+    principal: Principal | None = None,
 ) -> dict[str, tuple[int, datetime | None]]:
     scope = {
         "tenants": tenants,
@@ -359,6 +367,7 @@ async def _load_inbox_summary(
         "account_id": account_id,
         "platform": platform,
         "channel": channel,
+        "principal": principal,
     }
     human_statement = (
         select(func.count(), func.min(models.HumanWorkItem.created_at))
@@ -615,8 +624,14 @@ def _elapsed(started_at: datetime, finished_at: datetime | None) -> str:
 
 
 async def _load_health_metrics(
-    session, tenants: frozenset[str], now: datetime
+    session,
+    tenants: frozenset[str],
+    now: datetime,
+    *,
+    principal: Principal | None = None,
 ) -> list[_HealthMetric]:
+    if principal is not None:
+        principal.require_superadmin()
     tenant_id = sorted(tenants)[0]
     tenant_root = f"/app/t/{quote(tenant_id, safe='')}"
     raw_action = _raw_action_condition()
@@ -647,7 +662,12 @@ async def _load_health_metrics(
                 models.PlatformAccount,
                 models.PlatformAccount.id == models.DecisionJob.account_id,
             )
-            .where(models.PlatformAccount.tenant_id.in_(tenants))
+            .where(
+                models.PlatformAccount.tenant_id.in_(tenants),
+                _account_read_scope(principal, tenants)
+                if principal is not None
+                else models.PlatformAccount.tenant_id.in_(tenants),
+            )
         )
     ).one()
 
@@ -717,6 +737,9 @@ async def _load_health_metrics(
             .where(
                 models.PlatformCheckpoint.tenant_id.in_(tenants),
                 models.PlatformAccount.tenant_id.in_(tenants),
+                _account_read_scope(principal, tenants)
+                if principal is not None
+                else models.PlatformAccount.tenant_id.in_(tenants),
             )
         )
     ).one()
@@ -727,7 +750,12 @@ async def _load_health_metrics(
             select(
                 func.count().filter(account_action),
                 func.min(models.PlatformAccount.created_at).filter(account_action),
-            ).where(models.PlatformAccount.tenant_id.in_(tenants))
+            ).where(
+                models.PlatformAccount.tenant_id.in_(tenants),
+                _account_read_scope(principal, tenants)
+                if principal is not None
+                else models.PlatformAccount.tenant_id.in_(tenants),
+            )
         )
     ).one()
 
@@ -858,7 +886,7 @@ async def overview(request: Request) -> Response:
             .scalars()
             .all()
         )
-        health_metrics = await _load_health_metrics(session, tenants, now)
+        health_metrics = await _load_health_metrics(session, tenants, now, principal=principal)
 
     auto = action_counts.get("auto_reply", 0)
     handled = auto + action_counts.get("draft", 0) + action_counts.get("handoff", 0)
@@ -921,7 +949,7 @@ async def overview(request: Request) -> Response:
             page_title,
             body,
             active="overview",
-            show_users=principal.is_superadmin,
+            show_users=principal.is_admin,
             principal=principal,
         )
     )
@@ -996,6 +1024,7 @@ async def inbox_counts(request: Request) -> Response:
                 .where(
                     models.PlatformAccount.id == account_uuid,
                     models.PlatformAccount.tenant_id.in_(principal.allowed_tenants),
+                    _account_read_scope(principal, principal.allowed_tenants, tenant_id),
                 )
             )
             if not account_exists:
@@ -1007,6 +1036,7 @@ async def inbox_counts(request: Request) -> Response:
             account_id=account_uuid,
             platform=platform,
             channel=channel,
+            principal=principal,
         )
     return JSONResponse({key: value[0] for key, value in summary.items()})
 
@@ -1055,7 +1085,10 @@ async def inbox_page(request: Request) -> Response:
             (
                 await session.execute(
                     select(models.PlatformAccount)
-                    .where(models.PlatformAccount.tenant_id.in_(tenants))
+                    .where(
+                        models.PlatformAccount.tenant_id.in_(tenants),
+                        _account_read_scope(principal, tenants, tenant_id),
+                    )
                     .order_by(models.PlatformAccount.name)
                 )
             ).scalars()
@@ -1069,6 +1102,7 @@ async def inbox_page(request: Request) -> Response:
             account_id=account_uuid,
             platform=platform,
             channel=channel,
+            principal=principal,
         )
         now = datetime.now(UTC)
 
@@ -1346,7 +1380,7 @@ async def inbox_page(request: Request) -> Response:
             body,
             active="inbox",
             refresh_seconds=0 if queue == "drafts" else 20,
-            show_users=principal.is_superadmin,
+            show_users=principal.is_admin,
             principal=principal,
         )
     )
@@ -1392,7 +1426,10 @@ async def conversations_page(request: Request) -> Response:
             (
                 await session.execute(
                     select(models.PlatformAccount)
-                    .where(models.PlatformAccount.tenant_id.in_(tenants))
+                    .where(
+                        models.PlatformAccount.tenant_id.in_(tenants),
+                        _account_read_scope(principal, tenants, tenant_id),
+                    )
                     .order_by(models.PlatformAccount.name)
                 )
             ).scalars()
@@ -1417,6 +1454,7 @@ async def conversations_page(request: Request) -> Response:
                 models.Conversation.tenant_id.in_(tenants),
                 models.Contact.tenant_id == models.Conversation.tenant_id,
                 models.PlatformAccount.tenant_id == models.Conversation.tenant_id,
+                _account_read_scope(principal, tenants, tenant_id),
             )
         )
         if tenant_id:
@@ -1483,7 +1521,7 @@ async def conversations_page(request: Request) -> Response:
             page_title,
             body,
             active="conversations",
-            show_users=principal.is_superadmin,
+            show_users=principal.is_admin,
             principal=principal,
         )
     )
@@ -1548,6 +1586,7 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
                 select(models.PlatformAccount).where(
                     models.PlatformAccount.id == conv.platform_account_id,
                     models.PlatformAccount.tenant_id == conv.tenant_id,
+                    _account_read_scope(principal, principal.allowed_tenants, conv.tenant_id),
                 )
             )
         ).scalar_one_or_none()
@@ -1778,7 +1817,8 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
 <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="target" value="{dst}">
 <input type="hidden" name="expect" value="{cur_state}"><button class="btn-sm {cls}">{translate(message_key)}</button></form>"""
         for dst, (message_key, cls) in _TRANSITION_MESSAGE_KEYS.items()
-        if cur is not None
+        if principal.is_admin
+        and cur is not None
         and can_transition(cur, AutomationStateEnum(dst))
         and get_settings().automation_default_allowed(account.platform, dst)
         and (dst == "HUMAN_ACTIVE" or work_item is None)
@@ -1852,16 +1892,19 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         else translate("admin.conversation.policy.draft")
     )
     work_actions = ""
-    if work_item is not None and work_item.status == "WAITING":
-        work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm">{translate("admin.inbox.claim_and_take_over")}</button></form>"""
+    if work_item is None and principal.user_id is not None:
+        work_actions = f"""<form class="inline" method="post" action="/admin/conversations/{conversation_id}/start-reception"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm">{translate("conversation.start_reception")}</button></form>"""
+    elif work_item is not None and work_item.status == "WAITING":
+        work_actions = f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/claim"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm">{translate("admin.inbox.claim_and_take_over")}</button></form>"""
     if (
         work_item is not None
         and work_item.status == "CLAIMED"
-        and (principal.is_superadmin or work_item.assigned_actor == principal.actor)
+        and (principal.is_admin or work_item.assigned_actor == principal.actor)
     ):
         work_actions += f"""<form class="inline" method="post" action="/admin/work-items/{work_item.id}/resolve"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="version" value="{work_item.version}"><button class="btn-sm btn-ghost">{translate("admin.conversation.resolve_and_resume", policy=policy_label)}</button></form>"""
     if (
-        work_item is not None
+        principal.is_admin
+        and work_item is not None
         and work_item.status == "RESOLVED"
         and cur_state
         in {
@@ -1878,13 +1921,12 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
         work_actions += f"""<form class="inline" method="post" action="/admin/conversations/{conversation_id}/resume"><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm" name="target" value="BOT_DRAFT_ONLY">{translate("admin.conversation.resume_draft")}</button>{resume_auto}</form>"""
 
     work_fields = ""
-    if work_item is not None and work_item.status in {"WAITING", "CLAIMED"}:
+    if work_item is not None and work_item.status == "CLAIMED":
         work_fields = f'<input type="hidden" name="work_item_id" value="{work_item.id}"><input type="hidden" name="version" value="{work_item.version}">'
     can_handle = (
-        work_item is None
-        or work_item.status != "CLAIMED"
-        or principal.is_superadmin
-        or work_item.assigned_actor == principal.actor
+        work_item is not None
+        and work_item.status == "CLAIMED"
+        and work_item.assigned_actor == principal.actor
     )
     composer = (
         f"""<section class="card composer"><h2>{reply_heading}</h2>
@@ -1964,7 +2006,7 @@ async def conversation_detail(request: Request, conversation_id: uuid.UUID) -> R
             page_title,
             body,
             active="conversations",
-            show_users=principal.is_superadmin,
+            show_users=principal.is_admin,
             principal=principal,
         )
     )
@@ -1985,6 +2027,7 @@ async def claim_work_item(request: Request, work_item_id: uuid.UUID) -> Response
             actor=principal.actor,
             user_id=principal.user_id,
             expected_version=_expected_version(form),
+            principal=principal,
         )
     except HumanWorkflowError as exc:
         raise _workflow_error(exc) from exc
@@ -2004,7 +2047,9 @@ async def resolve_work_item(request: Request, work_item_id: uuid.UUID) -> Respon
             allowed_tenants=principal.allowed_tenants,
             actor=principal.actor,
             expected_version=_expected_version(form),
-            allow_override=principal.is_superadmin,
+            allow_override=principal.is_admin,
+            user_id=principal.user_id,
+            principal=principal,
         )
     except HumanWorkflowError as exc:
         raise _workflow_error(exc) from exc
@@ -2016,6 +2061,7 @@ async def resume_conversation(request: Request, conversation_id: uuid.UUID) -> R
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
+    principal.require_tenant_admin()
     form = await _form(request)
     _require_csrf(request, form)
     target = form.get("target", "")
@@ -2027,6 +2073,7 @@ async def resume_conversation(request: Request, conversation_id: uuid.UUID) -> R
             allowed_tenants=principal.allowed_tenants,
             actor=principal.actor,
             target=target,
+            principal=principal,
         )
     except HumanWorkflowError as exc:
         raise _workflow_error(exc) from exc
@@ -2058,6 +2105,8 @@ async def send_manual_reply(request: Request, conversation_id: uuid.UUID) -> Res
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_work_item_id") from exc
         expected_version = _expected_version(form)
+        if work_item_id is None:
+            raise HTTPException(status_code=409, detail="human_reception_required")
     try:
         await send_human_reply(
             conversation_id=conversation_id,
@@ -2067,9 +2116,10 @@ async def send_manual_reply(request: Request, conversation_id: uuid.UUID) -> Res
             allowed_tenants=principal.allowed_tenants,
             actor=principal.actor,
             user_id=principal.user_id,
-            allow_override=principal.is_superadmin,
+            allow_override=False,
             work_item_id=work_item_id,
             expected_version=expected_version,
+            principal=principal,
         )
     except HumanWorkflowError as exc:
         raise _workflow_error(exc) from exc
@@ -2082,11 +2132,54 @@ async def send_manual_reply(request: Request, conversation_id: uuid.UUID) -> Res
     )
 
 
+@router.post("/conversations/{conversation_id}/start-reception")
+async def start_legacy_human_reception(request: Request, conversation_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request, require_admin=False)
+    if isinstance(principal, Response):
+        return principal
+    principal.require_tenant(DEFAULT_TENANT_ID)
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        await start_human_reception(conversation_id=conversation_id, principal=principal)
+    except (TypeError, ValueError, HumanWorkflowError) as exc:
+        raise _workflow_error(exc) from exc
+    return RedirectResponse(
+        f"/admin/conversations/{conversation_id}", status_code=status.HTTP_303_SEE_OTHER
+    )
+
+
+@router.post("/work-items/{work_item_id}/transfer")
+async def transfer_legacy_work_item(request: Request, work_item_id: uuid.UUID) -> Response:
+    principal = await _web_principal(request)
+    if isinstance(principal, Response):
+        return principal
+    principal.require_tenant_admin()
+    form = await _form(request)
+    _require_csrf(request, form)
+    try:
+        target_user_id = uuid.UUID(form.get("target_user_id") or "")
+        expected_version = _expected_version(form)
+        await transfer_human_work_item(
+            work_item_id=work_item_id,
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            user_id=principal.user_id,
+            target_user_id=target_user_id,
+            expected_version=expected_version,
+            principal=principal,
+        )
+    except (TypeError, ValueError, HumanWorkflowError) as exc:
+        raise _workflow_error(exc) from exc
+    return RedirectResponse("/admin/inbox?queue=human", status_code=status.HTTP_303_SEE_OTHER)
+
+
 @router.post("/conversations/{conversation_id}/state")
 async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) -> Response:
     principal = await _web_principal(request)
     if isinstance(principal, Response):
         return principal
+    principal.require_tenant_admin()
     form = await _form(request)
     _require_csrf(request, form)
     target, expect = form.get("target", ""), form.get("expect", "")
@@ -2094,64 +2187,24 @@ async def flip_conversation_state(request: Request, conversation_id: uuid.UUID) 
         raise HTTPException(status_code=422, detail="invalid_state_transition")
     if not can_transition(AutomationStateEnum(expect), AutomationStateEnum(target)):
         raise HTTPException(status_code=422, detail="transition_not_allowed")
-    async with get_session_factory()() as session:
-        conv = await session.get(models.Conversation, conversation_id)
-        if conv is None or conv.tenant_id not in principal.allowed_tenants:
-            raise HTTPException(status_code=404, detail="conversation_not_found")
-        account = await session.get(models.PlatformAccount, conv.platform_account_id)
-        if account is None or account.tenant_id != conv.tenant_id:
-            raise HTTPException(status_code=404, detail="conversation_not_found")
-        if not get_settings().automation_default_allowed(account.platform, target):
-            raise HTTPException(status_code=422, detail="automation_default_not_allowed")
-        # CAS：仅当仍处于提交时看到的状态才翻转（防并发接管竞态）
-        if target == AutomationStateEnum.HUMAN_ACTIVE:
-            flipped = await flip_to_human_active(
-                session,
-                conversation_id,
-                principal.actor,
-                "admin_manual",
-                expected_state=AutomationStateEnum(expect),
-            )
-            if not flipped:
-                raise HTTPException(status_code=409, detail="automation_state_version_conflict")
-            await ensure_open_human_work_item(
-                session,
-                tenant_id=conv.tenant_id,
+    try:
+        if target == "HUMAN_ACTIVE":
+            await start_human_reception(
                 conversation_id=conversation_id,
-                reason_code="ADMIN_MANUAL",
+                principal=principal,
+                expected_state=expect,
             )
         else:
-            open_work = (
-                await session.execute(
-                    select(models.HumanWorkItem).where(
-                        models.HumanWorkItem.conversation_id == conversation_id,
-                        models.HumanWorkItem.status.in_(("WAITING", "CLAIMED")),
-                    )
-                )
-            ).scalar_one_or_none()
-            if open_work is not None:
-                try:
-                    require_work_conversation_tenant(
-                        open_work, conversation_tenant_id=conv.tenant_id
-                    )
-                except HumanWorkflowError as exc:
-                    raise _workflow_error(exc) from exc
-                raise HTTPException(status_code=409, detail="human_work_item_still_open")
-            changed = await session.execute(
-                update(models.AutomationState)
-                .where(
-                    models.AutomationState.conversation_id == conversation_id,
-                    models.AutomationState.state == expect,
-                )
-                .values(
-                    state=target,
-                    state_version=models.AutomationState.state_version + 1,
-                    state_changed_reason="admin_manual",
-                )
+            await resume_bot(
+                conversation_id=conversation_id,
+                allowed_tenants=principal.allowed_tenants,
+                actor=principal.actor,
+                target=target,
+                principal=principal,
+                expected_state=expect,
             )
-            if changed.rowcount != 1:
-                raise HTTPException(status_code=409, detail="automation_state_version_conflict")
-        await session.commit()
+    except HumanWorkflowError as exc:
+        raise _workflow_error(exc) from exc
     return RedirectResponse(
         f"/admin/conversations/{conversation_id}", status_code=status.HTTP_303_SEE_OTHER
     )
@@ -2223,6 +2276,7 @@ async def approve_draft(request: Request, decision_id: uuid.UUID) -> Response:
             final_reply_text=form.get("final_reply_text"),
             expected_generation=_optional_expected_generation(form),
             expected_review_action=form.get("expected_review_action") or None,
+            principal=principal,
         )
     except (DraftReviewNotFound, DraftReviewConflict, DraftReviewValidationError) as exc:
         raise _draft_review_http_error(exc) from exc
@@ -2245,6 +2299,7 @@ async def discard_draft(request: Request, decision_id: uuid.UUID) -> Response:
             review_reason=form.get("review_reason", ""),
             expected_generation=_optional_expected_generation(form),
             expected_review_action=form.get("expected_review_action") or None,
+            principal=principal,
         )
     except (DraftReviewNotFound, DraftReviewConflict, DraftReviewValidationError) as exc:
         raise _draft_review_http_error(exc) from exc
@@ -2252,7 +2307,6 @@ async def discard_draft(request: Request, decision_id: uuid.UUID) -> Response:
 
 
 # ---------- 知识库 ----------
-
 
 def _log_knowledge_exception(message: str, exc: Exception) -> None:
     sanitized = RuntimeError("exception details redacted")
@@ -2262,7 +2316,6 @@ def _log_knowledge_exception(message: str, exc: Exception) -> None:
         type(exc).__name__,
         exc_info=(RuntimeError, sanitized, exc.__traceback__),
     )
-
 
 _KB_BANNERS = {
     "added": ("ok", "admin.knowledge.banner.added"),
@@ -2276,10 +2329,6 @@ _KB_BANNERS = {
     "import_too_large": ("err", "admin.knowledge.banner.import_too_large"),
 }
 
-_MAX_IMPORT_BYTES = 2 * 1024 * 1024
-_KNOWLEDGE_BULK_PUBLISH_CHUNK_SIZE = 500
-
-
 def _legacy_knowledge_location(tenant_id: str, *, notice: str = "", **values: object) -> str:
     query = {
         key: str(value)
@@ -2291,6 +2340,8 @@ def _legacy_knowledge_location(tenant_id: str, *, notice: str = "", **values: ob
 
 
 def _legacy_knowledge_http_error(exc: KnowledgeApplicationError) -> HTTPException:
+    if isinstance(exc, KnowledgeAuthorizationError):
+        return HTTPException(status_code=403, detail=exc.code)
     if isinstance(exc, KnowledgeNotFoundError):
         return HTTPException(status_code=404, detail=exc.code)
     if isinstance(exc, KnowledgeConflictError):
@@ -2386,63 +2437,6 @@ def _require_knowledge_corpus_mutation_allowed() -> None:
     # Runtime provenance is checked at decision/send time; do not freeze knowledge maintenance.
     return None
 
-
-async def _require_knowledge_publishable(session, doc: models.KnowledgeDocument) -> None:
-    settings = get_settings()
-    if (
-        settings.multilingual_knowledge_reply_enabled or settings.english_knowledge_only_enabled
-    ) and not (doc.source_language == "en" and doc.language_verified):
-        raise HTTPException(status_code=409, detail="confirm_english_before_publish")
-    if doc.is_official_contact or has_contact_like(doc.reply or ""):
-        raise HTTPException(status_code=409, detail="official_contact_requires_review")
-    if settings.multilingual_knowledge_reply_enabled or settings.english_knowledge_only_enabled:
-        current_embedding = await session.scalar(
-            select(models.KnowledgeChunk.id)
-            .where(
-                models.KnowledgeChunk.tenant_id == doc.tenant_id,
-                models.KnowledgeChunk.document_id == doc.id,
-                models.KnowledgeChunk.embedding_version == settings.openai_embedding_model,
-                models.KnowledgeChunk.embedding.is_not(None),
-            )
-            .limit(1)
-        )
-        if current_embedding is None:
-            raise HTTPException(status_code=409, detail="knowledge_embedding_not_ready")
-    normalized = normalize_question(doc.question)
-    lock_key = f"knowledge-publish:{doc.tenant_id}:{doc.brand_id}:{normalized}"
-    await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0))))
-    platform_overlap = (
-        True
-        if doc.platform is None
-        else or_(
-            models.KnowledgeDocument.platform.is_(None),
-            models.KnowledgeDocument.platform == doc.platform,
-        )
-    )
-    conflicts = await session.scalar(
-        select(func.count())
-        .select_from(models.KnowledgeDocument)
-        .where(
-            models.KnowledgeDocument.id != doc.id,
-            models.KnowledgeDocument.tenant_id == doc.tenant_id,
-            models.KnowledgeDocument.brand_id == doc.brand_id,
-            platform_overlap,
-            models.KnowledgeDocument.status == "published",
-            func.regexp_replace(
-                func.lower(func.trim(models.KnowledgeDocument.question)),
-                r"\s+",
-                " ",
-                "g",
-            )
-            == normalized,
-            or_(
-                models.KnowledgeDocument.reply != doc.reply,
-                models.KnowledgeDocument.is_official_contact != doc.is_official_contact,
-            ),
-        )
-    )
-    if conflicts:
-        raise HTTPException(status_code=409, detail="conflicting_published_knowledge")
 
 
 @router.get("/content/knowledge", response_class=HTMLResponse)
@@ -2590,7 +2584,7 @@ async def knowledge_page(request: Request, notice: str = "") -> Response:
             page_title,
             body,
             active="knowledge",
-            show_users=principal.is_superadmin,
+            show_users=principal.is_admin,
             principal=principal,
         )
     )
@@ -2624,7 +2618,7 @@ async def knowledge_add(request: Request) -> Response:
                 session,
                 CreateKnowledgeDocumentCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     question=form.get("question", ""),
                     reply=form.get("reply", ""),
                     brand_id=form.get("brand_id", "") or "default",
@@ -2650,57 +2644,6 @@ async def knowledge_add(request: Request) -> Response:
         _legacy_knowledge_location(tenant_id, notice="created"),
         status_code=status.HTTP_303_SEE_OTHER,
     )
-    question = (form.get("question") or "").strip()
-    reply = (form.get("reply") or "").strip()
-    official_value = (form.get("is_official_contact") or "").strip().casefold()
-    if official_value not in {"", "true"}:
-        raise HTTPException(status_code=422, detail="invalid_is_official_contact")
-    is_official_contact = official_value == "true"
-    if not question or not reply:
-        raise HTTPException(status_code=422, detail="question_and_reply_required")
-    detected_language, detection_status = assess_knowledge_language(question, reply)
-    draft = build_knowledge_draft(
-        tenant_id=tenant_id,
-        question=question,
-        reply=reply,
-        brand_id=(form.get("brand_id") or "").strip() or "default",
-        category=(form.get("category") or "").strip() or None,
-        is_official_contact=is_official_contact,
-        detected_language=detected_language,
-        language_detection_status=detection_status,
-        source_file="admin-console",
-        import_batch_id=uuid.uuid4(),
-    )
-    from social_reply.application.reply_decision.runner import _get_embedder
-
-    async with get_session_factory()() as session:
-        existing = await existing_content_hashes(
-            session,
-            tenant_id=tenant_id,
-            content_hashes=[draft.content_hash],
-        )
-    if existing:
-        return RedirectResponse(
-            "/admin/knowledge?notice=duplicate", status_code=status.HTTP_303_SEE_OTHER
-        )
-    try:
-        embedder = _get_embedder()
-        embedding = (await embedder.embed([draft.embed_text]))[0]
-    except Exception as exc:
-        _log_knowledge_exception("Knowledge manual add embedding failed", exc)
-        return RedirectResponse(
-            "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
-        )
-    async with get_session_factory()() as session:
-        await persist_knowledge_draft(
-            session,
-            draft,
-            embedding_version=embedder.version,
-            embedding=embedding,
-            actor=principal.actor,
-        )
-        await session.commit()
-    return RedirectResponse("/admin/knowledge?notice=added", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/knowledge/import")
@@ -2737,7 +2680,7 @@ async def knowledge_import(request: Request) -> Response:
                 session,
                 ImportKnowledgeBatchCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     csv_text=csv_text,
                     source_name=(str(filename or "").strip() or "import.csv")[:256],
                     brand_id_default=str(form.get("brand_id") or "default"),
@@ -2745,6 +2688,8 @@ async def knowledge_import(request: Request) -> Response:
                 embedder=_get_embedder(),
             )
             await session.commit()
+    except KnowledgeAuthorizationError as exc:
+        raise _legacy_knowledge_http_error(exc) from exc
     except (KnowledgeApplicationError, ValueError):
         return RedirectResponse(
             _legacy_knowledge_location(tenant_id, notice="import_bad_csv"),
@@ -2765,55 +2710,6 @@ async def knowledge_import(request: Request) -> Response:
             blank=report.blank,
             batch_id=report.batch_id,
         ),
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
-    if not callable(read):
-        return RedirectResponse(
-            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
-        )
-    raw = await read(_MAX_IMPORT_BYTES + 1)
-    if len(raw) > _MAX_IMPORT_BYTES:
-        return RedirectResponse(
-            "/admin/knowledge?notice=import_too_large", status_code=status.HTTP_303_SEE_OTHER
-        )
-    if not raw:
-        return RedirectResponse(
-            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
-        )
-    try:
-        text_csv = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return RedirectResponse(
-            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
-        )
-    brand_id_default = str(form.get("brand_id") or "").strip() or "default"
-    source_name = (str(filename or "").strip() or "import.csv")[:256]
-    import io
-
-    from social_reply.application.reply_decision.runner import _get_embedder
-
-    try:
-        embedder = _get_embedder()
-        report = await import_knowledge_rows(
-            io.StringIO(text_csv),
-            source_name=source_name,
-            embedder=embedder,
-            tenant_id=tenant_id,
-            brand_id_default=brand_id_default,
-            actor=principal.actor,
-        )
-    except ValueError:
-        return RedirectResponse(
-            "/admin/knowledge?notice=import_bad_csv", status_code=status.HTTP_303_SEE_OTHER
-        )
-    except Exception as exc:
-        _log_knowledge_exception("Knowledge CSV import failed", exc)
-        return RedirectResponse(
-            "/admin/knowledge?notice=embed_failed", status_code=status.HTTP_303_SEE_OTHER
-        )
-    return RedirectResponse(
-        f"/admin/knowledge?notice=imported&inserted={report.inserted}"
-        f"&skipped={report.skipped}&blank={report.blank}&batch_id={report.batch_id}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -2842,7 +2738,7 @@ async def knowledge_confirm_english(request: Request, doc_id: uuid.UUID) -> Resp
                 session,
                 ConfirmKnowledgeEnglishCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     document_id=doc_id,
                     confirmation_reason=form.get("confirmation_reason", ""),
                 ),
@@ -2852,54 +2748,6 @@ async def knowledge_confirm_english(request: Request, doc_id: uuid.UUID) -> Resp
         raise _legacy_knowledge_http_error(exc) from exc
     return RedirectResponse(
         f"/app/t/{quote(tenant_id, safe='')}/knowledge/documents/{doc_id}",
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
-    confirmation_reason = (form.get("confirmation_reason") or "").strip()
-    async with get_session_factory()() as session:
-        doc = (
-            await session.execute(
-                select(models.KnowledgeDocument)
-                .where(
-                    models.KnowledgeDocument.id == doc_id,
-                    models.KnowledgeDocument.tenant_id.in_(principal.allowed_tenants),
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if doc is None:
-            raise HTTPException(status_code=404, detail="knowledge_not_found")
-        if doc.status != "draft":
-            raise HTTPException(status_code=409, detail="unpublish_before_language_confirmation")
-        if doc.language_detection_status in {"mixed", "non_english"}:
-            raise HTTPException(status_code=409, detail="english_replacement_required")
-        if doc.language_detection_status == "unknown" and len(confirmation_reason) < 10:
-            raise HTTPException(status_code=422, detail="language_confirmation_reason_required")
-        if not doc.language_verified or doc.source_language != "en":
-            doc.source_language = "en"
-            doc.language_verified = True
-            session.add(
-                models.AuditLog(
-                    tenant_id=doc.tenant_id,
-                    category="admin_action",
-                    actor=principal.actor,
-                    action="CONFIRM_KNOWLEDGE_ENGLISH",
-                    subject_type="knowledge_document",
-                    subject_id=str(doc.id),
-                    detail={
-                        "detected_language": doc.detected_language,
-                        "detection_status": doc.language_detection_status,
-                        "source_file": doc.source_file,
-                        "import_batch_id": str(doc.import_batch_id)
-                        if doc.import_batch_id
-                        else None,
-                        "confirmation_reason": confirmation_reason or None,
-                        "bulk": False,
-                    },
-                )
-            )
-        await session.commit()
-    return RedirectResponse(
-        "/admin/knowledge?notice=language_confirmed",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -2941,7 +2789,7 @@ async def knowledge_bulk_confirm_english(request: Request) -> Response:
                 session,
                 ConfirmKnowledgeEnglishBatchCommand(
                     required_tenant_id=batch_tenant,
-                    actor=principal.actor,
+                    principal=principal,
                     import_batch_id=import_batch_id,
                 ),
             )
@@ -2954,58 +2802,6 @@ async def knowledge_bulk_confirm_english(request: Request) -> Response:
             notice="bulk_confirmed",
             count=confirmed_count,
         ),
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
-    confirmation_batch_id = str(uuid.uuid4())
-    async with get_session_factory()() as session:
-        batch_tenant = await session.scalar(
-            select(models.KnowledgeDocument.tenant_id)
-            .where(models.KnowledgeDocument.import_batch_id == import_batch_id)
-            .limit(1)
-        )
-        if batch_tenant is None or batch_tenant not in principal.allowed_tenants:
-            raise HTTPException(status_code=404, detail="knowledge_import_batch_not_found")
-        filters = [
-            models.KnowledgeDocument.tenant_id == batch_tenant,
-            models.KnowledgeDocument.import_batch_id == import_batch_id,
-            models.KnowledgeDocument.status == "draft",
-            models.KnowledgeDocument.language_detection_status == "english",
-            models.KnowledgeDocument.language_verified.is_(False),
-        ]
-        docs = (
-            (
-                await session.execute(
-                    select(models.KnowledgeDocument).where(*filters).with_for_update()
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for doc in docs:
-            doc.source_language = "en"
-            doc.language_verified = True
-            session.add(
-                models.AuditLog(
-                    tenant_id=doc.tenant_id,
-                    category="admin_action",
-                    actor=principal.actor,
-                    action="CONFIRM_KNOWLEDGE_ENGLISH",
-                    subject_type="knowledge_document",
-                    subject_id=str(doc.id),
-                    detail={
-                        "detected_language": doc.detected_language,
-                        "detection_status": doc.language_detection_status,
-                        "source_file": doc.source_file,
-                        "brand": doc.brand_id,
-                        "bulk": True,
-                        "import_batch_id": str(import_batch_id),
-                        "confirmation_batch_id": confirmation_batch_id,
-                    },
-                )
-            )
-        await session.commit()
-    return RedirectResponse(
-        f"/admin/knowledge?notice=bulk_language_confirmed&count={len(docs)}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -3034,7 +2830,7 @@ async def knowledge_bulk_publish(request: Request) -> Response:
                 session,
                 BulkPublishKnowledgeCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                 ),
             )
             await session.commit()
@@ -3047,73 +2843,6 @@ async def knowledge_bulk_publish(request: Request) -> Response:
             published=result.published_count,
             skipped=result.skipped_count,
         ),
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
-    async with get_session_factory()() as session:
-        published_count = 0
-        skipped_reasons: Counter[str] = Counter()
-        last_id: uuid.UUID | None = None
-        while True:
-            candidate_query = (
-                select(models.KnowledgeDocument)
-                .where(
-                    models.KnowledgeDocument.tenant_id == tenant_id,
-                    models.KnowledgeDocument.status == "draft",
-                    models.KnowledgeDocument.is_official_contact.is_(False),
-                )
-                .order_by(models.KnowledgeDocument.id)
-                .limit(_KNOWLEDGE_BULK_PUBLISH_CHUNK_SIZE)
-                .with_for_update()
-            )
-            if last_id is not None:
-                candidate_query = candidate_query.where(models.KnowledgeDocument.id > last_id)
-            candidates = (await session.execute(candidate_query)).scalars().all()
-            if not candidates:
-                break
-            last_id = candidates[-1].id
-            for doc in candidates:
-                if has_contact_like(doc.reply or ""):
-                    skipped_reasons["official_contact_requires_review"] += 1
-                    continue
-                try:
-                    await _require_knowledge_publishable(session, doc)
-                except HTTPException as exc:
-                    if exc.status_code == 409:
-                        skipped_reasons[str(exc.detail or "publish_rejected")] += 1
-                        continue
-                    raise
-                doc.status = "published"
-                session.add(
-                    models.AuditLog(
-                        tenant_id=doc.tenant_id,
-                        category="admin_action",
-                        actor=principal.actor,
-                        action="PUBLISH_KNOWLEDGE",
-                        subject_type="knowledge_document",
-                        subject_id=str(doc.id),
-                        detail={
-                            "from": "draft",
-                            "to": "published",
-                            "brand": doc.brand_id,
-                            "platform": doc.platform,
-                            "is_official_contact": doc.is_official_contact,
-                            "bulk": True,
-                        },
-                    )
-                )
-                published_count += 1
-            await session.commit()
-    skipped_count = sum(skipped_reasons.values())
-    query = urlencode(
-        {
-            "notice": "bulk_published",
-            "count": published_count,
-            "skipped": skipped_count,
-            "skip_reasons": json.dumps(dict(skipped_reasons), ensure_ascii=False, sort_keys=True),
-        }
-    )
-    return RedirectResponse(
-        f"/admin/knowledge?{query}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -3149,7 +2878,7 @@ async def knowledge_set_status(request: Request, doc_id: uuid.UUID) -> Response:
                     session,
                     PublishKnowledgeCommand(
                         required_tenant_id=tenant_id,
-                        actor=principal.actor,
+                        principal=principal,
                         document_id=doc_id,
                     ),
                 )
@@ -3158,7 +2887,7 @@ async def knowledge_set_status(request: Request, doc_id: uuid.UUID) -> Response:
                     session,
                     UnpublishKnowledgeCommand(
                         required_tenant_id=tenant_id,
-                        actor=principal.actor,
+                        principal=principal,
                         document_id=doc_id,
                     ),
                 )
@@ -3168,63 +2897,6 @@ async def knowledge_set_status(request: Request, doc_id: uuid.UUID) -> Response:
     return RedirectResponse(
         f"/app/t/{quote(tenant_id, safe='')}/knowledge/documents/{doc_id}",
         status_code=status.HTTP_303_SEE_OTHER,
-    )
-    async with get_session_factory()() as session:
-        doc = (
-            await session.execute(
-                select(models.KnowledgeDocument)
-                .where(
-                    models.KnowledgeDocument.id == doc_id,
-                    models.KnowledgeDocument.tenant_id.in_(principal.allowed_tenants),
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if doc is None:
-            raise HTTPException(status_code=404, detail="knowledge_not_found")
-        if target == "published":
-            await _require_knowledge_publishable(session, doc)
-        previous = doc.status
-        if previous != target:
-            if target == "draft":
-                try:
-                    await revoke_document_localizations(
-                        session,
-                        tenant_id=doc.tenant_id,
-                        document_id=doc.id,
-                        actor=principal.actor,
-                        reason="source knowledge unpublished",
-                    )
-                except LocalizationValidationError as exc:
-                    if str(exc) == "localization has a sending outbox":
-                        raise HTTPException(
-                            status_code=409,
-                            detail="localization_send_in_progress",
-                        ) from exc
-                    raise
-            doc.status = target
-            await session.execute(
-                models.AuditLog.__table__.insert().values(
-                    tenant_id=doc.tenant_id,
-                    category="admin_action",
-                    actor=principal.actor,
-                    action=(
-                        "PUBLISH_KNOWLEDGE" if target == "published" else "UNPUBLISH_KNOWLEDGE"
-                    ),
-                    subject_type="knowledge_document",
-                    subject_id=str(doc.id),
-                    detail={
-                        "from": previous,
-                        "to": target,
-                        "brand": doc.brand_id,
-                        "platform": doc.platform,
-                        "is_official_contact": doc.is_official_contact,
-                    },
-                )
-            )
-        await session.commit()
-    return RedirectResponse(
-        "/admin/knowledge?notice=status_changed", status_code=status.HTTP_303_SEE_OTHER
     )
 
 
@@ -3256,7 +2928,7 @@ async def knowledge_set_official_contact(request: Request, doc_id: uuid.UUID) ->
                 session,
                 SetKnowledgeOfficialContactCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     document_id=doc_id,
                     is_official_contact=target,
                 ),
@@ -3266,52 +2938,6 @@ async def knowledge_set_official_contact(request: Request, doc_id: uuid.UUID) ->
         raise _legacy_knowledge_http_error(exc) from exc
     return RedirectResponse(
         f"/app/t/{quote(tenant_id, safe='')}/knowledge/documents/{doc_id}",
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
-    async with get_session_factory()() as session:
-        doc = (
-            await session.execute(
-                select(models.KnowledgeDocument)
-                .where(
-                    models.KnowledgeDocument.id == doc_id,
-                    models.KnowledgeDocument.tenant_id.in_(principal.allowed_tenants),
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if doc is None:
-            raise HTTPException(status_code=404, detail="knowledge_not_found")
-        if doc.status != "draft":
-            raise HTTPException(status_code=409, detail="unpublish_before_classification")
-        previous = doc.is_official_contact
-        if previous != target:
-            content_hash = await session.scalar(
-                select(models.KnowledgeChunk.content_hash).where(
-                    models.KnowledgeChunk.document_id == doc.id
-                )
-            )
-            doc.is_official_contact = target
-            await session.execute(
-                models.AuditLog.__table__.insert().values(
-                    tenant_id=doc.tenant_id,
-                    category="admin_action",
-                    actor=principal.actor,
-                    action="SET_KNOWLEDGE_OFFICIAL_CONTACT",
-                    subject_type="knowledge_document",
-                    subject_id=str(doc.id),
-                    detail={
-                        "from": previous,
-                        "to": target,
-                        "brand": doc.brand_id,
-                        "platform": doc.platform,
-                        "status": doc.status,
-                        "content_hash": content_hash,
-                    },
-                )
-            )
-        await session.commit()
-    return RedirectResponse(
-        "/admin/knowledge?notice=classification_changed",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -3340,7 +2966,7 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
                 session,
                 DeleteKnowledgeDraftCommand(
                     required_tenant_id=tenant_id,
-                    actor=principal.actor,
+                    principal=principal,
                     document_id=doc_id,
                 ),
             )
@@ -3350,31 +2976,6 @@ async def knowledge_delete(request: Request, doc_id: uuid.UUID) -> Response:
     return RedirectResponse(
         _legacy_knowledge_location(tenant_id, notice="deleted"),
         status_code=status.HTTP_303_SEE_OTHER,
-    )
-    async with get_session_factory()() as session:
-        doc = await session.get(models.KnowledgeDocument, doc_id)
-        if doc is None or doc.tenant_id not in principal.allowed_tenants:
-            raise HTTPException(status_code=404, detail="knowledge_not_found")
-        if doc.status == "published":
-            _require_knowledge_corpus_mutation_allowed()
-            raise HTTPException(status_code=409, detail="unpublish_knowledge_before_delete")
-        localization_exists = await session.scalar(
-            select(models.KnowledgeLocalization.id)
-            .where(
-                models.KnowledgeLocalization.tenant_id == doc.tenant_id,
-                models.KnowledgeLocalization.document_id == doc.id,
-            )
-            .limit(1)
-        )
-        if localization_exists is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="knowledge_with_localization_history_is_immutable",
-            )
-        await session.delete(doc)
-        await session.commit()
-    return RedirectResponse(
-        "/admin/knowledge?notice=deleted", status_code=status.HTTP_303_SEE_OTHER
     )
 
 
@@ -3447,6 +3048,7 @@ async def prompt_save(request: Request) -> Response:
                     expected_revision=expected_revision,
                     actor=principal.actor,
                     change_note=form.get("change_note"),
+                    principal=principal,
                 ),
             )
             await session.commit()
@@ -3493,6 +3095,7 @@ async def prompt_rollback(version_id: uuid.UUID, request: Request) -> Response:
                     source_version_id=version_id,
                     expected_revision=expected_revision,
                     actor=principal.actor,
+                    principal=principal,
                 ),
             )
             await session.commit()
@@ -3578,7 +3181,7 @@ async def health_page(request: Request) -> Response:
     now = datetime.now(UTC)
     day_ago = now - timedelta(hours=24)
     async with get_session_factory()() as session:
-        health_metrics = await _load_health_metrics(session, tenants, now)
+        health_metrics = await _load_health_metrics(session, tenants, now, principal=principal)
         outbox = (
             (
                 await session.execute(
@@ -3620,9 +3223,16 @@ async def health_page(request: Request) -> Response:
                 .group_by(models.RawEvent.source, models.RawEvent.processing_status)
             )
         ).all()
+    action_metric_count = sum(metric.action_count for metric in health_metrics)
+    warning_metric_count = sum(metric.warning_count for metric in health_metrics)
+    oldest_metric_at = min(
+        (metric.oldest_at for metric in health_metrics if metric.oldest_at is not None),
+        default=None,
+    )
+    health_status = "degraded" if action_metric_count else "healthy"
     metric_rows = "".join(
         f'<tr id="{metric.key}"><td><strong>{metric.label}</strong></td>'
-        f"<td>{_pill(metric.level)}</td>"
+        f"<td>{status_badge(health_status if metric.action_count else 'healthy', label=metric.level)}</td>"
         f"<td>{translate('admin.health.backlog_summary', action_count=metric.action_count, warning_count=metric.warning_count)}</td>"
         f"<td class='muted'>{_health_age(now, metric.oldest_at)}</td>"
         f"<td><a href='{metric.href}'>{translate('admin.common.view')}</a></td></tr>"
@@ -3650,17 +3260,28 @@ async def health_page(request: Request) -> Response:
         or f"<tr><td colspan='4' class='muted'>{translate('admin.health.no_ingress')}</td></tr>"
     )
     page_title = translate("admin.health.title")
-    body = f"""<h1>{page_title}</h1><p class="lede">{translate("admin.health.description")}</p>
-<section class="card"><h2>{translate("admin.health.core_pipeline")}</h2><div class="tablewrap"><table><thead><tr><th>{translate("admin.overview.stage")}</th><th>{translate("common.status")}</th><th>{translate("admin.overview.backlog")}</th><th>{translate("admin.overview.oldest_wait")}</th><th></th></tr></thead><tbody>{metric_rows}</tbody></table></div></section>
-<section class="card"><h2>Outbox</h2><p class="hint">{translate("admin.health.outbox_hint")}</p><div class="tablewrap"><table><thead><tr><th>{translate("common.time")}</th><th>{translate("common.status")}</th><th>{translate("admin.health.destination")}</th><th>{translate("admin.common.content")}</th><th>{translate("admin.common.attempts")}</th><th>{translate("admin.common.error")}</th></tr></thead><tbody>{rows}</tbody></table></div></section>
-<section class="card" id="ingress"><h2>{translate("admin.health.ingress")}</h2><div class="tablewrap"><table><thead><tr><th>{translate("admin.health.ingress_source")}</th><th>{translate("admin.health.processing_status")}</th><th>{translate("admin.health.event_count")}</th><th>{translate("admin.health.last_received")}</th></tr></thead><tbody>{ingress_rows}</tbody></table></div></section>"""
+    body = f"""<section class="saas-next-action"><div><div class="saas-eyebrow">{escape(translate("nav.system_health"))}</div>
+<h2>{escape(translate("admin.health.core_pipeline"))}</h2>
+<p>{escape(translate("admin.health.backlog_summary", action_count=action_metric_count, warning_count=warning_metric_count))}</p></div>
+{secondary_action("/admin/system/safety", translate("system.overview.safety"), small=True)}</section>
+<div class="saas-status-summary"><span class="saas-status-summary-label">{escape(translate("common.status"))}</span>
+<div class="saas-status-summary-items">{status_badge(health_status)}<span class="saas-muted">{escape(translate("admin.overview.oldest_wait"))} · {escape(_health_age(now, oldest_metric_at))}</span></div></div>
+<div class="saas-section-header"><div class="saas-section-header-copy"><h2>{escape(translate("admin.health.core_pipeline"))}</h2>
+<p>{escape(translate("admin.health.description"))}</p></div></div>
+<div class="saas-table-wrap"><table class="saas-table"><thead><tr><th>{escape(translate("admin.overview.stage"))}</th><th>{escape(translate("common.status"))}</th><th>{escape(translate("admin.overview.backlog"))}</th><th>{escape(translate("admin.overview.oldest_wait"))}</th><th></th></tr></thead><tbody>{metric_rows}</tbody></table></div>
+<div class="saas-section-header"><div class="saas-section-header-copy"><h2>Outbox</h2><p>{escape(translate("admin.health.outbox_hint"))}</p></div></div>
+<div class="saas-table-wrap"><table class="saas-table"><thead><tr><th>{escape(translate("common.time"))}</th><th>{escape(translate("common.status"))}</th><th>{escape(translate("admin.health.destination"))}</th><th>{escape(translate("admin.common.content"))}</th><th>{escape(translate("admin.common.attempts"))}</th><th>{escape(translate("admin.common.error"))}</th></tr></thead><tbody>{rows}</tbody></table></div>
+<div class="saas-section-header"><div class="saas-section-header-copy"><h2>{escape(translate("admin.health.ingress"))}</h2><p>{escape(translate("admin.health.last_received"))}</p></div></div>
+<div class="saas-table-wrap" id="ingress"><table class="saas-table"><thead><tr><th>{escape(translate("admin.health.ingress_source"))}</th><th>{escape(translate("admin.health.processing_status"))}</th><th>{escape(translate("admin.health.event_count"))}</th><th>{escape(translate("admin.health.last_received"))}</th></tr></thead><tbody>{ingress_rows}</tbody></table></div>"""
     return HTMLResponse(
-        _page(
-            page_title,
-            body,
-            active="health",
-            show_users=principal.is_superadmin,
+        render_saas_page(
             principal=principal,
+            title=page_title,
+            description=translate("admin.health.description"),
+            body=body,
+            active_navigation="system-health",
+            tenant_id=None,
+            system_admin=True,
         )
     )
 
@@ -3751,6 +3372,7 @@ async def delivery_retry(request: Request, outbox_id: uuid.UUID) -> Response:
             expected_attempt_count=expected_attempt_count,
             review_reason=_LEGACY_DELIVERY_RETRY_REASON,
             verification_source=_LEGACY_DELIVERY_VERIFICATION_SOURCE,
+            principal=principal,
         )
     except (
         DeliveryRecoveryNotFound,
@@ -3874,7 +3496,10 @@ async def accounts_page(request: Request) -> Response:
             (
                 await session.execute(
                     select(models.PlatformAccount)
-                    .where(models.PlatformAccount.tenant_id.in_(tenants))
+                    .where(
+                        models.PlatformAccount.tenant_id.in_(tenants),
+                        _account_read_scope(principal, tenants),
+                    )
                     .order_by(models.PlatformAccount.created_at.desc())
                 )
             )
@@ -3950,7 +3575,7 @@ async def accounts_page(request: Request) -> Response:
                 f"<div>XChat Activity {_pill(xchat_subscription)}</div>"
             )
             if settings.xchat_enabled and xchat_registered and not capability.get("x_chat", False):
-                xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><label class="sr-only" for="xchat-pin-{a.id}">XChat PIN</label><input id="xchat-pin-{a.id}" type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">{translate("admin.accounts.restore_xchat")}</button></form>"""
+                xchat_form = f"""<form class="inline" method="post" action="/admin/accounts/{a.id}/xchat"><input type="hidden" name="expected_config_version" value="{a.config_version}"><label class="sr-only" for="xchat-pin-{a.id}">XChat PIN</label><input id="xchat-pin-{a.id}" type="password" name="xchat_pin" inputmode="numeric" pattern="[0-9]{{4}}" maxlength="4" placeholder="XChat PIN" required><input type="hidden" name="csrf_token" value="{csrf}"><button class="btn-sm btn-ghost">{translate("admin.accounts.restore_xchat")}</button></form>"""
         elif a.platform == "feishu":
             account_config = dict(a.config or {})
             health_status = str(account_config.get("feishu_health_status") or "UNKNOWN")
@@ -4181,7 +3806,7 @@ async def accounts_page(request: Request) -> Response:
             page_title,
             body,
             active="accounts",
-            show_users=principal.is_superadmin,
+            show_users=principal.is_admin,
             principal=principal,
         )
     )
@@ -4204,30 +3829,38 @@ async def safety_page(request: Request) -> Response:
     finally:
         await redis.aclose()
     controls = "".join(
-        f'<form class="card" method="post" action="/admin/killswitch/toggle">'
+        f'<form class="saas-card saas-danger-action" method="post" action="/admin/killswitch/toggle">'
         f'<input type="hidden" name="csrf_token" value="{csrf}">'
         '<input type="hidden" name="scope" value="global">'
         f'<input type="hidden" name="tenant_id" value="{html.escape(tenant)}">'
         f'<input type="hidden" name="enabled" value="{"false" if flags[index] else "true"}">'
-        f"<h2>{html.escape(tenant)}</h2>"
-        f'<p class="hint">{translate("admin.safety.tenant_hint")}</p>'
-        f'<label for="f-safety-password-{index}">{translate("admin.users.bootstrap_password")}</label>'
+        f'<div class="saas-card-header"><div><h2>{html.escape(tenant)}</h2>'
+        f"<p>{translate('admin.safety.tenant_hint')}</p></div>"
+        f"{status_badge('enabled' if flags[index] else 'disabled')}</div>"
+        '<div class="saas-card-body">'
+        f'<p class="saas-danger-action-impact">{escape(translate("admin.safety.description"))}</p>'
+        f'<label class="saas-field" for="f-safety-password-{index}"><span>{translate("admin.users.bootstrap_password")}</span>'
         f'<input id="f-safety-password-{index}" name="bootstrap_password" type="password" '
-        'autocomplete="current-password" required>'
-        f'<button class="{"btn-ghost" if flags[index] else "btn-danger"}">'
-        f"{translate('admin.safety.disable_global') if flags[index] else translate('admin.safety.enable_global')}</button></form>"
+        'autocomplete="current-password" required></label>'
+        f'<button class="saas-button {"danger" if not flags[index] else ""}" type="submit">'
+        f"{translate('admin.safety.disable_global') if flags[index] else translate('admin.safety.enable_global')}</button></div></form>"
         for index, tenant in enumerate(tenants)
     )
     page_title = translate("admin.safety.title")
-    body = f"""<h1>{page_title}</h1><p class="lede">{translate("admin.safety.description")}</p>
-<div class="grid">{controls}</div>"""
+    body = f"""<section class="saas-next-action"><div><div class="saas-eyebrow">{escape(translate("nav.security_controls"))}</div>
+<h2>{escape(page_title)}</h2><p>{escape(translate("admin.safety.description"))}</p></div>
+{secondary_action("/admin/system/health", translate("nav.system_health"), small=True)}</section>
+<div class="saas-section-header"><div class="saas-section-header-copy"><h2>{escape(translate("system.overview.global_kill_switch"))}</h2>
+<p>{escape(translate("admin.safety.tenant_hint"))}</p></div></div><div class="saas-grid two">{controls}</div>"""
     response = HTMLResponse(
-        _page(
-            page_title,
-            body,
-            active="safety",
-            show_users=True,
+        render_saas_page(
             principal=principal,
+            title=page_title,
+            description=translate("admin.safety.description"),
+            body=body,
+            active_navigation="system-safety",
+            tenant_id=None,
+            system_admin=True,
         )
     )
     return _ensure_csrf(response, request, csrf)
@@ -4235,7 +3868,7 @@ async def safety_page(request: Request) -> Response:
 
 @router.post("/accounts/{account_id}/xchat")
 async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Response:
-    principal = await _web_principal(request)
+    principal = await _web_principal(request, require_admin=False)
     if isinstance(principal, Response):
         return principal
     if not get_settings().xchat_enabled:
@@ -4243,13 +3876,32 @@ async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Respo
     form = await _form(request)
     _require_csrf(request, form)
     async with get_session_factory()() as session:
-        account = await session.get(models.PlatformAccount, account_id)
+        account = await session.scalar(
+            select(models.PlatformAccount).where(
+                models.PlatformAccount.id == account_id,
+                or_(
+                    _account_read_scope(principal, principal.allowed_tenants),
+                    select(models.AccountReauthorizationGrant.id).where(
+                        models.AccountReauthorizationGrant.platform_account_id == models.PlatformAccount.id,
+                        models.AccountReauthorizationGrant.tenant_id == models.PlatformAccount.tenant_id,
+                        models.AccountReauthorizationGrant.user_id == principal.user_id,
+                        models.AccountReauthorizationGrant.active.is_(True),
+                    ).exists() if principal.user_id is not None else False,
+                ),
+            )
+        )
     if (
         account is None
         or account.tenant_id not in principal.allowed_tenants
         or account.platform != "x"
     ):
         raise HTTPException(status_code=404, detail="x_account_not_found")
+    try:
+        expected_config_version = int(form.get("expected_config_version") or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_integer:expected_config_version") from exc
+    if expected_config_version < 1:
+        raise HTTPException(status_code=422, detail="invalid_integer:expected_config_version")
     pin = (form.get("xchat_pin") or "").strip()
     if len(pin) != 4 or not pin.isdigit():
         raise HTTPException(status_code=422, detail="invalid_xchat_pin")
@@ -4259,11 +3911,12 @@ async def enable_account_xchat(request: Request, account_id: uuid.UUID) -> Respo
             account_id=account_id,
             actor=ChannelActor(
                 actor=principal.actor,
-                role="ADMIN",
+                role="ADMIN" if principal.is_workspace_admin else "USER",
                 user_id=principal.user_id,
                 session_id=principal.session_id,
             ),
             pin=pin,
+            expected_config_version=expected_config_version,
         )
     except ChannelManagementError as exc:
         raise _channel_management_http_error(exc) from exc
@@ -4302,7 +3955,12 @@ async def flip_account_automation(request: Request, account_id: uuid.UUID) -> Re
     if target not in {"BOT_ACTIVE", "BOT_DRAFT_ONLY"}:
         raise HTTPException(status_code=422, detail="invalid_automation_default")
     async with get_session_factory()() as session:
-        account = await session.get(models.PlatformAccount, account_id)
+        account = await session.scalar(
+            select(models.PlatformAccount).where(
+                models.PlatformAccount.id == account_id,
+                _account_read_scope(principal, principal.allowed_tenants),
+            )
+        )
     if account is None or account.tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=404, detail="account_not_found")
     try:
@@ -4383,7 +4041,12 @@ async def killswitch_toggle(request: Request) -> Response:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid_account_id") from exc
         async with get_session_factory()() as session:
-            account = await session.get(models.PlatformAccount, parsed_account_id)
+            account = await session.scalar(
+                select(models.PlatformAccount).where(
+                    models.PlatformAccount.id == parsed_account_id,
+                    _account_read_scope(principal, principal.allowed_tenants, tenant_id),
+                )
+            )
         if account is None or account.tenant_id != tenant_id:
             raise HTTPException(status_code=404, detail="account_not_found")
         redis = aioredis.from_url(settings.redis_url)

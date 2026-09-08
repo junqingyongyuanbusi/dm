@@ -1,10 +1,18 @@
 import uuid
 from dataclasses import dataclass, field
 
+import pytest
 from sqlalchemy import select
 
 from social_reply.application.account_management import channel_management
+from social_reply.application.account_management.auth import (
+    authenticate,
+    hash_password,
+    issue_session,
+)
 from social_reply.application.account_management.kill_switch_recovery import (
+    build_pending_account_kill_switch_detail,
+    reconcile_account_kill_switch_command,
     sweep_account_kill_switch_commands,
 )
 from social_reply.infrastructure.database import models
@@ -14,6 +22,7 @@ from social_reply.infrastructure.database import models
 class FakeRedis:
     values: set[str] = field(default_factory=set)
     fail_delete_after_apply_once: bool = False
+    fail_set: bool = False
     set_calls: list[str] = field(default_factory=list)
     delete_calls: list[str] = field(default_factory=list)
 
@@ -22,6 +31,8 @@ class FakeRedis:
 
     async def set(self, key: str, _value: str) -> bool:
         self.set_calls.append(key)
+        if self.fail_set:
+            raise RuntimeError("redis set unavailable")
         self.values.add(key)
         return True
 
@@ -118,6 +129,15 @@ async def _seed_command(
             owner_user_id=owner_user_id,
         ),
     )
+    if actor_role == "ADMIN":
+        _token, session_id = await issue_session()
+        audit.detail = {
+            **audit.detail,
+            "authority_version": 2,
+            "actor_kind": "BOOTSTRAP",
+            "actor_user_id": None,
+            "actor_session_id": str(session_id),
+        }
     session.add(audit)
     return audit
 
@@ -149,14 +169,15 @@ async def test_request_persists_complete_operation_contract(
         lambda _url: fake_redis,
     )
 
+    _token, admin_session_id = await issue_session()
     await channel_management.set_channel_account_kill_switch(
         tenant_id="default",
         account_id=account.id,
         actor=channel_management.ChannelActor(
-            actor="user:kill-switch-owner",
-            role="USER",
-            user_id=owner.id,
-            session_id=uuid.uuid4(),
+            actor="user:admin",
+            role="ADMIN",
+            user_id=None,
+            session_id=admin_session_id,
         ),
         enabled=False,
     )
@@ -174,7 +195,10 @@ async def test_request_persists_complete_operation_contract(
     assert audit.detail["account_sequence"] == 1
     assert audit.detail["target_enabled"] is False
     assert audit.detail["enabled"] is False
-    assert audit.detail["actor_role"] == "USER"
+    assert audit.detail["actor_role"] == "ADMIN"
+    assert audit.detail["authority_version"] == 2
+    assert audit.detail["actor_kind"] == "BOOTSTRAP"
+    assert audit.detail["actor_session_id"] == str(admin_session_id)
     assert audit.detail["owner_user_id"] == str(owner.id)
     assert audit.detail["status"] == "UNCHANGED"
     assert audit.detail["outcome"] == "UNCHANGED"
@@ -369,11 +393,11 @@ async def test_uncertain_target_and_stale_ownership_remain_fail_closed(
 
     await session.refresh(uncertain_audit)
     await session.refresh(stale_owner_audit)
-    assert recovered == []
-    assert uncertain_audit.detail["status"] == "UNKNOWN"
+    assert set(recovered) == {uncertain_operation_id, stale_owner_operation_id}
+    assert uncertain_audit.detail["status"] == "REJECTED"
     assert uncertain_audit.detail["error_code"] == "KILL_SWITCH_TARGET_UNCERTAIN"
-    assert stale_owner_audit.detail["status"] == "UNKNOWN"
-    assert stale_owner_audit.detail["error_code"] == "ACCOUNT_OWNERSHIP_CHANGED"
+    assert stale_owner_audit.detail["status"] == "RECONFIRM_REQUIRED"
+    assert stale_owner_audit.detail["error_code"] == "LEGACY_KILL_SWITCH_RECONFIRM_REQUIRED"
     assert _redis_key(uncertain_account.id) in fake_redis.values
     assert _redis_key(reassigned_account.id) in fake_redis.values
     assert fake_redis.delete_calls == []
@@ -424,3 +448,195 @@ async def test_sweep_limits_each_pass_by_account(
 
     second_pass = await sweep_account_kill_switch_commands(batch_size=1)
     assert set(first_pass + second_pass) == {first_operation_id, second_operation_id}
+
+
+async def _business_admin(session, suffix):
+    password = "staff-admin-test-password"
+    user = models.AdminUser(
+        username=f"recovery-admin-{suffix}",
+        password_hash=await hash_password(password),
+        tenant_id="default",
+        role="WORKSPACE_ADMIN",
+        must_change_password=False,
+        status="active",
+    )
+    session.add(user)
+    await session.commit()
+    result = await authenticate(user.username, password)
+    assert result is not None
+    principal, _token = result
+    actor = channel_management.ChannelActor(
+        actor=principal.actor, role="ADMIN", user_id=user.id, session_id=principal.session_id
+    )
+    return user, actor
+
+
+@pytest.mark.parametrize("revocation", ["disabled", "demoted", "expired", "none"])
+async def test_staff_redis_retry_rechecks_current_authority(
+    session, migrated_db, monkeypatch, revocation
+):
+    from datetime import UTC, datetime, timedelta
+
+    from social_reply.application.account_management import kill_switch_recovery
+
+    user, actor = await _business_admin(session, revocation)
+    account = await _seed_account(session, suffix=f"staff-{revocation}")
+    await session.commit()
+    key = _redis_key(account.id)
+    redis = FakeRedis(values={key}, fail_delete_after_apply_once=True)
+    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    with pytest.raises(RuntimeError, match="redis delete result unknown"):
+        await channel_management.set_channel_account_kill_switch(
+            tenant_id="default", account_id=account.id, actor=actor, enabled=False
+        )
+    audit = await session.scalar(
+        select(models.AuditLog).where(
+            models.AuditLog.action == "SET_PLATFORM_ACCOUNT_KILL_SWITCH",
+            models.AuditLog.subject_id == str(account.id),
+        )
+    )
+    assert audit is not None
+    assert audit.detail["status"] == "UNKNOWN"
+    if revocation == "disabled":
+        user.status = "disabled"
+    elif revocation == "demoted":
+        user.role = "USER"
+    elif revocation == "expired":
+        stored = await session.get(models.AdminSession, actor.session_id)
+        stored.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    await session.commit()
+    await sweep_account_kill_switch_commands()
+    await session.refresh(audit)
+    if revocation == "none":
+        assert audit.detail["status"] == "APPLIED"
+        assert key not in redis.values
+        return
+    assert audit.detail["status"] == "REJECTED"
+    assert key in redis.values
+    calls = len(redis.delete_calls)
+    user.status = "active"
+    user.role = "WORKSPACE_ADMIN"
+    await session.commit()
+    assert await sweep_account_kill_switch_commands() == []
+    assert len(redis.delete_calls) == calls
+    assert key in redis.values
+
+
+async def test_rejected_command_only_retries_protective_write(session, migrated_db, monkeypatch):
+    from social_reply.application.account_management import kill_switch_recovery
+
+    user, actor = await _business_admin(session, "safe-only")
+    account = await _seed_account(session, suffix="safe-only")
+    operation_id = uuid.uuid4()
+    audit = models.AuditLog(
+        id=operation_id,
+        tenant_id="default",
+        category="account_management",
+        actor=actor.actor,
+        action="SET_PLATFORM_ACCOUNT_KILL_SWITCH",
+        subject_type="platform_account",
+        subject_id=str(account.id),
+        detail=build_pending_account_kill_switch_detail(
+            operation_id=operation_id,
+            tenant_id="default",
+            account_id=account.id,
+            target_enabled=False,
+            account_sequence=1,
+            actor_role="ADMIN",
+            owner_user_id=None,
+            actor_user_id=user.id,
+            actor_session_id=actor.session_id,
+        ),
+    )
+    session.add(audit)
+    user.role = "USER"
+    await session.commit()
+    redis = FakeRedis(fail_set=True)
+    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    assert await reconcile_account_kill_switch_command(operation_id) == "FAIL_CLOSED_PENDING"
+    user.role = "WORKSPACE_ADMIN"
+    await session.commit()
+    redis.fail_set = False
+    assert await reconcile_account_kill_switch_command(operation_id) == "REJECTED"
+    assert _redis_key(account.id) in redis.values
+    assert redis.delete_calls == []
+
+
+async def test_rejected_batch_does_not_starve_later_valid_command(
+    session, migrated_db, monkeypatch
+):
+    from datetime import UTC, datetime, timedelta
+
+    from social_reply.application.account_management import kill_switch_recovery
+
+    rows = []
+    base = datetime.now(UTC) - timedelta(minutes=10)
+    for index in range(4):
+        account = await _seed_account(session, suffix=f"fair-{index}")
+        audit = await _seed_command(
+            session,
+            account=account,
+            operation_id=uuid.uuid4(),
+            target_enabled=False,
+            account_sequence=1,
+        )
+        audit.created_at = base + timedelta(seconds=index)
+        if index < 3:
+            # No persisted identity exists for a pre-upgrade bootstrap command.
+            audit.detail = _command_detail(
+                operation_id=audit.id,
+                account_id=account.id,
+                target_enabled=False,
+                account_sequence=1,
+            )
+        rows.append((account, audit))
+    await session.commit()
+    redis = FakeRedis(values={_redis_key(account.id) for account, _ in rows})
+    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    await sweep_account_kill_switch_commands(batch_size=2)
+    await sweep_account_kill_switch_commands(batch_size=2)
+    for _account, audit in rows:
+        await session.refresh(audit)
+    assert all(audit.detail["status"] == "RECONFIRM_REQUIRED" for _, audit in rows[:3])
+    assert rows[-1][1].detail["status"] == "APPLIED"
+    assert redis.delete_calls == [_redis_key(rows[-1][0].id)]
+
+
+async def test_invalid_account_scope_is_quarantined_without_starving_valid_work(
+    session, migrated_db, monkeypatch
+):
+    from datetime import UTC, datetime, timedelta
+
+    from social_reply.application.account_management import kill_switch_recovery
+
+    invalid = models.AuditLog(
+        tenant_id="default",
+        category="account_management",
+        actor="system:legacy",
+        action="SET_PLATFORM_ACCOUNT_KILL_SWITCH",
+        subject_type="platform_account",
+        subject_id="invalid-account-id",
+        created_at=datetime.now(UTC) - timedelta(days=1),
+        detail={"status": "UNKNOWN", "actor_role": "ADMIN", "enabled": False},
+    )
+    session.add(invalid)
+    account = await _seed_account(session, suffix="after-invalid-scope")
+    valid = await _seed_command(
+        session,
+        account=account,
+        operation_id=uuid.uuid4(),
+        target_enabled=True,
+        account_sequence=1,
+    )
+    await session.commit()
+    redis = FakeRedis()
+    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    assert await sweep_account_kill_switch_commands(batch_size=1) == [invalid.id]
+    await session.refresh(invalid)
+    assert invalid.detail["status"] == "QUARANTINED"
+    assert invalid.detail["fail_closed"] is False
+    assert invalid.detail["manual_review_required"] is True
+    assert await sweep_account_kill_switch_commands(batch_size=1) == [valid.id]
+    await session.refresh(valid)
+    assert valid.detail["status"] == "APPLIED"
+    assert _redis_key(account.id) in redis.values

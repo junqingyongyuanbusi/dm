@@ -165,7 +165,8 @@ async def test_user_management_current_and_legacy_routes_are_bilingual(migrated_
 
     for response in (current_chinese, current_english):
         assert response.status_code == 200
-        assert '<div class="app-shell app-shell-nav"><aside class="sidebar">' in response.text
+        assert '<aside class="saas-sidebar"' in response.text
+        assert 'data-page-layout="page"' in response.text
         assert "aria-current='page'" in response.text
 
     for response in (legacy_chinese_redirect, legacy_english_redirect):

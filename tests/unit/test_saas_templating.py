@@ -56,7 +56,7 @@ def test_saas_renderer_marks_only_escaped_view_html_as_trusted() -> None:
     assert '<aside class="saas-sidebar"' in html
 
 
-def test_agent_card_template_escapes_scope_data_and_shows_readiness() -> None:
+def test_agent_card_template_escapes_scope_data_and_shows_next_step() -> None:
     from social_reply.application.account_management import saas_console
 
     html = saas_console._render_agent_card(
@@ -81,8 +81,9 @@ def test_agent_card_template_escapes_scope_data_and_shows_readiness() -> None:
     assert "<img src=x" not in html
     assert "<script>" not in html
     assert "&lt;img src=x onerror=" in html
-    assert "&lt;script&gt;alert" in html
-    assert "100%" in html
+    assert "&lt;script&gt;alert" not in html
+    assert "100%" not in html
+    assert 'class="saas-agent-row"' in html
     assert 'class="saas-agent-open"' in html
 
 
@@ -118,6 +119,7 @@ def test_agent_lifecycle_template_uses_real_product_routes() -> None:
             "support",
             current_stage="test",
         ),
+        show_lifecycle=True,
         list_summary="All 0",
         scope_description="No agent yet",
         cards=(),
@@ -128,6 +130,22 @@ def test_agent_lifecycle_template_uses_real_product_routes() -> None:
     assert "/app/t/tenant-a/agents/support/channels" in html
     assert "/app/t/tenant-a/agents/support/activity" in html
     assert html.count('aria-current="step"') == 1
+
+
+def test_agent_list_hides_lifecycle_after_onboarding_is_complete() -> None:
+    html = render_template(
+        "tenant/agent_list.html",
+        lifecycle_eyebrow="",
+        lifecycle_title="",
+        lifecycle_description="",
+        lifecycle_stages=(),
+        show_lifecycle=False,
+        list_summary="All 1",
+        scope_description="Ready",
+        cards=(),
+    )
+
+    assert "saas-lifecycle" not in html
 
 
 def test_agent_create_template_autoescapes_values_and_explains_safe_lifecycle() -> None:
@@ -200,7 +218,7 @@ def test_agent_test_workspace_is_isolated_and_autoescapes_model_output() -> None
 
     assert mode == "BOT_DRAFT_ONLY"
     assert 'action="/app/t/tenant-a/agents/support/test"' in html
-    assert 'aria-current="step"' in html
+    assert 'aria-current="step"' not in html
     assert "不会创建生产决策、Outbox 或外发消息" in html
     assert "KNOWLEDGE_MATCH" in html
     assert "248 ms" in html

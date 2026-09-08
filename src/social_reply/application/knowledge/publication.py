@@ -7,11 +7,16 @@ from dataclasses import dataclass
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from social_reply.application.account_management.auth import Principal
+from social_reply.application.knowledge.authorization import (
+    AuthorizedKnowledgeWrite,
+    authorize_knowledge_write,
+)
 from social_reply.application.knowledge.commands import (
     KnowledgeConflictError,
     KnowledgeNotFoundError,
     decision_references_knowledge,
-    validate_knowledge_actor_scope,
+    validate_knowledge_tenant_scope,
 )
 from social_reply.application.knowledge.drafts import (
     audit_value_hash,
@@ -35,21 +40,21 @@ from social_reply.shared.config import get_settings
 @dataclass(frozen=True)
 class PublishKnowledgeCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     document_id: uuid.UUID
 
 
 @dataclass(frozen=True)
 class UnpublishKnowledgeCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     document_id: uuid.UUID
 
 
 @dataclass(frozen=True)
 class BulkPublishKnowledgeCommand:
     required_tenant_id: str
-    actor: str
+    principal: Principal | None
     document_ids: tuple[uuid.UUID, ...] = ()
 
 
@@ -92,7 +97,7 @@ async def _document(
         select(models.KnowledgeDocument).where(
             models.KnowledgeDocument.tenant_id == tenant_id,
             models.KnowledgeDocument.id == document_id,
-        )
+        ).execution_options(populate_existing=True)
     )
     if document is None:
         raise KnowledgeNotFoundError("knowledge_document_not_found")
@@ -107,6 +112,30 @@ async def _acquire_publication_lock(
     lock_key = f"knowledge-publish:{document.tenant_id}:{document.brand_id}:{normalized_question}"
     await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0))))
 
+
+async def _lock_publication_document(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    document_id: uuid.UUID,
+    safety_lock_held: bool = False,
+) -> models.KnowledgeDocument:
+    if not safety_lock_held:
+        await acquire_xact_lock(
+            session,
+            knowledge_document_safety_lock_key(tenant_id, document_id),
+        )
+    document = await _document(
+        session,
+        tenant_id=tenant_id,
+        document_id=document_id,
+    )
+    await _acquire_publication_lock(session, document)
+    return await _locked_document(
+        session,
+        tenant_id=tenant_id,
+        document_id=document_id,
+    )
 
 async def _require_current_embedding(
     session: AsyncSession,
@@ -260,65 +289,72 @@ def _publication_audit(
     )
 
 
-async def execute_publish_knowledge(
+async def _publish_authorized(
     session: AsyncSession,
-    command: PublishKnowledgeCommand,
     *,
-    bulk: bool = False,
-) -> models.KnowledgeDocument:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
-    )
-    await acquire_xact_lock(
-        session,
-        knowledge_document_safety_lock_key(tenant_id, command.document_id),
-    )
-    document = await _document(
+    tenant_id: str,
+    document_id: uuid.UUID,
+    authorized: AuthorizedKnowledgeWrite,
+    bulk: bool,
+    safety_lock_held: bool = False,
+) -> tuple[models.KnowledgeDocument, bool]:
+    document = await _lock_publication_document(
         session,
         tenant_id=tenant_id,
-        document_id=command.document_id,
-    )
-    await _acquire_publication_lock(session, document)
-    document = await _locked_document(
-        session,
-        tenant_id=tenant_id,
-        document_id=command.document_id,
+        document_id=document_id,
+        safety_lock_held=safety_lock_held,
     )
     if document.status == "published":
-        return document
+        return document, False
     await _require_publishable(session, document)
     previous_status = document.status
     document.status = "published"
     session.add(
         _publication_audit(
             document,
-            actor=actor,
+            actor=authorized.actor,
             action="PUBLISH_KNOWLEDGE",
             previous_status=previous_status,
             target_status="published",
             bulk=bulk,
         )
     )
-    return document
+    return document, True
 
 
-async def execute_unpublish_knowledge(
+async def execute_publish_knowledge(
     session: AsyncSession,
-    command: UnpublishKnowledgeCommand,
+    command: PublishKnowledgeCommand,
+    *,
+    bulk: bool = False,
 ) -> models.KnowledgeDocument:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
-    )
-    await acquire_xact_lock(
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    authorized = await authorize_knowledge_write(
         session,
-        knowledge_document_safety_lock_key(tenant_id, command.document_id),
+        principal=command.principal,
+        tenant_id=tenant_id,
     )
-    document = await _locked_document(
+    document, _changed = await _publish_authorized(
         session,
         tenant_id=tenant_id,
         document_id=command.document_id,
+        authorized=authorized,
+        bulk=bulk,
+    )
+    return document
+
+
+async def _unpublish_authorized(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    document_id: uuid.UUID,
+    authorized: AuthorizedKnowledgeWrite,
+) -> models.KnowledgeDocument:
+    document = await _lock_publication_document(
+        session,
+        tenant_id=tenant_id,
+        document_id=document_id,
     )
     if document.status == "draft":
         return document
@@ -329,7 +365,7 @@ async def execute_unpublish_knowledge(
             session,
             tenant_id=tenant_id,
             document_id=document.id,
-            actor=actor,
+            actor=authorized.actor,
             reason="source knowledge unpublished",
         )
     except LocalizationValidationError as exc:
@@ -341,7 +377,7 @@ async def execute_unpublish_knowledge(
     session.add(
         _publication_audit(
             document,
-            actor=actor,
+            actor=authorized.actor,
             action="UNPUBLISH_KNOWLEDGE",
             previous_status=previous_status,
             target_status="draft",
@@ -351,13 +387,33 @@ async def execute_unpublish_knowledge(
     return document
 
 
+async def execute_unpublish_knowledge(
+    session: AsyncSession,
+    command: UnpublishKnowledgeCommand,
+) -> models.KnowledgeDocument:
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    authorized = await authorize_knowledge_write(
+        session,
+        principal=command.principal,
+        tenant_id=tenant_id,
+    )
+    return await _unpublish_authorized(
+        session,
+        tenant_id=tenant_id,
+        document_id=command.document_id,
+        authorized=authorized,
+    )
+
+
 async def execute_bulk_publish_knowledge(
     session: AsyncSession,
     command: BulkPublishKnowledgeCommand,
 ) -> BulkPublishKnowledgeResult:
-    tenant_id, actor = validate_knowledge_actor_scope(
-        command.required_tenant_id,
-        command.actor,
+    tenant_id = validate_knowledge_tenant_scope(command.required_tenant_id)
+    authorized = await authorize_knowledge_write(
+        session,
+        principal=command.principal,
+        tenant_id=tenant_id,
     )
     statement = select(models.KnowledgeDocument.id).where(
         models.KnowledgeDocument.tenant_id == tenant_id,
@@ -368,23 +424,28 @@ async def execute_bulk_publish_knowledge(
     document_ids = tuple(
         (await session.execute(statement.order_by(models.KnowledgeDocument.id))).scalars()
     )
+    for document_id in document_ids:
+        await acquire_xact_lock(
+            session,
+            knowledge_document_safety_lock_key(tenant_id, document_id),
+        )
     skipped_reasons: Counter[str] = Counter()
     published_count = 0
     for document_id in document_ids:
         try:
-            await execute_publish_knowledge(
+            _, changed = await _publish_authorized(
                 session,
-                PublishKnowledgeCommand(
-                    required_tenant_id=tenant_id,
-                    actor=actor,
-                    document_id=document_id,
-                ),
+                tenant_id=tenant_id,
+                document_id=document_id,
+                authorized=authorized,
                 bulk=True,
+                safety_lock_held=True,
             )
-        except KnowledgeConflictError as exc:
+        except (KnowledgeConflictError, KnowledgeNotFoundError) as exc:
             skipped_reasons[exc.code] += 1
             continue
-        published_count += 1
+        if changed:
+            published_count += 1
     return BulkPublishKnowledgeResult(
         published_count=published_count,
         skipped_count=sum(skipped_reasons.values()),

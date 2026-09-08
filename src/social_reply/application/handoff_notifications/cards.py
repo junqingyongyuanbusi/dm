@@ -98,12 +98,9 @@ def render_handoff_card(snapshot: HandoffCardSnapshot) -> dict[str, object]:
         raise ValueError("handoff_card_state_invalid")
 
     lines = [
-        f"**来源**：{_markdown(snapshot.platform, limit=40)} / "
-        f"{_markdown(snapshot.account_name, limit=80)}",
-        f"**会话**：{_markdown(snapshot.channel_type, limit=40)}",
-        f"**客户**：{_markdown(snapshot.contact_label, limit=80)}",
+        "**人工工单**：客户内容仅在 Reply Core 站内鉴权后可见",
+        f"**工单状态**：{_markdown(state, limit=40)}",
         f"**原因**：{_reason(snapshot.reason_code)}",
-        f"**消息摘要**：{_markdown(snapshot.latest_message, limit=_MAX_SUMMARY_CHARS)}",
         f"**已等待**：{_elapsed_minutes(snapshot)} 分钟",
     ]
     if snapshot.due_at is not None:
