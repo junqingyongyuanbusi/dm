@@ -63,11 +63,14 @@ async def test_startup_request_requires_stopped_processes_and_bound_namespace(co
     )
     request = replace(
         request, startup_namespace=(
-            "dramatiq-cutover-invalid" if confirmed else f"dramatiq-cutover-{request.cutover_id.hex}"
+            "dramatiq-cutover-invalid"
+            if confirmed else f"dramatiq-cutover-{request.cutover_id.hex}"
         ),
     )
     session = AsyncMock()
-    expected = "startup_namespace_mismatch" if confirmed else "processes_stopped_confirmation_required"
+    expected = (
+        "startup_namespace_mismatch" if confirmed else "processes_stopped_confirmation_required"
+    )
     with pytest.raises(ValueError, match=expected):
         await run_cutover(session, request)
     session.begin.assert_not_called()

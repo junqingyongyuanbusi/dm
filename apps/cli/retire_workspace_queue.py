@@ -55,7 +55,8 @@ class CutoverRequest:
             raise ValueError("before_timezone_required")
         if self.before > datetime.now(UTC):
             raise ValueError("before_in_future")
-        if (self.apply or self.startup_namespace is not None) and not self.confirm_processes_stopped:
+        requires_stopped_processes = self.apply or self.startup_namespace is not None
+        if requires_stopped_processes and not self.confirm_processes_stopped:
             raise ValueError("processes_stopped_confirmation_required")
         if self.startup_namespace is not None and self.startup_namespace != (
             f"dramatiq-cutover-{self.cutover_id.hex}"
