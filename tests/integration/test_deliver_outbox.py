@@ -210,46 +210,47 @@ async def test_missing_optional_handoff_route_respects_notification_flag(
 
 async def _seed_human_delivery(session) -> tuple[uuid.UUID, uuid.UUID]:
     conversation_id, outbox_id = await _seed(session, state="HUMAN_ACTIVE")
-    username = f"delivery-human-{uuid.uuid4().hex}"
-    password = f"human-delivery-password-{uuid.uuid4().hex}"
-    user = models.AdminUser(
-        username=username,
-        password_hash=await hash_password(password),
-        tenant_id="default",
-        role="WORKSPACE_ADMIN",
-        must_change_password=False,
-        status="active",
+    await _attach_human_delivery_authority(
+        session, outbox_id, origin_kind="MANUAL_REPLY"
     )
-    session.add(user)
-    await session.commit()
+    return conversation_id, outbox_id
 
-    authenticated = await authenticate(username, password)
-    assert authenticated is not None
-    principal, _token = authenticated
+
+async def _attach_human_delivery_authority(session, outbox_id, *, origin_kind):
+    principal = await _prompt_admin_principal(session)
     assert principal.session_id is not None
     outbox = await session.get(models.OutboxMessage, outbox_id)
     assert outbox is not None
-    session.add(
-        models.HumanWorkItem(
-            tenant_id=outbox.tenant_id,
-            conversation_id=conversation_id,
-            status="CLAIMED",
-            reason_code="TEST_MANUAL_REPLY",
-            assigned_user_id=user.id,
-            assigned_actor=principal.actor,
-            assigned_session_id=principal.session_id,
-            claimed_at=datetime.now(UTC),
-            version=1,
+    work_version = None
+    if origin_kind == "MANUAL_REPLY":
+        work_version = 1
+        session.add(
+            models.HumanWorkItem(
+                tenant_id=outbox.tenant_id,
+                conversation_id=outbox.conversation_id,
+                status="CLAIMED",
+                reason_code="TEST_MANUAL_REPLY",
+                assigned_user_id=principal.user_id,
+                assigned_actor=principal.actor,
+                assigned_session_id=principal.session_id,
+                claimed_at=datetime.now(UTC),
+                version=work_version,
+            )
+        )
+    await session.execute(
+        update(models.OutboxMessage)
+        .where(models.OutboxMessage.id == outbox_id)
+        .values(
+            origin_kind=origin_kind,
+            actor_kind="ADMIN_HUMAN",
+            actor_id=principal.actor,
+            initiator_user_id=principal.user_id,
+            initiator_session_id=principal.session_id,
+            human_work_item_version=work_version,
         )
     )
-    outbox.origin_kind = "MANUAL_REPLY"
-    outbox.actor_kind = "ADMIN_HUMAN"
-    outbox.actor_id = principal.actor
-    outbox.initiator_user_id = user.id
-    outbox.initiator_session_id = principal.session_id
-    outbox.human_work_item_version = 1
     await session.commit()
-    return conversation_id, outbox_id
+    return principal
 
 
 async def _prompt_admin_principal(session):
@@ -598,10 +599,8 @@ async def _mark_ambiguity_match_only_reply(
 
 
 async def _convert_to_approval(session, outbox_id: uuid.UUID, *, final_text: str) -> None:
-    await session.execute(
-        update(models.OutboxMessage)
-        .where(models.OutboxMessage.id == outbox_id)
-        .values(origin_kind="DRAFT_APPROVAL", actor_kind="ADMIN_HUMAN")
+    principal = await _attach_human_delivery_authority(
+        session, outbox_id, origin_kind="DRAFT_APPROVAL"
     )
     await session.execute(
         update(models.ReplyDecision)
@@ -615,7 +614,7 @@ async def _convert_to_approval(session, outbox_id: uuid.UUID, *, final_text: str
                 if final_text == "您好，请提供订单号。"
                 else "EDITED"
             ),
-            reviewed_by="user:admin",
+            reviewed_by=principal.actor,
             reviewed_at=datetime.now(UTC),
             review_outbox_id=outbox_id,
             outbox_id=None,
@@ -630,29 +629,22 @@ async def _convert_to_predecessor_approval(
     *,
     final_text: str,
 ) -> None:
+    await _convert_to_approval(session, outbox_id, final_text=final_text)
     outbox = await session.get(models.OutboxMessage, outbox_id)
+    # Preserve authenticated provenance while exercising the predecessor link layout.
     await session.execute(
         update(models.OutboxMessage)
         .where(models.OutboxMessage.id == outbox_id)
         .values(
-            origin_kind="DRAFT_APPROVAL",
-            actor_kind="ADMIN_HUMAN",
             payload=dict(outbox.payload)
-            | {"approval": "admin", "approved_by": "user:predecessor-admin"},
+            | {"approval": "admin", "approved_by": outbox.actor_id},
         )
     )
     await session.execute(
         update(models.ReplyDecision)
-        .where(models.ReplyDecision.outbox_id == outbox_id)
+        .where(models.ReplyDecision.review_outbox_id == outbox_id)
         .values(
-            action="draft",
-            original_reply_text="您好，请提供订单号。",
-            final_reply_text=final_text,
-            review_action=(
-                "ACCEPTED" if final_text == "您好，请提供订单号。" else "EDITED"
-            ),
-            reviewed_by="user:predecessor-admin",
-            reviewed_at=datetime.now(UTC),
+            outbox_id=outbox_id,
             review_outbox_id=None,
         )
     )
@@ -1102,52 +1094,58 @@ async def test_localization_revoke_serializes_with_review_delivery(session, link
         )
 
         revoke_task = asyncio.create_task(revoke_while_sending())
-        await asyncio.wait_for(started.wait(), timeout=2)
-        blocked_on_artifact = False
-        blocking_detail = None
-        blocker_locks = []
-        for _attempt in range(200):
-            if revoke_task.done():
-                break
-            blocking_detail = (
-                await session.execute(
-                    text(
-                        "SELECT wait_event_type, wait_event, pg_blocking_pids(pid) "
-                        "FROM pg_stat_activity WHERE pid = :pid"
-                    ),
-                    {"pid": revoker_pid[0]},
-                )
-            ).one_or_none()
-            wait_event_type = blocking_detail[0] if blocking_detail is not None else None
-            if wait_event_type == "Lock":
-                blocker_locks = (
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            blocked_on_artifact = False
+            blocking_detail = None
+            blocker_locks = []
+            for _attempt in range(200):
+                if revoke_task.done():
+                    break
+                blocking_detail = (
                     await session.execute(
                         text(
-                            "SELECT pid, locktype, relation::regclass::text, mode, granted, "
-                            "transactionid FROM pg_locks WHERE pid = ANY(:pids) "
-                            "ORDER BY pid, granted, locktype, mode"
+                            "SELECT wait_event_type, wait_event, pg_blocking_pids(pid) "
+                            "FROM pg_stat_activity WHERE pid = :pid"
                         ),
-                        {"pids": [delivery_pid, revoker_pid[0]]},
+                        {"pid": revoker_pid[0]},
                     )
-                ).all()
-                blockers = set(blocking_detail[2])
-                holds_localization_row_lock = any(
-                    lock.pid == delivery_pid
-                    and lock.relation == "knowledge_localizations"
-                    and lock.mode == "RowShareLock"
-                    and lock.granted
-                    for lock in blocker_locks
-                )
-                if delivery_pid in blockers and holds_localization_row_lock:
-                    blocked_on_artifact = True
-                    break
-            await asyncio.sleep(0.01)
+                ).one_or_none()
+                wait_event_type = blocking_detail[0] if blocking_detail is not None else None
+                if wait_event_type == "Lock":
+                    blocker_locks = (
+                        await session.execute(
+                            text(
+                                "SELECT pid, locktype, relation::regclass::text, mode, granted, "
+                                "transactionid FROM pg_locks WHERE pid = ANY(:pids) "
+                                "ORDER BY pid, granted, locktype, mode"
+                            ),
+                            {"pids": [delivery_pid, revoker_pid[0]]},
+                        )
+                    ).all()
+                    blockers = set(blocking_detail[2])
+                    holds_localization_row_lock = any(
+                        lock.pid == delivery_pid
+                        and lock.relation == "knowledge_localizations"
+                        and lock.mode == "RowShareLock"
+                        and lock.granted
+                        for lock in blocker_locks
+                    )
+                    if delivery_pid in blockers and holds_localization_row_lock:
+                        blocked_on_artifact = True
+                        break
+                await asyncio.sleep(0.01)
 
-        if blocked_on_artifact:
-            await delivery_session.commit()
-        else:
+            if blocked_on_artifact:
+                await delivery_session.commit()
+            else:
+                await delivery_session.rollback()
+            revoke_result = await asyncio.wait_for(revoke_task, timeout=2)
+        finally:
             await delivery_session.rollback()
-        revoke_result = await asyncio.wait_for(revoke_task, timeout=2)
+            if not revoke_task.done():
+                revoke_task.cancel()
+            await asyncio.gather(revoke_task, return_exceptions=True)
 
     assert blocked_on_artifact, "send preflight must lock the localization before SENDING commits"
     assert revoke_result == "localization has a sending outbox"
@@ -2464,10 +2462,8 @@ async def test_feishu_manual_reply_and_ambiguous_timeout_share_delivery_semantic
         .where(models.AutomationState.conversation_id == outbox.conversation_id)
         .values(state="HUMAN_ACTIVE")
     )
-    await session.execute(
-        update(models.OutboxMessage)
-        .where(models.OutboxMessage.id == outbox_id)
-        .values(origin_kind="MANUAL_REPLY", actor_kind="ADMIN_HUMAN")
+    await _attach_human_delivery_authority(
+        session, outbox_id, origin_kind="MANUAL_REPLY"
     )
     await session.commit()
     calls = 0
@@ -2975,18 +2971,14 @@ async def test_x_post_reply_is_not_blocked_by_legacy_dm_flag(session, monkeypatc
         assert _account_id == account_id
         return Sender()
 
-    monkeypatch.setattr(
-        outbox_module,
-        "get_settings",
-        lambda: type(
-            "Settings",
-            (),
-            {
-                "x_legacy_dm_enabled": False,
-                "xchat_enabled": False,
-            },
-        )(),
+    settings = get_settings().model_copy(
+        update={
+            "x_legacy_dm_enabled": False,
+            "xchat_enabled": False,
+            "x_public_reply_enabled": True,
+        }
     )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
     monkeypatch.setattr(registry, "get_platform_sender", get_sender)
     monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
 
@@ -3134,6 +3126,11 @@ async def _seed_email_outbox(
             sent_at=sent_at,
         )
     )
+    principal = None
+    if actor_kind == "ADMIN_HUMAN" and origin_kind in {"MANUAL_REPLY", "DRAFT_APPROVAL"}:
+        principal = await _attach_human_delivery_authority(
+            session, outbox_id, origin_kind=origin_kind
+        )
     if (origin_kind, actor_kind) == ("DECISION", "BOT"):
         await session.execute(
             insert(models.ReplyDecision).values(
@@ -3148,6 +3145,7 @@ async def _seed_email_outbox(
             )
         )
     elif (origin_kind, actor_kind) == ("DRAFT_APPROVAL", "ADMIN_HUMAN"):
+        assert principal is not None
         await session.execute(
             insert(models.ReplyDecision).values(
                 tenant_id="default",
@@ -3158,7 +3156,7 @@ async def _seed_email_outbox(
                 original_reply_text="reply",
                 final_reply_text="reply",
                 review_action="ACCEPTED",
-                reviewed_by="user:admin",
+                reviewed_by=principal.actor,
                 reviewed_at=datetime.now(UTC),
                 source="rule",
                 decision_generation=1,
@@ -3170,16 +3168,32 @@ async def _seed_email_outbox(
 
 
 async def test_email_sender_lock_reruns_full_public_preflight(session, monkeypatch):
-    _account_id, outbox_id = await _seed_email_outbox(session)
+    account_id, outbox_id = await _seed_email_outbox(session)
     settings = outbox_module.get_settings().model_copy(
         update={"email_enabled": True, "email_auto_reply_enabled": True}
     )
     monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
     original_preflight = outbox_module._public_bot_send_preflight
+    original_lock = outbox_module.hold_connection_advisory_lock
+    sender_lock_key = outbox_module._email_sender_lock_key(account_id, "sender@example.com")
+    sender_lock_held = False
     checked = []
 
+    @asynccontextmanager
+    async def observed_lock(connection, key):
+        nonlocal sender_lock_held
+        async with original_lock(connection, key):
+            if key == sender_lock_key:
+                sender_lock_held = True
+            try:
+                yield
+            finally:
+                if key == sender_lock_key:
+                    sender_lock_held = False
+
     async def observed_preflight(*args, **kwargs):
-        checked.append(kwargs["outbox"].id)
+        outbox = kwargs["outbox"]
+        checked.append((outbox.id, sender_lock_held, outbox.attempt_count))
         return await original_preflight(*args, **kwargs)
 
     class Sender:
@@ -3190,10 +3204,16 @@ async def test_email_sender_lock_reruns_full_public_preflight(session, monkeypat
         return Sender()
 
     monkeypatch.setattr(outbox_module, "_public_bot_send_preflight", observed_preflight)
+    monkeypatch.setattr(outbox_module, "hold_connection_advisory_lock", observed_lock)
     monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
 
     assert await deliver_outbox(str(outbox_id)) == "SENT"
-    assert checked == [outbox_id, outbox_id]
+    assert checked == [
+        (outbox_id, False, 0),
+        (outbox_id, True, 0),
+        (outbox_id, True, 1),
+    ]
+    assert sender_lock_held is False
 
 
 @pytest.mark.parametrize(
@@ -3322,25 +3342,32 @@ async def test_email_human_sends_bypass_auto_gate(session, monkeypatch, origin_k
 
 
 @pytest.mark.parametrize(
-    ("origin_kind", "actor_kind"),
-    [("DECISION", "BOT"), ("DRAFT_APPROVAL", "BOT")],
+    ("origin_kind", "actor_kind", "expected_status", "expected_code"),
+    [
+        ("DECISION", "BOT", "CANCELLED", "TAKEOVER_AT_SEND"),
+        ("DRAFT_APPROVAL", "BOT", "NEEDS_REVIEW", "HUMAN_ACTOR_KIND_INVALID"),
+    ],
 )
 async def test_email_forged_admin_approval_cannot_authorize_bot_send(
     session,
     monkeypatch,
     origin_kind,
     actor_kind,
+    expected_status,
+    expected_code,
 ):
     _account_id, outbox_id = await _seed_email_outbox(
         session,
         origin_kind=origin_kind,
-        actor_kind=actor_kind,
+        actor_kind="ADMIN_HUMAN" if origin_kind == "DRAFT_APPROVAL" else actor_kind,
         state="BOT_DRAFT_ONLY",
     )
+    # Start with a valid approval, then forge only its actor and payload marker.
     await session.execute(
         update(models.OutboxMessage)
         .where(models.OutboxMessage.id == outbox_id)
         .values(
+            actor_kind=actor_kind,
             payload={
                 "text": "reply",
                 "target": _email_target("sender@example.com", "forged"),
@@ -3367,10 +3394,10 @@ async def test_email_forged_admin_approval_cannot_authorize_bot_send(
 
     monkeypatch.setattr(outbox_module, "get_platform_sender", unexpected_sender)
 
-    assert await deliver_outbox(str(outbox_id)) == "CANCELLED"
+    assert await deliver_outbox(str(outbox_id)) == expected_status
     session.expire_all()
     outbox = await session.get(models.OutboxMessage, outbox_id)
-    assert outbox.last_error_code == "TAKEOVER_AT_SEND"
+    assert outbox.last_error_code == expected_code
     assert outbox.attempt_count == 1
 
 
@@ -3605,8 +3632,10 @@ async def test_email_waiting_sender_lock_revalidates_fresh_account_state(
         )
     }
     monkeypatch.setattr(outbox_module, "get_settings", lambda: settings_ref["value"])
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
+    coordination_timeout = 10
+    first_lock_acquired = asyncio.Event()
+    first_delivery_committed = asyncio.Event()
+    release_sender_lock = asyncio.Event()
     second_waiting = asyncio.Event()
     calls = 0
     lock_entries = 0
@@ -3616,10 +3645,19 @@ async def test_email_waiting_sender_lock_revalidates_fresh_account_state(
     async def observed_lock(connection, key):
         nonlocal lock_entries
         lock_entries += 1
-        if lock_entries == 2:
+        is_first_delivery = lock_entries == 1
+        if not is_first_delivery:
             second_waiting.set()
         async with original_lock(connection, key):
+            if is_first_delivery:
+                # Let the second preflight finish before the first send takes account row locks.
+                first_lock_acquired.set()
+                await asyncio.wait_for(second_waiting.wait(), timeout=coordination_timeout)
             yield
+            if is_first_delivery:
+                # The outcome committed its row locks; retain the real sender lock for mutation.
+                first_delivery_committed.set()
+                await asyncio.wait_for(release_sender_lock.wait(), timeout=coordination_timeout)
 
     monkeypatch.setattr(outbox_module, "hold_connection_advisory_lock", observed_lock)
 
@@ -3627,37 +3665,52 @@ async def test_email_waiting_sender_lock_revalidates_fresh_account_state(
         async def send_text(self, *, target, text):
             nonlocal calls
             calls += 1
-            if calls == 1:
-                first_started.set()
-                await release_first.wait()
             return f"email-stale-lock-{calls}"
 
     async def get_sender(_account_id):
         return Sender()
 
     monkeypatch.setattr(outbox_module, "get_platform_sender", get_sender)
+    second_task = None
     first_task = asyncio.create_task(deliver_outbox(str(first_id)))
-    await asyncio.wait_for(first_started.wait(), timeout=1)
-    second_task = asyncio.create_task(deliver_outbox(str(second_id)))
-    await asyncio.wait_for(second_waiting.wait(), timeout=1)
-    assert second_task.done() is False
+    try:
+        await asyncio.wait_for(first_lock_acquired.wait(), timeout=coordination_timeout)
+        second_task = asyncio.create_task(deliver_outbox(str(second_id)))
+        await asyncio.wait_for(second_waiting.wait(), timeout=coordination_timeout)
+        await asyncio.wait_for(first_delivery_committed.wait(), timeout=coordination_timeout)
+        assert second_task.done() is False
+        assert calls == 1
 
-    if state_change == "disable":
-        settings_ref["value"] = settings_ref["value"].model_copy(update={"email_enabled": False})
-    else:
-        async with get_session_factory()() as mutation_session:
-            await mutation_session.execute(
-                update(models.PlatformAccount)
-                .where(models.PlatformAccount.id == account_id)
-                .values(
-                    config={"delivery_mode": "direct", "email_health_status": "ERROR"}
-                )
+        if state_change == "disable":
+            settings_ref["value"] = settings_ref["value"].model_copy(
+                update={"email_enabled": False}
             )
-            await mutation_session.commit()
+        else:
+            async with get_session_factory()() as mutation_session:
+                async with asyncio.timeout(coordination_timeout):
+                    await mutation_session.execute(
+                        update(models.PlatformAccount)
+                        .where(models.PlatformAccount.id == account_id)
+                        .values(
+                            config={"delivery_mode": "direct", "email_health_status": "ERROR"}
+                        )
+                    )
+                    await mutation_session.commit()
 
-    release_first.set()
-    assert await first_task == "SENT"
-    assert await second_task == "NEEDS_REVIEW"
+        release_sender_lock.set()
+        assert await asyncio.wait_for(first_task, timeout=coordination_timeout) == "SENT"
+        assert await asyncio.wait_for(second_task, timeout=coordination_timeout) == "NEEDS_REVIEW"
+    finally:
+        release_sender_lock.set()
+        second_waiting.set()
+        delivery_tasks = tuple(task for task in (first_task, second_task) if task is not None)
+        for delivery_task in delivery_tasks:
+            if not delivery_task.done():
+                delivery_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(*delivery_tasks, return_exceptions=True),
+            timeout=coordination_timeout,
+        )
     assert calls == 1
     session.expire_all()
     second = await session.get(models.OutboxMessage, second_id)

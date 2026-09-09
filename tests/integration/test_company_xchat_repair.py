@@ -44,6 +44,7 @@ async def _seed_xchat_account(
     *,
     owner_user_id: uuid.UUID,
     grant_user_id: uuid.UUID | None = None,
+    grant_account_access: bool = False,
 ):
     seed = await seed_conversation(
         session,
@@ -69,6 +70,15 @@ async def _seed_xchat_account(
         account.capability = {"dm": True, "x_chat": False, "repair_marker": "preserve"}
         account.config_version = 1
         if grant_user_id is not None:
+            if grant_account_access:
+                fresh.add(
+                    models.AccountAccessGrant(
+                        tenant_id="default",
+                        platform_account_id=seed.account_id,
+                        user_id=grant_user_id,
+                        active=True,
+                    )
+                )
             fresh.add(
                 models.AccountReauthorizationGrant(
                     tenant_id="default",
@@ -179,7 +189,7 @@ def _stub_dispatch(monkeypatch) -> list[tuple[str, tuple, dict]]:
 
 # Both POST adapters are intended to reach the same grant-aware repair service.
 @pytest.mark.parametrize("route", ["saas", "legacy"])
-async def test_user_active_grant_repair_preserves_scope_and_denies_inbox(
+async def test_user_with_both_grants_repair_preserves_scope_and_allows_inbox(
     session, monkeypatch, route
 ):
     owner = await create_staff(session, username=f"xchat-owner-{uuid.uuid4().hex}")
@@ -190,6 +200,7 @@ async def test_user_active_grant_repair_preserves_scope_and_denies_inbox(
         session,
         owner_user_id=owner.user_id,
         grant_user_id=operator.user_id,
+        grant_account_access=True,
     )
     client_calls, unlock_calls = _stub_xchat_network(monkeypatch)
     dispatched = _stub_dispatch(monkeypatch)
@@ -205,8 +216,7 @@ async def test_user_active_grant_repair_preserves_scope_and_denies_inbox(
         )
         assert response.status_code == 303, response.text
         inbox = await client.get(f"/app/t/default/conversations/{seed.conversation_id}")
-        assert inbox.status_code == 404
-        assert inbox.json() == {"detail": "conversation_not_found"}
+        assert inbox.status_code == 200
 
     state = await _account_snapshot(seed.account_id)
     assert state["owner_user_id"] == owner.user_id
@@ -251,12 +261,20 @@ async def test_user_active_grant_repair_preserves_scope_and_denies_inbox(
 
 
 
-async def test_user_without_active_grant_is_rejected_without_network(session, monkeypatch):
+@pytest.mark.parametrize("route", ["saas", "legacy"])
+@pytest.mark.parametrize("has_reauthorization_grant", [False, True])
+async def test_user_without_account_access_is_rejected_without_network(
+    session, monkeypatch, route, has_reauthorization_grant
+):
     owner = await create_staff(session, username=f"xchat-no-grant-owner-{uuid.uuid4().hex}")
     operator = await create_staff(
         session, username=f"xchat-no-grant-user-{uuid.uuid4().hex}", role="OPERATOR"
     )
-    seed = await _seed_xchat_account(session, owner_user_id=owner.user_id)
+    seed = await _seed_xchat_account(
+        session,
+        owner_user_id=owner.user_id,
+        grant_user_id=operator.user_id if has_reauthorization_grant else None,
+    )
     before = await _account_snapshot(seed.account_id)
     client_calls, unlock_calls = _stub_xchat_network(monkeypatch)
     dispatched = _stub_dispatch(monkeypatch)
@@ -265,13 +283,16 @@ async def test_user_without_active_grant_is_rejected_without_network(session, mo
         csrf = await login_client(client, username=operator.username, password=operator.password)
         response = await _post_repair(
             client,
-            route="saas",
+            route=route,
             account_id=seed.account_id,
             csrf=csrf,
             expected_config_version="1",
         )
         assert response.status_code == 403
         assert response.json() == {"detail": "account_reauthorization_denied"}
+        inbox = await client.get(f"/app/t/default/conversations/{seed.conversation_id}")
+        assert inbox.status_code == 404
+        assert inbox.json() == {"detail": "conversation_not_found"}
 
     assert client_calls == []
     assert unlock_calls == []
@@ -363,6 +384,7 @@ async def test_repair_rechecks_session_after_real_revoke_during_unlock(session, 
         session,
         owner_user_id=owner.user_id,
         grant_user_id=operator.user_id,
+        grant_account_access=True,
     )
     before = await _account_snapshot(seed.account_id)
     unlock_started = asyncio.Event()
@@ -412,6 +434,7 @@ async def test_repair_cas_keeps_new_oauth_write_after_unlock_race(session, monke
         session,
         owner_user_id=owner.user_id,
         grant_user_id=operator.user_id,
+        grant_account_access=True,
     )
     unlock_started = asyncio.Event()
     release_unlock = asyncio.Event()

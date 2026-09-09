@@ -2978,10 +2978,12 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
         )
 
     assert bad_csrf.status_code == 403
+    assert bad_csrf.json() == {"detail": "invalid_csrf_token"}
     assert first.status_code == second.status_code == 303
     assert "notice=bulk_published&published=2" in first.headers["location"]
     assert "notice=bulk_published&published=0" in second.headers["location"]
-    assert foreign_attempt.status_code == 403
+    assert foreign_attempt.status_code == 404
+    assert foreign_attempt.json() == {"detail": "tenant_workspace_not_found"}
     session.expire_all()
     assert (await session.get(models.KnowledgeDocument, normal_id)).status == "published"
     assert (await session.get(models.KnowledgeDocument, normal_two_id)).status == "published"
@@ -3456,7 +3458,8 @@ async def test_knowledge_csv_import_rejects_bad_tenant_and_csrf(migrated_db, mon
             data={"csrf_token": csrf},
             files={"file": ("t.csv", payload, "text/csv")},
         )
-        assert bad_tenant.status_code == 403
+        assert bad_tenant.status_code == 404
+        assert bad_tenant.json() == {"detail": "tenant_workspace_not_found"}
 
         no_csrf = await client.post(
             "/app/t/default/knowledge/import",
@@ -3464,6 +3467,7 @@ async def test_knowledge_csv_import_rejects_bad_tenant_and_csrf(migrated_db, mon
             files={"file": ("t.csv", payload, "text/csv")},
         )
         assert no_csrf.status_code == 403
+        assert no_csrf.json() == {"detail": "invalid_csrf_token"}
 
 
 async def test_global_killswitch_has_separate_safety_page(migrated_db):

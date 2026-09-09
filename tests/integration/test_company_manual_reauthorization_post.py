@@ -14,7 +14,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("has_owner", [True, False])
-async def test_manual_reauthorization_post_creates_canonical_job_without_inbox_access(
+async def test_manual_reauthorization_post_requires_access_and_reauthorization_grants(
     session, monkeypatch, has_owner
 ):
     password = "manual-reconnection-password"
@@ -84,7 +84,24 @@ async def test_manual_reauthorization_post_creates_canonical_job_without_inbox_a
         assert 'id="maintenance-channels"' in maintenance.text
         assert f"/channels/accounts/{account_id}" in maintenance.text
         private = await client.get(f"/app/t/default/conversations/{conversation_id}")
-        assert private.status_code in {403, 404}
+        assert private.status_code == 404
+        assert private.json() == {"detail": "conversation_not_found"}
+        maintenance_only = await client.post(
+            "/app/t/default/channels/accounts/telegram",
+            params={"target_account_id": str(account_id), "expected_config_version": version},
+            data={"csrf_token": csrf, "token": "replacement-token-for-test"},
+        )
+        assert maintenance_only.status_code == 403
+        assert maintenance_only.json() == {"detail": "account_reauthorization_denied"}
+        assert await session.scalar(select(models.ProvisioningJob.id).limit(1)) is None
+        assert dispatched == []
+        access_grant = models.AccountAccessGrant(
+            tenant_id="default",
+            platform_account_id=account_id,
+            user_id=operator_id,
+            active=True,
+        )
+        session.add(access_grant)
         grant = await session.scalar(
             select(models.AccountReauthorizationGrant).where(
                 models.AccountReauthorizationGrant.user_id == operator_id,
@@ -95,7 +112,20 @@ async def test_manual_reauthorization_post_creates_canonical_job_without_inbox_a
         await session.commit()
         removed = await client.get("/app/t/default/channels")
         assert removed.status_code == 200
-        assert 'id="maintenance-channels"' not in removed.text
+        assert f"/channels/accounts/{account_id}" in removed.text
+        readable = await client.get(f"/app/t/default/conversations/{conversation_id}")
+        assert readable.status_code == 200
+        revoked = await client.post(
+            "/app/t/default/channels/accounts/telegram",
+            params={"target_account_id": str(account_id), "expected_config_version": version},
+            data={"csrf_token": csrf, "token": "replacement-token-for-test"},
+        )
+        assert revoked.status_code == 403
+        assert revoked.json() == {"detail": "account_reauthorization_denied"}
+        await session.refresh(access_grant)
+        assert access_grant.active is True
+        assert await session.scalar(select(models.ProvisioningJob.id).limit(1)) is None
+        assert dispatched == []
         grant.active = True
         await session.commit()
         for forbidden_option in ("rotate_webhook_secret", "drop_pending_updates"):
@@ -133,7 +163,7 @@ async def test_manual_reauthorization_post_creates_canonical_job_without_inbox_a
         assert "replacement-token-for-test" not in str(job.staging_secret)
         assert len(dispatched) == 1
         private_conversation = await client.get(f"/app/t/default/conversations/{conversation_id}")
-        assert private_conversation.status_code in {403, 404}
+        assert private_conversation.status_code == 200
     await session.refresh(account)
     assert account.owner_user_id == expected_owner
     assert account.shared_with_support is False
