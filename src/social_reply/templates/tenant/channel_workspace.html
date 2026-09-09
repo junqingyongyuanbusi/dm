@@ -1,0 +1,100 @@
+{% macro channel_card(account) -%}
+<article class="channel-workspace-account" data-channel-health="{{ account.health_tone }}">
+  <div class="channel-workspace-card-top">
+    <span class="channel-workspace-platform channel-workspace-platform-{{ account.platform }}" aria-label="{{ account.platform_label }}">
+      {% if account.platform == 'instagram' %}
+      <svg aria-hidden="true" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="18" height="18" rx="5"></rect><circle cx="12" cy="12" r="4"></circle><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"></circle></svg>
+      {% elif account.platform == 'whatsapp' %}
+      <svg aria-hidden="true" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M20 11.5a8 8 0 0 1-11.8 7L4 20l1.4-4.1A8 8 0 1 1 20 11.5Z"></path><path d="M9 8c0 4 3 7 6 7l1-2-2-1-1 1-2-2 1-1-1-2Z" stroke-linejoin="round"></path></svg>
+      {% elif account.platform in ('facebook', 'telegram', 'x', 'email', 'feishu') %}
+      <img src="/static/channel-icons/{{ account.platform }}.svg" alt="{{ account.platform_label }}" width="24" height="24">
+      {% else %}<span aria-hidden="true">?</span>{% endif %}
+    </span>
+    <span class="channel-workspace-badge channel-workspace-badge-{{ account.health_tone }}">{{ account.health_label }}</span>
+  </div>
+  <div class="channel-workspace-identity">
+    <h3>{{ account.name }}</h3>
+    <p>{{ account.identity }}</p>
+  </div>
+  <div class="channel-workspace-capabilities" aria-label="{{ copy('capabilities') }}">
+    {% for label, enabled in account.capabilities %}
+    <span class="channel-workspace-badge{% if not enabled %} channel-workspace-badge-muted{% endif %}">{{ label }}{% if not enabled %} · {{ copy('not_enabled') }}{% endif %}</span>
+    {% else %}<span class="channel-workspace-badge">{{ copy('capabilities_unknown') }}</span>{% endfor %}
+  </div>
+  <dl class="channel-workspace-account-details">
+    <div><dt>{{ copy('brand') }}</dt><dd>{{ account.brand_id }}</dd></div>
+    <div><dt>{{ copy('owner') }}</dt><dd>{{ account.owner_name }}</dd></div>
+    {% if account.kill_switch_enabled %}<div><dt>{{ copy('blocked') }}</dt><dd><span class="channel-workspace-blocked">{{ copy('sending_blocked') }}</span></dd></div>{% endif %}
+  </dl>
+  <footer class="channel-workspace-card-footer">
+    <span class="channel-workspace-automation"><span aria-hidden="true">&#10023;</span>{{ account.automation_label }}</span>
+    <a class="channel-workspace-button channel-workspace-button-small" href="{{ root }}/channels/accounts/{{ account.account_id }}" aria-label="{{ copy('manage') }} {{ account.name }}">{{ copy('manage') }}</a>
+  </footer>
+</article>
+{%- endmacro %}
+{% if card_only %}
+{{ channel_card(card_only) }}
+{% else %}
+<div class="channel-workspace">
+  {{ banner_html }}
+  <div class="channel-workspace-metrics" aria-label="{{ copy('overview') }}">
+    {% for key, label, value in metrics %}
+    <section class="channel-workspace-metric" aria-labelledby="channel-metric-{{ key }}">
+      <h2 id="channel-metric-{{ key }}">{{ label }}</h2>
+      <strong data-metric="{{ key }}">{{ value }}</strong>
+    </section>
+    {% endfor %}
+  </div>
+
+  <form class="channel-workspace-toolbar" method="get" action="{{ root }}/channels" role="search" aria-label="{{ copy('search') }}">
+    {% if requested_brand_id %}<input type="hidden" name="brand_id" value="{{ brand_id }}">{% endif %}
+    <label class="channel-workspace-search" for="channel-workspace-search">
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 4 4"></path></svg>
+      <input id="channel-workspace-search" name="q" type="search" maxlength="120" value="{{ filters.query }}" placeholder="{{ copy('search_placeholder') }}" aria-label="{{ copy('search_placeholder') }}">
+    </label>
+    <select name="platform" aria-label="{{ copy('platform_filter') }}">
+      {% for platform in platform_links %}<option value="{{ platform.value }}"{% if filters.platform == platform.value %} selected{% endif %}>{{ platform.label }}</option>{% endfor %}
+    </select>
+    <select name="channel_status" aria-label="{{ copy('status_filter') }}">
+      {% for value, label in status_options %}<option value="{{ value }}"{% if filters.channel_status == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+    </select>
+    <button class="channel-workspace-button" type="submit">{{ copy('filter') }}</button>
+    {% if filters.query or filters.platform != 'all' or filters.channel_status != 'all' %}<a class="channel-workspace-reset" href="{{ reset_url }}">{{ copy('clear_filters') }}</a>{% endif %}
+    <span class="channel-workspace-result-count" role="status">{{ copy('result_count').format(count=accounts|length, total=total_accounts) }}</span>
+  </form>
+
+  <div class="channel-workspace-grid" aria-label="{{ copy('accounts') }}">
+    {% for account in accounts %}{{ channel_card(account) }}{% endfor %}
+    {% if can_connect %}
+    <button class="channel-workspace-account channel-workspace-add" type="button" data-open-channel-workspace aria-haspopup="dialog" aria-controls="add-channels">
+      <span class="channel-workspace-add-symbol" aria-hidden="true">+</span>
+      <strong>{{ copy('connect_another') }}</strong>
+      <p>Facebook{{ copy('platform_separator') }}Instagram{{ copy('platform_separator') }}Telegram<br>X{{ copy('platform_separator') }}WhatsApp{{ copy('platform_separator') }}{{ copy('email') }}{{ copy('platform_or') }}{{ copy('feishu') }}</p>
+    </button>
+    {% endif %}
+  </div>
+  {% if not accounts %}
+  <div class="channel-workspace-empty" role="status">
+    <h2>{% if filters.query or filters.platform != 'all' or filters.channel_status != 'all' %}{{ copy('no_matches') }}{% else %}{{ copy('no_accounts') }}{% endif %}</h2>
+    <p>{{ copy('empty_connect' if can_connect else 'empty_readonly') }}</p>
+  </div>
+  {% endif %}
+  {% if can_connect %}
+  <dialog id="add-channels" class="channel-workspace-connect" aria-labelledby="channel-connect-title">
+    <header class="channel-workspace-dialog-header">
+      <h2 id="channel-connect-title">{{ copy('add_channels') }}</h2>
+      <button type="button" class="channel-workspace-button" data-close-channel-workspace aria-label="{{ copy('close') }}">{{ copy('close') }}</button>
+    </header>
+    <div class="channel-workspace-connect-body">
+      <div class="saas-provider-grid">{{ provider_html }}</div>
+    </div>
+  </dialog>
+  {% endif %}
+  {{ maintenance_html }}
+  <details class="channel-workspace-progress"{% if pending_job_count %} open{% endif %}>
+    <summary><span><strong>{{ copy('progress') }}</strong><small>{{ copy('recent_jobs').format(count=pending_job_count) }}</small></span></summary>
+    <div class="saas-channel-jobs">{{ jobs_html }}</div>
+  </details>
+  {{ dialogs_html }}
+</div>
+{% endif %}

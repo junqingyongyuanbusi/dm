@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from social_reply.application.account_management.access import (
     lock_session_authorities,
     lock_user_authority,
-    user_can_access_account,
+    user_can_access_account_in_session,
 )
 from social_reply.application.account_management.auth import FeishuActionProof, Principal
 from social_reply.application.account_management.human_workflow import (
@@ -20,6 +20,7 @@ from social_reply.application.account_management.human_workflow import (
     claim_human_work_item_in_session,
     resolve_human_work_item_in_session,
 )
+from social_reply.application.account_management.permissions import user_has_capability
 from social_reply.application.handoff_notifications.projection import (
     render_current_handoff_card,
 )
@@ -501,7 +502,6 @@ async def handle_feishu_card_action(
                     models.AdminUser.id == operator.admin_user_id,
                     models.AdminUser.tenant_id == tenant_id,
                     models.AdminUser.status == "active",
-                    models.AdminUser.role.in_(["USER", "WORKSPACE_ADMIN"]),
                 )
             )
             if operator is not None and operator.admin_user_id is not None
@@ -510,7 +510,8 @@ async def handle_feishu_card_action(
         if (
             not permission_allowed
             or admin_user is None
-            or not user_can_access_account(admin_user, customer_account)
+            or not user_has_capability(admin_user, "takeover")
+            or not await user_can_access_account_in_session(session, admin_user, customer_account)
         ):
             response = _response("error", "你没有该 Tenant 的工单操作权限")
             receipt.outcome = "UNAUTHORIZED"
@@ -549,6 +550,9 @@ async def handle_feishu_card_action(
             role=admin_user.role,
             authentication_kind="FEISHU_ACTION",
             action_proof=proof,
+            operator_reply_enabled=admin_user.operator_reply_enabled is True,
+            operator_takeover_enabled=admin_user.operator_takeover_enabled is True,
+            account_access_ids=frozenset({customer_account.id}),
         )
         try:
             if parsed.action == "claim":

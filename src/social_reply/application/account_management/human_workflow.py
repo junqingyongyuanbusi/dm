@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import and_, or_, select, update
@@ -12,12 +12,15 @@ from social_reply.application.account_management.access import (
     lock_session_authorities,
     lock_user_authority,
     user_can_access_account,
+    user_can_access_account_in_session,
 )
 from social_reply.application.account_management.auth import (
     Principal,
+    _account_access_ids,
     authenticated_principal_context,
     principal_from_session_row,
 )
+from social_reply.application.account_management.permissions import user_has_capability
 from social_reply.application.handoff_notifications.service import (
     advance_handoff_notification_for_work,
     lock_handoff_notification_action,
@@ -242,7 +245,18 @@ async def _refresh_principal(
         or proof.action != expected_action
     ):
         raise HumanWorkflowError("feishu_action_proof_invalid")
-    return principal
+    user = await session.scalar(
+        select(models.AdminUser).where(models.AdminUser.id == principal.user_id)
+        .execution_options(populate_existing=True)
+    )
+    if user is None or not user_has_capability(user, "takeover"):
+        raise HumanWorkflowError("human_account_access_denied")
+    return replace(
+        principal, role=user.role, must_change_password=user.must_change_password,
+        operator_reply_enabled=user.operator_reply_enabled is True,
+        operator_takeover_enabled=user.operator_takeover_enabled is True,
+        account_access_ids=await _account_access_ids(session, user),
+    )
 
 
 async def _verify_feishu_action_proof(
@@ -608,6 +622,7 @@ async def _authorize_human_actor(
     tenant_id: str,
     actor: str,
     user_id: uuid.UUID | None,
+    required_capability: str = "takeover",
 ) -> tuple[Principal, models.AdminUser | None, uuid.UUID | None, str]:
     if principal is None or current_principal is None:
         raise HumanWorkflowError("human_principal_required")
@@ -616,6 +631,7 @@ async def _authorize_human_actor(
         tenant_id not in current.allowed_tenants
         or current.tenant_id not in {None, tenant_id}
         or current.must_change_password
+        or not current.has_capability(required_capability)
         or not current.can_access_account(account)
     ):
         raise HumanWorkflowError("human_account_access_denied")
@@ -638,9 +654,11 @@ async def _authorize_human_actor(
         or staff_user.tenant_id != tenant_id
         or staff_user.username != current.username
         or staff_user.status != "active"
-        or staff_user.role not in {"USER", "WORKSPACE_ADMIN"}
+        or not user_has_capability(staff_user, required_capability)
         or staff_user.must_change_password != current.must_change_password
-        or not user_can_access_account(staff_user, account)
+        or not user_can_access_account(
+            staff_user, account, account_access_ids=current.account_access_ids
+        )
     ):
         raise HumanWorkflowError("human_account_access_denied")
     expected_actor = f"user:{staff_user.username}"
@@ -1130,8 +1148,14 @@ async def transfer_human_work_item(
         if (
             target.tenant_id != conversation.tenant_id
             or target.status != "active"
-            or target.role not in {"USER", "WORKSPACE_ADMIN"}
-            or not user_can_access_account(target, account)
+            or not (
+                user_has_capability(target, "takeover")
+                or (
+                    current_principal.is_workspace_admin
+                    and user_has_capability(target, "reply")
+                )
+            )
+            or not await user_can_access_account_in_session(session, target, account)
         ):
             raise HumanWorkflowError("human_transfer_target_not_accessible")
         if state.state not in {"HANDOFF_PENDING", "HUMAN_ACTIVE"}:
@@ -1460,6 +1484,7 @@ async def send_human_reply(
             tenant_id=conversation.tenant_id,
             actor=actor,
             user_id=user_id,
+            required_capability="reply",
         )
         if account.status != "active":
             raise HumanWorkflowConflict("human_account_access_denied")

@@ -63,10 +63,14 @@ from social_reply.application.account_management.feishu_handoff_service import (
     set_feishu_handoff_operator_status,
     upsert_feishu_handoff_operator,
 )
+from social_reply.application.account_management.financial_knowledge import (
+    FINANCIAL_KNOWLEDGE_TEMPLATES,
+)
+from social_reply.application.account_management.home_dashboard_data import load_home_dashboard
+from social_reply.application.account_management.home_dashboard_view import render_home_dashboard
 from social_reply.application.account_management.home_overview import (
     HomeBusinessActivity,
     HomeChannelAlert,
-    load_home_overview,
 )
 from social_reply.application.account_management.human_workflow import (
     HumanWorkflowError,
@@ -81,6 +85,12 @@ from social_reply.application.account_management.jobs import (
     provisioning_job_is_in_flight,
     public_job,
     requires_secret_resubmission,
+)
+from social_reply.application.account_management.knowledge_read_view import (
+    knowledge_matches_search,
+    knowledge_search_query,
+    render_knowledge_workspace,
+    render_published_knowledge,
 )
 from social_reply.application.account_management.meta_credentials import (
     facebook_app_credentials,
@@ -127,9 +137,17 @@ from social_reply.application.account_management.templating import (
     trusted_html,
 )
 from social_reply.application.account_management.ui_i18n import (
+    get_locale,
     reset_request_location,
     set_request_location,
     translate,
+)
+from social_reply.application.account_management.workspace_audit import (
+    audit_read_condition,
+    auditor_safe_detail,
+)
+from social_reply.application.account_management.workspace_route_policy import (
+    require_workspace_route,
 )
 from social_reply.application.account_management.x_app import x_app_credentials
 from social_reply.application.account_management.xchat_activation import XChatActivationError
@@ -356,6 +374,7 @@ async def _require_tenant_principal(
     if tenant_id != DEFAULT_TENANT_ID:
         raise HTTPException(status_code=404, detail="tenant_workspace_not_found")
     principal.require_tenant(tenant_id)
+    require_workspace_route(principal, request.url.path, request.method, tenant_id)
     return principal
 
 
@@ -718,71 +737,23 @@ async def tenant_home(request: Request, tenant_id: str) -> Response:
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
+    if not principal.has_capability("home.read"):
+        return RedirectResponse(f"{_tenant_root(tenant_id)}/inbox", status_code=303)
     now = datetime.now(UTC)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     async with get_session_factory()() as session:
-        inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-        message_count = await session.scalar(
-            select(func.count())
-            .select_from(models.Message)
-            .join(
-                models.Conversation,
-                models.Message.conversation_id == models.Conversation.id,
-            )
-            .join(
-                models.PlatformAccount,
-                models.Conversation.platform_account_id == models.PlatformAccount.id,
-            )
-            .where(
-                models.Conversation.tenant_id == tenant_id,
-                _account_scope_condition(principal, tenant_id),
-                models.Message.created_at >= today_start,
-            )
-        )
-        overview = await load_home_overview(session, principal, tenant_id, settings=get_settings())
-    active_queue_count = sum(
-        count > 0
-        for count in (
-            inbox_summary.human_count,
-            inbox_summary.draft_count,
-            inbox_summary.delivery_count,
-        )
-    )
-    next_action = _home_next_action(tenant_id, inbox_summary) if active_queue_count > 1 else ""
-    queue_summary = _home_queue_summary_grid(tenant_id, inbox_summary)
-
-    body = render_template(
-        "tenant/home.html",
-        channel_alerts=_home_alert_views(tenant_id, overview.alerts),
-        alerts_title=translate("home.alerts_title"),
-        alerts_description=translate("home.alerts_description"),
-        view_channel_label=translate("home.view_channel"),
-        attention_title=translate("home.attention_title"),
-        next_action_html=trusted_html(next_action),
-        queue_summary_html=trusted_html(queue_summary),
-        today_title=translate("home.today_overview"),
-        today_description=translate("home.today_message_scope"),
-        message_count=int(message_count or 0),
-        message_count_label=translate("home.metric.today_messages"),
-        business_activity_title=translate("home.business_activity_title"),
-        business_activity_description=translate("home.business_activity_description"),
-        business_activities=_home_activity_views(tenant_id, overview.activities),
-        view_conversation_label=translate("home.view_conversation"),
-    )
-    return _render_page(
+        dashboard = await load_home_dashboard(session, principal, tenant_id, now=now)
+    body = render_home_dashboard(dashboard, tenant_id, now, can_manage=principal.is_admin)
+    response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
         title=translate("home.title"),
-        description=(
-            translate("home.description", tenant_id=tenant_id, count=inbox_summary.total)
-            if inbox_summary.total
-            else ""
-        ),
+        description="",
         body=body,
         active_navigation="home",
-        inbox_count=inbox_summary.total,
-        breadcrumbs=((translate("nav.home"), None), (translate("home.workspace_overview"), None)),
+        inbox_count=dashboard.pending_count,
     )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _home_next_action(
@@ -855,14 +826,14 @@ def _home_queue_summary_grid(
             else ""
         )
         cards.append(
-            f'<a href="{root}/inbox?queue={queue}" class="saas-home-metric-card">'
+            f'<a href="{root}/inbox?queue={queue}" class="saas-metric saas-home-metric-card">'
             f'<span class="saas-metric-label">{escape(translate(label_key))}</span>'
             '<div class="saas-metric-row">'
-            f'<span class="saas-metric-num font-mono">{count}</span>'
+            f'<span class="saas-metric-value saas-metric-num font-mono">{count}</span>'
             f"{wait_html}</div>"
             f'<span class="saas-home-record-action">{escape(translate("home.open_queue"))}</span></a>'
         )
-    return '<section class="saas-status-summary saas-home-metrics">' + "".join(cards) + "</section>"
+    return "".join(cards)
 
 
 def _home_alert_views(
@@ -2297,7 +2268,7 @@ async def _agent_test_page_response(
     test_body, agent_mode = _render_agent_test_workspace(
         tenant_id=tenant_id,
         agent_id=agent_id,
-        can_run=principal.is_admin,
+        can_run=principal.has_capability("playground.read"),
         csrf_token=_csrf(request),
         accounts=accounts,
         prompt_pointer=prompt_pointer,
@@ -2354,7 +2325,7 @@ async def run_agent_test(
     tenant_id: str,
     agent_id: str,
 ) -> Response:
-    principal = await _require_tenant_admin_principal(request, tenant_id)
+    principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as authorization_session:
@@ -2983,7 +2954,6 @@ def _render_inbox_workspace(
     )
 
 
-@router.get("/app/t/{tenant_id}/inbox", response_class=HTMLResponse)
 async def tenant_inbox(
     request: Request,
     tenant_id: str,
@@ -3998,12 +3968,28 @@ async def tenant_conversation_detail(
                         .where(
                             models.AdminUser.tenant_id == tenant_id,
                             models.AdminUser.status == "active",
-                            models.AdminUser.role.in_(("USER", "WORKSPACE_ADMIN")),
+                            models.AdminUser.must_change_password.is_(False),
+                            or_(
+                                models.AdminUser.role.in_(("USER", "AGENT", "MANAGER", "WORKSPACE_ADMIN")),
+                                and_(
+                                    models.AdminUser.role == "OPERATOR",
+                                    or_(
+                                        models.AdminUser.operator_takeover_enabled.is_(True),
+                                        and_(principal.is_admin, models.AdminUser.operator_reply_enabled.is_(True)),
+                                    ),
+                                ),
+                            ),
                             models.AdminUser.id != work_item.assigned_user_id,
                             or_(
                                 models.AdminUser.role == "WORKSPACE_ADMIN",
                                 models.AdminUser.id == account.owner_user_id,
-                                account.shared_with_support is True,
+                                models.AdminUser.id.in_(
+                                    select(models.AccountAccessGrant.user_id).where(
+                                        models.AccountAccessGrant.tenant_id == tenant_id,
+                                        models.AccountAccessGrant.platform_account_id == account.id,
+                                        models.AccountAccessGrant.active.is_(True),
+                                    )
+                                ),
                             ),
                         )
                         .order_by(models.AdminUser.username)
@@ -4023,7 +4009,9 @@ async def tenant_conversation_detail(
         for message in reversed(newest_messages)
     )
     work_actions = ""
-    if work_item is None:
+    if not principal.has_capability("takeover"):
+        work_actions = ""
+    elif work_item is None:
         work_actions = f"""<form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/conversations/{conversation_id}/start-reception">
 <input type="hidden" name="csrf_token" value="{csrf}">
 <button class="saas-button primary" type="submit">{escape(translate("conversation.start_reception"))}</button></form>
@@ -4064,6 +4052,7 @@ async def tenant_conversation_detail(
         and work_item is not None
         and work_item.status == "CLAIMED"
         and owns_work
+        and principal.has_capability("reply")
     )
     if can_reply:
         reply_form = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("conversation.reply_title"))}</h2>
@@ -4124,7 +4113,9 @@ async def start_tenant_human_reception(
     except (TypeError, ValueError, HumanWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(
-        f"{_tenant_root(tenant_id)}/conversations/{conversation_id}",
+        f"{_tenant_root(tenant_id)}/inbox?item_id={conversation_id}"
+        if form.get("return_to") == "inbox"
+        else f"{_tenant_root(tenant_id)}/conversations/{conversation_id}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -4252,7 +4243,9 @@ async def reply_to_tenant_conversation(
     except (TypeError, ValueError, HumanWorkflowError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedirectResponse(
-        f"{_tenant_root(tenant_id)}/conversations/{conversation_id}",
+        f"{_tenant_root(tenant_id)}/inbox?item_id={conversation_id}"
+        if form.get("return_to") == "inbox"
+        else f"{_tenant_root(tenant_id)}/conversations/{conversation_id}",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -4268,7 +4261,9 @@ async def tenant_knowledge_query(request: Request, tenant_id: str) -> Response:
             f"{_tenant_root(tenant_id)}/knowledge-query",
             status_code=status.HTTP_303_SEE_OTHER,
         )
-    query = ""
+    query = request.query_params.get("keyword", "")
+    if query and query not in {template.keyword for template in FINANCIAL_KNOWLEDGE_TEMPLATES}:
+        raise HTTPException(status_code=422, detail="knowledge_topic_invalid")
     if request.method == "POST":
         form = await _form(request)
         _require_csrf(request, form)
@@ -4341,7 +4336,7 @@ async def tenant_knowledge_query(request: Request, tenant_id: str) -> Response:
             title=translate("knowledge_query.title"),
             description=translate("knowledge_query.description"),
             body=body,
-            active_navigation="knowledge-query",
+            active_navigation="knowledge",
             inbox_count=inbox_summary.total,
         )
     finally:
@@ -4466,19 +4461,14 @@ def _channel_avatar(account: models.PlatformAccount) -> str:
 
 
 def _channel_account_health(account: models.PlatformAccount) -> tuple[str, str]:
-    if account.status != "active":
-        return "danger", translate("channels.health.disabled")
-    config = dict(account.config or {})
-    health_values = {
-        str(config.get("meta_health_status") or ""),
-        str(config.get("email_health_status") or ""),
-        str(config.get("feishu_health_status") or ""),
-    }
-    if "ERROR" in health_values:
-        return "warning", translate("channels.health.reauthorize")
-    if "PROVISIONING" in health_values:
-        return "info", translate("channels.health.provisioning")
-    return "success", translate("channels.health.connected")
+    from social_reply.application.account_management.channel_workspace_view import (
+        CONNECTION_LABELS,
+        CONNECTION_TONES,
+        channel_connection_status,
+    )
+
+    connection_status = channel_connection_status(account)
+    return CONNECTION_TONES[connection_status], CONNECTION_LABELS[connection_status]
 
 
 def _channel_job_error_message(job: models.ProvisioningJob) -> str:
@@ -4546,29 +4536,17 @@ def _render_connected_channel(
     owner_name: str | None,
     kill_switch_enabled: bool,
 ) -> str:
-    health_tone, health_label = _channel_account_health(account)
-    username = (
-        f"@{account.provider_username.lstrip('@')}"
-        if account.provider_username and account.platform not in {"email", "telegram"}
-        else account.provider_username
+    from social_reply.application.account_management.channel_workspace_view import (
+        build_channel_account_view,
+        render_channel_card,
     )
-    profile_line = username or account.external_account_id or translate("channels.platform_account")
-    connected_at = account.profile_updated_at or account.created_at
-    owner_label = owner_name or translate("channels.organization_account")
-    kill_switch_label = translate(
-        "channels.kill_switch.enabled" if kill_switch_enabled else "channels.kill_switch.disabled"
+
+    return render_channel_card(
+        build_channel_account_view(
+            account, owner_name=owner_name, kill_switch_enabled=kill_switch_enabled
+        ),
+        tenant_id=tenant_id,
     )
-    return f"""<article class="saas-connected-channel" data-channel-health="{escape(health_tone)}">
-<div class="saas-connected-identity">{_channel_avatar(account)}<div>
-<h3>{escape(account.name)}</h3><p>{escape(profile_line)}</p></div></div>
-<div class="saas-connected-meta"><span class="saas-platform-label">
-<img src="{_channel_icon_path(account.platform)}" alt="">{escape(account.platform.title())}</span>
-<span class="saas-status {health_tone}">{escape(health_label)}</span>
-<span class="saas-muted">{escape(translate("channels.owner", owner=owner_label))}</span>
-<span class="saas-muted">{escape(kill_switch_label)}</span>
-<span class="saas-muted">{escape(translate("channels.recent_connection", time=format_datetime(connected_at, include_year=True)))}</span></div>
-<div class="saas-provider-actions"><a class="saas-button small" href="{_tenant_root(tenant_id)}/channels/accounts/{account.id}">{escape(translate("channels.manage_account"))}</a></div>
-</article>"""
 
 
 def _channel_oauth_form(
@@ -4907,7 +4885,7 @@ def _channel_provider_card(
 <div class="saas-provider-heading"><span class="saas-provider-icon">
 <img src="{_channel_icon_path(platform)}" alt=""></span>
 <span class="saas-provider-state {state_class}">{escape(state_label)}</span></div>
-<div><h3>{escape(title)}</h3><p>{escape(description)}</p></div>
+<div><h3>{escape(title)}</h3></div>
 <div class="saas-provider-actions">{actions}</div></article>"""
 
 
@@ -4916,9 +4894,19 @@ async def tenant_channels(
     request: Request,
     tenant_id: str,
 ) -> Response:
+    from social_reply.application.account_management.channel_workspace_view import (
+        ChannelFilters,
+        build_channel_account_view,
+        render_channel_workspace,
+    )
+
     principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
+    try:
+        channel_filters = ChannelFilters.from_query(request.query_params)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid_channel_filters") from exc
     requested_brand_id = request.query_params.get("brand_id", "") if principal.is_admin else ""
     try:
         channel_brand_id = (
@@ -5033,20 +5021,14 @@ async def tenant_channels(
     instagram_direct_available = settings.instagram_messaging_enabled and instagram_app is not None
     instagram_meta_available = settings.instagram_messaging_enabled and facebook_app is not None
     csrf = _csrf(request)
-    connected_channels = "".join(
-        _render_connected_channel(
+    channel_views = tuple(
+        build_channel_account_view(
             account,
-            tenant_id=tenant_id,
             owner_name=owner_names.get(account.owner_user_id),
             kill_switch_enabled=kill_switches.get(account.id, False),
         )
         for account in accounts
     )
-    if not connected_channels:
-        connected_channels = empty_state(
-            translate("channels.connected_empty_title"),
-            translate("channels.connected_empty_description"),
-        )
     job_cards = (
         "".join(
             f"""<article class="saas-channel-job" data-channel-job
@@ -5055,7 +5037,7 @@ data-job-status="{escape(job.status)}">
 <div><img src="{_channel_icon_path(job.platform)}" alt=""><strong>{escape(job.platform.title())}</strong>
 <span>{format_datetime(job.created_at, include_year=True)}</span>
 <span>{escape(translate("channels.owner", owner=owner_names.get(job.owner_user_id) or translate("channels.organization_account")))}</span></div>
-<div>{status_badge(job.status)}<span data-job-step>{escape(job.current_step)}</span>{_channel_job_action(job, tenant_id=tenant_id, csrf=csrf, principal=principal)}</div>
+<div>{status_badge(job.status)}<span data-job-step>{escape(job.current_step)}</span>{_channel_job_action(job, tenant_id=tenant_id, csrf=csrf, principal=principal) if principal.has_capability("connect") else ""}</div>
 {f'<p class="saas-job-error">{escape(_channel_job_error_message(job))}</p>' if job.last_error_code else ""}
 </article>"""
             for job in jobs
@@ -5274,28 +5256,34 @@ data-job-status="{escape(job.status)}">
             f"<p>{escape(translate('channels.maintenance_description'))}</p></div></div>"
             f'<div class="saas-card-body"><ul>{maintenance_rows}</ul></div></section>'
         )
-    active_channel_count = sum(account.status == "active" for account in accounts)
-    pending_job_count = sum(job.status in {"PENDING", "PROCESSING", "RETRY"} for job in jobs)
-    body = f"""{banner}<section><div class="saas-section-header"><div class="saas-section-header-copy"><span class="saas-eyebrow">{escape(translate("nav.group.configuration"))}</span><h2>{escape(translate("channels.connected_title"))}</h2>
-<p>{escape(translate("channels.connected_description"))}</p></div></div>
-<div class="saas-status-summary"><span class="saas-status-summary-label">{escape(translate("common.status"))}</span><div class="saas-status-summary-items">{status_badge("active", label=translate("channels.summary.connected", count=active_channel_count))}</div></div>
-<div class="saas-connected-grid">{connected_channels}</div></section>{maintenance_section}
-<section id="add-channels"><div class="saas-section-header"><div class="saas-section-header-copy"><span class="saas-eyebrow">{escape(translate("nav.channels"))}</span><h2>{escape(translate("channels.add_title"))}</h2>
-<p>{escape(translate("channels.add_description"))}</p></div></div>
-<div class="saas-provider-grid">{provider_cards}</div></section>
-<section><div class="saas-section-header"><div class="saas-section-header-copy"><span class="saas-eyebrow">{escape(translate("common.details"))}</span><h2>{escape(translate("channels.progress_title"))}</h2>
-<p>{escape(translate("channels.progress_description"))}</p></div></div>
-<div class="saas-status-summary"><span class="saas-status-summary-label">{escape(translate("common.status"))}</span><div class="saas-status-summary-items">{status_badge("processing" if pending_job_count else "healthy", label=translate("channels.summary.pending_jobs", count=pending_job_count))}</div></div>
-<div class="saas-channel-jobs">{job_cards}</div></section>{dialogs}
-<script src="/static/channels.js" defer></script>"""
+    pending_job_count = sum(provisioning_job_is_in_flight(job) for job in jobs)
+    body = render_channel_workspace(
+        accounts=channel_views,
+        tenant_id=tenant_id,
+        filters=channel_filters,
+        brand_id=channel_brand_id,
+        requested_brand_id=requested_brand_id,
+        can_connect=principal.has_capability("connect"),
+        provider_html=provider_cards,
+        banner_html=banner,
+        maintenance_html=maintenance_section,
+        jobs_html=job_cards,
+        dialogs_html=dialogs,
+        pending_job_count=pending_job_count,
+    ) + '<script src="/static/channels.js" defer></script>'
     response = _render_page(
         principal=principal,
         tenant_id=tenant_id,
         title=translate("channels.title"),
-        description=translate("channels.description"),
+        description="连接客户所在的渠道，按账号分配接待与访问范围。",
         body=body,
         active_navigation="channels",
         inbox_count=inbox_summary.total,
+        primary_action_html=(
+            primary_action("#add-channels", "连接账号")
+            if principal.has_capability("connect")
+            else ""
+        ),
     )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -5501,7 +5489,7 @@ async def channel_account_detail(
                         select(models.AdminUser)
                         .where(
                             models.AdminUser.tenant_id == tenant_id,
-                            models.AdminUser.role.in_(("USER", "WORKSPACE_ADMIN")),
+                            models.AdminUser.role.in_(("USER", "AGENT", "MANAGER", "OPERATOR", "VIEWER", "WORKSPACE_ADMIN")),
                             models.AdminUser.status == "active",
                         )
                         .order_by(models.AdminUser.username)
@@ -5550,19 +5538,10 @@ async def channel_account_detail(
         if principal.is_admin
         else ""
     )
-    shared_label = translate(
-        "channels.account.support_shared"
-        if account.shared_with_support
-        else "channels.account.support_private"
-    )
+    shared_label = translate("workspace.explicit_access")
     support_visibility_form = (
-        f"""<form class="saas-form" method="post" action="{account_path}/support-visibility">
-<input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}">
-<input type="hidden" name="shared" value="{"false" if account.shared_with_support else "true"}">
-<p class="saas-muted">{escape(translate("channels.account.support_visibility_notice"))}</p>
-<button class="saas-button" type="submit">{escape(translate("channels.account.disable_support_sharing" if account.shared_with_support else "channels.account.enable_support_sharing"))}</button></form>"""
-        if principal.is_admin
-        else ""
+        secondary_action("/admin/users", translate("workspace.manage_account_access"))
+        if principal.is_admin else ""
     )
     grant_controls = ""
     if principal.is_admin:
@@ -5570,10 +5549,12 @@ async def channel_account_detail(
             f"""<div class="saas-form-row"><span>{escape(candidate.username)}</span><span class="saas-muted">{escape(translate("channels.account.grant_active") if candidate.id in active_grant_user_ids else translate("channels.account.grant_inactive"))}</span>
 <form method="post" action="{account_path}/reauthorization-grants/{candidate.id}"><input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="expected_config_version" value="{account.config_version}"><input type="hidden" name="enabled" value="{"false" if candidate.id in active_grant_user_ids else "true"}"><button class="saas-button small" type="submit">{escape(translate("channels.account.grant_disable" if candidate.id in active_grant_user_ids else "channels.account.grant_enable"))}</button></form></div>"""
             for candidate in assignable_owners
-            if candidate.role == "USER"
+            if candidate.role in {"MANAGER", "OPERATOR"}
         )
         grant_controls = f"""<section class="saas-card"><div class="saas-card-header"><h2>{escape(translate("channels.account.reauthorization_grants"))}</h2></div><div class="saas-card-body"><p class="saas-muted">{escape(translate("channels.account.reauthorization_grants_notice"))}</p>{grant_rows or f'<p class="saas-muted">{escape(translate("channels.account.no_support_agents"))}</p>'}</div></section>"""
-    can_reauthorize = principal.is_admin or principal.user_id in active_grant_user_ids
+    can_reauthorize = principal.has_capability("connect") and (
+        principal.is_admin or principal.user_id in active_grant_user_ids
+    )
     reauthorization_form = ""
     if can_reauthorize:
         if account.platform in {"x", "facebook", "instagram"}:
@@ -6206,9 +6187,11 @@ async def tenant_knowledge(
     platform: str = "",
     category: str = "",
 ) -> Response:
-    principal = await _require_tenant_admin_principal(request, tenant_id)
+    principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
+    if not principal.is_admin:
+        return await render_published_knowledge(request, principal, tenant_id)
     try:
         async with get_session_factory()() as session:
             inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
@@ -6267,27 +6250,43 @@ async def tenant_knowledge(
     except KnowledgeApplicationError as exc:
         raise _knowledge_http_error(exc) from exc
 
+    english = get_locale() == "en"
+    search_query = knowledge_search_query(request)
+    matching_documents = [
+        document for document in documents
+        if knowledge_matches_search(
+            search_query,
+            _knowledge_list_question(document),
+            _knowledge_visible_metadata(document, document.category),
+            _knowledge_visible_metadata(document, document.brand_id),
+            _knowledge_visible_metadata(document, document.platform),
+        )
+    ]
     brands, platforms, categories = filter_values
     safe_brand_filter = brand_id if brand_id in brands else ""
     safe_platform_filter = platform if platform in platforms else ""
     safe_category_filter = category if category in categories else ""
 
     def tab_href(target: str) -> str:
-        return _knowledge_location(
+        location = _knowledge_location(
             tenant_id,
             status_filter=target,
             brand_id=safe_brand_filter,
             platform=safe_platform_filter,
             category=safe_category_filter,
         )
+        if search_query:
+            separator = "&" if "?" in location else "?"
+            return f"{location}{separator}{urlencode({'search': search_query})}"
+        return location
 
     filter_tabs = tabs(
         (
             ("all", tab_href("all"), translate("agent.list_summary", count=sum(counts.values()))),
             (
-                "review",
-                tab_href("review"),
-                translate("knowledge.filter.review", count=int(review_count or 0)),
+                "published",
+                tab_href("published"),
+                translate("knowledge.filter.published", count=int(counts.get("published", 0))),
             ),
             (
                 "draft",
@@ -6295,9 +6294,9 @@ async def tenant_knowledge(
                 translate("knowledge.filter.draft", count=int(counts.get("draft", 0))),
             ),
             (
-                "published",
-                tab_href("published"),
-                translate("knowledge.filter.published", count=int(counts.get("published", 0))),
+                "review",
+                tab_href("review"),
+                translate("knowledge.filter.review", count=int(review_count or 0)),
             ),
         ),
         status_filter,
@@ -6305,13 +6304,14 @@ async def tenant_knowledge(
     safe_brand_prefill = safe_brand_filter or "default"
     filters = f"""<form class="saas-filter-toolbar" method="get">
 <input type="hidden" name="status_filter" value="{escape(status_filter)}">
+<input type="hidden" name="search" value="{escape(search_query)}">
 <div class="saas-filter-toolbar-controls">
 {_knowledge_filter_select("brand_id", "Brand", brands, safe_brand_filter)}
 {_knowledge_filter_select("platform", "Platform", platforms, safe_platform_filter)}
 {_knowledge_filter_select("category", translate("common.category"), categories, safe_category_filter)}</div>
 <div class="saas-filter-toolbar-actions"><button class="saas-button" type="submit">{escape(translate("common.apply_filters"))}</button></div></form>"""
     csrf = _csrf(request)
-    add_form = f"""<details class="saas-create-disclosure"><summary>{escape(translate("knowledge.add_document"))}</summary>
+    add_form = f"""<details id="knowledge-add" class="saas-create-disclosure"><summary>{escape(translate("knowledge.add_document"))}</summary>
 <div class="saas-card-body"><form class="saas-form" method="post" action="{_tenant_root(tenant_id)}/knowledge/documents">
 <input type="hidden" name="csrf_token" value="{escape(csrf)}">
 <label>Question<input name="question" maxlength="2000" required></label>
@@ -6340,7 +6340,7 @@ async def tenant_knowledge(
     next_review = next(
         (
             document
-            for document in documents
+            for document in matching_documents
             if document.status == "draft" and not document.language_verified
         ),
         None,
@@ -6356,14 +6356,20 @@ async def tenant_knowledge(
         f"<td>{escape(_knowledge_visible_metadata(document, document.brand_id))} / {escape(_knowledge_visible_metadata(document, document.platform or translate('knowledge.detail.all_platforms')))}</td>"
         f"<td>{escape(document.detected_language)} / {escape(document.language_detection_status)}</td><td>{status_badge(document.status)}</td>"
         f"<td>{escape(translate('knowledge.language_confirmed') if document.language_verified else translate('knowledge.language_pending'))}</td>"
+        f"<td>{format_datetime(document.updated_at, include_year=True)}</td>"
         f'<td><a href="{_tenant_root(tenant_id)}/knowledge/documents/{document.id}">{escape(translate("knowledge.review_action"))}</a></td></tr>'
-        for document in documents
+        for document in matching_documents
     )
+    scope_label = "Scope" if english else "适用范围"
+    updated_label = "Updated" if english else "更新于"
     table = (
-        f'<div class="saas-table-wrap"><table class="saas-table"><thead><tr><th>{escape(translate("knowledge.question_category"))}</th><th>Scope</th><th>{escape(translate("common.language"))}</th><th>{escape(translate("knowledge.publication_status"))}</th><th>{escape(translate("common.review"))}</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>'
+        f'<div class="saas-table-wrap"><table class="saas-table"><thead><tr><th scope="col">{escape(translate("knowledge.question_category"))}</th><th scope="col">{scope_label}</th><th scope="col">{escape(translate("common.language"))}</th><th scope="col">{escape(translate("knowledge.publication_status"))}</th><th scope="col">{escape(translate("common.review"))}</th><th scope="col">{updated_label}</th><th scope="col">{escape(translate("knowledge.review_action"))}</th></tr></thead><tbody>{rows}</tbody></table></div>'
         if rows
         else empty_state(
-            translate("knowledge.empty_title"), translate("knowledge.empty_description")
+            ("No matching knowledge" if english else "未找到匹配知识")
+            if search_query else translate("knowledge.empty_title"),
+            ("Try another keyword in the loaded records." if english else "请在已加载资料中尝试其他关键词。")
+            if search_query else translate("knowledge.empty_description"),
         )
     )
     safe_request_query = tuple(
@@ -6373,6 +6379,7 @@ async def tenant_knowledge(
             ("brand_id", safe_brand_filter),
             ("platform", safe_platform_filter),
             ("category", safe_category_filter),
+            ("search", search_query),
         )
         if value
     )
@@ -6383,13 +6390,19 @@ async def tenant_knowledge(
             tenant_id=tenant_id,
             title=translate("knowledge.title"),
             description=translate("knowledge.description"),
-            body=(
-                f"{filter_tabs}{filters}{next_review_html}"
-                f'<div class="saas-section-header"><div class="saas-section-header-copy">'
-                f'<span class="saas-eyebrow">{escape(translate("nav.group.content_ai"))}</span>'
-                f"<h2>{escape(translate('knowledge.title'))}</h2>"
-                f"<p>{escape(translate('knowledge.description'))}</p></div></div>{table}"
-                f'<div class="saas-grid two saas-low-frequency-tools">{add_form}{import_form}</div>{batch_forms}'
+            body=render_knowledge_workspace(
+                root=_tenant_root(tenant_id), can_manage=True, counts=counts,
+                review_count=int(review_count or 0), loaded_count=len(documents),
+                shown_count=len(matching_documents), table_html=table,
+                tabs_html=filter_tabs, filters_html=filters, review_html=next_review_html,
+                tools_html=(
+                    f'<div class="saas-grid two saas-low-frequency-tools">'
+                    f'{add_form}{import_form}</div>{batch_forms}'
+                ),
+                query=search_query,
+                hidden_filters=tuple(
+                    (key, value) for key, value in safe_request_query if key != "search"
+                ),
             ),
             active_navigation="knowledge",
             inbox_count=inbox_summary.total,
@@ -6565,12 +6578,17 @@ async def tenant_audit(
     tenant_id: str,
     category: str = "",
 ) -> Response:
-    principal = await _require_tenant_admin_principal(request, tenant_id)
+    from social_reply.application.account_management.workspace_settings_view import (
+        audit_result_label,
+        settings_copy,
+    )
+
+    principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-        statement = select(models.AuditLog).where(models.AuditLog.tenant_id == tenant_id)
+        statement = select(models.AuditLog).where(audit_read_condition(principal, tenant_id))
         if category:
             statement = statement.where(models.AuditLog.category == category)
         audits = (
@@ -6586,7 +6604,7 @@ async def tenant_audit(
             (
                 await session.execute(
                     select(models.AuditLog.category)
-                    .where(models.AuditLog.tenant_id == tenant_id)
+                    .where(audit_read_condition(principal, tenant_id))
                     .distinct()
                     .order_by(models.AuditLog.category)
                 )
@@ -6604,32 +6622,43 @@ async def tenant_audit(
 <label class="saas-field"><span>{escape(translate("common.category"))}</span><select name="category">{category_options}</select></label>
 <button class="saas-button" type="submit">{escape(translate("common.apply_filters"))}</button></form>"""
     rows = "".join(
-        f"<tr><td>{format_datetime(audit.created_at, include_year=True)}</td>"
-        f"<td>{escape(audit.actor)}</td><td>{escape(audit.category)}</td>"
-        f"<td><strong>{escape(audit.action)}</strong><br>"
-        f'<span class="saas-muted">{escape(audit.subject_type)} · '
+        f'<tr><td class="workspace-audit-time">{format_datetime(audit.created_at, include_year=True)}</td>'
+        f"<td>{escape(audit.actor)}</td>"
+        f'<td><code class="workspace-audit-code">{escape(audit.action)}</code></td>'
+        f'<td><span class="saas-muted">{escape(audit.subject_type)} · '
         f"{escape(audit.subject_id)}</span></td>"
-        f'<td><a href="{_tenant_root(tenant_id)}/audit/{audit.id}">{escape(translate("audit.view"))}</a></td></tr>'
+        f"<td>{escape(audit_result_label(audit.detail))}</td>"
+        f'<td><a href="{_tenant_root(tenant_id)}/audit/{audit.id}">{escape(settings_copy("details"))}</a></td></tr>'
         for audit in audits
     )
     table = (
         '<div class="saas-table-wrap"><table class="saas-table"><thead><tr>'
-        f"<th>{escape(translate('common.time'))}</th><th>Actor</th>"
-        f"<th>{escape(translate('common.category'))}</th>"
-        f"<th>{escape(translate('audit.action_resource'))}</th><th></th>"
+        f'<th scope="col">{escape(translate("common.time"))}</th>'
+        f'<th scope="col">{escape(settings_copy("actor"))}</th>'
+        f'<th scope="col">{escape(settings_copy("event"))}</th>'
+        f'<th scope="col">{escape(settings_copy("resource"))}</th>'
+        f'<th scope="col">{escape(settings_copy("result"))}</th>'
+        f'<th scope="col">{escape(settings_copy("details"))}</th>'
         f"</tr></thead><tbody>{rows}</tbody></table></div>"
         if rows
         else empty_state(
             translate("audit.empty_title"),
-            translate("audit.empty_description"),
+            settings_copy("audit_empty"),
         )
+    )
+    body = (
+        '<section class="workspace-audit-card" aria-labelledby="workspace-audit-heading">'
+        '<div class="workspace-audit-header">'
+        f'<h2 id="workspace-audit-heading">{escape(settings_copy("audit"))}</h2>'
+        f'<span class="workspace-audit-readonly">{escape(settings_copy("readonly"))}</span>'
+        f'</div>{filters}{table}</section>'
     )
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
         title=translate("audit.title"),
-        description=translate("audit.description"),
-        body=f"{filters}{table}",
+        description=settings_copy("audit_description"),
+        body=body,
         active_navigation="audit",
         inbox_count=inbox_summary.total,
     )
@@ -6641,7 +6670,7 @@ async def tenant_audit_detail(
     tenant_id: str,
     audit_id: uuid.UUID,
 ) -> Response:
-    principal = await _require_tenant_admin_principal(request, tenant_id)
+    principal = await _require_tenant_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
     async with get_session_factory()() as session:
@@ -6649,12 +6678,16 @@ async def tenant_audit_detail(
         audit = await session.scalar(
             select(models.AuditLog).where(
                 models.AuditLog.id == audit_id,
-                models.AuditLog.tenant_id == tenant_id,
+                audit_read_condition(principal, tenant_id),
             )
         )
     if audit is None:
         raise HTTPException(status_code=404, detail="audit_not_found")
-    safe_audit_detail = _audit_detail_for_display(audit)
+    safe_audit_detail = (
+        _audit_detail_for_display(audit)
+        if principal.is_admin
+        else auditor_safe_detail(audit.detail)
+    )
     body = f"""<div class="saas-grid two" style="margin-top:0">
 <section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("audit.detail.facts"))}</h2>
 <p>{escape(translate("audit.detail.facts_description"))}</p></div></div><div class="saas-card-body">
@@ -7128,53 +7161,34 @@ async def tenant_health(request: Request, tenant_id: str) -> Response:
 
 
 @router.get("/app/t/{tenant_id}/settings", response_class=HTMLResponse)
-async def tenant_settings(request: Request, tenant_id: str) -> Response:
+async def tenant_settings(
+    request: Request, tenant_id: str, section: str = "general"
+) -> Response:
+    from social_reply.application.account_management.workspace_settings_view import (
+        render_workspace_settings,
+        settings_copy,
+        validate_settings_section,
+    )
+
     principal = await _require_tenant_admin_principal(request, tenant_id)
     if isinstance(principal, Response):
         return principal
+    try:
+        validate_settings_section(section)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="invalid_settings_section") from error
     async with get_session_factory()() as session:
         inbox_summary = await _load_inbox_summary(session, principal, tenant_id)
-        account_count = await session.scalar(
-            select(func.count()).where(models.PlatformAccount.tenant_id == tenant_id)
-        )
-    tenant_root = _tenant_root(tenant_id)
-    canonical_links = "".join(
-        (
-            secondary_action(
-                f"{_agent_root(tenant_id, DEFAULT_TENANT_ID)}/instructions",
-                translate("settings.business_instructions"),
-            ),
-            secondary_action(
-                f"{tenant_root}/knowledge",
-                translate("settings.knowledge_governance"),
-            ),
-            secondary_action(
-                f"{tenant_root}/channels",
-                translate("agent.overview.channel_accounts"),
-            ),
-            secondary_action(
-                f"{tenant_root}/channels/feishu/handoff",
-                translate("nav.feishu_handoff"),
-            ),
-            secondary_action(f"{tenant_root}/health", translate("nav.system_health")),
-            secondary_action(f"{tenant_root}/audit", translate("nav.audit_center")),
-            secondary_action(f"{tenant_root}/journeys", translate("nav.processing_journey")),
-        )
+    body = render_workspace_settings(
+        tenant_id=tenant_id,
+        section=section,
+        instructions_url=f"{_agent_root(tenant_id, DEFAULT_TENANT_ID)}/instructions",
     )
-    body = f"""<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("settings.identity"))}</h2>
-<p>{escape(translate("settings.identity_description"))}</p></div></div><div class="saas-card-body">
-{definition_list((("Tenant ID", tenant_id), (translate("settings.workspace_user"), principal.username), (translate("settings.account_count"), int(account_count or 0)), (translate("settings.default_mode"), "BOT_DRAFT_ONLY")))}</div></section>
-<div class="saas-section-title"><div><h2>{escape(translate("settings.configuration"))}</h2>
-<p>{escape(translate("settings.configuration_description"))}</p></div></div>
-<div class="saas-action-row">{canonical_links}</div>
-<section class="saas-card"><div class="saas-card-header"><div><h2>{escape(translate("settings.preferences"))}</h2></div></div>
-<div class="saas-card-body">{definition_list(((translate("settings.language"), translate("settings.not_persisted")), (translate("settings.timezone"), translate("settings.not_persisted")), (translate("settings.notifications"), translate("settings.not_persisted"))))}
-<p class="saas-muted">{escape(translate("settings.preferences_deferred"))}</p></div></section>"""
     return _render_page(
         principal=principal,
         tenant_id=tenant_id,
         title=translate("settings.title"),
-        description=translate("settings.description"),
+        description=settings_copy("settings_description"),
         body=body,
         active_navigation="settings",
         inbox_count=inbox_summary.total,

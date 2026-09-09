@@ -1,6 +1,42 @@
 <div class="saas-home-workspace">
+  {% if queue_summary_html or message_count %}
+  <div class="saas-home-overview saas-status-summary{% if queue_summary_html %} saas-home-metrics{% endif %}">
+    {% if queue_summary_html %}{{ queue_summary_html }}{% endif %}
+    {% if message_count %}
+    <section class="saas-metric saas-home-metric-card saas-home-today" aria-labelledby="home-today-title">
+      <h2 id="home-today-title" class="saas-metric-label">{{ message_count_label }}</h2>
+      <span class="saas-metric-value saas-metric-num font-mono">{{ message_count }}</span>
+      <p class="saas-home-section-desc">{{ today_description }}</p>
+    </section>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if workspace_entries is defined and workspace_entries %}
+  <section class="saas-workspace-welcome" aria-labelledby="workspace-entry-title">
+    <h2 id="workspace-entry-title">{{ entry_title }}</h2>
+    <p class="saas-muted">{{ entry_description }}</p>
+    <div class="saas-workspace-entry-grid">
+      {% for entry in workspace_entries %}
+      <a class="saas-workspace-entry" href="{{ entry.href }}">
+        <strong>{{ entry.title }}</strong>
+        <span>{{ entry.description }}</span>
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 12h15m-6-6 6 6-6 6"/></svg>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if next_action_html %}
+  <section class="saas-card saas-home-section saas-home-attention" aria-labelledby="home-attention-title">
+    <h2 id="home-attention-title" class="saas-home-section-title">{{ attention_title }}</h2>
+    {{ next_action_html }}
+  </section>
+  {% endif %}
+
   {% if channel_alerts %}
-  <section class="saas-home-alerts" aria-labelledby="home-alerts-title">
+  <section class="saas-card saas-home-section saas-home-alerts" aria-labelledby="home-alerts-title">
     <div class="saas-home-heading">
       <h2 id="home-alerts-title" class="saas-home-section-title">{{ alerts_title }}</h2>
       <p class="saas-home-section-desc">{{ alerts_description }}</p>
@@ -19,31 +55,6 @@
       </li>
       {% endfor %}
     </ul>
-  </section>
-  {% endif %}
-
-  {% if next_action_html or queue_summary_html %}
-  <section class="saas-home-attention" aria-labelledby="home-attention-title">
-    <h2 id="home-attention-title" class="saas-home-section-title">{{ attention_title }}</h2>
-    {% if next_action_html %}{{ next_action_html }}{% endif %}
-    {% if queue_summary_html %}{{ queue_summary_html }}{% endif %}
-  </section>
-  {% endif %}
-
-  {% if message_count %}
-  <section class="saas-card saas-home-section saas-home-today" aria-labelledby="home-today-title">
-    <div class="saas-home-section-head">
-      <div class="saas-home-heading">
-        <h2 id="home-today-title" class="saas-home-section-title">{{ today_title }}</h2>
-        <p class="saas-home-section-desc">{{ today_description }}</p>
-      </div>
-    </div>
-    <div class="saas-home-today-grid">
-      <div class="saas-today-card">
-        <span class="saas-today-label">{{ message_count_label }}</span>
-        <span class="saas-today-val font-mono">{{ message_count }}</span>
-      </div>
-    </div>
   </section>
   {% endif %}
 

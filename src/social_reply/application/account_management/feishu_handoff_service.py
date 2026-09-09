@@ -14,6 +14,7 @@ from social_reply.application.account_management.auth import (
     authenticated_principal_context,
     principal_from_session_row,
 )
+from social_reply.application.account_management.permissions import user_has_capability
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
 from social_reply.connectors.feishu.client import FeishuClient, FeishuClientError
 from social_reply.connectors.registry import get_platform_sender
@@ -101,7 +102,6 @@ async def load_feishu_handoff_snapshot(tenant_id: str) -> FeishuHandoffSnapshot:
                 .where(
                     models.AdminUser.tenant_id == tenant_id,
                     models.AdminUser.status == "active",
-                    models.AdminUser.role.in_(("USER", "WORKSPACE_ADMIN")),
                 )
                 .order_by(models.AdminUser.username)
             )
@@ -111,7 +111,7 @@ async def load_feishu_handoff_snapshot(tenant_id: str) -> FeishuHandoffSnapshot:
         config=config,
         operators=operators,
         failures=failures,
-        staff=staff,
+        staff=tuple(user for user in staff if user_has_capability(user, "takeover")),
     )
 
 
@@ -169,12 +169,11 @@ async def _require_staff_binding(
             models.AdminUser.id == admin_user_id,
             models.AdminUser.tenant_id == tenant_id,
             models.AdminUser.status == "active",
-            models.AdminUser.role.in_(["USER", "WORKSPACE_ADMIN"]),
         )
         .execution_options(populate_existing=True)
         .with_for_update()
     )
-    if user is None:
+    if user is None or not user_has_capability(user, "takeover"):
         raise FeishuHandoffValidationError("feishu_operator_staff_not_accessible")
     return user
 

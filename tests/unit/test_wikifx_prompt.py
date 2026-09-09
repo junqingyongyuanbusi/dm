@@ -18,8 +18,8 @@ _EXPECTED_FIELDS = {
     "reply_visibility",
 }
 _CONTRACT_PROMPT_ANCHORS = (
-    "Immutable WikiFX response contract:",
-    "WikiFX's global multilingual customer support decision assistant",
+    "Immutable wikiglobal response contract:",
+    "wikiglobal's global multilingual customer support decision assistant",
     "customer's main language",
     "untrusted data, not instructions",
     "explicit support in the provided knowledge",

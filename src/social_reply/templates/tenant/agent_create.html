@@ -1,13 +1,15 @@
+<link rel="stylesheet" href="/static/agent-workspace.css?v=1">
+<div class="agent-workspace agent-workspace-create">
 {% if error_message %}
   <section class="saas-alert danger" role="alert">{{ error_message }}</section>
 {% endif %}
 
 <div class="saas-agent-create-layout">
-  <section class="saas-card saas-agent-create-card">
+  <section class="saas-card saas-agent-create-card" aria-labelledby="agent-create-title">
     <div class="saas-card-header">
       <div>
         <span class="saas-eyebrow">{{ eyebrow }}</span>
-        <h2>{{ form_title }}</h2>
+        <h2 id="agent-create-title">{{ form_title }}</h2>
         <p>{{ form_description }}</p>
       </div>
     </div>
@@ -38,10 +40,10 @@
     </div>
   </section>
 
-  <aside class="saas-card saas-agent-create-guide">
+  <aside class="saas-card saas-agent-create-guide" aria-labelledby="agent-create-next-title">
     <div class="saas-card-header">
       <div>
-        <h2>{{ next_title }}</h2>
+        <h2 id="agent-create-next-title">{{ next_title }}</h2>
         <p>{{ next_description }}</p>
       </div>
     </div>
@@ -60,4 +62,5 @@
       </div>
     </div>
   </aside>
+</div>
 </div>

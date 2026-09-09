@@ -1,0 +1,105 @@
+<div class="home-dashboard">
+  <header class="home-dashboard-header">
+    <div>
+      <p class="home-dashboard-eyebrow">{{ labels.subtitle }} <span aria-hidden="true">/</span> <time datetime="{{ today }}">{{ today }} UTC</time></p>
+      <h1>{{ labels.title }}</h1>
+    </div>
+    <a class="home-dashboard-primary" href="{{ root }}/inbox">{{ labels.inbox }} <span aria-hidden="true">&#8594;</span></a>
+  </header>
+
+  <div class="home-dashboard-metrics">
+    {% for metric in metrics %}
+    <section class="home-dashboard-metric" aria-labelledby="home-metric-{{ metric.key }}">
+      <div class="home-dashboard-metric-heading">
+        <h2 id="home-metric-{{ metric.key }}">{{ labels[metric.key] }}</h2>
+        <span class="home-dashboard-metric-symbol home-dashboard-symbol-{{ metric.key }}" aria-hidden="true">{% if metric.key == 'pending' %}&#9719;{% elif metric.key == 'ai' %}&#10023;{% elif metric.key == 'accounts' %}&#9638;{% else %}&#10003;{% endif %}</span>
+      </div>
+      <strong class="home-dashboard-metric-value">{{ metric.value }}</strong>
+      <p>{{ metric.note }}</p>
+    </section>
+    {% endfor %}
+  </div>
+
+  <div class="home-dashboard-panels">
+    <section class="home-dashboard-panel home-dashboard-trend" aria-labelledby="home-trend-heading">
+      <div class="home-dashboard-panel-heading">
+        <h2 id="home-trend-heading">{{ labels.trend }}</h2>
+        <span class="home-dashboard-period">{{ labels.period }}</span>
+      </div>
+      <div class="home-dashboard-legend">
+        <span><i class="home-dashboard-swatch" aria-hidden="true"></i>{{ labels.received }}</span>
+        <span><i class="home-dashboard-swatch home-dashboard-swatch-ai" aria-hidden="true"></i>{{ labels.ai_replied }}</span>
+      </div>
+      <div class="home-dashboard-chart-scroll">
+        <svg class="home-dashboard-chart" viewBox="0 0 700 230" role="img" aria-labelledby="home-trend-title home-trend-description">
+          <title id="home-trend-title">{{ labels.trend }}</title>
+          <desc id="home-trend-description">{{ labels.trend_note }} {{ labels.data_table }}</desc>
+          {% for tick in chart.ticks %}
+          <line class="home-dashboard-gridline" x1="60" x2="680" y1="{{ tick.vertical }}" y2="{{ tick.vertical }}"></line>
+          <text class="home-dashboard-axis" x="48" y="{{ tick.vertical + 4 }}" text-anchor="end">{{ tick.value }}</text>
+          {% endfor %}
+          {% for series in chart.series %}
+          <path class="home-dashboard-area home-dashboard-area-{{ series.key }}" d="{{ series.area }}"></path>
+          <path class="home-dashboard-line home-dashboard-line-{{ series.key }}" d="{{ series.line }}"></path>
+          {% endfor %}
+          {% for point in chart.points %}
+          <text class="home-dashboard-axis" x="{{ point.horizontal }}" y="216" text-anchor="middle">{{ point.label }}</text>
+          <circle class="home-dashboard-point home-dashboard-point-received" cx="{{ point.horizontal }}" cy="{{ point.received_vertical }}" r="4" tabindex="0" role="img" aria-label="{{ point.day }} {{ labels.received }}: {{ point.received }}"><title>{{ point.day }} · {{ labels.received }}: {{ point.received }}</title></circle>
+          <circle class="home-dashboard-point home-dashboard-point-ai" cx="{{ point.horizontal }}" cy="{{ point.ai_vertical }}" r="3" tabindex="0" role="img" aria-label="{{ point.day }} {{ labels.ai_replied }}: {{ point.ai }}"><title>{{ point.day }} · {{ labels.ai_replied }}: {{ point.ai }}</title></circle>
+          {% endfor %}
+        </svg>
+      </div>
+      {% if chart.empty %}
+      <p class="home-dashboard-chart-empty"><strong>{{ labels.empty_trend }}</strong> {{ labels.empty_trend_note }}</p>
+      {% endif %}
+      <p class="home-dashboard-footnote">{{ labels.trend_note }}</p>
+      <details class="home-dashboard-data">
+        <summary>{{ labels.data_table }}</summary>
+        <div class="home-dashboard-table-scroll">
+          <table>
+            <caption>{{ labels.trend }} · UTC</caption>
+            <thead><tr><th scope="col">{{ labels.day }}</th><th scope="col">{{ labels.received }}</th><th scope="col">{{ labels.ai_replied }}</th></tr></thead>
+            <tbody>{% for point in chart.points %}<tr><th scope="row">{{ point.day }}</th><td>{{ point.received }}</td><td>{{ point.ai }}</td></tr>{% endfor %}</tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <section class="home-dashboard-panel" aria-labelledby="home-attention-heading">
+      <div class="home-dashboard-panel-heading"><h2 id="home-attention-heading">{{ labels.attention }}</h2><span class="home-dashboard-count">{{ attention | length }}</span></div>
+      <p class="home-dashboard-panel-note">{{ labels.attention_note }}</p>
+      <ul class="home-dashboard-action-list">
+        {% for item in attention %}
+        <li><a href="{{ item.href }}"><span class="home-dashboard-list-dot" aria-hidden="true"></span><span><strong>{{ item.title }}</strong><span class="home-dashboard-action-description">{{ item.description }}</span></span><span class="home-dashboard-list-arrow" aria-hidden="true">&#8599;</span></a></li>
+        {% else %}
+        <li class="home-dashboard-routine"><a href="{{ root }}/inbox"><span class="home-dashboard-check" aria-hidden="true">&#10003;</span><span><strong>{{ labels.routine }}</strong><span class="home-dashboard-action-description">{{ labels.routine_note }}</span></span><span class="home-dashboard-list-arrow" aria-hidden="true">&#8599;</span></a></li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="home-dashboard-panel" aria-labelledby="home-channels-heading">
+      <div class="home-dashboard-panel-heading"><h2 id="home-channels-heading">{{ labels.channels }}</h2><span class="home-dashboard-period">{{ labels.period }}</span></div>
+      <p class="home-dashboard-panel-note">{{ labels.channel_note }}</p>
+      <ul class="home-dashboard-channel-list">
+        {% for channel in channels %}
+        <li>
+          <div class="home-dashboard-channel-heading"><div><strong>{{ channel.platform }}</strong><span>{{ channel.accounts }}</span></div><strong>{{ channel.received }}</strong></div>
+          <div class="home-dashboard-bar" aria-hidden="true"><span style="--app-channel-share: {{ channel.width }}%"></span></div>
+        </li>
+        {% else %}
+        <li class="home-dashboard-empty"><strong>{{ labels.empty_channels }}</strong><p>{{ labels.empty_channels_note }}</p><div class="home-dashboard-bar" aria-hidden="true"></div></li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="home-dashboard-panel" aria-labelledby="home-quality-heading">
+      <div class="home-dashboard-panel-heading"><h2 id="home-quality-heading">{{ labels.quality }}</h2></div>
+      <p class="home-dashboard-panel-note">{{ labels.quality_note }}</p>
+      <ul class="home-dashboard-action-list home-dashboard-quality-list">
+        {% for item in quality_items %}
+        <li><a href="{{ item.href }}"><span class="home-dashboard-task-marker" aria-hidden="true"></span><span><strong>{{ item.title }}</strong><span class="home-dashboard-action-description">{{ item.description }}</span></span><span class="home-dashboard-list-arrow" aria-hidden="true">&#8599;</span></a></li>
+        {% endfor %}
+      </ul>
+    </section>
+  </div>
+</div>

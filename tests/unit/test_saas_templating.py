@@ -219,7 +219,7 @@ def test_agent_test_workspace_is_isolated_and_autoescapes_model_output() -> None
     assert mode == "BOT_DRAFT_ONLY"
     assert 'action="/app/t/tenant-a/agents/support/test"' in html
     assert 'aria-current="step"' not in html
-    assert "不会创建生产决策、Outbox 或外发消息" in html
+    assert "仅提示词试答，不会向客户外发" in html
     assert "KNOWLEDGE_MATCH" in html
     assert "248 ms" in html
     assert "<script>" not in html

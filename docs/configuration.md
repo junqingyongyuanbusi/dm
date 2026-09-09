@@ -8,6 +8,25 @@ Use `.env.example` for local development only. Production configuration is store
 platform and validated by `scripts/validate_railway_config.py` during every release. API, Worker, and
 Scheduler must use the same application settings unless a variable is explicitly deployment-role-only.
 
+## Workspace roles and local UI acceptance
+
+Workspace roles, explicit account grants and the two per-member operator capabilities are persisted
+in PostgreSQL, not environment variables or browser storage. Manage them through the named business
+administrator's member access page. `SUPERADMIN` remains environment-backed and cannot be assigned
+as a database role. The UI company name is wikiglobal; account/provider/knowledge identity records
+are not rewritten by a global string replacement.
+
+The language preference uses the existing `reply_ui_locale` cookie. Theme preference remains in
+browser-local storage with `system`, `light`, and `dark` choices. These preferences do not affect
+account scope, provider credentials, knowledge publication or send-time authorization.
+
+`scripts/seed_workspace_acceptance.py` is an optional, fictional fixture setup tool. It refuses any
+database except `wikiglobal_ui_test` on a loopback host, requires `TESTING=true`, and requires a
+password supplied through `ACCEPTANCE_PASSWORD`. It creates five named role fixtures and four
+fictional conversations without credentials, provider calls, queued jobs or published knowledge.
+Run it only after applying the current migration to that separate local database. Never point
+production configuration or the normal integration test suite at the UI acceptance database.
+
 ## Production image registry
 
 GitHub Actions builds and verifies the production image once after Ruff and Pytest succeed. A
@@ -72,16 +91,18 @@ a disabled polling stack performs no provider reconciliation until it is re-enab
 
 ## Browser role and route contract
 
-Production is single-organization and uses `default` as the only browser Tenant. Database roles are
-`USER` (support agent) and `WORKSPACE_ADMIN` (business administrator); no other database role is
-accepted. Support agents read their owned accounts and company channels explicitly published by an
-administrator. Shared visibility grants neither credential writes nor administrative actions.
+The installation is single-organization and uses `default` as the only browser Tenant. New database
+members use `WORKSPACE_ADMIN`, `MANAGER`, `OPERATOR`, `AGENT` or `VIEWER`; legacy USER is treated
+as AGENT. Non-administrators read owned accounts or active explicit account grants. The old shared
+visibility flag no longer authorizes access. Account grants confer neither credential writes nor
+administrative actions. Consult `docs/architecture.md` for the capability matrix and the pending
+coordinated migration notes before any production release.
 Bootstrap `SUPERADMIN` comes exclusively from `ADMIN_USERNAME` / `ADMIN_PASSWORD`, has `user_id=None`,
 and is the only identity allowed into `/admin/system/*`. Named business administrators manage staff
 at `/admin/users` using their own password for sensitive confirmations. Bootstrap can perform
 emergency removal of the sole business administrator only with password reconfirmation and a reason.
 Do not configure another browser Tenant to represent an employee: `/app/t/<non-default>` fails
-closed with 404. Role, publication and reconnection grants are PostgreSQL facts, not service variables.
+closed with 404. Roles, account access and reconnection grants are PostgreSQL facts, not service variables.
 
 This intentionally makes the environment credential a direct entry point to customer business
 data: anyone who can read `.env` or Railway service variables can access all configured Tenant
@@ -95,10 +116,13 @@ compatibility adapters and keep CSRF, authorization, idempotency, audit, kill-sw
 guards. OAuth callback URLs stay under `/admin/oauth/*/callback`; only the encrypted OAuth context
 selects whether the result returns through legacy or Channels navigation.
 
-## Ordinary-user Channels prerequisites
+## Operations-role Channels prerequisites
 
 `/app/t/default/channels` does not introduce per-user OAuth application credentials. API,
 Worker and Scheduler must share the existing deployment-level X and Meta/Instagram App settings:
+
+Self-service connection requires MANAGER or OPERATOR capability (or business administrator
+authority); AGENT, VIEWER and legacy USER cannot initiate or execute new connections.
 
 - X self-authorization requires `X_API_KEY` and `X_API_SECRET` plus at least one enabled X message
   stack.

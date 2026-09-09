@@ -757,10 +757,7 @@ def _principal_is_current_for_tenant(principal: Principal | None, tenant_id: str
         and principal.session_id is not None
         and tenant_id in principal.allowed_tenants
         and not principal.must_change_password
-        and (
-            principal.is_superadmin
-            or principal.role in {"USER", "WORKSPACE_ADMIN"}
-        )
+        and principal.has_capability("connect")
     )
 
 
@@ -823,10 +820,11 @@ async def _validate_job_authority(
         or principal.user_id != user_id
         or job.tenant_id not in principal.allowed_tenants
         or principal.must_change_password
+        or not principal.has_capability("connect")
         or (authority_kind == "BOOTSTRAP_SESSION" and not principal.is_superadmin)
         or (
             authority_kind == "STAFF_SESSION"
-            and (principal.user_id is None or principal.role not in {"USER", "WORKSPACE_ADMIN"})
+            and principal.user_id is None
         )
     ):
         raise PermissionError("initiator_session_invalid")
@@ -957,10 +955,7 @@ async def submit_provisioning_job(
                 or principal.user_id != initial_user_id
                 or principal.must_change_password
                 or tenant_id not in principal.allowed_tenants
-                or (
-                    principal.user_id is not None
-                    and principal.role not in {"USER", "WORKSPACE_ADMIN"}
-                )
+                or not principal.has_capability("connect")
             ):
                 raise PermissionError("admin_session_invalid")
             authority_kind = "BOOTSTRAP_SESSION" if principal.is_superadmin else "STAFF_SESSION"

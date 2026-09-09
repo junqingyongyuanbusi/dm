@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, false, or_, select
 
+from social_reply.application.account_management.permissions import SUPPORTED_ROLES
 from social_reply.infrastructure.database import models
 
 if TYPE_CHECKING:
@@ -21,28 +22,55 @@ def account_read_condition(principal: Principal, tenant_id: str):
     tenant = models.PlatformAccount.tenant_id == tenant_id
     if principal.is_workspace_admin:
         return tenant
-    if principal.user_id is None:
+    if principal.user_id is None or principal.role not in SUPPORTED_ROLES:
         return false()
     return and_(
         tenant,
         or_(
             models.PlatformAccount.owner_user_id == principal.user_id,
-            models.PlatformAccount.shared_with_support.is_(True),
+            select(models.AccountAccessGrant.id).where(
+                models.AccountAccessGrant.tenant_id == models.PlatformAccount.tenant_id,
+                models.AccountAccessGrant.platform_account_id == models.PlatformAccount.id,
+                models.AccountAccessGrant.user_id == principal.user_id,
+                models.AccountAccessGrant.active.is_(True),
+            ).correlate(models.PlatformAccount).exists(),
         ),
     )
 
 
-def user_can_access_account(user: models.AdminUser, account: models.PlatformAccount) -> bool:
+def user_can_access_account(
+    user: models.AdminUser, account: models.PlatformAccount,
+    *, account_access_ids: frozenset[uuid.UUID] = frozenset(),
+) -> bool:
     return (
         user.status == "active"
         and user.tenant_id == account.tenant_id
-        and user.role in {"USER", "WORKSPACE_ADMIN"}
+        and user.role in SUPPORTED_ROLES
         and (
             user.role == "WORKSPACE_ADMIN"
             or account.owner_user_id == user.id
-            or account.shared_with_support is True
+            or account.id in account_access_ids
         )
     )
+
+
+async def user_can_access_account_in_session(
+    session: AsyncSession, user: models.AdminUser, account: models.PlatformAccount,
+) -> bool:
+    if user_can_access_account(user, account):
+        return True
+    if (
+        user.status != "active"
+        or user.tenant_id != account.tenant_id
+        or user.role not in SUPPORTED_ROLES
+    ):
+        return False
+    return await session.scalar(select(models.AccountAccessGrant.id).where(
+        models.AccountAccessGrant.tenant_id == account.tenant_id,
+        models.AccountAccessGrant.platform_account_id == account.id,
+        models.AccountAccessGrant.user_id == user.id,
+        models.AccountAccessGrant.active.is_(True),
+    )) is not None
 
 
 async def require_reauthorization(
@@ -52,7 +80,11 @@ async def require_reauthorization(
     account: models.PlatformAccount,
     expected_config_version: int | None = None,
 ) -> None:
-    if account.tenant_id not in principal.allowed_tenants or principal.must_change_password:
+    if (
+        account.tenant_id not in principal.allowed_tenants
+        or not principal.has_capability("connect")
+        or not principal.can_access_account(account)
+    ):
         raise PermissionError("account_reauthorization_denied")
     if expected_config_version is not None and account.config_version != expected_config_version:
         raise ValueError("account_reauthorization_version_conflict")

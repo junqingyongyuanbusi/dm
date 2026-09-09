@@ -1,3 +1,11 @@
+{% if lifecycle_compact|default(false) %}
+  <nav class="agent-workspace-tabs" aria-label="{{ lifecycle_title }}">
+    {% for stage in lifecycle_stages %}
+      <a href="{{ stage.href }}"{% if stage.current %} aria-current="page"{% endif %}
+         title="{{ stage.description }}">{{ stage.label }}</a>
+    {% endfor %}
+  </nav>
+{% else %}
 <section class="saas-lifecycle" aria-labelledby="agent-lifecycle-title">
   <div class="saas-lifecycle-heading">
     <div>
@@ -21,3 +29,4 @@
     {% endfor %}
   </ol>
 </section>
+{% endif %}

@@ -57,19 +57,28 @@ both character count and UTF-8 byte size must fit the existing upload limit.
 
 ## Browser surfaces and Channels ownership
 
-The deployed product is a single-organization installation. `default` is the only canonical
+The product is a single-organization installation. `default` is the only canonical
 Tenant exposed by browser routes; an authenticated request for `/app/t/{tenant_id}` with any other
 Tenant returns not-found before a business query runs. Browser authority is role-separated:
 
-- `USER` is the support-agent role. It uses `/app/t/default` and reads owned accounts plus
-  accounts explicitly published to the company inbox (`shared_with_support=true`). Account-derived
-  views use the same scope; sharing never grants credential, automation or employee-management rights.
+- `AGENT` is the support role, with Inbox, contacts and published knowledge access, plus
+  reception and reply capabilities. `USER` remains a compatibility spelling of AGENT; the
+  workspace-role migration converts existing USER rows to AGENT, removing new-channel access.
+- `MANAGER` can view overview, Inbox, contacts, Agents, flows, knowledge, playground, channels
+  and reports; it can receive, reply and connect, but cannot configure, administer members or audit.
+- `OPERATOR` can view Inbox and channels and connect accounts. Reply and takeover are separate,
+  per-member persisted opt-ins, both false by default. `VIEWER` only reads Inbox, reports and
+  account-scoped audit records. Hiding a navigation link is never an authorization check.
+- Non-administrators read only owned accounts or active tenant-bound `AccountAccessGrant` rows.
+  The old `shared_with_support` boolean no longer grants access. Lists, details, reports, audit
+  categories and send-time checks use the same scope; account reading is not credential authority.
 - `WORKSPACE_ADMIN` is a named database business administrator. It manages the default Workspace,
   staff, channel publication, reconnection grants, conversation handoffs and draft review.
 - bootstrap `SUPERADMIN` comes from `ADMIN_USERNAME` / `ADMIN_PASSWORD`, has no database user row,
   and remains the system/recovery identity. `/admin/system/*` explicitly requires SUPERADMIN;
   database business administrators never inherit system access.
-- Database roles are exactly `USER` and `WORKSPACE_ADMIN`. The old `ADMIN` role remains invalid.
+- New members use `WORKSPACE_ADMIN`, `MANAGER`, `OPERATOR`, `AGENT` or `VIEWER`; new member
+  forms default to AGENT. The database also accepts legacy USER for compatibility. ADMIN remains invalid.
   `is_admin`, `admin_required` and internal `ChannelActor(role="ADMIN")` denote business capability,
   not system authority. Sensitive commands reload the persisted authenticated identity.
 
@@ -81,21 +90,37 @@ adapters over the same command services during the compatibility window. OAuth c
 stable at `/admin/oauth/x/callback`, `/admin/oauth/meta/callback`, and
 `/admin/oauth/instagram/callback`.
 
-The Tenant home is a work overview, not a configuration or login-audit dashboard. It conditionally
-shows recorded channel issues, actionable queues, the current UTC day's stored message count
-(inbound and outbound), and up to five business events. Empty sections are omitted. Channel notices
-cover enabled, active Meta/Feishu accounts with explicitly recorded health failures; they link to
-account details and are not live probes. Business activity comes from human work-item creation,
-confirmed Outbox sends and recorded failed/review-required delivery attempts whose Outboxes are
-still in an issue state. It never loads the general audit stream. Support agents see accessible
-account notices and human-work events; Outbox and delivery-attempt activity is administrator-only.
-Each event source is limited before merging the latest five, with only display columns selected.
-Historical business events link to their conversations rather than assuming they remain in the
-current actionable inbox. Login and configuration changes remain available on the audit pages.
+The Tenant home is an account-scoped operations dashboard. It always displays four snapshot
+metrics (open human-work conversations, AI-state conversations without active human work, channel
+accounts and currently resolved conversations), a seven-calendar-day UTC inbound conversation
+trend, channel distribution, bounded attention records and knowledge/review quality tasks. Empty
+history displays zeroes, not demo data. Daily received counts deduplicate public/non-internal
+inbound messages by conversation; the AI series is the subset with a non-private bot reply on
+the same UTC day. Normal direct messages count; internal private records do not. Channel counts
+deduplicate across the whole seven-day window rather than summing daily counts.
 
-Channels use persisted account publication and employee identity for access. Existing accounts
-remain unpublished on upgrade; publication is an explicit administrator action exposing history to
-all support agents. Jobs remain scoped to their initiating employee or administrators, not to every
+Cards describe current memberships and are not mutually exclusive: a completed human reception
+may resume AI. Resolved membership follows the Inbox rule and is invalidated by newer inbound
+activity unless explicitly CLOSED. Account enabled means only the stored active status, never a
+successful credential or live provider health check. No provider probe or general audit stream
+is loaded. Each query uses the same tenant and owner/active-grant scope, with a transaction-local
+five-second statement timeout. Staff without home.read are redirected before database queries.
+SVG charts include explicit series legends, per-point values and a readable daily-data table;
+the dashboard retains the existing language and system/light/dark theme controls.
+
+The wikiglobal shell exposes the prototype's twelve business navigation items through a common
+capability policy. Contacts, bounded 7/30-day reports and a unified three-column Inbox use real
+account-scoped records. Staff without overview access land in Inbox. Language switching remains
+request/cookie-scoped; system/light/dark theme selection remains browser-local. Financial knowledge
+examples are explicitly unverified drafts, never automatically indexed or published; see
+`docs/wikiglobal-knowledge.md`. The flow page describes the existing controlled pipeline, not a
+drag-and-drop runtime. Playground delegates to the existing prompt trial, not a full RAG replay.
+
+Channels use explicit member grants and employee identity for access. The role migration snapshots
+existing shared-account visibility into grants for existing support staff; future employees do not
+inherit it. `/admin/users/{user_id}/access` manages account scope and operator opt-ins, with password
+confirmation, CSRF, stale-form detection and transaction-level authority revocation. Jobs remain
+scoped to their initiating employee or administrators, not to every
 reader of the resulting account. `owner_user_id` records responsibility and is not an OAuth actor
 or a credential-write permission. Business staff management lives at `/admin/users`; the system
 entry remains `/admin/system/users`. Both use the same command services, CSRF, persisted identity
@@ -112,7 +137,7 @@ credentials remain in PostgreSQL.
 
 New connections and reauthorization are separate command operations. Reauthorization binds a target
 account, stable provider identity, current account version and initiating session; only business
-administrators or explicitly granted support agents may perform it. Execution and persistence both
+administrators or explicitly authorized members with connect capability may perform it. Execution and persistence both
 recheck authority. A successful reconnect does not change owner, publication, brand, history or
 operator-selected automation. New accounts retain `BOT_DRAFT_ONLY`. Machine commands require an
 explicit, versioned Control API authority marker; NULL initiators never prove machine authority.

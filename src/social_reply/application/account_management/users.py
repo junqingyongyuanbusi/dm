@@ -6,7 +6,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from social_reply.application.account_management.admin import (
     _csrf,
@@ -15,11 +15,17 @@ from social_reply.application.account_management.admin import (
     _secure_cookie,
     _web_principal,
 )
+from social_reply.application.account_management.member_i18n import (
+    member_role_label,
+    member_translate,
+)
+from social_reply.application.account_management.permissions import ROLE_CAPABILITIES
 from social_reply.application.account_management.saas_ui import (
     render_saas_page,
     status_badge,
 )
 from social_reply.application.account_management.system_user_management import (
+    WORKSPACE_MEMBER_ROLES,
     SystemUserActor,
     SystemUserAuthenticationError,
     SystemUserConflictError,
@@ -32,7 +38,15 @@ from social_reply.application.account_management.system_user_management import (
     set_system_user_role,
     set_system_user_status,
 )
+from social_reply.application.account_management.templating import render_template, trusted_html
 from social_reply.application.account_management.ui_i18n import translate
+from social_reply.application.account_management.workspace_member_access import (
+    WorkspaceMemberAccess,
+    get_workspace_member_access,
+    parse_member_access_form,
+    require_workspace_member_manager,
+    set_workspace_member_access,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import DEFAULT_TENANT_ID
@@ -104,13 +118,11 @@ def _users_base_path(request: Request) -> str:
     return "/admin/system/users" if request.url.path.startswith("/admin/system/") else "/admin/users"
 
 
-def _role_field(selected: str = "USER") -> str:
+def _role_field(selected: str = "AGENT") -> str:
+    selected = "AGENT" if selected == "USER" else selected
     options = "".join(
-        f'<option value="{role}"{" selected" if role == selected else ""}>{html.escape(label)}</option>'
-        for role, label in (
-            ("USER", translate("admin.users.role.user")),
-            ("WORKSPACE_ADMIN", translate("admin.users.role.workspace_admin")),
-        )
+        f'<option value="{role}"{" selected" if role == selected else ""}>{html.escape(member_role_label(role))}</option>'
+        for role in WORKSPACE_MEMBER_ROLES
     )
     return f'<label>{translate("admin.users.role")}<select name="role">{options}</select></label>'
 
@@ -122,6 +134,7 @@ def _user_actions(
     emergency: bool,
     *,
     allow_self_status_role: bool = True,
+    include_access: bool = True,
 ) -> str:
     target_status = "active" if user.status == "disabled" else "disabled"
     emergency_field = (
@@ -147,11 +160,113 @@ def _user_actions(
 {_reauthentication_field()}<button class="saas-button" type="submit">{html.escape(translate("admin.users.force_password_reset"))}</button></form>"""
     revoke_form = f"""<form method="post" action="{base_path}/{user.id}/sessions/revoke">
 {_csrf_field(csrf)}{_reauthentication_field()}<button class="saas-button" type="submit">{html.escape(translate("admin.users.revoke_sessions"))}</button></form>"""
+    access_link = (
+        f'<a class="saas-button" href="/admin/users/{user.id}/access">{html.escape(member_translate("access.title"))}</a>'
+        if not emergency and include_access else ""
+    )
     return (
         '<details class="saas-danger-action"><summary>'
         f'{html.escape(translate("admin.users.manage"))}</summary>'
-        f'<div class="saas-danger-action-body">{status_form}{role_form}{reset_form}{revoke_form}</div></details>'
+        f'<div class="saas-danger-action-body">{access_link}{status_form}{role_form}{reset_form}{revoke_form}</div></details>'
     )
+
+
+def _member_list_statement():
+    member = models.AdminUser
+    account = models.PlatformAccount
+    grant = models.AccountAccessGrant
+    active_grant = select(grant.id).where(
+        grant.tenant_id == member.tenant_id,
+        grant.platform_account_id == account.id,
+        grant.user_id == member.id,
+        grant.active.is_(True),
+    ).correlate(member, account).exists()
+    # EXISTS counts each account once, including accounts both owned and granted.
+    account_count = select(func.count(account.id)).where(
+        account.tenant_id == member.tenant_id,
+        or_(member.role == "WORKSPACE_ADMIN", account.owner_user_id == member.id, active_grant),
+    ).correlate(member).scalar_subquery()
+    return select(member, account_count.label("account_count")).where(
+        member.tenant_id == DEFAULT_TENANT_ID,
+        member.role.in_((*WORKSPACE_MEMBER_ROLES, "USER")),
+    ).order_by(member.created_at, member.username)
+
+
+def _member_presentation(member, account_count: int, principal, csrf: str) -> dict:
+    member_status = (
+        "disabled" if member.status == "disabled"
+        else "password_required" if member.status == "active" and member.must_change_password
+        else "active" if member.status == "active" else "unknown"
+    )
+    return {
+        "id": member.id,
+        "username": member.username,
+        "initial": member.username[:1].upper(),
+        "role": "AGENT" if member.role == "USER" else member.role,
+        "role_label": member_role_label(member.role),
+        "account_count": account_count,
+        "is_self": member.id == principal.user_id,
+        "can_assign": not getattr(principal, "is_superadmin", False),
+        "status": member_status,
+        "status_label": member_translate(f"team.{member_status}") if member_status != "unknown" else "—",
+        "actions": trusted_html(_user_actions(
+            member, csrf, "/admin/users", getattr(principal, "is_superadmin", False),
+            allow_self_status_role=member.id != principal.user_id, include_access=False,
+        )),
+    }
+
+
+def _member_create_form(csrf: str) -> str:
+    create_fields = (
+        _csrf_field(csrf)
+        + _field("username", translate("admin.users.username"), autocomplete="username")
+        + _field("initial_password", translate("admin.users.initial_password"), input_type="password", autocomplete="new-password")
+        + _role_field() + _reauthentication_field()
+    )
+    return render_template(
+        "tenant/member_create.html", copy=member_translate,
+        create_fields=trusted_html(create_fields),
+    )
+
+
+def _render_member_workspace(principal, members, csrf: str, *, tab: str = "members") -> str:
+    active_tab = tab if tab in {"members", "roles", "scope"} else "members"
+    capabilities = sorted(set().union(*(ROLE_CAPABILITIES[role] for role in WORKSPACE_MEMBER_ROLES)))
+    return render_template(
+        "tenant/member_workspace.html", copy=member_translate,
+        active_tab=active_tab,
+        members=[_member_presentation(member, count, principal, csrf) for member, count in members],
+        roles=WORKSPACE_MEMBER_ROLES, role_label=member_role_label,
+        capabilities=capabilities, role_capabilities=ROLE_CAPABILITIES,
+    )
+
+
+async def _workspace_users_page(request: Request, principal, notice: str) -> Response:
+    if principal.is_superadmin:
+        principal.require_tenant(DEFAULT_TENANT_ID)
+    else:
+        require_workspace_member_manager(principal)
+    async with get_session_factory()() as session:
+        members = list((await session.execute(_member_list_statement())).all())
+    csrf = _csrf(request)
+    banner = (
+        f'<div class="banner ok" role="status">{html.escape(translate("admin.users.operation_completed"))}</div>'
+        if notice else ""
+    )
+    body = banner + _render_member_workspace(
+        principal, members, csrf, tab=request.query_params.get("tab", "members"),
+    )
+    response = HTMLResponse(render_saas_page(
+        principal=principal, title=member_translate("team.title"),
+        description=member_translate("team.description"), body=body,
+        active_navigation="users", tenant_id=DEFAULT_TENANT_ID,
+        primary_action_html=_member_create_form(csrf),
+    ))
+    if not request.cookies.get(_CSRF_COOKIE):
+        response.set_cookie(
+            _CSRF_COOKIE, csrf, httponly=False, samesite="lax", secure=_secure_cookie(request),
+        )
+    return response
 
 
 @router.get("/users", response_class=HTMLResponse)
@@ -165,6 +280,8 @@ async def users_page(request: Request, notice: str = "") -> Response:
     base_path = _users_base_path(request)
     if isinstance(principal, Response):
         return principal
+    if base_path == "/admin/users":
+        return await _workspace_users_page(request, principal, notice)
     async with get_session_factory()() as session:
         users = list(
             (
@@ -177,14 +294,10 @@ async def users_page(request: Request, notice: str = "") -> Response:
         )
 
     csrf = _csrf(request)
-    role_labels = {
-        "USER": translate("admin.users.role.user"),
-        "WORKSPACE_ADMIN": translate("admin.users.role.workspace_admin"),
-    }
     rows = (
         "".join(
             f"<tr><td>{html.escape(user.username)}</td>"
-            f"<td>{html.escape(role_labels.get(user.role, user.role))}</td>"
+            f"<td>{html.escape(member_role_label(user.role))}</td>"
             f"<td>{status_badge(user.status)}</td>"
             f"<td>{html.escape(translate('admin.users.must_change_password') if user.must_change_password else translate('admin.users.normal'))}</td>"
             f"<td class='muted'>{user.created_at:%Y-%m-%d %H:%M}</td>"
@@ -261,7 +374,7 @@ async def create_user(request: Request) -> Response:
         await create_system_user(
             username=form.get("username", ""),
             initial_password=form.get("initial_password", ""),
-            role=form.get("role", "USER"),
+            role=form.get("role", "AGENT"),
             bootstrap_password=form.get("bootstrap_password", ""),
             actor=_actor(principal),
         )
@@ -349,3 +462,62 @@ async def change_user_role(request: Request, user_id: uuid.UUID) -> Response:
     except SystemUserManagementError as exc:
         raise _management_http_error(exc) from exc
     return _redirect("role-updated", request)
+
+
+def _member_access_form(member: WorkspaceMemberAccess, csrf: str) -> str:
+    return render_template(
+        "tenant/member_access.html", member=member, copy=member_translate,
+        csrf_field=trusted_html(_csrf_field(csrf)),
+        confirmation_field=trusted_html(_reauthentication_field()),
+        operator_fields=(
+            ("operator_reply_enabled", "access.operator_reply", member.operator_reply_enabled),
+            ("operator_takeover_enabled", "access.operator_takeover", member.operator_takeover_enabled),
+        ),
+    )
+
+
+@router.get("/users/{user_id}/access", response_class=HTMLResponse)
+async def member_access_page(request: Request, user_id: uuid.UUID) -> Response:
+    principal = await _user_manager(request)
+    if isinstance(principal, Response):
+        return principal
+    require_workspace_member_manager(principal)
+    try:
+        member = await get_workspace_member_access(principal=principal, user_id=user_id)
+    except SystemUserManagementError as exc:
+        raise _management_http_error(exc) from exc
+    csrf = _csrf(request)
+    page_title = member_translate("access.title")
+    body = f"""<section class="member-workspace member-workspace-access"><header class="member-workspace-access-heading"><div class="member-workspace-identity">
+<span class="member-workspace-avatar" aria-hidden="true">{html.escape(member.username[:1].upper())}</span>
+<div><h2>{html.escape(member.username)}</h2><p>{html.escape(member_role_label(member.role))}</p></div></div>
+<a class="member-workspace-button" href="/admin/users">{html.escape(member_translate("access.back"))}</a></header>
+{_member_access_form(member, csrf)}</section>"""
+    response = HTMLResponse(render_saas_page(
+        principal=principal, title=page_title,
+        description=member_translate("access.description"), body=body,
+        active_navigation="users", tenant_id=DEFAULT_TENANT_ID,
+    ))
+    if not request.cookies.get(_CSRF_COOKIE):
+        response.set_cookie(
+            _CSRF_COOKIE, csrf, httponly=False, samesite="lax", secure=_secure_cookie(request),
+        )
+    return response
+
+
+@router.post("/users/{user_id}/access")
+async def change_member_access(request: Request, user_id: uuid.UUID) -> Response:
+    principal, form = await _management_form(request)
+    if isinstance(principal, Response):
+        return principal
+    require_workspace_member_manager(principal)
+    assert form is not None
+    try:
+        await set_workspace_member_access(
+            user_id=user_id, selection=parse_member_access_form(form),
+            bootstrap_password=form.get("bootstrap_password", ""), actor=_actor(principal),
+            expected_revision=form.get("access_revision", ""),
+        )
+    except SystemUserManagementError as exc:
+        raise _management_http_error(exc) from exc
+    return _redirect("access-updated", request)

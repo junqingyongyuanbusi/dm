@@ -1,0 +1,256 @@
+.knowledge-workspace {
+  min-width: 0;
+  color: var(--app-text);
+}
+
+.knowledge-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.knowledge-metric {
+  padding: 21px 22px;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background: var(--app-surface);
+}
+
+.knowledge-workspace .knowledge-metric h2 {
+  margin: 0 0 13px;
+  color: var(--app-text-subtle);
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.knowledge-metric > strong {
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.knowledge-metric p,
+.knowledge-scope-note,
+.knowledge-result-count,
+.knowledge-directory p {
+  color: var(--app-text-subtle);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.knowledge-metric p { margin: 10px 0 0; }
+.knowledge-scope-note { margin: 12px 0 22px; }
+
+.knowledge-library {
+  overflow: hidden;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background: var(--app-surface);
+}
+
+.knowledge-library-heading,
+.knowledge-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 18px;
+  padding: 19px 24px;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.knowledge-library-heading h2,
+.knowledge-management h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.knowledge-library-heading p {
+  margin: 6px 0 0;
+  color: var(--app-text-subtle);
+  font-size: 13px;
+}
+
+.knowledge-heading-actions,
+.knowledge-search > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.knowledge-toolbar .saas-tabs {
+  margin: 0;
+  border: 0;
+  gap: 20px;
+}
+
+.knowledge-search {
+  margin: 0;
+  min-width: 240px;
+  max-width: 100%;
+}
+
+.knowledge-search label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--app-text-subtle);
+  font-size: 12px;
+}
+
+.knowledge-search input {
+  flex: 1;
+  width: 200px;
+  min-width: 0;
+  padding: 8px 11px;
+  border: 1px solid var(--app-border-strong);
+  border-radius: var(--app-radius);
+  background: var(--app-surface);
+  color: var(--app-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.knowledge-readonly-tabs a {
+  display: inline-block;
+  padding: 10px 0;
+  border-bottom: 2px solid var(--app-accent);
+  color: var(--app-accent);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.knowledge-filters {
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.knowledge-filters .saas-filter-toolbar { margin: 0; }
+
+.knowledge-library-layout {
+  display: grid;
+  grid-template-columns: 222px minmax(0, 1fr);
+}
+
+.knowledge-directory {
+  padding: 22px 14px;
+  border-right: 1px solid var(--app-border);
+}
+
+.knowledge-directory h3 {
+  margin: 0 10px 14px;
+  color: var(--app-text-subtle);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.knowledge-directory a {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 6px;
+  color: var(--app-text-subtle);
+  font-size: 13px;
+  line-height: 1.5;
+  text-decoration: none;
+}
+
+.knowledge-directory a:hover {
+  background: var(--app-surface-muted);
+  color: var(--app-text);
+}
+
+.knowledge-directory .knowledge-all-link {
+  margin-bottom: 8px;
+  color: var(--app-accent);
+  font-weight: 600;
+}
+
+.knowledge-directory p { margin: 18px 10px 0; }
+.knowledge-directory .knowledge-safety-note {
+  padding: 12px;
+  margin-inline: 0;
+  border-radius: 6px;
+  background: var(--app-warning-soft);
+  color: var(--app-warning);
+}
+
+.knowledge-records { min-width: 0; }
+.knowledge-result-count { margin: 0; padding: 15px 20px; }
+.knowledge-records .saas-table-wrap {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  overflow-x: auto;
+}
+
+.knowledge-records .saas-table { min-width: 660px; }
+.knowledge-records th { white-space: nowrap; }
+.knowledge-records td { vertical-align: top; font-size: 13px; }
+.knowledge-records td:first-child { min-width: 210px; max-width: 380px; }
+.knowledge-records td strong { font-weight: 500; overflow-wrap: anywhere; }
+.knowledge-records td .saas-muted { font-size: 12px; margin-block: 5px 8px; }
+.knowledge-records td:last-child a { white-space: nowrap; }
+.knowledge-records .saas-empty-state { border: 0; }
+
+.knowledge-answer summary {
+  cursor: pointer;
+  color: var(--app-accent);
+  font-size: 12px;
+}
+
+.knowledge-answer .saas-knowledge-answer {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+}
+
+.knowledge-management,
+.knowledge-review-next,
+.knowledge-reference { margin-top: 24px; }
+.knowledge-management h2 { margin-bottom: 12px; }
+.knowledge-management .saas-low-frequency-tools { margin-top: 0; }
+.knowledge-reference {
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-surface);
+}
+
+.knowledge-reference > summary {
+  padding: 17px 20px;
+  cursor: pointer;
+  color: var(--app-text-subtle);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.knowledge-reference > .saas-card { margin: 0; border: 0; }
+#knowledge-add { scroll-margin-top: 80px; }
+.knowledge-workspace :is(a, button, input, select, summary):focus-visible {
+  outline: 2px solid var(--app-accent);
+  outline-offset: 3px;
+}
+
+@media (max-width: 1100px) {
+  .knowledge-library-layout { grid-template-columns: 190px minmax(0, 1fr); }
+  .knowledge-metric { padding: 18px; }
+}
+
+@media (max-width: 760px) {
+  .knowledge-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .knowledge-library-layout { grid-template-columns: minmax(0, 1fr); }
+  .knowledge-directory { border-right: 0; border-bottom: 1px solid var(--app-border); }
+  .knowledge-directory nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .knowledge-directory p { margin-top: 10px; }
+  .knowledge-library-heading, .knowledge-toolbar, .knowledge-filters { padding: 16px; }
+  .knowledge-toolbar .saas-tabs { width: 100%; overflow-x: auto; }
+  .knowledge-search { width: 100%; }
+}
+
+@media (max-width: 380px) {
+  .knowledge-metrics, .knowledge-directory nav { grid-template-columns: minmax(0, 1fr); }
+}

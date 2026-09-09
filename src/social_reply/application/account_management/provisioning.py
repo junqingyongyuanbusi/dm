@@ -624,10 +624,11 @@ async def _validate_persist_authority(
             or principal.user_id != initiator_user_id
             or tenant_id not in principal.allowed_tenants
             or principal.must_change_password
+            or not principal.has_capability("connect")
             or (authority_kind == "BOOTSTRAP_SESSION" and not principal.is_superadmin)
             or (
                 authority_kind == "STAFF_SESSION"
-                and (principal.user_id is None or principal.role not in {"USER", "WORKSPACE_ADMIN"})
+                and principal.user_id is None
             )
         ):
             raise PermissionError("initiator_session_invalid")

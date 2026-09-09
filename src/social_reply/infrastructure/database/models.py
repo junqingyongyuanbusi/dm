@@ -46,7 +46,10 @@ class AdminUser(Base):
     __table_args__ = (
         UniqueConstraint("username"),
         UniqueConstraint("tenant_id", "id", name="uq_admin_users_tenant_id_id"),
-        CheckConstraint("role IN ('USER', 'WORKSPACE_ADMIN')", name="ck_admin_users_role"),
+        CheckConstraint(
+            "role IN ('USER', 'WORKSPACE_ADMIN', 'MANAGER', 'OPERATOR', 'AGENT', 'VIEWER')",
+            name="ck_admin_users_role",
+        ),
         CheckConstraint("status IN ('active', 'disabled')", name="ck_admin_users_status"),
         Index("ix_admin_users_tenant_role_status", "tenant_id", "role", "status"),
     )
@@ -54,7 +57,13 @@ class AdminUser(Base):
     username: Mapped[str] = mapped_column(String(128))
     password_hash: Mapped[str] = mapped_column(Text)
     tenant_id: Mapped[str] = mapped_column(String(64))
-    role: Mapped[str] = mapped_column(String(16), default="USER")
+    role: Mapped[str] = mapped_column(String(16), default="AGENT", server_default="AGENT")
+    operator_reply_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    operator_takeover_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(16), default="active")
     password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -169,6 +178,30 @@ class PlatformAccount(Base):
     chatwoot_inbox_id: Mapped[int | None] = mapped_column(Integer, unique=True)
     automation_default: Mapped[str] = mapped_column(Text, default="BOT_DRAFT_ONLY")
     status: Mapped[str] = mapped_column(Text, default=ACTIVE_ACCOUNT_STATUS)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AccountAccessGrant(Base):
+    __tablename__ = "account_access_grants"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "platform_account_id", "user_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "platform_account_id"],
+            ["platform_accounts.tenant_id", "platform_accounts.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "user_id"],
+            ["admin_users.tenant_id", "admin_users.id"],
+            ondelete="CASCADE",
+        ),
+        Index("ix_account_access_grants_tenant_user_active", "tenant_id", "user_id", "active"),
+    )
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    tenant_id: Mapped[str] = mapped_column(Text)
+    platform_account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

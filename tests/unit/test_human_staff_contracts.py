@@ -68,11 +68,14 @@ def test_human_mutation_wrappers_expose_principal_fence():
         claim_human_work_item,
         resolve_human_work_item,
         send_human_reply,
-        start_human_reception,
         transfer_human_work_item,
     ):
         parameter = inspect.signature(operation).parameters["principal"]
         assert parameter.default is None
+
+    # Starting reception already requires an explicit principal argument; it is not optional.
+    required_principal = inspect.signature(start_human_reception).parameters["principal"]
+    assert required_principal.default is inspect.Parameter.empty
 
     assert set(inspect.signature(revoke_staff_authority).parameters) == {
         "session",

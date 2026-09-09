@@ -336,6 +336,7 @@ async def test_stale_named_admin_cannot_mutate_knowledge(
     session, migrated_db, authority_mode, operation
 ):
     user, principal, token = await _named_workspace_admin(session)
+    user_id = user.id
     await session.rollback()
     prepared = await _prepare_stale_operation(session, operation)
     before = await _knowledge_audits(session)
@@ -343,7 +344,7 @@ async def test_stale_named_admin_cannot_mutate_knowledge(
     if authority_mode == "revoke":
         await revoke_session(token)
     else:
-        await _change_named_admin_authority(user.id, authority_mode)
+        await _change_named_admin_authority(user_id, authority_mode)
 
     with pytest.raises(KnowledgeAuthorizationError):
         await _attempt_stale_operation(session, principal, operation, prepared)
@@ -372,6 +373,7 @@ async def test_named_workspace_admin_succeeds_and_user_is_rejected(session, migr
         ),
         embedder=FakeEmbeddingClient(),
     )
+    document_id = document.id
     await session.commit()
 
     _user, user_principal, _user_token = await _named_workspace_admin(session, role="USER")
@@ -382,12 +384,12 @@ async def test_named_workspace_admin_succeeds_and_user_is_rejected(session, migr
             SetKnowledgeOfficialContactCommand(
                 required_tenant_id="default",
                 principal=user_principal,
-                document_id=document.id,
+                document_id=document_id,
                 is_official_contact=True,
             ),
         )
     await session.rollback()
-    unchanged = await session.get(models.KnowledgeDocument, document.id)
+    unchanged = await session.get(models.KnowledgeDocument, document_id)
     assert unchanged is not None
     assert unchanged.is_official_contact is False
     assert await _knowledge_audits(session) == before

@@ -12,6 +12,11 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 from fastapi import HTTPException, Request
 from sqlalchemy import delete, select
 
+from social_reply.application.account_management.permissions import (
+    ALL_CAPABILITIES,
+    SUPPORTED_ROLES,
+    role_has_capability,
+)
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
@@ -62,6 +67,9 @@ class Principal:
     role: str = "USER"
     authentication_kind: str = "SESSION"
     action_proof: FeishuActionProof | None = None
+    operator_reply_enabled: bool = False
+    operator_takeover_enabled: bool = False
+    account_access_ids: frozenset[uuid.UUID] = frozenset()
     _bootstrap_marker: object | None = field(
         default=None,
         init=False,
@@ -104,8 +112,27 @@ class Principal:
             return False
         return self.is_workspace_admin or (
             self.user_id is not None
-            and (account.owner_user_id == self.user_id or account.shared_with_support is True)
+            and self.role in SUPPORTED_ROLES
+            and (
+                account.owner_user_id == self.user_id
+                or (bool(self.account_access_ids) and account.id in self.account_access_ids)
+            )
         )
+
+    def has_capability(self, capability: str) -> bool:
+        if self.must_change_password:
+            return False
+        if self.is_superadmin:
+            return capability in ALL_CAPABILITIES
+        return self.user_id is not None and role_has_capability(
+            self.role, capability,
+            operator_reply_enabled=self.operator_reply_enabled,
+            operator_takeover_enabled=self.operator_takeover_enabled,
+        )
+
+    def require_capability(self, capability: str) -> None:
+        if not self.has_capability(capability):
+            raise HTTPException(status_code=403, detail="capability_required:" + capability)
 
     def require_admin(self) -> None:
         if not self.is_workspace_admin:
@@ -324,7 +351,10 @@ async def authenticate(username: str, password: str) -> tuple[Principal, str] | 
             )
         )
         await session.commit()
-        principal = _user_principal(session_id, stored_user)
+        principal = _user_principal(
+            session_id, stored_user,
+            account_access_ids=await _account_access_ids(session, stored_user),
+        )
     return principal, raw_token
 
 
@@ -343,7 +373,20 @@ def _bootstrap_principal(session_id: uuid.UUID, *, verified: bool = False) -> Pr
     return principal
 
 
-def _user_principal(session_id: uuid.UUID, user: models.AdminUser) -> Principal:
+async def _account_access_ids(session, user: models.AdminUser) -> frozenset[uuid.UUID]:
+    return frozenset(await session.scalars(
+        select(models.AccountAccessGrant.platform_account_id).where(
+            models.AccountAccessGrant.tenant_id == user.tenant_id,
+            models.AccountAccessGrant.user_id == user.id,
+            models.AccountAccessGrant.active.is_(True),
+        )
+    ))
+
+
+def _user_principal(
+    session_id: uuid.UUID, user: models.AdminUser,
+    *, account_access_ids: frozenset[uuid.UUID] = frozenset(),
+) -> Principal:
     return Principal(
         session_id=session_id,
         user_id=user.id,
@@ -353,6 +396,9 @@ def _user_principal(session_id: uuid.UUID, user: models.AdminUser) -> Principal:
         allowed_tenants=frozenset({user.tenant_id}),
         must_change_password=user.must_change_password,
         role=user.role,
+        operator_reply_enabled=user.operator_reply_enabled is True,
+        operator_takeover_enabled=user.operator_takeover_enabled is True,
+        account_access_ids=account_access_ids,
     )
 
 
@@ -372,6 +418,10 @@ async def principal_from_token(raw_token: str) -> Principal | None:
                 )
             )
         ).one_or_none()
+        account_access_ids = (
+            await _account_access_ids(session, row[1])
+            if row is not None and row[1] is not None else frozenset()
+        )
     if row is None:
         return None
     stored_session, user = row
@@ -392,7 +442,7 @@ async def principal_from_token(raw_token: str) -> Principal | None:
         )
     ):
         return None
-    return _user_principal(stored_session.id, user)
+    return _user_principal(stored_session.id, user, account_access_ids=account_access_ids)
 
 
 async def principal_from_session_row(
@@ -439,7 +489,9 @@ async def principal_from_session_row(
         )
     ):
         return None
-    return _user_principal(stored_session.id, user)
+    return _user_principal(
+        stored_session.id, user, account_access_ids=await _account_access_ids(session, user)
+    )
 
 
 async def principal_from_session_id(session_id: uuid.UUID | str) -> Principal | None:

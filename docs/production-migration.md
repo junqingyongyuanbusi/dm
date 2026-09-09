@@ -4,6 +4,38 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 `docs/architecture.md` for runtime ownership, `docs/configuration.md` for environment variables, and
 `scripts/publish_railway_release.sh` for the required production release path.
 
+## Pending wikiglobal workspace authority migration
+
+Revision `c6f2a9d4e810` follows `b9e5f3a7d102` and is the current code head. It adds five
+workspace roles, per-member operator reply/takeover flags and tenant-bound account access grants.
+It snapshots existing `shared_with_support` access for existing USER members, then converts USER
+to AGENT. New users do not inherit old account sharing. Existing members lose self-service channel
+connection permission by the explicitly approved USER-to-AGENT mapping.
+
+This work has only been exercised in isolated local test databases. It is **not a production
+release approval**. A schema-compatible predecessor image alone is insufficient for authority
+rollback: old code trusts the shared boolean and does not enforce the new role capabilities.
+The revision intentionally refuses automatic downgrade; blanket AGENT-to-USER conversion would
+restore revoked connect authority and must never be used as a recovery shortcut.
+
+Production promotion must remain blocked until a reviewed coordinated rollout provides:
+
+1. A current database backup, inventory of named administrators and expected per-member account
+   grants, plus predecessor digest/deployment IDs and an authority-compatible recovery image.
+2. A bounded maintenance window preventing old API, Worker and Scheduler code from executing
+   user-authorized commands or external sends while authority semantics change. Merely deploying
+   the API while old workers continue sending is not an accepted compatibility window.
+3. Release-script support for this reviewed maintenance/rollback procedure. Do not replace the
+   default script with ad-hoc Railway commands or mistake migration-graph compatibility for
+   authorization compatibility.
+4. API-owned migration and verification of USER-to-AGENT conversion, shared grant snapshot,
+   tenant composite foreign keys, five-role denial matrix and named administrator recovery access.
+5. Worker/Scheduler on the identical approved digest before leaving maintenance, with revoked
+   reply/connect/grant checks verified, plus the normal health, region and digest checks.
+
+Until these prerequisites are implemented and reviewed, this revision is local-acceptance only;
+do not run the generic production promotion flow for it.
+
 ## Completed Docker Hub to GHCR registry bootstrap
 
 Production moved from Docker Hub digest
@@ -23,7 +55,7 @@ Code-only releases do not create this compatibility image. `latest` promotion an
 Railway rollout belong exclusively to `scripts/publish_railway_release.sh`; the local release path
 only inspects or retags registry manifests and never builds, pulls or runs image layers. Railway
 native image auto-update must remain disabled.
-The current Alembic graph has one head: `a8f4d2c6e901`. Database migration verifies schema state
+At that historical release the Alembic head was `a8f4d2c6e901`. Database migration verifies schema state
 only; it does not prove that any real Email DNS, TLS, credential, IMAP or SMTP connection has
 succeeded.
 

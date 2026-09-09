@@ -1,0 +1,54 @@
+<section class="saas-card saas-financial-knowledge wp-financial-panel" aria-labelledby="financial-knowledge-title">
+  <div class="saas-card-header wp-panel-heading">
+    <div>
+      <p class="saas-eyebrow">wikiglobal</p>
+      <h2 id="financial-knowledge-title">{{ 'Financial knowledge guide' if english else '外汇金融知识指南' }} <span class="wp-count">{{ cards|length }}</span></h2>
+    </div>
+    <span class="saas-status warning">{{ 'Not published' if english else '未发布 · 待人工核验' }}</span>
+  </div>
+  <div class="wp-knowledge-layout">
+    <aside class="wp-knowledge-folders">
+      <h3>{{ 'Financial knowledge topics' if english else '金融知识分类' }}</h3>
+    <nav aria-label="{{ 'Financial knowledge topics' if english else '金融知识分类' }}">
+      {% for card in cards %}
+      <a class="wp-knowledge-folder" href="{{ card.href }}"><span class="wp-folder-icon" aria-hidden="true">▤</span>{{ card.content.title }}</a>
+      {% endfor %}
+    </nav>
+    </aside>
+    <div class="saas-table-wrap wp-knowledge-table">
+      <table>
+        <thead><tr><th scope="col">{{ 'Example knowledge / review' if english else '知识模板 / 审阅' }}</th><th scope="col">{{ 'Status' if english else '状态' }}</th><th scope="col">{{ 'Verification' if english else '来源核验' }}</th></tr></thead>
+        <tbody>
+    {% for card in cards %}
+    <tr><td>
+    <details class="saas-create-disclosure" data-financial-category="{{ card.key }}">
+      <summary>{{ card.content.title }} — {{ 'Review example draft' if english else '审阅模板草稿' }}</summary>
+      <div class="saas-card-body saas-stack">
+        <h3>{{ card.content.question }}</h3>
+        <p>{{ card.content.reply }}</p>
+        <dl class="saas-definition-list">
+          <dt>{{ 'Source' if english else '来源提示' }}</dt><dd>{{ card.content.source_hint }}</dd>
+          <dt>{{ 'Verification date' if english else '核验日期提示' }}</dt><dd>{{ card.content.verified_at_hint }}</dd>
+          <dt>{{ 'Human completion required' if english else '需人工补全' }}</dt><dd>{{ card.content.required_information }}</dd>
+        </dl>
+        {% if can_manage and not english %}
+        <details>
+          <summary>英文编辑参考（仍需人工核实）</summary>
+          <dl class="saas-definition-list" lang="en">
+            <dt>Question</dt><dd>{{ card.english_content.question }}</dd>
+            <dt>Reply</dt><dd>{{ card.english_content.reply }}</dd>
+          </dl>
+        </details>
+        {% endif %}
+      </div>
+    </details>
+    </td><td><span class="saas-status warning">{{ 'Not published' if english else '未发布' }}</span></td><td class="saas-muted">{{ 'Human review required' if english else '待人工核验' }}</td></tr>
+    {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="saas-card-body saas-stack wp-knowledge-safety">
+    <p class="saas-muted">{{ 'Verify sources before publication. Examples are not investment advice; investing involves risk.' if english else '发布前请核验来源；示例不构成投资建议，投资有风险。' }}</p>
+  </div>
+</section>

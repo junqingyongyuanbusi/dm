@@ -388,11 +388,12 @@ async def _require_human_retry_authority(
     if (
         principal is None
         or principal.must_change_password
+        or not principal.has_capability("reply")
         or principal.user_id != outbox.initiator_user_id
         or not principal.can_access_account(context.account)
     ):
         raise DeliveryRecoveryConflict("human_outbox_authority_revoked")
-    if origin == "DRAFT_APPROVAL" and principal.is_workspace_admin:
+    if origin == "DRAFT_APPROVAL" and principal.has_capability("reply"):
         return
     if origin == "MANUAL_REPLY":
         work = await session.scalar(
@@ -449,6 +450,8 @@ async def _apply_resolution(
             outbox_id=outbox_id,
             required_tenant_id=required_tenant_id,
         )
+        if not current.can_access_account(context.account):
+            raise DeliveryRecoveryConflict("delivery_account_access_revoked")
         normalized_provider_message_id = _normalize_provider_message_id(
             provider_message_id,
             platform=context.account.platform,

@@ -687,6 +687,7 @@ async def _validate_human_outbox_authority(
         or principal.is_feishu_action
         or principal.session_id != outbox.initiator_session_id
         or principal.must_change_password
+        or not principal.has_capability("reply")
     ):
         return "HUMAN_INITIATOR_SESSION_INVALID"
     if principal.actor != outbox.actor_id:
@@ -753,7 +754,7 @@ async def _validate_human_outbox_authority(
             or decision.final_reply_text != payload.get("text")
         ):
             return "DRAFT_APPROVAL_PROVENANCE_INVALID"
-        return None if principal.is_workspace_admin else "DRAFT_APPROVER_NOT_AUTHORIZED"
+        return None if principal.has_capability("reply") else "DRAFT_APPROVER_NOT_AUTHORIZED"
     if outbox.human_work_item_version is None:
         return "HUMAN_WORK_VERSION_MISSING"
     work = await session.scalar(

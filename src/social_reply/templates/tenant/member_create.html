@@ -1,0 +1,13 @@
+<div class="member-workspace">
+  <details class="member-workspace-create">
+    <summary class="member-workspace-button member-workspace-primary"><span aria-hidden="true">+</span> {{ copy('team.add') }}</summary>
+    <div class="member-workspace-create-panel">
+      <h2>{{ copy('team.add') }}</h2>
+      <p class="member-workspace-muted">{{ copy('team.create_hint') }}</p>
+      <form class="member-workspace-form" method="post" action="/admin/users">
+        {{ create_fields }}
+        <button class="member-workspace-button member-workspace-primary" type="submit">{{ copy('team.add') }}</button>
+      </form>
+    </div>
+  </details>
+</div>

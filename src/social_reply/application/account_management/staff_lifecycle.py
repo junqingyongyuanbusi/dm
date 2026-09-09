@@ -79,7 +79,9 @@ async def revoke_staff_authority(
                 ).where(
                     models.OutboxMessage.tenant_id == tenant_id,
                     models.OutboxMessage.initiator_user_id == user_id,
-                    models.OutboxMessage.origin_kind == OutboxOrigin.MANUAL_REPLY,
+                    models.OutboxMessage.origin_kind.in_(
+                        [OutboxOrigin.MANUAL_REPLY, OutboxOrigin.DRAFT_APPROVAL]
+                    ),
                     models.OutboxMessage.actor_kind == OutboxActor.ADMIN_HUMAN,
                     models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
                 )
@@ -130,7 +132,9 @@ async def revoke_staff_authority(
                 ).where(
                     models.OutboxMessage.tenant_id == tenant_id,
                     models.OutboxMessage.initiator_user_id == user_id,
-                    models.OutboxMessage.origin_kind == OutboxOrigin.MANUAL_REPLY,
+                    models.OutboxMessage.origin_kind.in_(
+                        [OutboxOrigin.MANUAL_REPLY, OutboxOrigin.DRAFT_APPROVAL]
+                    ),
                     models.OutboxMessage.actor_kind == OutboxActor.ADMIN_HUMAN,
                     models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
                 )
@@ -189,7 +193,16 @@ async def revoke_staff_authority(
             )
         ).all()
     )
-    account_ids = sorted(set(grant_identity) | work_account_ids, key=str)
+    access_grant_identity = list(await session.scalars(
+        select(models.AccountAccessGrant.platform_account_id).where(
+            models.AccountAccessGrant.tenant_id == tenant_id,
+            models.AccountAccessGrant.user_id == user_id,
+            models.AccountAccessGrant.active.is_(True),
+        )
+    ))
+    account_ids = sorted(
+        set(grant_identity) | set(access_grant_identity) | work_account_ids, key=str
+    )
     accounts = {
         account.id: account
         for account in (
@@ -231,6 +244,14 @@ async def revoke_staff_authority(
             )
         ).all()
     )
+    active_access_grants = list(await session.scalars(
+        select(models.AccountAccessGrant).where(
+            models.AccountAccessGrant.tenant_id == tenant_id,
+            models.AccountAccessGrant.user_id == user_id,
+            models.AccountAccessGrant.active.is_(True),
+        ).execution_options(populate_existing=True).order_by(models.AccountAccessGrant.id)
+        .with_for_update()
+    ))
     work_items = list(
         (
             await session.scalars(
@@ -295,7 +316,7 @@ async def revoke_staff_authority(
         released_work += 1
 
     bumped_accounts: set[uuid.UUID] = set()
-    for grant in active_grants:
+    for grant in [*active_grants, *active_access_grants]:
         grant.active = False
         account = accounts.get(grant.platform_account_id)
         if account is None:
@@ -366,7 +387,9 @@ async def revoke_staff_authority(
                     models.OutboxMessage.tenant_id == tenant_id,
                     models.OutboxMessage.conversation_id.in_(conversation_ids),
                     models.OutboxMessage.initiator_user_id == user_id,
-                    models.OutboxMessage.origin_kind == OutboxOrigin.MANUAL_REPLY,
+                    models.OutboxMessage.origin_kind.in_(
+                        [OutboxOrigin.MANUAL_REPLY, OutboxOrigin.DRAFT_APPROVAL]
+                    ),
                     models.OutboxMessage.actor_kind == OutboxActor.ADMIN_HUMAN,
                     models.OutboxMessage.status.in_(["PENDING", "FAILED"]),
                 )
@@ -416,6 +439,7 @@ async def revoke_staff_authority(
                 "released_work_items": released_work,
                 "legacy_work_items_released": 0,
                 "revoked_grants": len(active_grants),
+                "revoked_access_grants": len(active_access_grants),
                 "bumped_accounts": len(bumped_accounts),
                 "cancelled_jobs": cancelled_jobs,
                 "cancelled_outbox": cancelled_outbox,
@@ -427,6 +451,7 @@ async def revoke_staff_authority(
         "released_work_items": released_work,
         "legacy_work_items_released": 0,
         "revoked_grants": len(active_grants),
+        "revoked_access_grants": len(active_access_grants),
         "bumped_accounts": len(bumped_accounts),
         "cancelled_jobs": cancelled_jobs,
         "cancelled_outbox": cancelled_outbox,

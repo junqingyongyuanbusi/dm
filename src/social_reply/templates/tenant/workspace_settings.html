@@ -1,0 +1,66 @@
+<div class="workspace-settings-grid">
+  <nav class="workspace-settings-nav" aria-label="{{ labels.navigation }}">
+    {% for target in sections %}
+    <a href="{{ root }}/settings?section={{ target }}"{% if section == target %} aria-current="page"{% endif %}>{{ labels[target] }}</a>
+    {% endfor %}
+  </nav>
+  <section class="workspace-settings-card" data-section="{{ section }}" aria-labelledby="settings-section-title">
+    <h2 id="settings-section-title">{{ labels[section] }}</h2>
+    {% if section == 'general' %}
+    <div class="workspace-settings-field">
+      <label for="workspace-name">{{ labels.name }}</label>
+      <input id="workspace-name" type="text" disabled placeholder="{{ labels.unavailable }}">
+    </div>
+    <div class="workspace-settings-fields">
+      <div class="workspace-settings-field">
+        <label for="workspace-timezone">{{ labels.timezone }}</label>
+        <select id="workspace-timezone" disabled><option>{{ labels.unavailable }}</option></select>
+      </div>
+      <div class="workspace-settings-field">
+        <span id="workspace-language">{{ labels.language }}</span>
+        <div class="workspace-settings-language" role="group" aria-labelledby="workspace-language">
+          <a href="{{ chinese_url }}" lang="zh-CN"{% if locale == 'zh-CN' %} aria-current="true"{% endif %}>简体中文</a>
+          <a href="{{ english_url }}" lang="en"{% if locale == 'en' %} aria-current="true"{% endif %}>English</a>
+        </div>
+      </div>
+    </div>
+    <div class="workspace-settings-field">
+      <label for="workspace-retention">{{ labels.retention }}</label>
+      <select id="workspace-retention" disabled><option>{{ labels.unavailable }}</option></select>
+    </div>
+    {% elif section == 'hours' %}
+    {% for field in ('business_hours', 'weekend_hours') %}
+    <div class="workspace-settings-field">
+      <label for="workspace-{{ field }}">{{ labels[field] }}</label>
+      <input id="workspace-{{ field }}" type="text" disabled placeholder="{{ labels.unavailable }}">
+    </div>
+    {% endfor %}
+    <div class="workspace-settings-field">
+      <label for="workspace-off-hours">{{ labels.off_hours }}</label>
+      <select id="workspace-off-hours" disabled><option>{{ labels.unavailable }}</option></select>
+    </div>
+    {% elif section == 'notifications' %}
+    {% for field in ('handoff_alert', 'channel_alert') %}
+    <div class="workspace-settings-row">
+      <label for="workspace-{{ field }}">{{ labels[field] }}</label>
+      <span class="workspace-settings-option"><input id="workspace-{{ field }}" type="checkbox" disabled aria-describedby="workspace-{{ field }}-status"><small id="workspace-{{ field }}-status">{{ labels.unavailable }}</small></span>
+    </div>
+    {% endfor %}
+    <div class="workspace-settings-row">
+      <h3>{{ labels.feishu }}</h3>
+      <a class="saas-button" href="{{ root }}/channels/feishu/handoff">{{ labels.configure }}</a>
+    </div>
+    {% else %}
+    {% for key, href in (('channels', root ~ '/channels'), ('health', root ~ '/health'), ('knowledge', root ~ '/knowledge'), ('instructions', instructions_url)) %}
+    <a class="workspace-settings-destination" href="{{ href }}">
+      <h3>{{ labels[key] }}</h3>
+      <span aria-hidden="true">&#8594;</span>
+    </a>
+    {% endfor %}
+    <div class="workspace-settings-footer">
+      <a class="saas-button" href="{{ root }}/audit">{{ labels.audit }}</a>
+      <a class="saas-button" href="{{ root }}/journeys">{{ labels.journeys }}</a>
+    </div>
+    {% endif %}
+  </section>
+</div>

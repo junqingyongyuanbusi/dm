@@ -1,0 +1,136 @@
+<div class="unified-inbox" data-has-selection="{{ has_selection|lower }}">
+  <header class="unified-inbox-heading">
+    <div class="unified-inbox-heading-title">
+      <h1>{{ labels.title }}</h1>
+      <span class="unified-inbox-brand">{{ labels.brand }}</span>
+    </div>
+    <span class="unified-inbox-scope{% if can_reply %} reply-enabled{% endif %}">{{ scope_label }}</span>
+  </header>
+  <div class="unified-inbox-layout">
+    <section class="unified-inbox-list" aria-label="{{ labels.all }}">
+      <form id="unified-inbox-filters" class="unified-inbox-filters" method="get" action="{{ form_action }}" role="search">
+        <input type="hidden" name="queue" value="{{ queue }}">
+        <div class="unified-inbox-search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg>
+          <label class="unified-inbox-visually-hidden" for="unified-search">{{ labels.search }}</label>
+          <input id="unified-search" type="search" name="q" value="{{ search }}"
+                 placeholder="{{ labels.search_hint }}" maxlength="200" autocomplete="off">
+          <button class="unified-inbox-search-submit" type="submit" aria-label="{{ labels.apply }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg>
+          </button>
+        </div>
+        <nav class="unified-inbox-queues" aria-label="{{ labels.title }}">
+          {% for link in queue_links if link.key not in ('drafts', 'delivery') %}
+            <a href="{{ link.href }}"{% if link.active %} class="active" aria-current="page"{% endif %}>{{ link.label }}</a>
+          {% endfor %}
+        </nav>
+        <div class="unified-inbox-filter-row">
+          <div>
+            <label class="unified-inbox-visually-hidden" for="unified-platform">{{ labels.platform }}</label>
+            <select id="unified-platform" name="platform">
+              <option value="">{{ labels.all_platforms }}</option>
+              {% for option in platforms %}
+                <option value="{{ option }}"{% if platform == option %} selected{% endif %}>{{ option|title }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label class="unified-inbox-visually-hidden" for="unified-channel">{{ labels.channel_type }}</label>
+            <select id="unified-channel" name="channel_type">
+              <option value="">{{ labels.all_channels }}</option>
+              {% for option in channel_types %}
+                <option value="{{ option }}"{% if channel_type == option %} selected{% endif %}>{{ labels.get(option, option) }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <button class="unified-inbox-filter-submit" type="submit" aria-label="{{ labels.apply }}" title="{{ labels.apply }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7h16M7 12h10m-7 5h4"/></svg>
+          </button>
+        </div>
+      </form>
+      {% if queue_links|length > 5 %}
+      <nav class="unified-inbox-review-links" aria-label="{{ labels.drafts }}">
+        {% for link in queue_links if link.key in ('drafts', 'delivery') %}
+          <a href="{{ link.href }}">{{ link.label }}</a>
+        {% endfor %}
+      </nav>
+      {% endif %}
+      <div class="unified-inbox-list-meta"><span>{{ count_label }}</span><span>{{ labels.recent }}</span></div>
+      <div class="unified-inbox-conversations">
+        {% for row in rows %}
+          <a class="unified-inbox-conversation{% if row.active %} active{% endif %}" href="{{ row.href }}"
+             {% if row.active %}aria-current="true"{% endif %}>
+            <span class="unified-inbox-avatar-wrap" aria-hidden="true">
+              <span class="unified-inbox-avatar">{{ row.initial }}</span>
+              <span class="unified-inbox-platform-mark" data-platform="{{ row.platform }}">{{ row.platform[:1]|upper }}</span>
+            </span>
+            <span class="unified-inbox-conversation-copy">
+              <span class="unified-inbox-row-heading"><strong>{{ row.title }}</strong><time>{{ row.time }}</time></span>
+              <span class="unified-inbox-preview">{{ row.preview }}</span>
+              <span class="unified-inbox-row-meta">{{ row.badge }}<span>{{ labels.get(row.channel_type, row.channel_type) }}</span></span>
+              <span class="unified-inbox-channel">{{ row.platform|title }} · {{ row.account }}</span>
+            </span>
+          </a>
+        {% else %}
+          <div class="saas-empty unified-inbox-empty">
+            {{ inbox_icon }}
+            <h2>{{ labels.empty_title }}</h2>
+            <p>{{ labels.empty_description }}</p>
+            {% if search or platform or channel_type or queue != 'all' %}
+              <a class="saas-button small" href="{{ clear_href }}">{{ labels.clear }}</a>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+      <nav class="unified-inbox-pagination" aria-label="{{ labels.all }}">
+        {% if previous_href %}<a class="saas-button small" href="{{ previous_href }}">{{ labels.previous }}</a>{% endif %}
+        {% if next_href %}<a class="saas-button small" href="{{ next_href }}">{{ labels.next }}</a>{% endif %}
+      </nav>
+    </section>
+    <section class="unified-inbox-detail" aria-label="{{ labels.conversation_content }}">
+      <a class="unified-inbox-back" href="{{ back_href }}">{{ labels.back }}</a>
+      {% if selected_item %}
+      <header class="unified-inbox-conversation-header">
+        <div class="unified-inbox-conversation-title">
+          <h2>{{ selected_item.title }}</h2>
+          <p>{{ selected_item.platform|title }} · {{ selected_item.account_name }} · {{ labels.get(selected_item.channel_type, selected_item.channel_type) }}</p>
+        </div>
+        <div class="unified-inbox-conversation-tools">{{ reception_html }}</div>
+      </header>
+      <div class="unified-inbox-conversation-banner">
+        {{ selected_badge }}
+        <span>{{ labels.brand }}</span>
+      </div>
+      <details class="unified-inbox-mobile-inspector">
+        <summary>{{ labels.inspector }}</summary>
+        <div>{{ inspector_html }}</div>
+        {% if record_href %}<a class="unified-inbox-record-link" href="{{ record_href }}">{{ record_label }}</a>{% endif %}
+      </details>
+      <div class="unified-inbox-thread" tabindex="0" aria-label="{{ labels.conversation_content }}">
+        {% if messages %}<p class="unified-inbox-history-label">{{ labels.history_limit }}</p>{% endif %}
+        {% for message in messages %}
+          <article class="unified-inbox-message{% if message.direction == 'outbound' %} outbound{% endif %}">
+            <div class="unified-inbox-message-meta">
+              <span>{{ selected_item.title if message.direction == 'inbound' else message.sender_type }}</span>
+              <time>{{ format_datetime(message.occurred_at or message.created_at, include_year=True) }}</time>
+            </div>
+            <div class="unified-inbox-bubble">{{ message.text or labels.non_text }}</div>
+          </article>
+        {% else %}
+          <div class="saas-empty unified-inbox-empty"><p>{{ labels.no_message }}</p></div>
+        {% endfor %}
+      </div>
+      {% if actions_html %}<div class="unified-inbox-actions">{{ actions_html }}</div>{% endif %}
+      {% else %}
+      <div class="saas-empty unified-inbox-empty unified-inbox-selection-empty">
+        {{ inbox_icon }}<h2>{{ labels.select }}</h2><p>{{ labels.description }}</p>
+      </div>
+      {% endif %}
+    </section>
+    <aside class="unified-inbox-inspector" aria-label="{{ labels.inspector }}">
+      <h2>{{ labels.inspector }}</h2>
+      {{ inspector_html }}
+      {% if record_href %}<a class="unified-inbox-record-link" href="{{ record_href }}">{{ record_label }}</a>{% endif %}
+    </aside>
+  </div>
+</div>

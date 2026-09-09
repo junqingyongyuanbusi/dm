@@ -237,7 +237,7 @@ async def test_业务_prompt_使用低于不可变系统契约的_user_policy_�
     messages = json.loads(captured[0].content)["messages"]
 
     assert [message["role"] for message in messages] == ["system", "user"]
-    assert "Immutable WikiFX response contract" in messages[0]["content"]
+    assert "Immutable wikiglobal response contract" in messages[0]["content"]
     assert "Brand voice preferences" not in messages[0]["content"]
     assert business_prompt.text in messages[1]["content"]
     assert "lower-authority JSON data" in messages[1]["content"]

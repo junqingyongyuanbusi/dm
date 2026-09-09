@@ -1,0 +1,65 @@
+<div class="saas-workspace-page saas-contacts-workspace">
+  {% if selected %}
+    <div class="saas-filter-toolbar">
+      <a class="saas-button" href="{{ tenant_root }}/contacts">{{ workspace_text('contacts.back') }}</a>
+    </div>
+    <section class="saas-card saas-contact-detail" aria-labelledby="contact-heading">
+      <h2 id="contact-heading">{{ workspace_text('contacts.detail') }}</h2>
+      <h3>{{ selected.display_name or selected.external_user_id }}</h3>
+      <dl class="saas-workspace-facts">
+        <div><dt>{{ workspace_text('contacts.external_id') }}</dt><dd class="saas-mono">{{ selected.external_user_id }}</dd></div>
+        <div><dt>{{ workspace_text('common.platform') }}</dt><dd>{{ selected.platform }}</dd></div>
+        <div><dt>{{ workspace_text('contacts.account') }}</dt><dd>{{ selected.account_name }}</dd></div>
+        <div><dt>{{ workspace_text('contacts.recorded') }}</dt><dd>{{ timestamp(selected.created_at) }}</dd></div>
+      </dl>
+    </section>
+    <section class="saas-card saas-stack" aria-labelledby="contact-conversations-heading">
+      <h2 id="contact-conversations-heading">{{ workspace_text('contacts.recent') }}</h2>
+      <p class="saas-muted">{{ workspace_text('contacts.detail_note') }}</p>
+      <div class="saas-table-wrap">
+        <table>
+          <thead><tr><th scope="col">{{ workspace_text('common.channel') }}</th><th scope="col">{{ workspace_text('common.created') }}</th><th scope="col">{{ workspace_text('common.conversation') }}</th></tr></thead>
+          <tbody>
+            {% for conversation in conversations %}
+              <tr><td>{{ conversation.channel_type }}</td><td>{{ timestamp(conversation.created_at) }}</td><td><a class="saas-button" href="{{ tenant_root }}/conversations/{{ conversation.id }}">{{ workspace_text('common.conversation') }}</a></td></tr>
+            {% else %}
+              <tr><td colspan="3" class="saas-empty-state">{{ workspace_text('contacts.no_conversations') }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% else %}
+    <section class="saas-card wp-panel" aria-label="{{ workspace_text('contacts.title') }}">
+      <header class="wp-panel-heading">
+        <div><h2>{{ workspace_text('contacts.visible') }} <span class="wp-count">{{ contacts|length }}</span></h2></div>
+      </header>
+      <form method="get" action="{{ tenant_root }}/contacts" class="wp-table-toolbar" role="search">
+        <label class="wp-search-label" for="contact-search">{{ workspace_text('contacts.search') }}</label>
+        <input id="contact-search" type="search" name="search" maxlength="100" value="{{ search }}" placeholder="{{ workspace_text('contacts.placeholder') }}">
+        <button class="saas-button primary" type="submit">{{ workspace_text('common.search') }}</button>
+      </form>
+      <div class="saas-table-wrap">
+      <table>
+        <thead><tr><th scope="col">{{ workspace_text('contacts.name') }}</th><th scope="col">{{ workspace_text('common.platform') }}</th><th scope="col">{{ workspace_text('contacts.account') }}</th><th scope="col">{{ workspace_text('contacts.recorded') }}</th><th scope="col">{{ workspace_text('common.open') }}</th></tr></thead>
+        <tbody>
+          {% for contact in contacts %}
+            <tr>
+              <td><div class="wp-identity"><span class="wp-avatar" aria-hidden="true">{{ (contact.display_name or contact.external_user_id or '?')[:1]|upper }}</span><div><strong>{{ contact.display_name or contact.external_user_id }}</strong><div class="saas-muted saas-mono">{{ contact.external_user_id }}</div></div></div></td>
+              <td><span class="saas-status neutral">{{ contact.platform }}</span></td>
+              <td>{{ contact.account_name }}</td><td>{{ timestamp(contact.created_at) }}</td>
+              <td><a class="saas-button" href="{{ contact.href }}">{{ workspace_text('common.open') }}</a></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="saas-empty-state">{{ workspace_text('contacts.empty') }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </section>
+    <nav class="saas-filter-toolbar" aria-label="{{ workspace_text('contacts.title') }}">
+      {% if previous_href %}<a class="saas-button" rel="prev" href="{{ previous_href }}">{{ workspace_text('common.previous') }}</a>{% endif %}
+      {% if next_href %}<a class="saas-button" rel="next" href="{{ next_href }}">{{ workspace_text('common.next') }}</a>{% endif %}
+    </nav>
+  {% endif %}
+</div>

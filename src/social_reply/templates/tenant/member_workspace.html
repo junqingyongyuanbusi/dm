@@ -1,0 +1,43 @@
+<div class="member-workspace">
+  <nav class="member-workspace-tabs" aria-label="{{ copy('team.title') }}">
+    {% for tab in ('members', 'roles', 'scope') %}
+    <a class="member-workspace-tab{% if active_tab == tab %} is-active{% endif %}" href="/admin/users?tab={{ tab }}"{% if active_tab == tab %} aria-current="page"{% endif %}>{{ copy('team.' ~ tab) }}</a>
+    {% endfor %}
+  </nav>
+
+  {% if active_tab == 'members' %}
+  <div class="member-workspace-card member-workspace-table-wrap">
+    <table class="member-workspace-table">
+      <thead><tr><th scope="col">{{ copy('team.members') }}</th><th scope="col">{{ copy('team.role') }}</th><th scope="col">{{ copy('team.group') }}</th><th scope="col">{{ copy('team.accounts') }}</th><th scope="col">{{ copy('team.status') }}</th><th scope="col"><span class="member-workspace-sr-only">{{ copy('team.actions') }}</span></th></tr></thead>
+      <tbody>
+        {% for member in members %}
+        <tr>
+          <td><div class="member-workspace-identity"><span class="member-workspace-avatar member-workspace-avatar-{{ loop.index0 % 4 }}" aria-hidden="true">{{ member.initial }}</span><div><strong>{{ member.username }}</strong> {% if member.is_self %}<span class="member-workspace-badge">{{ copy('team.you') }}</span>{% endif %}<div class="member-workspace-muted">—</div></div></div></td>
+          <td><span class="member-workspace-badge member-workspace-role-{{ member.role|lower }}">{{ member.role_label }}</span></td>
+          <td class="member-workspace-muted">—</td>
+          <td>{% if member.role == 'WORKSPACE_ADMIN' %}{{ copy('team.all_accounts') }}{% else %}{{ member.account_count }} {{ copy('team.assigned_accounts') }}{% endif %}</td>
+          <td><span class="member-workspace-badge member-workspace-status-{{ member.status }}">{{ member.status_label }}</span></td>
+          <td><div class="member-workspace-actions">{% if member.can_assign %}<a class="member-workspace-button member-workspace-button-small" href="/admin/users/{{ member.id }}/access" aria-label="{{ copy('team.assign') }} · {{ member.username }}">{{ copy('team.assign') }}</a>{% endif %}{{ member.actions }}</div></td>
+        </tr>
+        {% else %}<tr><td colspan="6" class="member-workspace-empty">{{ copy('team.empty') }}</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="member-workspace-notice">{{ copy('team.operator_note') }}</p>
+  {% elif active_tab == 'roles' %}
+  <div class="member-workspace-role-summary">
+    {% for role in roles %}<section class="member-workspace-role-card"><h2>{{ role_label(role) }}</h2><p>{{ copy('summary.' ~ role) }}</p></section>{% endfor %}
+  </div>
+  <div class="member-workspace-card member-workspace-table-wrap">
+    <table class="member-workspace-table member-workspace-permissions">
+      <thead><tr><th scope="col">{{ copy('team.capability') }}</th>{% for role in roles %}<th scope="col">{{ role_label(role) }}</th>{% endfor %}</tr></thead>
+      <tbody>{% for capability in capabilities %}<tr data-capability="{{ capability }}"><th scope="row">{{ copy('capability.' ~ capability) }}</th>{% for role in roles %}<td data-role="{{ role }}" data-allowed="{{ 'true' if capability in role_capabilities[role] else 'false' }}">{% if capability in role_capabilities[role] %}<span class="member-workspace-permission-yes" aria-label="{{ copy('team.allowed') }}">&#10003;</span>{% elif role == 'OPERATOR' and capability in ('reply', 'takeover') %}<span class="member-workspace-muted">{{ copy('team.per_member') }}</span>{% else %}<span class="member-workspace-muted" aria-label="{{ copy('team.denied') }}">—</span>{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  <p class="member-workspace-footnote">{{ copy('team.matrix_note') }}</p>
+  {% else %}
+  <section class="member-workspace-card member-workspace-rules" aria-label="{{ copy('team.scope') }}">
+    {% for rule in ('rule_scope', 'rule_actions', 'rule_revoke') %}<p><span class="member-workspace-badge" aria-hidden="true">0{{ loop.index }}</span>{{ copy('team.' ~ rule) }}</p>{% endfor %}
+  </section>
+  {% endif %}
+</div>

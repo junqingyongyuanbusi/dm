@@ -1,82 +1,100 @@
-<div class="saas-test-layout">
-  <section class="saas-card saas-test-console">
-    <div class="saas-card-header">
-      <div>
-        <h2>{{ playground_title }}</h2>
-        <p>{{ playground_description }}</p>
-      </div>
-      <span class="saas-status info">{{ sandbox_label }}</span>
-    </div>
-    <div class="saas-card-body">
-      {% if can_run %}
-        <form method="post" action="{{ test_action }}" class="saas-test-form">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <label class="saas-field" for="agent-test-message">
-            <span>{{ message_label }}</span>
-            <textarea id="agent-test-message" name="text" maxlength="4000" required
-                      placeholder="{{ message_placeholder }}">{{ input_text }}</textarea>
-          </label>
-          <div class="saas-test-submit-row">
-            <span class="saas-muted">{{ isolation_notice }}</span>
-            <button class="saas-button primary" type="submit">{{ run_label }}</button>
+<link rel="stylesheet" href="/static/agent-workspace.css?v=1">
+<div class="agent-workspace agent-workspace-test">
+  <div class="agent-workspace-test-layout">
+    <div class="agent-workspace-test-input">
+      <section class="saas-card saas-test-console" aria-labelledby="agent-test-title">
+        <div class="saas-card-header">
+          <div>
+            <h2 id="agent-test-title">{{ playground_title }}</h2>
           </div>
-        </form>
-      {% else %}
-        <section class="saas-alert">{{ read_only_notice }}</section>
-      {% endif %}
-
-      {% if error_message %}
-        <section class="saas-alert danger saas-test-result">{{ error_message }}</section>
-      {% elif result %}
-        <section class="saas-test-result" aria-live="polite">
-          <div class="saas-test-result-heading">
-            <div>
-              <div class="saas-eyebrow">{{ result_eyebrow }}</div>
-              <h3>{{ result_title }}</h3>
-            </div>
-            <span class="saas-status success">{{ completed_label }}</span>
-          </div>
-          <dl class="saas-test-result-grid">
-            <div><dt>{{ action_label }}</dt><dd>{{ result.action }}</dd></div>
-            <div><dt>{{ intent_label }}</dt><dd>{{ result.intent or "—" }}</dd></div>
-            <div><dt>{{ risk_label }}</dt><dd>{{ result.risk_level }}</dd></div>
-            <div><dt>{{ confidence_label }}</dt><dd>{{ "%.2f"|format(result.confidence) }}</dd></div>
-            <div><dt>{{ duration_label }}</dt><dd>{{ result.duration_ms }} ms</dd></div>
-            <div><dt>{{ reason_codes_label }}</dt><dd>{{ result.reason_codes|join(", ") or "—" }}</dd></div>
-          </dl>
-          {% if result.reply_text %}
-            <div class="saas-test-reply">
-              <span>{{ reply_label }}</span>
-              <p>{{ result.reply_text }}</p>
-            </div>
+        </div>
+        <div class="saas-card-body">
+          {% if can_run %}
+            <form method="post" action="{{ test_action }}" class="saas-test-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <label class="saas-field" for="agent-test-message">
+                <span>{{ message_label }}</span>
+                <textarea id="agent-test-message" name="text" maxlength="4000" required rows="7"
+                          aria-describedby="agent-test-isolation"
+                          placeholder="{{ message_placeholder }}">{{ input_text }}</textarea>
+              </label>
+              <div class="saas-test-submit-row">
+                <span class="saas-muted" id="agent-test-isolation">{{ isolation_notice }}</span>
+                <button class="saas-button primary" type="submit">{{ run_label }}</button>
+              </div>
+            </form>
           {% else %}
-            <p class="saas-muted">{{ no_reply_label }}</p>
+            <section class="saas-alert">{{ read_only_notice }}</section>
           {% endif %}
-        </section>
-      {% endif %}
-    </div>
-  </section>
+        </div>
+      </section>
 
-  <aside class="saas-card saas-test-context">
-    <div class="saas-card-header">
-      <div>
-        <h2>{{ context_title }}</h2>
-        <p>{{ context_description }}</p>
-      </div>
+      <aside class="saas-card saas-test-context" aria-labelledby="agent-test-context-title">
+        <div class="saas-card-header">
+          <div>
+            <h2 id="agent-test-context-title">{{ context_title }}</h2>
+          </div>
+        </div>
+        <div class="saas-card-body">
+          <dl class="agent-workspace-context-grid">
+            <div><dt>{{ prompt_label }}</dt><dd>{{ prompt_version }}</dd></div>
+            <div><dt>{{ knowledge_label }}</dt><dd>{{ published_knowledge_count }}</dd></div>
+            <div><dt>{{ channels_label }}</dt><dd>{{ active_account_count }}/{{ account_count }}</dd></div>
+            <div><dt>{{ mode_label }}</dt><dd>{{ mode }}</dd></div>
+          </dl>
+        </div>
+      </aside>
     </div>
-    <div class="saas-card-body">
-      <dl class="saas-definition-list">
-        <dt>{{ prompt_label }}</dt><dd>{{ prompt_version }}</dd>
-        <dt>{{ knowledge_label }}</dt><dd>{{ published_knowledge_count }}</dd>
-        <dt>{{ channels_label }}</dt><dd>{{ active_account_count }}/{{ account_count }}</dd>
-        <dt>{{ mode_label }}</dt><dd>{{ mode }}</dd>
-      </dl>
-      <div class="saas-test-guardrails">
-        <strong>{{ guardrails_title }}</strong>
-        <ul>
-          {% for guardrail in guardrails %}<li>{{ guardrail }}</li>{% endfor %}
-        </ul>
+
+    <section class="saas-card agent-workspace-output" aria-labelledby="agent-test-result-title">
+      <div class="saas-card-header">
+        <div>
+          <span class="saas-eyebrow">{{ result_eyebrow }}</span>
+          <h2 id="agent-test-result-title">{{ result_title }}</h2>
+        </div>
+        <span class="saas-status info">{{ sandbox_label }}</span>
       </div>
-    </div>
-  </aside>
+      <div class="saas-card-body">
+        {% if error_message %}
+          <section class="saas-alert danger saas-test-result" role="alert">{{ error_message }}</section>
+        {% elif result %}
+          <section class="saas-test-result" aria-live="polite">
+            <div class="agent-workspace-result-meta">
+              <span class="saas-status neutral">{{ completed_label }}</span>
+              <span class="saas-mono">{{ duration_label }} · {{ result.duration_ms }} ms</span>
+            </div>
+            <div class="saas-test-reply">
+              <h3>{{ reply_label }}</h3>
+              {% if result.reply_text %}
+                <p>{{ result.reply_text }}</p>
+              {% else %}
+                <p class="saas-muted">{{ no_reply_label }}</p>
+              {% endif %}
+            </div>
+            <dl class="saas-test-result-grid">
+              <div><dt>{{ action_label }}</dt><dd>{{ result.action }}</dd></div>
+              <div><dt>{{ intent_label }}</dt><dd>{{ result.intent or "—" }}</dd></div>
+              <div><dt>{{ risk_label }}</dt><dd>{{ result.risk_level }}</dd></div>
+              <div><dt>{{ confidence_label }}</dt><dd>{{ "%.2f"|format(result.confidence) }}</dd></div>
+            </dl>
+            <div class="agent-workspace-reasons">
+              <h3>{{ reason_codes_label }}</h3>
+              {% if result.reason_codes %}
+                <ul>{% for reason in result.reason_codes %}<li><code>{{ reason }}</code></li>{% endfor %}</ul>
+              {% else %}
+                <p class="saas-muted">—</p>
+              {% endif %}
+            </div>
+          </section>
+        {% else %}
+          <div class="agent-workspace-output-empty">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M9 3h6M10 3v6l-6 10a1.5 1.5 0 0 0 1.3 2h13.4a1.5 1.5 0 0 0 1.3-2L14 9V3M8 15h8"/>
+            </svg>
+            <p>{{ message_placeholder }}</p>
+          </div>
+        {% endif %}
+      </div>
+    </section>
+  </div>
 </div>

@@ -1,0 +1,70 @@
+<link rel="stylesheet" href="/static/knowledge-workspace.css?v=1">
+<section class="knowledge-workspace" aria-label="{{ 'Knowledge workspace' if english else '知识工作台' }}">
+  {% set metric_labels = {'total': ('Knowledge sources' if english else '知识来源'), 'published': ('Published' if english else '已发布'), 'draft': ('Drafts' if english else '草稿'), 'review': ('Awaiting language review' if english else '待语言核验')} %}
+  <div class="knowledge-metrics">
+    {% for key, value in metrics %}
+    <article class="knowledge-metric">
+      <h2>{{ metric_labels[key] }}</h2>
+      <strong>{{ value if value is not none else '—' }}</strong>
+      {% if not can_manage and key not in ('total', 'published') %}<p>{{ 'Outside your access' if english else '不在当前权限范围内' }}</p>{% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  <p class="knowledge-scope-note">
+    {% if can_manage %}
+    {{ 'Workspace totals; search covers loaded records only.' if english else '指标为工作空间总量；搜索仅限已加载资料。' }}
+    {% else %}
+    {{ 'Counts and search cover loaded, accessible published records only.' if english else '统计与搜索仅限已加载、可访问的已发布资料。' }}
+    {% endif %}
+  </p>
+  <section class="knowledge-library" aria-labelledby="knowledge-library-title">
+    <header class="knowledge-library-heading">
+      <div>
+        <h2 id="knowledge-library-title">{{ 'Business knowledge' if english else '业务知识资料' }}</h2>
+      </div>
+      <div class="knowledge-heading-actions">
+        <a class="saas-button" href="{{ root }}/knowledge-query">{{ 'Search published answers' if english else '检索已发布问答' }}</a>
+        {% if can_manage %}<a class="saas-button primary" href="#knowledge-add">{{ 'Add knowledge' if english else '添加知识' }}</a>{% endif %}
+      </div>
+    </header>
+    <div class="knowledge-toolbar">
+      {% if can_manage %}
+      {{ tabs_html }}
+      {% else %}
+      <nav class="knowledge-readonly-tabs" aria-label="{{ 'Knowledge status' if english else '知识状态' }}">
+        <a href="{{ root }}/knowledge" aria-current="page">{{ 'Published · read only' if english else '已发布 · 只读' }}</a>
+      </nav>
+      {% endif %}
+      <form class="knowledge-search" method="get" action="{{ root }}/knowledge">
+        {% for name, value in hidden_filters %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+        <label for="knowledge-search">{{ 'Search loaded records' if english else '搜索已加载资料' }}</label>
+        <div><input id="knowledge-search" name="search" type="search" value="{{ query }}" maxlength="200" placeholder="{{ 'Question or topic' if english else '问题或主题关键词' }}"><button class="saas-button" type="submit">{{ 'Search' if english else '搜索' }}</button></div>
+      </form>
+    </div>
+    {% if filters_html %}<div class="knowledge-filters">{{ filters_html }}</div>{% endif %}
+    <div class="knowledge-library-layout">
+      <aside class="knowledge-directory">
+        <h3>{{ 'Financial topics' if english else '金融知识主题' }}</h3>
+        <a class="knowledge-all-link" href="{{ root }}/knowledge">{{ 'All accessible knowledge' if english else '全部可访问资料' }}</a>
+        <nav aria-label="{{ 'Search published financial topics' if english else '检索已发布金融主题' }}">
+          {% for topic in topics %}<a href="{{ topic.href }}"><span aria-hidden="true">▤</span>{{ topic.title }}</a>{% endfor %}
+        </nav>
+      </aside>
+      <div class="knowledge-records">
+        <p class="knowledge-result-count" role="status">{{ 'Showing' if english else '当前显示' }} <strong>{{ shown_count }}</strong> / {{ loaded_count }} {{ 'loaded records' if english else '条已加载资料' }} · {{ 'Load limit' if english else '加载上限' }} {{ limit }}</p>
+        {{ table_html }}
+      </div>
+    </div>
+  </section>
+  {% if can_manage %}
+  {% if review_html %}<div class="knowledge-review-next">{{ review_html }}</div>{% endif %}
+  <section class="knowledge-management" aria-labelledby="knowledge-management-title">
+    <h2 id="knowledge-management-title">{{ 'Create and review' if english else '新增与审核' }}</h2>
+    {{ tools_html }}
+  </section>
+  {% endif %}
+  <details id="knowledge-reference" class="knowledge-reference">
+    <summary>{{ 'Financial template reference · not published knowledge' if english else '金融模板参考 · 不属于已发布知识' }}</summary>
+    {{ guide_html }}
+  </details>
+</section>

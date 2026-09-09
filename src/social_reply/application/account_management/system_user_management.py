@@ -22,6 +22,8 @@ from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
+WORKSPACE_MEMBER_ROLES = ("WORKSPACE_ADMIN", "MANAGER", "OPERATOR", "AGENT", "VIEWER")
+
 
 class SystemUserManagementError(Exception):
     def __init__(self, code: str) -> None:
@@ -63,7 +65,9 @@ def validate_system_username(username: str) -> str:
 
 def validate_system_user_role(role: str) -> str:
     normalized = role.strip().upper()
-    if normalized not in {"USER", "WORKSPACE_ADMIN"}:
+    if normalized == "USER":
+        normalized = "AGENT"
+    if normalized not in WORKSPACE_MEMBER_ROLES:
         raise SystemUserValidationError("invalid_user_role")
     return normalized
 
@@ -270,7 +274,7 @@ async def set_system_user_role(
         previous = user.role
         if previous == target:
             return
-        if target == "USER":
+        if target != "WORKSPACE_ADMIN":
             await _protect_last_admin(
                 session, user, actor=current_actor, emergency_reason=emergency_reason
             )

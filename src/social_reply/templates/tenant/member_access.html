@@ -1,0 +1,31 @@
+<form class="member-workspace-access-form" method="post" action="/admin/users/{{ member.user_id }}/access">
+  {{ csrf_field }}<input type="hidden" name="access_revision" value="{{ member.revision }}">
+  <fieldset>
+    <legend>{{ copy('access.accounts') }}</legend>
+    {% if member.role == 'WORKSPACE_ADMIN' %}<p class="member-workspace-notice">{{ copy('access.admin_hint') }}</p>{% endif %}
+    <div class="member-workspace-account-grid">
+      {% for account in member.accounts %}
+      <label class="member-workspace-scope-item">
+        <input type="checkbox" name="account_{{ account.account_id }}"{% if account.owned or account.granted %} checked{% endif %}{% if account.owned %} disabled{% endif %}>
+        {% set platform = account.platform|lower %}
+        <span class="member-workspace-platform" aria-hidden="true">{% if platform in ('facebook', 'instagram', 'telegram', 'x', 'whatsapp', 'email', 'feishu') %}<img src="/static/channel-icons/{{ platform }}.svg" width="24" height="24" alt="">{% else %}{{ account.platform[:1]|upper }}{% endif %}</span>
+        <span><strong>{{ account.name }}</strong><small>{{ account.platform }}{% if account.owned %} · {{ copy('access.owner') }}{% endif %}</small></span>
+      </label>
+      {% else %}<p class="member-workspace-muted">{{ copy('access.empty') }}</p>{% endfor %}
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend>{{ copy('access.operations') }}</legend>
+    <p class="member-workspace-muted">{{ copy('access.operator_hint') }}</p>
+    <div class="member-workspace-operation-grid">
+      {% for name, label, enabled in operator_fields %}
+      <label class="member-workspace-scope-item"><input type="checkbox" name="{{ name }}"{% if enabled %} checked{% endif %}><span>{{ copy(label) }}</span></label>
+      {% endfor %}
+    </div>
+  </fieldset>
+  <div class="member-workspace-confirmation">
+    <p class="member-workspace-footnote">{{ copy('access.revocation_hint') }}</p>
+    <div class="member-workspace-form">{{ confirmation_field }}</div>
+    <div class="member-workspace-form-actions"><a class="member-workspace-button" href="/admin/users">{{ copy('access.back') }}</a><button class="member-workspace-button member-workspace-primary" type="submit">{{ copy('access.save') }}</button></div>
+  </div>
+</form>

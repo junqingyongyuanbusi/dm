@@ -1,11 +1,13 @@
 import uuid
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
 from fastapi import HTTPException, Request
 
 from apps.api.main import create_app
-from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.auth import Principal, _bootstrap_principal
 from social_reply.application.account_management.ui_i18n import reset_locale, set_locale
 
 
@@ -34,15 +36,15 @@ def _database_principal(
     )
 
 
-def _superadmin_principal() -> Principal:
-    return Principal(
-        session_id=uuid.uuid4(),
-        username="system-admin",
-        actor="bootstrap:system-admin",
-        tenant_id="default",
-        allowed_tenants=frozenset({"default"}),
-        role="SUPERADMIN",
+def _superadmin_principal(username: str = "system-admin") -> Principal:
+    settings = SimpleNamespace(
+        admin_username=username,
+        allowed_admin_tenants=frozenset({"default"}),
     )
+    with patch(
+        "social_reply.application.account_management.auth.get_settings", return_value=settings
+    ):
+        return _bootstrap_principal(uuid.uuid4(), verified=True)
 
 
 def _request(path: str) -> Request:
@@ -95,7 +97,7 @@ async def test_admin_login_renders_english_locale_in_shared_auth_shell():
     assert switch_response.status_code == 303
     assert response.status_code == 200
     assert '<html lang="en">' in response.text
-    assert "Sign in to Reply Core" in response.text
+    assert "Sign in to wikiglobal" in response.text
     assert "Username" in response.text
     assert "Password" in response.text
     assert 'href="/auth/login?ui_lang=zh-CN"' in response.text
@@ -120,13 +122,7 @@ async def test_language_switch_link_preserves_login_return_target_and_filters():
 def test_admin_shared_shell_groups_navigation_and_marks_active_page():
     from social_reply.application.account_management import admin
 
-    principal = Principal(
-        session_id=uuid.uuid4(),
-        username="root-admin",
-        actor="bootstrap:root-admin",
-        allowed_tenants=frozenset({"default"}),
-        role="SUPERADMIN",
-    )
+    principal = _superadmin_principal("root-admin")
 
     page_html = admin._page(
         "Overview",
@@ -225,13 +221,7 @@ async def test_admin_login_sets_http_only_session_cookie(monkeypatch):
         assert username == "admin"
         assert password == "test-admin-password"
         return (
-            Principal(
-                session_id=__import__("uuid").uuid4(),
-                username="admin",
-                actor="user:admin",
-                allowed_tenants=frozenset({"default"}),
-                role="SUPERADMIN",
-            ),
+            _superadmin_principal("admin"),
             "opaque-session-token",
         )
 

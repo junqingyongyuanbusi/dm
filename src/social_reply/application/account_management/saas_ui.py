@@ -32,7 +32,7 @@ class NavigationGroup:
 
 
 PageSurface = Literal["tenant", "admin", "system", "auth"]
-_STATIC_ASSET_VERSION = "20260903-helpdesk-foundation-1"
+_STATIC_ASSET_VERSION = "20260909-wikiglobal-compact-5"
 
 
 _STATUS_PRESENTATION: dict[str, tuple[str, str]] = {
@@ -194,6 +194,7 @@ def render_shared_page(
         principal=principal,
         tenant_id=tenant_id,
         has_sidebar=has_sidebar,
+        title=title,
     )
     sidebar_html = _render_sidebar(
         navigation_html=navigation_html,
@@ -223,6 +224,7 @@ def render_shared_page(
         refresh_seconds=refresh_seconds,
         surface=surface,
         layout_mode=layout_mode,
+        active_navigation=active_navigation,
         close_navigation_label=translate("shell.close_navigation"),
         skip_to_content_label=translate("shell.skip_to_content"),
         header_html=trusted_html(header_html),
@@ -273,44 +275,10 @@ def _tenant_navigation_groups(
     tenant_id: str,
     inbox_count: int,
 ) -> tuple[NavigationGroup, ...]:
-    if not tenant_id:
+    if not tenant_id or tenant_id not in principal.allowed_tenants:
         return ()
     root = f"/app/t/{tenant_id}"
-    if not principal.is_admin:
-        return (
-            NavigationGroup(
-                translate("nav.group.work"),
-                (
-                    NavigationItem("home", root, translate("nav.home")),
-                    NavigationItem(
-                        "inbox",
-                        f"{root}/inbox",
-                        translate("nav.inbox"),
-                        inbox_count or None,
-                    ),
-                    NavigationItem(
-                        "conversations", f"{root}/conversations", translate("nav.conversations")
-                    ),
-                ),
-            ),
-            NavigationGroup(
-                translate("nav.group.configuration"),
-                (
-                    NavigationItem("agents", f"{root}/agents", translate("nav.agents")),
-                    NavigationItem(
-                        "knowledge-query",
-                        f"{root}/knowledge-query",
-                        translate("nav.knowledge_query"),
-                    ),
-                    NavigationItem("channels", f"{root}/channels", translate("nav.channels")),
-                ),
-            ),
-            NavigationGroup(
-                translate("nav.group.observability"),
-                (NavigationItem("activity", f"{root}/activity", translate("nav.my_activity")),),
-            ),
-        )
-    return (
+    candidates = (
         NavigationGroup(
             translate("nav.group.work"),
             (
@@ -318,43 +286,47 @@ def _tenant_navigation_groups(
                 NavigationItem(
                     "inbox", f"{root}/inbox", translate("nav.inbox"), inbox_count or None
                 ),
-                NavigationItem(
-                    "conversations", f"{root}/conversations", translate("nav.conversations")
-                ),
+                NavigationItem("contacts", f"{root}/contacts", translate("nav.contacts")),
             ),
         ),
         NavigationGroup(
             translate("nav.group.configuration"),
             (
                 NavigationItem("agents", f"{root}/agents", translate("nav.agents")),
+                NavigationItem("flows", f"{root}/flows", translate("nav.flows")),
                 NavigationItem(
                     "knowledge",
                     f"{root}/knowledge",
                     translate("nav.documents_knowledge"),
                 ),
+                NavigationItem("playground", f"{root}/playground", translate("nav.playground")),
+            ),
+        ),
+        NavigationGroup(
+            translate("nav.group.management"),
+            (
                 NavigationItem("channels", f"{root}/channels", translate("nav.channels")),
-            ),
-        ),
-        NavigationGroup(
-            translate("nav.group.observability"),
-            (
-                NavigationItem("health", f"{root}/health", translate("nav.system_health")),
-                NavigationItem("audit", f"{root}/audit", translate("nav.audit_center")),
-                NavigationItem(
-                    "journeys", f"{root}/journeys", translate("nav.processing_journey")
-                ),
-            ),
-        ),
-        NavigationGroup(
-            translate("nav.group.settings"),
-            (
+                NavigationItem("reports", f"{root}/reports", translate("nav.reports")),
                 NavigationItem("users", "/admin/users", translate("nav.users_access")),
+                NavigationItem("audit", f"{root}/audit", translate("nav.audit_center")),
                 NavigationItem(
                     "settings", f"{root}/settings", translate("nav.workspace_settings")
                 ),
             ),
         ),
     )
+    capability_keys = {"users": "team"}
+    authorized_groups = (
+        NavigationGroup(
+            group.label,
+            tuple(
+                item for item in group.items
+                if principal.has_capability(f"{capability_keys.get(item.key, item.key)}.read")
+            ),
+        )
+        for group in candidates
+    )
+    return tuple(group for group in authorized_groups if group.items)
 
 
 def _system_navigation_groups() -> tuple[NavigationGroup, ...]:
@@ -383,9 +355,19 @@ def _system_navigation_groups() -> tuple[NavigationGroup, ...]:
 
 
 _NAVIGATION_ICON_PATHS: dict[str, str] = {
+    "flows": (
+        '<rect x="9" y="3" width="6" height="5" rx="1"/>'
+        '<path d="M12 8v5M5 16v-3h14v3"/>'
+        '<rect x="2" y="16" width="6" height="5" rx="1"/>'
+        '<rect x="16" y="16" width="6" height="5" rx="1"/>'
+    ),
+    "playground": (
+        '<path d="M9 3h6M10 3v7l-6 9a1.3 1.3 0 0 0 1 2h14a1.3 1.3 0 0 0 1-2l-6-9V3"/>'
+        '<path d="M7 15h10"/>'
+    ),
+    "reports": '<path d="M4 3v18h17M8 17v-5M13 17V7M18 17v-8"/>',
     "home": (
-        '<path d="M3.5 11.5 12 4l8.5 7.5"/>'
-        '<path d="M5.5 10.5V20h13v-9.5M9.5 20v-6h5v6"/>'
+        '<path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/>'
     ),
     "inbox": (
         '<path d="M4 5h16l-1.5 14h-13L4 5Z"/>'
@@ -396,27 +378,28 @@ _NAVIGATION_ICON_PATHS: dict[str, str] = {
         '<path d="M8 10h8M8 13h5"/>'
     ),
     "agents": (
-        '<rect x="5" y="7" width="14" height="12" rx="3"/>'
-        '<path d="M12 3v4M8.5 12h.01M15.5 12h.01M9 16h6"/>'
+        '<path d="m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4z"/>'
     ),
     "knowledge": (
         '<path d="M4.5 5.5A3.5 3.5 0 0 1 8 4h4v15H8a3.5 3.5 0 0 0-3.5 1V5.5Z"/>'
         '<path d="M19.5 5.5A3.5 3.5 0 0 0 16 4h-4v15h4a3.5 3.5 0 0 1 3.5 1V5.5Z"/>'
     ),
     "audit": (
-        '<path d="M8 4h8M9 3h6v3H9zM6 5h12v16H6z"/>'
-        '<path d="m9 14 2 2 4-5"/>'
+        '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
     ),
     "settings": (
-        '<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/>'
-        '<circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>'
+        '<path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8"/>'
+        '<path d="M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1z"/>'
     ),
     "channels": (
-        '<path d="M7 8.5a5 5 0 0 0 0 7M4.5 6a8.5 8.5 0 0 0 0 12"/>'
-        '<path d="M17 8.5a5 5 0 0 1 0 7M19.5 6a8.5 8.5 0 0 1 0 12"/>'
-        '<circle cx="12" cy="12" r="2"/>'
+        '<path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-2 2"/>'
+        '<path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l2-2"/>'
     ),
     "users": (
+        '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/>'
+        '<path d="m8 12 3 3 5-6"/>'
+    ),
+    "contacts": (
         '<circle cx="9" cy="8" r="3"/>'
         '<path d="M3.5 20v-2.5A4.5 4.5 0 0 1 8 13h2a4.5 4.5 0 0 1 4.5 4.5V20"/>'
         '<path d="M15.5 5.5a3 3 0 0 1 0 5.5M16 14a4.5 4.5 0 0 1 4.5 4.5V20"/>'
@@ -437,7 +420,7 @@ _NAVIGATION_ICON_ALIASES: dict[str, str] = {
     "reply-prompt": "knowledge",
     "system-audit": "audit",
     "journeys": "activity",
-    "profile": "users",
+    "profile": "contacts",
     "accounts": "channels",
     "handoff": "conversations",
     "system-health": "health",
@@ -512,8 +495,14 @@ def _render_header(
     principal: Principal | None,
     tenant_id: str | None,
     has_sidebar: bool,
+    title: str = "",
 ) -> str:
     context_html = _render_context(surface=surface, tenant_id=tenant_id)
+    if has_sidebar and title:
+        context_html += (
+            '<span class="saas-context-divider" aria-hidden="true">/</span>'
+            f'<span class="saas-context-current">{escape(title)}</span>'
+        )
     toggle_html = (
         '<button type="button" data-sidebar-toggle aria-controls="primary-navigation" '
         f'aria-label="{escape(translate("shell.open_navigation"))}">'
@@ -547,23 +536,20 @@ def _render_brand(surface: PageSurface) -> str:
         "system": "/admin/system/overview",
         "auth": "/auth/login",
     }[surface]
-    if surface == "tenant":
-        return (
-            f'<a class="saas-brand" href="{escape(brand_href)}">'
-            '<span class="saas-brand-mark">D</span>'
-            '<span class="saas-brand-tenant">Acme Global</span>'
-            '<span class="saas-tenant-chip font-mono">#t_8820</span></a>'
-        )
     return (
         f'<a class="saas-brand" href="{escape(brand_href)}">'
-        '<span class="saas-brand-mark">RC</span>'
-        f'<span>{escape(translate("shell.product_name"))}</span></a>'
+        f'<span class="saas-brand-mark" aria-hidden="true">{navigation_icon("flows")}</span>'
+        f'<span class="saas-brand-name">{escape(translate("shell.product_name"))}</span>'
+        '<span class="saas-brand-dot" aria-hidden="true"></span></a>'
     )
 
 
 def _render_context(*, surface: PageSurface, tenant_id: str | None) -> str:
     if surface == "tenant":
-        return f'<span class="saas-context-label">{escape(translate("shell.workspace"))}</span>'
+        return (
+            '<span class="saas-context-label">'
+            f'{escape(translate("shell.product_name"))}</span>'
+        )
     context_key = {
         "admin": "shell.admin_control_plane",
         "system": "shell.system_control_plane",
@@ -576,7 +562,7 @@ def _user_initials(username: str) -> str:
     if not username:
         return "U"
     cleaned = username.replace("-", " ").replace("_", " ").strip()
-    parts = [p for p in cleaned.split() if p]
+    parts = [part for part in cleaned.split() if part]
     if len(parts) >= 2:
         return (parts[0][:1] + parts[1][:1]).upper()
     if len(username) >= 2 and ord(username[0]) < 128:
@@ -589,10 +575,20 @@ def _render_user_profile(principal: Principal | None) -> str:
         return ""
     username = principal.username
     initials = _user_initials(username)
+    role_key = {
+        "WORKSPACE_ADMIN": "role.admin",
+        "MANAGER": "role.manager",
+        "OPERATOR": "role.operator",
+        "AGENT": "role.agent",
+        "USER": "role.agent",
+        "VIEWER": "role.viewer",
+        "SUPERADMIN": "shell.system_admin_label",
+    }.get(principal.role, "role.unknown")
     return (
         '<div class="saas-user-profile">'
         f'<span class="saas-user-avatar">{escape(initials)}</span>'
         f'<span class="saas-user-name" title="{escape(username)}">{escape(username)}</span>'
+        f'<span class="saas-role-label">{escape(translate(role_key))}</span>'
         f'<span class="saas-status-dot-online" title="{escape(translate("common.online"))}"></span>'
         '</div>'
     )
@@ -751,7 +747,7 @@ def _render_sidebar(
         else ""
     )
     workspace_name = (
-        tenant_id
+        translate("workspace.financial_support")
         if surface == "tenant" and tenant_id
         else translate(
             {
@@ -764,20 +760,32 @@ def _render_sidebar(
     )
     sidebar_header = (
         '<div class="saas-sidebar-header" data-sidebar-header>'
-        f'{_render_brand(surface)}<span class="saas-sidebar-workspace">'
-        f"{escape(workspace_name)}</span>{close_button}</div>"
+        f'<div class="saas-sidebar-brand">{_render_brand(surface)}</div>{close_button}'
+        '<div class="saas-sidebar-workspace">'
+        '<span class="saas-workspace-avatar" aria-hidden="true">W</span>'
+        '<span class="saas-workspace-copy">'
+        f'<strong>{escape(translate("shell.product_name"))}</strong>'
+        f'<small title="{escape(workspace_name)}">{escape(workspace_name)}</small>'
+        '</span></div></div>'
+    )
+    profile_html = ""
+    if principal is not None:
+        profile_html = (
+            '<div class="saas-sidebar-user">'
+            f'{_render_user_profile(principal)}</div>'
+        )
+    sidebar_bottom = (
+        f'<div class="saas-sidebar-bottom">{footer_html}{profile_html}</div>'
     )
     sidebar_contents = (
         f"{sidebar_header}{admin_banner}"
         '<nav id="primary-navigation" '
         f'aria-label="{escape(translate("shell.primary_navigation"))}">'
-        f"{navigation_html}</nav>{footer_html}"
+        f"{navigation_html}</nav>{sidebar_bottom}"
     )
     if legacy_content:
         return f'<aside class="sidebar"><div data-sidebar>{sidebar_contents}</div></aside>'
     return f'<aside class="saas-sidebar" data-sidebar>{sidebar_contents}</aside>'
-
-
 
 
 def _render_main_content(

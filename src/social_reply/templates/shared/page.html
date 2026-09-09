@@ -1,3 +1,4 @@
+{% set active_navigation = active_navigation|default('') %}
 <!doctype html>
 <html lang="{{ locale }}">
 <head>
@@ -8,10 +9,21 @@
   <title>{{ title }} · {{ product_name }}</title>
   <script src="/static/theme.js?v={{ asset_version }}"></script>
   <link rel="stylesheet" href="/static/saas.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/workspace.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/workspace-pages.css?v={{ asset_version }}">
+  {% if active_navigation in ('settings', 'audit') %}<link rel="stylesheet" href="/static/workspace-settings.css?v={{ asset_version }}">{% endif %}
+  {% if active_navigation == 'users' %}<link rel="stylesheet" href="/static/member-workspace.css?v={{ asset_version }}">{% endif %}
+  {% if active_navigation == 'channels' %}
+  <link rel="stylesheet" href="/static/channel-workspace.css?v={{ asset_version }}">
+  <script src="/static/channel-workspace.js?v={{ asset_version }}" defer></script>
+  {% endif %}
+  {% if active_navigation == 'home' %}<link rel="stylesheet" href="/static/home-dashboard.css?v={{ asset_version }}">{% endif %}
+  {% if layout_mode == 'workbench' %}<link rel="stylesheet" href="/static/inbox.css?v={{ asset_version }}">{% endif %}
   <script src="/static/app.js?v={{ asset_version }}" defer></script>
 </head>
 <body class="saas-surface saas-surface-{{ surface }} saas-layout-{{ layout_mode }}"
       data-page-layout="{{ layout_mode }}"
+      data-active-navigation="{{ active_navigation }}"
       data-sidebar-backdrop-label="{{ close_navigation_label }}">
   <a class="skip-link" href="#main-content">{{ skip_to_content_label }}</a>
   {{ header_html }}

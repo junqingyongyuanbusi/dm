@@ -1,4 +1,6 @@
-<article class="saas-agent-row">
+<article class="saas-agent-row" data-agent-choice{% if is_current_card|default(false) %} data-current="true"{% endif %}>
+  <a class="agent-workspace-choice-link" href="{{ card.open_href }}"
+     {% if is_current_card|default(false) %}aria-details="agent-workspace-configuration"{% endif %}>
   <div class="saas-agent-row-identity">
     <span class="saas-agent-avatar" aria-hidden="true">✦</span>
     <div>
@@ -25,5 +27,6 @@
     </div>
   </dl>
   <div class="saas-agent-row-next"><p><strong>{{ card.next_step_label }}</strong>{{ card.next_step }}</p>
-  <a class="saas-agent-open" href="{{ card.open_href }}">{{ card.open_label }} <span aria-hidden="true">→</span></a></div>
+  <span class="saas-agent-open">{{ card.open_label }} <span aria-hidden="true">→</span></span></div>
+  </a>
 </article>

@@ -30,7 +30,11 @@ from social_reply.application.account_management.ui_i18n import (
     set_locale,
     set_request_location,
 )
+from social_reply.application.account_management.unified_inbox import router as unified_inbox_router
 from social_reply.application.account_management.users import router as admin_users_router
+from social_reply.application.account_management.workspace_pages import (
+    router as workspace_pages_router,
+)
 from social_reply.connectors.feishu.router import router as feishu_router
 from social_reply.connectors.meta.router import router as meta_router
 from social_reply.connectors.telegram.router import router as telegram_router
@@ -200,6 +204,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(feishu_handoff_admin_router)
     app.include_router(admin_users_router)
     app.include_router(oauth_router)
+    app.include_router(unified_inbox_router)
+    app.include_router(workspace_pages_router)
     app.include_router(saas_console_router)
     app.include_router(account_management_router)
     app.include_router(telegram_router)

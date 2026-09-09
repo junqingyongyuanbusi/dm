@@ -1,0 +1,152 @@
+{% set selected = selected|default(none) %}
+<div class="saas-workspace-page saas-playground-workspace">
+  <div class="wp-page-context"><p class="saas-muted">{{ workspace_text('playground.notice') }}</p></div>
+  <div class="wp-test-layout">
+    <section class="saas-card wp-test-configuration" aria-labelledby="playground-agent-heading">
+      <h2 id="playground-agent-heading">{{ workspace_text('playground.select') }}</h2>
+      {% if agents %}
+        <form method="get" action="{{ tenant_root }}/playground" class="saas-stack" id="workspace-agent-selection">
+          <label for="playground-agent">{{ workspace_text('playground.select') }}</label>
+          <select id="playground-agent" name="agent_id" required>
+            {% for agent in agents %}<option value="{{ agent.brand_id }}"{% if selected and agent.brand_id == selected.brand_id %} selected{% endif %}>{{ agent.name }}</option>{% endfor %}
+          </select>
+          <button class="saas-button" type="submit">{{ workspace_text('playground.load') }}</button>
+        </form>
+        {% if selected %}
+          <form method="post" action="{{ selected.test_href }}" class="saas-stack wp-trial-form" id="workspace-trial-form"
+                data-running="{{ workspace_text('playground.running') }}" data-complete="{{ workspace_text('playground.complete') }}"
+                data-failed="{{ workspace_text('playground.failed') }}" data-timeout="{{ workspace_text('playground.timeout') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <p class="saas-muted">{{ workspace_text('playground.select') }}: <strong>{{ selected.name }}</strong></p>
+            <label for="workspace-trial-message">{{ workspace_text('playground.message') }}</label>
+            <textarea id="workspace-trial-message" name="text" maxlength="4000" required placeholder="{{ workspace_text('playground.placeholder') }}"></textarea>
+            <div class="wp-test-submit"><span class="saas-muted">{{ workspace_text('playground.no_send') }}</span><button class="saas-button primary" type="submit">{{ workspace_text('playground.run') }}</button></div>
+          </form>
+          <a class="wp-test-fallback" href="{{ selected.test_href }}">{{ workspace_text('agents.test') }}</a>
+        {% endif %}
+      {% else %}
+        <p class="saas-empty-state">{{ workspace_text('agents.empty') }}</p>
+      {% endif %}
+    </section>
+    <section class="saas-card wp-panel wp-test-result-panel" aria-labelledby="workspace-result-heading">
+      <header class="wp-panel-heading"><h2 id="workspace-result-heading">{{ workspace_text('playground.result') }}</h2><span class="saas-status neutral" id="workspace-test-status">{{ workspace_text('playground.waiting') }}</span></header>
+      <div id="workspace-test-output" class="wp-test-output" role="status" aria-live="polite" aria-atomic="true">
+        <div class="wp-test-empty"><span class="wp-test-symbol" aria-hidden="true">◇</span><h3>{{ workspace_text('playground.empty_title') }}</h3><p class="saas-muted">{{ workspace_text('playground.empty_note') }}</p></div>
+      </div>
+    </section>
+  </div>
+</div>
+{% if selected %}
+<script>
+(() => {
+  const trialForm = document.getElementById('workspace-trial-form');
+  const output = document.getElementById('workspace-test-output');
+  const statusLabel = document.getElementById('workspace-test-status');
+  const selectionForm = document.getElementById('workspace-agent-selection');
+  const messageInput = document.getElementById('workspace-trial-message');
+  const submitButton = trialForm.querySelector('button[type="submit"]');
+  const idleLabel = submitButton.textContent;
+
+  function showMessage(message, isError) {
+    const notice = document.createElement('p');
+    notice.className = isError ? 'saas-alert danger' : 'saas-muted';
+    notice.textContent = message;
+    output.replaceChildren(notice);
+  }
+
+  function renderTrialResult(resultElement) {
+    // Copy only text from the authenticated server response, never model HTML.
+    const reply = resultElement.querySelector('.saas-test-reply p');
+    const resultGrid = resultElement.querySelector('.saas-test-result-grid');
+    const resultBody = document.createElement('div');
+    resultBody.className = 'wp-trial-result';
+    if (reply) {
+      const answer = document.createElement('p');
+      answer.className = 'wp-trial-answer';
+      answer.textContent = reply.textContent;
+      resultBody.append(answer);
+    }
+    if (resultGrid) {
+      const summary = document.createElement('dl');
+      summary.className = 'wp-trial-summary';
+      resultGrid.querySelectorAll('div').forEach((record) => {
+        const sourceLabel = record.querySelector('dt');
+        const sourceValue = record.querySelector('dd');
+        if (!sourceLabel || !sourceValue) return;
+        const label = document.createElement('dt');
+        const value = document.createElement('dd');
+        label.textContent = sourceLabel.textContent;
+        value.textContent = sourceValue.textContent;
+        summary.append(label, value);
+      });
+      resultBody.append(summary);
+    }
+    const duration = resultElement.querySelector('.agent-workspace-result-meta .saas-mono');
+    if (duration) {
+      const durationLabel = document.createElement('p');
+      durationLabel.className = 'saas-muted';
+      durationLabel.textContent = duration.textContent;
+      resultBody.append(durationLabel);
+    }
+    const reasons = resultElement.querySelector('.agent-workspace-reasons');
+    if (reasons) {
+      const reasonSummary = document.createElement('p');
+      reasonSummary.className = 'saas-muted';
+      reasonSummary.textContent = [reasons.querySelector('h3'), ...reasons.querySelectorAll('code')]
+        .filter(Boolean).map((element) => element.textContent.trim()).join(' · ');
+      resultBody.append(reasonSummary);
+    }
+    if (!reply) {
+      const message = document.createElement('p');
+      message.textContent = resultElement.querySelector('p.saas-muted')?.textContent || '';
+      resultBody.append(message);
+    }
+    output.replaceChildren(resultBody);
+  }
+
+  trialForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (submitButton.disabled) return;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 90000);
+    submitButton.disabled = true;
+    messageInput.readOnly = true;
+    submitButton.textContent = trialForm.dataset.running;
+    selectionForm.querySelectorAll('button, select').forEach((control) => { control.disabled = true; });
+    output.setAttribute('aria-busy', 'true');
+    statusLabel.textContent = trialForm.dataset.running;
+    showMessage(trialForm.dataset.running, false);
+    try {
+      const response = await fetch(trialForm.action, {
+        method: 'POST',
+        body: new URLSearchParams(new FormData(trialForm)),
+        credentials: 'same-origin',
+        redirect: 'error',
+        signal: controller.signal,
+      });
+      const responseDocument = new DOMParser().parseFromString(await response.text(), 'text/html');
+      const resultElement = responseDocument.querySelector('.saas-test-result');
+      if (!response.ok || !resultElement || resultElement.classList.contains('saas-alert')) {
+        const message = resultElement?.classList.contains('saas-alert')
+          ? resultElement.textContent.trim() : trialForm.dataset.failed;
+        showMessage(message, true);
+        statusLabel.textContent = String(response.status);
+        return;
+      }
+      renderTrialResult(resultElement);
+      statusLabel.textContent = trialForm.dataset.complete;
+    } catch (error) {
+      showMessage(error.name === 'AbortError' ? trialForm.dataset.timeout : trialForm.dataset.failed, true);
+      statusLabel.textContent = '—';
+    } finally {
+      window.clearTimeout(timeout);
+      submitButton.disabled = false;
+      messageInput.readOnly = false;
+      submitButton.textContent = idleLabel;
+      selectionForm.querySelectorAll('button, select').forEach((control) => { control.disabled = false; });
+      output.setAttribute('aria-busy', 'false');
+    }
+  });
+})();
+</script>
+{% endif %}

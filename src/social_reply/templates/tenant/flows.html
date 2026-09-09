@@ -1,0 +1,46 @@
+<div class="saas-workspace-page saas-flows-workspace">
+  <section class="saas-card wp-panel" aria-labelledby="flow-chain-heading">
+    <header class="wp-panel-heading">
+      <div><h2 id="flow-chain-heading">{{ workspace_text('flows.chain') }}</h2></div>
+      <span class="saas-status neutral">{{ workspace_text('flows.readonly') }}</span>
+    </header>
+    <fieldset class="wp-flow-editor">
+      <legend class="wp-sr-only">{{ workspace_text('flows.inspector') }}</legend>
+      {% for stage in flow_stages %}
+        <input class="wp-flow-radio wp-sr-only" type="radio" name="flow-stage" id="flow-stage-{{ stage }}" value="{{ stage }}" aria-controls="flow-detail-{{ stage }}"{% if loop.first %} checked{% endif %}>
+      {% endfor %}
+      <div class="wp-flow-canvas">
+        <ol class="wp-flow-chain">
+          {% for stage in flow_stages %}
+            <li><label class="wp-flow-node" for="flow-stage-{{ stage }}"><span class="wp-node-number" aria-hidden="true">{{ '%02d'|format(loop.index) }}</span><strong>{{ workspace_text('flows.' ~ stage) }}</strong><span class="wp-node-arrow" aria-hidden="true">›</span></label></li>
+          {% endfor %}
+        </ol>
+        <div class="wp-flow-outcomes"><strong>{{ workspace_text('flows.outcomes') }}</strong><p>{{ workspace_text('flows.outcomes_note') }}</p></div>
+      </div>
+      <aside class="wp-flow-inspector">
+        <p class="saas-eyebrow">{{ workspace_text('flows.inspector') }}</p>
+        {% for stage in flow_stages %}
+          <section class="wp-node-detail" id="flow-detail-{{ stage }}">
+            <span class="wp-node-number">{{ '%02d'|format(loop.index) }}</span>
+            <h3>{{ workspace_text('flows.' ~ stage) }}</h3>
+            <p>{{ workspace_text('flows.' ~ stage ~ '_note') }}</p>
+          </section>
+        {% endfor %}
+      </aside>
+    </fieldset>
+  </section>
+  <p class="saas-muted">{{ workspace_text('flows.notice') }}</p>
+    <section class="saas-card wp-flow-agents" aria-labelledby="flow-agents-heading">
+      <h2 id="flow-agents-heading">{{ workspace_text('agents.heading') }}</h2>
+      <div class="wp-agent-links">
+        {% for agent in agents %}
+          <article class="saas-workspace-agent">
+            <h3>{{ agent.name }}</h3><p class="saas-muted saas-mono">{{ agent.brand_id }}</p>
+            <a class="saas-button" href="{{ agent.href }}">{{ workspace_text('agents.configure') }}</a>
+          </article>
+        {% else %}
+          <p class="saas-empty-state">{{ workspace_text('agents.empty') }}</p>
+        {% endfor %}
+      </div>
+    </section>
+</div>

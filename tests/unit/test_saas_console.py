@@ -2,11 +2,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 
 from apps.api.main import create_app
-from social_reply.application.account_management.auth import Principal
+from social_reply.application.account_management.auth import Principal, _bootstrap_principal
 from social_reply.application.account_management.saas_ui import (
     format_age,
     navigation_icon,
@@ -23,15 +24,15 @@ async def _client() -> httpx.AsyncClient:
     )
 
 
-def _tenant_principal() -> Principal:
-    return Principal(
-        session_id=uuid.uuid4(),
-        username="system-admin",
-        actor="bootstrap:system-admin",
-        tenant_id="tenant-a",
-        allowed_tenants=frozenset({"tenant-a"}),
-        role="SUPERADMIN",
+def _tenant_principal(tenant_id: str = "tenant-a") -> Principal:
+    settings = SimpleNamespace(
+        admin_username="system-admin",
+        allowed_admin_tenants=frozenset({tenant_id}),
     )
+    with patch(
+        "social_reply.application.account_management.auth.get_settings", return_value=settings
+    ):
+        return _bootstrap_principal(uuid.uuid4(), verified=True)
 
 
 def test_format_age_returns_a_duration_for_waiting_copy() -> None:
@@ -151,14 +152,7 @@ async def test_database_user_cannot_enter_non_default_workspace(monkeypatch) -> 
 async def test_superadmin_selector_redirects_to_default_tenant_workspace(monkeypatch) -> None:
     from social_reply.application.account_management import saas_console
 
-    principal = Principal(
-        session_id=uuid.uuid4(),
-        username="system-admin",
-        actor="bootstrap:system-admin",
-        allowed_tenants=frozenset({"default"}),
-        tenant_id="default",
-        role="SUPERADMIN",
-    )
+    principal = _tenant_principal("default")
 
     async def fake_current_principal(_request):
         return principal
@@ -194,13 +188,7 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
         active_navigation="home",
         tenant_id="tenant-a",
     )
-    system_principal = Principal(
-        session_id=uuid.uuid4(),
-        username="system-admin",
-        actor="bootstrap:system-admin",
-        allowed_tenants=frozenset({"tenant-a"}),
-        role="SUPERADMIN",
-    )
+    system_principal = _tenant_principal()
     system_html = render_saas_page(
         principal=system_principal,
         title="系统总览",
@@ -213,7 +201,7 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
 
     assert "/app/t/tenant-a/agents" in tenant_html
     assert "跨租户审计" not in tenant_html
-    for group_label in ("处理", "自动化", "观察", "更多"):
+    for group_label in ("工作台", "自动回复", "管理"):
         assert f">{group_label}<" in tenant_html
     assert "href=\"/app/t/tenant-a\" aria-current='page'" in tenant_html
     assert '<script src="/static/theme.js?v=' in tenant_html
@@ -230,11 +218,26 @@ def test_saas_shell_keeps_tenant_and_system_navigation_distinct() -> None:
     tenant_topbar_end = tenant_html.index("</header>", tenant_topbar_start)
     tenant_sidebar_html = tenant_html[tenant_sidebar_start:tenant_sidebar_end]
     tenant_topbar_html = tenant_html[tenant_topbar_start:tenant_topbar_end]
+    primary_navigation = tenant_sidebar_html.split('<nav id="primary-navigation"', 1)[1]
+    primary_navigation = primary_navigation.split("</nav>", 1)[0]
+    assert primary_navigation.count('class="saas-nav-text"') == 12
+    for navigation_href in (
+        "/app/t/tenant-a", "/app/t/tenant-a/inbox", "/app/t/tenant-a/contacts",
+        "/app/t/tenant-a/agents", "/app/t/tenant-a/flows", "/app/t/tenant-a/knowledge",
+        "/app/t/tenant-a/playground", "/app/t/tenant-a/channels", "/app/t/tenant-a/reports",
+        "/admin/users", "/app/t/tenant-a/audit", "/app/t/tenant-a/settings",
+    ):
+        assert f'href="{navigation_href}"' in primary_navigation
     assert tenant_sidebar_start < tenant_html.index('class="saas-brand"') < tenant_sidebar_end
     assert "saas-brand" not in tenant_topbar_html
     assert "saas-toolbar" in tenant_topbar_html
     assert "system-admin" in tenant_topbar_html
     assert "saas-sidebar-actions" not in tenant_sidebar_html
+    assert "wikiglobal" in tenant_sidebar_html
+    assert "saas-sidebar-user" in tenant_sidebar_html
+    assert "system-admin" in tenant_sidebar_html
+    assert "Acme Global" not in tenant_html
+    assert "#t_8820" not in tenant_html
     assert '<svg class="saas-nav-icon" aria-hidden="true"' in tenant_html
     assert tenant_html.count('class="saas-nav-icon"') >= 8
     assert 'data-popover-trigger="language-menu"' in tenant_html
@@ -289,7 +292,7 @@ def test_tenant_topbar_uses_neutral_workspace_context_without_selector() -> None
     topbar_end = html.index("</header>", topbar_start)
     topbar_html = html[topbar_start:topbar_end]
 
-    assert "工作区" in topbar_html
+    assert "wikiglobal" in topbar_html
     assert "Tenant" not in topbar_html
     assert "saas-tenant-switcher" not in topbar_html
     assert 'href="/app"' not in topbar_html
@@ -297,6 +300,27 @@ def test_tenant_topbar_uses_neutral_workspace_context_without_selector() -> None
     assert 'data-popover-trigger="theme-menu"' in topbar_html
     assert 'href="/auth/logout"' in topbar_html
     assert "workspace-user" in topbar_html
+
+
+def test_workspace_identity_is_escaped_without_granting_management_navigation() -> None:
+    tenant_id = 'workspace<sample>&"'
+    principal = _ordinary_user_principal(tenant_id)
+    rendered = render_saas_page(
+        principal=principal,
+        title="Overview",
+        description="",
+        body="",
+        active_navigation="home",
+        tenant_id=tenant_id,
+    )
+
+    assert "wikiglobal" in rendered
+    assert "workspace&lt;sample&gt;&amp;&quot;" in rendered
+    assert "workspace<sample>" not in rendered
+    assert 'href="/admin/users"' not in rendered
+    assert 'href="/admin/system/overview"' not in rendered
+    assert "Acme Global" not in rendered
+    assert "#t_8820" not in rendered
 
 
 class _ScalarResult:
@@ -343,7 +367,7 @@ async def test_user_agent_ids_only_include_owned_account_brands() -> None:
     assert len(session.statements) == 1
 
 
-async def test_user_without_accounts_only_gets_default_onboarding_agent() -> None:
+async def test_user_without_accounts_does_not_get_a_default_onboarding_agent() -> None:
     from social_reply.application.account_management import saas_console
 
     session = _AgentBrandSession([[]])
@@ -354,7 +378,7 @@ async def test_user_without_accounts_only_gets_default_onboarding_agent() -> Non
         "tenant-a",
     )
 
-    assert agent_ids == ["default"]
+    assert agent_ids == []
     assert len(session.statements) == 1
 
 
@@ -462,26 +486,25 @@ def test_workbench_shell_omits_page_chrome_and_marks_layout() -> None:
 def test_ordinary_user_shell_only_shows_authorized_navigation_items() -> None:
     html = render_saas_page(
         principal=_ordinary_user_principal(),
-        title="首页",
+        title="收件箱",
         description="普通用户工作区",
         body="<p>body</p>",
-        active_navigation="home",
+        active_navigation="inbox",
         tenant_id="tenant-a",
     )
 
-    for label in (
-        "首页",
-        "收件箱",
-        "对话",
-        "Agents",
-        "知识查询",
-        "我的活动",
-        "Channels",
-        "个人中心",
-    ):
+    for label in ("收件箱", "联系人", "知识库"):
         assert f">{label}<" in html
-    for forbidden_label in ("审计中心", "Processing Journey", "工作区设置", "打开系统后台"):
+    for forbidden_label in (
+        "总览", "首页", "对话", "AI Agent", "渠道账号", "审计日志",
+        "Processing Journey", "工作空间设置", "打开系统后台",
+    ):
         assert forbidden_label not in html
+    for forbidden_href in (
+        "/app/t/tenant-a", "/app/t/tenant-a/agents", "/app/t/tenant-a/channels",
+        "/app/t/tenant-a/settings", "/admin/users",
+    ):
+        assert f'href="{forbidden_href}"' not in html
     assert 'href="/admin"' not in html
 
 
@@ -500,7 +523,7 @@ def test_saas_shell_uses_request_locale_without_translating_identity_data() -> N
         reset_locale(locale_token)
 
     assert '<html lang="en">' in html
-    for group_label in ("Work", "Automation", "Observe", "More"):
+    for group_label in ("Workbench", "Auto reply", "Management"):
         assert f">{group_label}<" in html
     assert 'href="?ui_lang=zh-CN"' in html
     assert "system-admin" in html
@@ -705,7 +728,7 @@ def test_inbox_workbench_has_three_panes_search_and_selected_inspector() -> None
     assert "data-inbox-list" in empty_workspace
     assert "data-inbox-thread" in empty_workspace
     assert 'class="saas-detail-inspector"' in empty_workspace
-    assert "Filters soon" in empty_workspace
+    assert "Filters soon" not in empty_workspace
     assert 'aria-label="工作队列"' in empty_workspace
     assert "1 个工作项" in empty_workspace
     assert "data-list-search" in empty_workspace
@@ -1112,6 +1135,31 @@ async def test_ordinary_user_cannot_open_admin_or_tenant_governance_pages(monkey
     assert admin_response.status_code == 403
     assert admin_response.json() == {"detail": "tenant_admin_required"}
     assert audit_response.status_code == 403
-    assert audit_response.json() == {"detail": "tenant_admin_required"}
+    assert audit_response.json() == {"detail": "capability_required:audit.read"}
     assert draft_queue_response.status_code == 403
     assert draft_queue_response.json() == {"detail": "inbox_queue_access_denied"}
+
+
+async def test_ordinary_user_cannot_connect_channels_before_database_access(monkeypatch) -> None:
+    from social_reply.application.account_management import saas_console
+
+    principal = _ordinary_user_principal("default")
+    assert not principal.has_capability("connect")
+
+    async def fake_current_principal(_request):
+        return principal
+
+    def unexpected_session_factory():
+        raise AssertionError("Unauthorized connect must fail before database access")
+
+    monkeypatch.setattr(saas_console, "current_principal", fake_current_principal)
+    monkeypatch.setattr(saas_console, "get_session_factory", unexpected_session_factory)
+    async with await _client() as client:
+        await client.get("/auth/login")
+        response = await client.post(
+            "/app/t/default/channels/accounts/telegram",
+            data={"csrf_token": client.cookies["reply_admin_csrf"]},
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "capability_required:channels.read"}

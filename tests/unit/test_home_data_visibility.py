@@ -1,9 +1,9 @@
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy.dialects import postgresql
 from starlette.requests import Request
 
 from social_reply.application.account_management import saas_console
@@ -154,17 +154,17 @@ def test_business_activity_links_to_its_conversation_with_observed_event_time(ki
     assert views[0]["title"]
 
 
-@pytest.mark.parametrize("role", ["USER", "SUPERADMIN"])
-@pytest.mark.parametrize("message_count", [None, 0, 9])
+@pytest.mark.parametrize("role", ["MANAGER", "WORKSPACE_ADMIN"])
+@pytest.mark.parametrize("received_count", [0, 9])
 @pytest.mark.parametrize("has_work", [False, True])
 async def test_home_loads_real_scoped_data_without_agent_readiness_queries(
-    monkeypatch, role, message_count, has_work
+    monkeypatch, role, received_count, has_work
 ):
     principal = Principal(
         session_id=uuid.uuid4(),
-        user_id=uuid.uuid4() if role == "USER" else None,
-        username="operator",
-        actor="user:operator",
+        user_id=uuid.uuid4(),
+        username="manager",
+        actor="user:manager",
         tenant_id="default",
         allowed_tenants=frozenset({"default"}),
         role=role,
@@ -172,32 +172,52 @@ async def test_home_loads_real_scoped_data_without_agent_readiness_queries(
     monkeypatch.setattr(
         saas_console, "_require_tenant_principal", AsyncMock(return_value=principal)
     )
-    monkeypatch.setattr(
-        saas_console,
-        "_load_inbox_summary",
-        AsyncMock(
-            return_value=_summary(
-                human=int(has_work), delivery=int(has_work and role == "SUPERADMIN")
-            )
-        ),
-    )
     agent_loader = AsyncMock(side_effect=AssertionError("Homepage must not load agent readiness"))
     monkeypatch.setattr(saas_console, "_load_agent_ids", agent_loader)
     session = AsyncMock()
     session.__aenter__.return_value = session
-    session.scalar.return_value = message_count
-    account_id, conversation_id = uuid.uuid4(), uuid.uuid4()
-    alert = HomeChannelAlert(account_id, "<account>", "feishu", "ERROR", None)
-    activity = HomeBusinessActivity(
-        uuid.uuid4(), conversation_id, "handoff", "<account>", datetime.now(UTC)
+    session.scalar.return_value = 0
+    # Keep the former loader bounded while proving the route switches to dashboard facts.
+    monkeypatch.setattr(saas_console, "_load_inbox_summary", AsyncMock(return_value=_summary()))
+    monkeypatch.setattr(
+        saas_console,
+        "load_home_overview",
+        AsyncMock(return_value=HomeOverview((), ())),
+        raising=False,
     )
-    overview_loader = AsyncMock(
-        return_value=HomeOverview(
-            alerts=(alert,) if has_work else (),
-            activities=(activity,) if has_work else (),
+    current_day = datetime.now(UTC).date()
+    account_id = uuid.uuid4()
+    dashboard = SimpleNamespace(
+        pending_count=int(has_work),
+        ai_count=received_count,
+        account_count=1,
+        enabled_account_count=1,
+        resolved_count=0,
+        published_knowledge_count=0,
+        draft_knowledge_count=0,
+        pending_draft_count=0,
+        trend=tuple(
+            SimpleNamespace(
+                day=current_day - timedelta(days=6 - offset),
+                received=received_count,
+                ai=0,
+            )
+            for offset in range(7)
+        ),
+        channels=(SimpleNamespace(platform="telegram", accounts=1, received=received_count),),
+        attention=(
+            SimpleNamespace(
+                title="<account>",
+                description="<recorded observation>",
+                href=f"/app/t/default/channels/accounts/{account_id}",
+                kind="channel",
+            ),
         )
+        if has_work
+        else (),
     )
-    monkeypatch.setattr(saas_console, "load_home_overview", overview_loader)
+    dashboard_loader = AsyncMock(return_value=dashboard)
+    monkeypatch.setattr(saas_console, "load_home_dashboard", dashboard_loader, raising=False)
     monkeypatch.setattr(saas_console, "get_session_factory", lambda: lambda: session)
     request = Request({"type": "http", "method": "GET", "path": "/app/t/default", "headers": []})
 
@@ -205,35 +225,52 @@ async def test_home_loads_real_scoped_data_without_agent_readiness_queries(
     rendered = response.body.decode()
 
     assert response.status_code == 200
+    dashboard_loader.assert_awaited_once()
+    assert dashboard_loader.await_args.args == (session, principal, "default")
+    assert dashboard_loader.await_args.kwargs["now"].utcoffset() == timedelta(0)
     agent_loader.assert_not_awaited()
-    session.scalar.assert_awaited_once()
-    session.execute.assert_not_awaited()
-    overview_loader.assert_awaited_once_with(
-        session, principal, "default", settings=saas_console.get_settings()
-    )
-    query = session.scalar.await_args.args[0]
-    compiled = query.compile(dialect=postgresql.dialect())
-    assert "messages.created_at >=" in str(compiled)
-    assert "conversations.tenant_id =" in str(compiled)
-    if role == "USER":
-        assert "platform_accounts.owner_user_id =" in str(compiled)
-        assert principal.user_id in compiled.params.values()
-    assert ("saas-home-nextup" in rendered) == (has_work and role == "SUPERADMIN")
-    assert ("saas-home-metrics" in rendered) == has_work
-    assert ("saas-home-alerts" in rendered) == has_work
-    assert "saas-home-agents" not in rendered
-    assert ("saas-home-stream" in rendered) == has_work
-    assert ("saas-home-today" in rendered) == bool(message_count)
+    for section in (
+        "当前待处理",
+        "AI 接待中",
+        "渠道账号",
+        "已解决会话",
+        "会话趋势",
+        "需要关注",
+        "各渠道接待",
+        "接待质量",
+    ):
+        assert section in rendered
+    assert "<svg" in rendered
+    assert "home-dashboard.css" in rendered
+    assert "Telegram" in rendered
     if has_work:
         assert "&lt;account&gt;" in rendered
         assert "<account>" not in rendered
         assert f"/channels/accounts/{account_id}" in rendered
-        assert f"/conversations/{conversation_id}" in rendered
-        section_order = ["home-alerts-title", "home-attention-title"]
-        if message_count:
-            section_order.append("home-today-title")
-        section_order.append("home-activity-title")
-        positions = [rendered.index(f'id="{section_id}"') for section_id in section_order]
-        assert positions == sorted(positions)
     for demo_value in (">284<", ">221<", "77.8%", "rev_902", "@olivia_chen", "SLA"):
         assert demo_value not in rendered
+
+
+@pytest.mark.parametrize("role", ["USER", "AGENT"])
+async def test_staff_home_redirects_to_inbox_before_database_access(monkeypatch, role):
+    principal = Principal(
+        session_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        username="staff",
+        actor="user:staff",
+        tenant_id="default",
+        allowed_tenants=frozenset({"default"}),
+        role=role,
+    )
+    monkeypatch.setattr(saas_console, "current_principal", AsyncMock(return_value=principal))
+
+    def unexpected_session_factory():
+        raise AssertionError("Staff home must redirect before database access")
+
+    monkeypatch.setattr(saas_console, "get_session_factory", unexpected_session_factory)
+    request = Request({"type": "http", "method": "GET", "path": "/app/t/default", "headers": []})
+
+    response = await saas_console.tenant_home(request, "default")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/app/t/default/inbox"

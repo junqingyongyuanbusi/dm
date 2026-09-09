@@ -1,0 +1,64 @@
+<div class="saas-workspace-page saas-reports-workspace">
+  <form method="get" action="{{ tenant_root }}/reports" class="saas-filter-toolbar wp-report-toolbar">
+    <label for="report-days">{{ workspace_text('reports.window') }}</label>
+    <select id="report-days" name="days">
+      <option value="7"{% if days == 7 %} selected{% endif %}>{{ workspace_text('reports.seven') }}</option>
+      <option value="30"{% if days == 30 %} selected{% endif %}>{{ workspace_text('reports.thirty') }}</option>
+    </select>
+    <button class="saas-button primary" type="submit">{{ workspace_text('reports.apply') }}</button>
+  </form>
+  <details class="wp-report-methodology">
+    <summary>{{ workspace_text('reports.methodology') }}</summary>
+    <p>{{ workspace_text('reports.messages_note') }}</p>
+    <p>{{ workspace_text('reports.conversations_note') }}</p>
+  </details>
+  <div class="saas-grid four saas-report-metrics">
+    {% for metric in metrics %}
+      <section class="saas-card saas-metric"><span class="saas-metric-label">{{ metric.label }}</span><span class="saas-metric-value">{{ metric.value }}</span></section>
+    {% endfor %}
+  </div>
+  <section class="saas-card wp-panel" aria-labelledby="report-trend-heading">
+    <header class="wp-panel-heading">
+      <h2 id="report-trend-heading">{{ workspace_text('reports.trend') }}</h2>
+      <div class="wp-trend-legend"><span class="wp-trend-inbound">{{ workspace_text('reports.inbound') }}</span><span class="wp-trend-outbound">{{ workspace_text('reports.outbound') }}</span></div>
+    </header>
+    {% if trend|default(()) and platforms %}
+    <div class="wp-trend-scroll">
+      <svg class="wp-report-trend" viewBox="0 0 900 260" role="img" aria-labelledby="report-trend-heading report-trend-description">
+        <desc id="report-trend-description">{% for record in trend %}{{ record.day.isoformat() }}: {{ workspace_text('reports.inbound') }} {{ record.inbound }}, {{ workspace_text('reports.outbound') }} {{ record.outbound }}. {% endfor %}</desc>
+        {% for ratio in [0, 0.5, 1] %}
+        <line class="wp-trend-grid" x1="48" y1="{{ 216 - 184 * ratio }}" x2="870" y2="{{ 216 - 184 * ratio }}" />
+        <text class="wp-trend-label" x="38" y="{{ 220 - 184 * ratio }}" text-anchor="end">{{ '%g'|format(trend_max * ratio) }}</text>
+        {% endfor %}
+        {% for direction in ['inbound', 'outbound'] %}
+        <polyline class="wp-trend-line wp-trend-{{ direction }}" points="{% for record in trend %}{{ 48 + loop.index0 * 822 / (trend|length - 1) }},{{ 216 - record[direction] * 184 / trend_max }} {% endfor %}" />
+        {% endfor %}
+        {% for record in trend %}
+          {% set position = 48 + loop.index0 * 822 / (trend|length - 1) %}
+          {% for direction in ['inbound', 'outbound'] %}
+          <circle class="wp-trend-point wp-trend-{{ direction }}" cx="{{ position }}" cy="{{ 216 - record[direction] * 184 / trend_max }}" r="3"><title>{{ record.day.isoformat() }} · {{ workspace_text('reports.' ~ direction) }}: {{ record[direction] }}</title></circle>
+          {% endfor %}
+          {% if loop.first or loop.last or (trend|length <= 8) or loop.index0 % 5 == 0 %}
+          <text class="wp-trend-label" x="{{ position }}" y="246" text-anchor="middle">{{ record.day.strftime('%m/%d') }}</text>
+          {% endif %}
+        {% endfor %}
+      </svg>
+    </div>
+    {% else %}<p class="saas-empty-state">{{ workspace_text('common.no_records') }}</p>{% endif %}
+  </section>
+  <section class="saas-card wp-panel" aria-labelledby="report-platforms-heading">
+    <header class="wp-panel-heading"><h2 id="report-platforms-heading">{{ workspace_text('reports.platforms') }}</h2></header>
+    <div class="saas-table-wrap">
+      <table>
+        <thead><tr><th scope="col">{{ workspace_text('common.platform') }}</th><th scope="col">{{ workspace_text('reports.inbound') }}</th><th scope="col">{{ workspace_text('reports.outbound') }}</th><th scope="col">{{ workspace_text('reports.active_conversations') }}</th></tr></thead>
+        <tbody>
+          {% for platform in platforms %}
+            <tr><td>{{ platform.platform }}</td><td>{{ platform.inbound }}</td><td>{{ platform.outbound }}</td><td>{{ platform.active_conversations }}</td></tr>
+          {% else %}
+            <tr><td colspan="4" class="saas-empty-state">{{ workspace_text('common.no_records') }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>

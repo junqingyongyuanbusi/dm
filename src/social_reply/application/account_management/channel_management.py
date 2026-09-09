@@ -10,7 +10,7 @@ from social_reply.application.account_management.access import (
     lock_session_authorities,
     lock_user_authority,
     require_reauthorization,
-    user_can_access_account,
+    user_can_access_account_in_session,
 )
 from social_reply.application.account_management.auth import Principal, principal_from_session_row
 from social_reply.application.account_management.jobs import (
@@ -26,6 +26,10 @@ from social_reply.application.account_management.kill_switch_recovery import (
     build_pending_account_kill_switch_detail,
     next_account_kill_switch_sequence,
     reconcile_account_kill_switch_command,
+)
+from social_reply.application.account_management.permissions import (
+    SUPPORTED_ROLES,
+    user_has_capability,
 )
 from social_reply.application.account_management.router import (
     EmailAccountRequest,
@@ -52,8 +56,8 @@ from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.queue.dispatch import dispatch_actor
 from social_reply.shared.config import get_settings
 
-# "ADMIN" is an internal Tenant-wide capability label projected only from the
-# environment SUPERADMIN. It is not a persistable admin_users role.
+# These are transport labels, not persisted roles. Every command reloads the session;
+# "ADMIN" must match a verified workspace admin or the marker-backed bootstrap identity.
 ChannelRole = Literal["USER", "ADMIN"]
 ProvisioningOperation = Literal["CONNECT_ACCOUNT", "REAUTHORIZE"]
 AutomationTarget = Literal["BOT_ACTIVE", "BOT_DRAFT_ONLY"]
@@ -397,6 +401,8 @@ async def submit_channel_provisioning(command: ProvisioningCommand) -> uuid.UUID
                 else "provisioning_session_invalid"
             ),
         )
+        if not principal.has_capability("connect"):
+            raise ChannelPermissionError("connect_capability_required")
         if operation == "CONNECT_ACCOUNT":
             try:
                 validate_owner_provisioning_policy(
@@ -595,7 +601,7 @@ async def _locked_account(
             raise ChannelNotFoundError("platform_account_not_found")
     else:
         user = staff_rows.get(principal.user_id)
-        if user is None or not user_can_access_account(user, account):
+        if user is None or not await user_can_access_account_in_session(session, user, account):
             raise ChannelNotFoundError("platform_account_not_found")
     return account
 
@@ -607,6 +613,7 @@ async def _lock_channel_reauthorization_grant_context(
     account_id: uuid.UUID,
     actor: ChannelActor,
     target_user_id: uuid.UUID,
+    grant_enabled: bool = True,
 ):
     initial_principal = await principal_from_session_row(session, actor.session_id)
     if not _channel_admin_principal_matches_actor(initial_principal, actor, tenant_id):
@@ -637,8 +644,7 @@ async def _lock_channel_reauthorization_grant_context(
     if (
         target is None
         or target.tenant_id != tenant_id
-        or target.role != "USER"
-        or target.status != "active"
+        or (grant_enabled and not user_has_capability(target, "connect"))
     ):
         raise ChannelValidationError("platform_account_reauthorization_grantee_invalid")
 
@@ -1119,7 +1125,8 @@ async def _lock_account_access_context(
     )
 
 
-def _account_work_assignment_is_eligible(
+async def _account_work_assignment_is_eligible(
+    session,
     work: models.HumanWorkItem,
     *,
     account: models.PlatformAccount,
@@ -1139,7 +1146,14 @@ def _account_work_assignment_is_eligible(
         )
 
     staff_user = staff_rows.get(work.assigned_user_id)
-    if staff_user is None or not user_can_access_account(staff_user, account):
+    if (
+        staff_user is None
+        or not (
+            user_has_capability(staff_user, "takeover")
+            or user_has_capability(staff_user, "reply")
+        )
+        or not await user_can_access_account_in_session(session, staff_user, account)
+    ):
         return False
     return True
 
@@ -1176,7 +1190,8 @@ async def _release_ineligible_account_work(
         work = context.work_items[work_id]
         if work.status != "CLAIMED":
             continue
-        if _account_work_assignment_is_eligible(
+        if await _account_work_assignment_is_eligible(
+            session,
             work,
             account=context.account,
             staff_rows=context.staff_rows,
@@ -1273,7 +1288,7 @@ async def _apply_channel_account_access_change(
                             owner is None
                             or owner.tenant_id != tenant_id
                             or owner.status != "active"
-                            or owner.role not in {"USER", "WORKSPACE_ADMIN"}
+                            or owner.role not in SUPPORTED_ROLES
                         ):
                             raise ChannelValidationError(
                                 "platform_account_owner_not_assignable"
@@ -1492,15 +1507,60 @@ async def set_channel_account_support_visibility(
     shared: bool,
     expected_config_version: int,
 ) -> None:
-    await _apply_channel_account_access_change(
-        tenant_id=tenant_id,
-        account_id=account_id,
-        actor=actor,
-        expected_config_version=expected_config_version,
-        change="support",
-        shared=shared,
-        reason="account_support_visibility_revoked",
-    )
+    # Compatibility metadata only: granting/revoking actual scope requires named members.
+    # Refuse the old mutation rather than pretending a tenant-wide boolean is an ACL.
+    raise ChannelValidationError("explicit_account_access_grants_required")
+
+
+async def set_channel_account_access_grant(
+    *,
+    tenant_id: str,
+    account_id: uuid.UUID,
+    actor: ChannelActor,
+    user_id: uuid.UUID,
+    enabled: bool,
+    expected_config_version: int,
+) -> None:
+    if not isinstance(enabled, bool):
+        raise ChannelValidationError("account_access_grant_value_invalid")
+    async with get_session_factory()() as session:
+        context = await _lock_account_access_context(
+            session, tenant_id=tenant_id, account_id=account_id, actor=actor,
+            expected_config_version=expected_config_version, target_owner_user_id=user_id,
+        )
+        target = context.staff_rows.get(user_id)
+        if target is None or target.tenant_id != tenant_id or target.role not in SUPPORTED_ROLES:
+            raise ChannelValidationError("account_access_grantee_invalid")
+        if enabled and target.status != "active":
+            raise ChannelValidationError("account_access_grantee_invalid")
+        grant = await session.scalar(select(models.AccountAccessGrant).where(
+            models.AccountAccessGrant.tenant_id == tenant_id,
+            models.AccountAccessGrant.platform_account_id == account_id,
+            models.AccountAccessGrant.user_id == user_id,
+        ).with_for_update())
+        changed = bool(grant and grant.active) != enabled
+        if changed:
+            if grant is None:
+                session.add(models.AccountAccessGrant(
+                    tenant_id=tenant_id, platform_account_id=account_id,
+                    user_id=user_id, active=enabled,
+                ))
+            else:
+                grant.active = enabled
+            context.account.config_version += 1
+            await session.flush()
+        released = await _release_ineligible_account_work(
+            session, context=context, actor=actor, reason="account_access_grant_changed",
+        )
+        _add_account_audit(
+            session, tenant_id=tenant_id, actor=actor,
+            action="SET_PLATFORM_ACCOUNT_ACCESS_GRANT", account_id=account_id,
+            detail={"user_id": str(user_id), "enabled": enabled, "changed": changed,
+                    "released_work_items": released,
+                    "config_version": context.account.config_version},
+        )
+        await session.commit()
+
 
 async def set_channel_reauthorization_grant(
     *,
@@ -1518,6 +1578,7 @@ async def set_channel_reauthorization_grant(
             account_id=account_id,
             actor=actor,
             target_user_id=user_id,
+            grant_enabled=enabled,
         )
         _require_config_version(account, expected_config_version)
         grant = await session.scalar(

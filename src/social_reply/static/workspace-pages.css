@@ -1,0 +1,597 @@
+/* Secondary business pages; load after workspace.css. */
+.saas-workspace-page,
+.wp-financial-panel {
+  --wp-line: var(--app-border, #e7e9ed);
+  --wp-paper: var(--app-surface, #fff);
+  --wp-soft: var(--app-surface-muted, #f7f8fa);
+  --wp-green: #12765c;
+  --wp-green-soft: #e7f5ee;
+  --wp-muted: var(--app-text-muted, #777e8b);
+  font-size: 14px;
+}
+
+.saas-workspace-page .saas-card,
+.wp-financial-panel {
+  border: 1px solid var(--wp-line);
+  border-radius: 12px;
+  background: var(--wp-paper);
+  box-shadow: none;
+  min-width: 0;
+}
+
+.saas-workspace-page > .saas-card.wp-panel,
+.wp-test-layout > .wp-panel,
+.wp-financial-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.saas-workspace-page h2,
+.wp-financial-panel h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.saas-workspace-page h3,
+.wp-financial-panel h3 {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.saas-workspace-page p,
+.wp-financial-panel p {
+  line-height: 1.7;
+}
+
+.wp-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 20px 22px;
+  border-bottom: 1px solid var(--wp-line);
+}
+
+.wp-panel-heading p {
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+
+.saas-workspace-page .saas-button {
+  border-radius: 7px;
+  box-shadow: none;
+  font-size: 13px;
+  min-height: 36px;
+}
+
+.saas-workspace-page .saas-button.primary {
+  background: var(--wp-green);
+  border-color: var(--wp-green);
+  color: #fff;
+}
+
+.saas-workspace-page :is(button, a, input, select, textarea, summary):focus-visible,
+.wp-financial-panel :is(a, summary):focus-visible {
+  outline: 2px solid var(--wp-green);
+  outline-offset: 3px;
+}
+
+.saas-workspace-page :is(input, textarea, select) {
+  border: 1px solid var(--wp-line);
+  border-radius: 7px;
+  background: var(--wp-paper);
+  font: inherit;
+}
+
+.saas-workspace-page table,
+.wp-financial-panel table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.saas-workspace-page table th,
+.wp-financial-panel table th {
+  padding: 14px 22px;
+  background: var(--wp-soft);
+  color: var(--wp-muted);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.saas-workspace-page table td,
+.wp-financial-panel table td {
+  padding: 17px 22px;
+  border-bottom: 1px solid var(--wp-line);
+  font-size: 13px;
+}
+
+.saas-workspace-page table tbody tr:last-child td,
+.wp-financial-panel table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.wp-count {
+  display: inline-block;
+  margin-left: 7px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--wp-soft);
+  color: var(--wp-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.wp-table-toolbar,
+.wp-report-toolbar,
+.wp-page-context,
+.wp-test-submit {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.wp-table-toolbar {
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--wp-line);
+}
+
+.wp-table-toolbar input {
+  width: min(100%, 330px);
+}
+
+.wp-search-label,
+.wp-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.wp-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.wp-identity .saas-mono {
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+
+.wp-avatar,
+.wp-node-number,
+.wp-test-symbol {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 35px;
+  height: 35px;
+  border-radius: 50%;
+  color: #597968;
+  background: #edf3ef;
+  font-size: 14px;
+}
+
+.wp-info-note {
+  border: 1px solid #dfe8ef;
+  background: #f2f6fa;
+  color: #51667b;
+  border-radius: 8px;
+  padding: 14px 16px;
+  font-size: 12px;
+}
+
+.wp-report-toolbar {
+  justify-content: flex-end;
+}
+
+.wp-report-methodology {
+  color: var(--wp-muted);
+  font-size: 12px;
+  justify-self: end;
+}
+
+.wp-report-methodology summary {
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.wp-report-methodology p {
+  margin: 6px 0;
+}
+
+.saas-report-metrics .saas-metric {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 22px;
+}
+
+.saas-report-metrics .saas-metric-label {
+  color: var(--wp-muted);
+  font-size: 13px;
+}
+
+.saas-report-metrics .saas-metric-value {
+  font-size: 30px;
+  line-height: 1.1;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.wp-trend-legend { display: flex; flex-wrap: wrap; gap: 20px; font-size: 12px; }
+.wp-trend-legend span { display: inline-flex; align-items: center; gap: 7px; }
+.wp-trend-legend span::before { content: ''; width: 18px; border-top: 3px solid currentColor; }
+.wp-trend-legend .wp-trend-outbound::before { border-top-style: dashed; }
+.wp-trend-inbound { color: #527c60; }
+.wp-trend-outbound { color: #687a99; }
+.wp-trend-scroll { padding: 18px 16px; overflow-x: auto; }
+.wp-report-trend { display: block; width: 100%; min-width: 540px; }
+.wp-trend-grid { stroke: var(--wp-line); stroke-dasharray: 4 5; }
+.wp-trend-label { fill: var(--wp-muted); font-size: 11px; }
+.wp-trend-line { fill: none; stroke: currentColor; stroke-width: 2.5; }
+.wp-trend-line.wp-trend-outbound { stroke-dasharray: 7 5; }
+.wp-trend-point { fill: currentColor; }
+
+.wp-flow-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.wp-flow-canvas {
+  padding: 32px 24px;
+  background-color: var(--wp-soft);
+  background-image: radial-gradient(var(--wp-line) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+.wp-flow-chain {
+  display: grid;
+  justify-items: center;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.wp-flow-chain li {
+  width: min(100%, 365px);
+  position: relative;
+}
+
+.wp-flow-chain li:not(:last-child)::after {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 23px;
+  margin-inline: auto;
+  background: #b9c6bf;
+}
+
+.wp-flow-node {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 69px;
+  padding: 14px 16px;
+  border: 1px solid var(--wp-line);
+  border-radius: 9px;
+  background: var(--wp-paper);
+  cursor: pointer;
+  transition: border-color 150ms, background 150ms;
+}
+
+.wp-node-number {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.wp-node-arrow {
+  margin-left: auto;
+  color: var(--wp-muted);
+}
+
+.wp-flow-node:hover {
+  border-color: var(--wp-green);
+}
+
+.wp-flow-inspector {
+  padding: 26px 22px;
+  border-left: 1px solid var(--wp-line);
+}
+
+.wp-node-detail {
+  margin-top: 24px;
+}
+
+.wp-node-detail h3 {
+  margin: 16px 0 12px;
+}
+
+.wp-node-detail p,
+.wp-flow-outcomes p,
+.wp-flow-help {
+  color: var(--wp-muted);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.wp-flow-help {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--wp-line);
+}
+
+.wp-flow-outcomes {
+  width: min(100%, 365px);
+  margin: 26px auto 0;
+  padding: 15px;
+  border: 1px dashed #b9c6bf;
+  border-radius: 8px;
+  background: var(--wp-paper);
+}
+
+/* Native radios keep node selection keyboard-accessible and entirely local. */
+@supports selector(:has(*)) {
+  .wp-node-detail { display: none; }
+
+  .wp-flow-editor:has(#flow-stage-state:checked) #flow-detail-state,
+  .wp-flow-editor:has(#flow-stage-rules:checked) #flow-detail-rules,
+  .wp-flow-editor:has(#flow-stage-hard:checked) #flow-detail-hard,
+  .wp-flow-editor:has(#flow-stage-grounding:checked) #flow-detail-grounding,
+  .wp-flow-editor:has(#flow-stage-language:checked) #flow-detail-language,
+  .wp-flow-editor:has(#flow-stage-delivery:checked) #flow-detail-delivery {
+    display: block;
+  }
+
+  .wp-flow-editor:has(#flow-stage-state:checked) label[for='flow-stage-state'],
+  .wp-flow-editor:has(#flow-stage-rules:checked) label[for='flow-stage-rules'],
+  .wp-flow-editor:has(#flow-stage-hard:checked) label[for='flow-stage-hard'],
+  .wp-flow-editor:has(#flow-stage-grounding:checked) label[for='flow-stage-grounding'],
+  .wp-flow-editor:has(#flow-stage-language:checked) label[for='flow-stage-language'],
+  .wp-flow-editor:has(#flow-stage-delivery:checked) label[for='flow-stage-delivery'] {
+    border-color: var(--wp-green);
+    background: var(--wp-green-soft);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--wp-green) 10%, transparent);
+  }
+
+  .wp-flow-editor:has(.wp-flow-radio:focus-visible) .wp-flow-canvas {
+    outline: 2px solid var(--wp-green);
+    outline-offset: -3px;
+  }
+}
+
+.wp-agent-links {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.wp-page-context,
+.wp-test-submit {
+  justify-content: space-between;
+}
+
+.wp-page-context p {
+  flex: 1;
+  margin: 0;
+  font-size: 12px;
+}
+
+.wp-test-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+  gap: 22px;
+  align-items: stretch;
+}
+
+.wp-test-configuration {
+  padding: 24px;
+}
+
+.wp-test-configuration > h2 {
+  margin-bottom: 22px;
+}
+
+.wp-trial-form {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--wp-line);
+}
+
+.wp-trial-form textarea {
+  width: 100%;
+  min-height: 155px;
+  padding: 13px;
+  line-height: 1.7;
+  resize: vertical;
+}
+
+.wp-test-submit > span,
+.wp-agent-scope,
+.wp-test-fallback {
+  font-size: 12px;
+}
+
+.wp-test-fallback {
+  display: inline-block;
+  margin-top: 16px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.wp-test-result-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.wp-test-output {
+  padding: 24px;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.wp-test-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 330px;
+  height: 100%;
+  text-align: center;
+  gap: 12px;
+}
+
+.wp-test-empty p {
+  max-width: 270px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.wp-test-symbol {
+  width: 50px;
+  height: 50px;
+  border-radius: 12px;
+  font-size: 30px;
+}
+
+.wp-trial-answer {
+  padding: 18px;
+  border-radius: 10px;
+  background: var(--wp-green-soft);
+  white-space: pre-wrap;
+}
+
+.wp-trial-summary {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(0, 1fr);
+  margin-top: 24px;
+}
+
+.wp-trial-summary dt,
+.wp-trial-summary dd {
+  margin: 0;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--wp-line);
+  font-size: 13px;
+}
+
+.wp-trial-summary dt { color: var(--wp-muted); }
+.wp-trial-summary dd { text-align: right; }
+
+.wp-knowledge-layout {
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr);
+}
+
+.wp-knowledge-folders {
+  padding: 24px 16px;
+  border-right: 1px solid var(--wp-line);
+}
+
+.wp-knowledge-folders h3 {
+  margin: 0 10px 18px;
+  color: var(--wp-muted);
+  font-size: 12px;
+}
+
+.wp-knowledge-folders nav {
+  display: grid;
+  gap: 5px;
+}
+
+.wp-knowledge-folder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 10px;
+  border-radius: 7px;
+  color: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  text-decoration: none;
+}
+
+.wp-knowledge-folder:hover {
+  background: var(--wp-green-soft);
+  color: var(--wp-green);
+}
+
+.wp-folder-icon { color: var(--wp-green); }
+.wp-knowledge-folders > p { margin-top: 24px; font-size: 12px; }
+.wp-knowledge-table td { vertical-align: top; }
+.wp-knowledge-table td:first-child { width: 65%; }
+.wp-knowledge-table .saas-create-disclosure { border: 0; }
+.wp-knowledge-table summary { padding: 0; min-height: 24px; cursor: pointer; }
+.wp-knowledge-table details[open] > summary { color: var(--wp-green); }
+.wp-knowledge-table .saas-card-body { padding: 20px 0 0; white-space: normal; }
+.wp-knowledge-table .saas-definition-list { display: block; }
+.wp-knowledge-table dt { font-size: 12px; margin: 14px 0 5px; color: var(--wp-muted); }
+.wp-knowledge-table dd { margin: 0; line-height: 1.7; }
+.wp-knowledge-safety { border-top: 1px solid var(--wp-line); padding: 20px 22px; font-size: 12px; }
+
+html[data-theme='dark'] .saas-workspace-page,
+html[data-theme='dark'] .wp-financial-panel {
+  --wp-green: #36b28a;
+  --wp-green-soft: #1b352c;
+}
+
+html[data-theme='dark'] .wp-info-note {
+  background: #1d2b38;
+  border-color: #33475a;
+  color: #b6cadd;
+}
+
+html[data-theme='dark'] .saas-workspace-page .saas-button.primary {
+  color: #10251d;
+}
+
+html[data-theme='dark'] .wp-trend-inbound { color: #90baa0; }
+html[data-theme='dark'] .wp-trend-outbound { color: #aebacf; }
+
+@media (max-width: 1100px) {
+  .wp-flow-editor { grid-template-columns: minmax(0, 1fr) 255px; }
+  .wp-knowledge-layout { grid-template-columns: 195px minmax(0, 1fr); }
+}
+
+@media (max-width: 960px) {
+  .wp-test-layout { grid-template-columns: minmax(0, 1fr); }
+  .saas-report-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .wp-knowledge-layout { grid-template-columns: minmax(0, 1fr); }
+  .wp-knowledge-folders { border-right: 0; border-bottom: 1px solid var(--wp-line); }
+  .wp-knowledge-folders nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 640px) {
+  .wp-flow-editor { grid-template-columns: minmax(0, 1fr); }
+  .wp-flow-inspector { border-left: 0; border-top: 1px solid var(--wp-line); }
+  .wp-flow-canvas { padding: 24px 16px; }
+  .wp-report-toolbar { justify-content: flex-start; }
+  .wp-report-methodology { justify-self: start; }
+  .wp-panel-heading { padding: 18px 16px; }
+  .wp-knowledge-table table { min-width: 540px; }
+  .saas-contacts-workspace table { min-width: 650px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wp-flow-node { transition: none; }
+}

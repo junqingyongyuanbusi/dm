@@ -1,14 +1,65 @@
-{% if show_lifecycle %}
-  {% include "components/agent_lifecycle.html" %}
-{% endif %}
-
-<div class="saas-filter-toolbar">
-  <span class="saas-status neutral">{{ list_summary }}</span>
-  <span class="saas-muted">{{ scope_description }}</span>
-</div>
-
-<div class="saas-agent-grid">
-  {% for card in cards %}
-    {% include "components/agent_card.html" %}
-  {% endfor %}
+<link rel="stylesheet" href="/static/agent-workspace.css?v=1">
+<div class="agent-workspace">
+  <div class="agent-workspace-summary">
+    <span class="saas-status neutral" id="agent-workspace-list-title">{{ list_summary }}</span>
+  </div>
+  {% if cards %}
+    {% set current_card = cards[0] %}
+    <div class="agent-workspace-layout">
+      <nav class="agent-workspace-list" aria-labelledby="agent-workspace-list-title">
+        {% for card in cards %}
+          {% with is_current_card=loop.first %}
+            {% include "components/agent_card.html" %}
+          {% endwith %}
+        {% endfor %}
+      </nav>
+      <section class="saas-card agent-workspace-configuration" id="agent-workspace-configuration"
+               aria-labelledby="agent-workspace-current-title">
+        <header class="saas-card-header agent-workspace-configuration-heading">
+          <div class="agent-workspace-identity">
+            <span class="saas-agent-avatar" aria-hidden="true">✦</span>
+            <div>
+              <h2 id="agent-workspace-current-title">{{ current_card.name }}</h2>
+              <p>{{ current_card.scope_label }} <span class="saas-mono">{{ current_card.agent_id }}</span></p>
+            </div>
+          </div>
+          {{ current_card.status_html }}
+        </header>
+        {% with lifecycle_compact=true %}
+          {% include "components/agent_lifecycle.html" %}
+        {% endwith %}
+        <div class="saas-card-body agent-workspace-configuration-body">
+          <div class="agent-workspace-section-heading">
+            <h3>{{ lifecycle_title }}</h3>
+          </div>
+          <dl class="agent-workspace-settings">
+            <div><dt>{{ current_card.release_label }}</dt><dd>{{ current_card.release_text }}</dd></div>
+            <div><dt>{{ current_card.mode_label }}</dt><dd>{{ current_card.mode_html }}</dd></div>
+            <div><dt>{{ current_card.channels_label }}</dt><dd>{{ current_card.active_accounts }}/{{ current_card.account_count }}</dd></div>
+            <div><dt>{{ current_card.knowledge_label }}</dt><dd>{{ current_card.published_count }}</dd></div>
+          </dl>
+          <p class="agent-workspace-prompt saas-mono">{{ current_card.prompt_text }}</p>
+          {% if show_lifecycle %}
+            <div class="agent-workspace-readiness">
+              <label for="agent-workspace-readiness">{{ current_card.readiness_label }}</label>
+              <span>{{ current_card.readiness_percent }}%</span>
+              <progress id="agent-workspace-readiness" value="{{ current_card.readiness_percent }}" max="100">{{ current_card.readiness_percent }}%</progress>
+            </div>
+          {% endif %}
+          <div class="agent-workspace-next">
+            <div><strong>{{ current_card.next_step_label }}</strong><p>{{ current_card.next_step }}</p></div>
+            <a class="saas-button" href="{{ current_card.open_href }}">{{ current_card.open_label }} <span aria-hidden="true">→</span></a>
+          </div>
+        </div>
+      </section>
+    </div>
+  {% else %}
+    {% if show_lifecycle %}
+      {% include "components/agent_lifecycle.html" %}
+    {% endif %}
+    <section class="saas-card agent-workspace-empty" aria-labelledby="agent-workspace-list-title">
+      <span class="saas-agent-avatar" aria-hidden="true">✦</span>
+      <p>{{ scope_description }}</p>
+    </section>
+  {% endif %}
 </div>
