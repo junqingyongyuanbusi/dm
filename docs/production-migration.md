@@ -6,6 +6,28 @@ This file covers database, encrypted-secret and staged rollout requirements. See
 
 ## Pending wikiglobal workspace authority migration
 
+### Explicit development rollout exception (2026-09-09)
+
+The owner confirmed that the existing `reply-core` environment named `production` is currently
+used for development, authorized commit/push followed by an in-place upgrade, and explicitly
+deferred additional backups, a coordinated maintenance procedure and authority-compatible
+rollback engineering. This authorization applies only to this development rollout, not to a
+future production release; the production prerequisites below remain the default.
+
+Railway data is authoritative. Do not load local fixtures or reset the database. Read-only
+inspection found revision `d4e9a2f6b710`, two active legacy `ADMIN` identities, six platform
+accounts and 1,365 knowledge documents. The owner separately approved preserving those two
+existing administrators as `WORKSPACE_ADMIN` using their pre-migration IDs; do not promote
+unrelated users or change passwords. The intervening historical ADMIN-to-USER migration remains
+unchanged. Restore only the approved identities after schema upgrade, with an audit record.
+
+GitHub CI must still pass for the exact pushed SHA, and the existing release script must still
+verify configuration, promote the immutable image and converge all three services to one digest.
+API owns schema preparation. The compatibility image's schema smoke does not establish safe
+authority rollback; this development exception does not change that limitation.
+
+### Default production requirements
+
 Revision `c6f2a9d4e810` follows `b9e5f3a7d102` and is the current code head. It adds five
 workspace roles, per-member operator reply/takeover flags and tenant-bound account access grants.
 It snapshots existing `shared_with_support` access for existing USER members, then converts USER

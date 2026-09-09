@@ -193,7 +193,7 @@ allowlist，且 DNS 解析结果全部为公共目标。会话按 thread 建立�
 以避免串人；24 小时自动回复限额按 account+sender 跨 thread 统计。轮询 RawEvent 只保存 UID、
 UIDVALIDITY、size 和可选 SHA-256，不保存 RFC822 正文。
 
-当前迁移唯一 head 为 `a8f4d2c6e901`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
+当前迁移唯一 head 为 `c6f2a9d4e810`。仓库尚不声称已用真实企业邮箱完成 live E2E；管理员提供
 目标凭证后，必须先做 Phase 0 TLS/login/readonly 检查，再执行 draft-only real smoke。完整步骤见
 [Email operator runbook](docs/email-integration.md)。
 

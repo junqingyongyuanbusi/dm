@@ -395,7 +395,9 @@ async def seed_feishu_handoff(
             brand_id=f"company-customer-{index}",
             owner_user_id=None,
             shared_with_support=customer_shared,
-            authorized_user_ids=tuple(member.user_id for member in staff) if customer_shared else (),
+            authorized_user_ids=(
+                tuple(member.user_id for member in staff) if customer_shared else ()
+            ),
             account_name=f"Company customer account {index}",
             state="HUMAN_ACTIVE" if work_status == "CLAIMED" else "HANDOFF_PENDING",
             work_status=work_status,
