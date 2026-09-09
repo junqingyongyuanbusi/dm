@@ -8,9 +8,16 @@ from migrations.versions.a9d4e6f2b713_repair_human_handoff_lifecycle import (
 )
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from tests.integration.migration_support import assert_alembic_succeeds, temporary_database
+from tests.integration.migration_support import (
+    assert_alembic_succeeds,
+    assert_upgrades_to_current_head,
+    temporary_database,
+)
 
 pytestmark = pytest.mark.integration
+
+# Workspace authority migration intentionally revokes the legacy claims tested here.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 
 
 async def test_human_handoff_repair_downgrade_and_reupgrade():
@@ -151,7 +158,7 @@ async def test_human_handoff_repair_downgrade_and_reupgrade():
             )
         await engine.dispose()
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             states = (
@@ -188,7 +195,7 @@ async def test_human_handoff_repair_downgrade_and_reupgrade():
         await engine.dispose()
 
         await assert_alembic_succeeds(database_url, "downgrade", "f8a1c3d5e702")
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             versions = (
@@ -202,6 +209,7 @@ async def test_human_handoff_repair_downgrade_and_reupgrade():
             )
         assert versions == [2, 2, 2, 1, 1, 2, 2, 2, 5, 5]
         await engine.dispose()
+        await assert_upgrades_to_current_head(database_url)
 
 
 async def test_human_handoff_repair_waits_for_committed_account_policy():

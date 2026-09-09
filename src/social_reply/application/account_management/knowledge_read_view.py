@@ -144,7 +144,8 @@ async def render_published_knowledge(
         f'<details class="knowledge-answer"><summary>{answer_label}</summary>'
         f'<p class="saas-knowledge-answer">{escape(document.reply)}</p></details></td>'
         f'<td>{escape(document.brand_id)}</td><td><span class="saas-status success">'
-        f'{published_label}</span></td><td>{format_datetime(document.updated_at, include_year=True)}'
+        f'{published_label}</span></td><td>'
+        f'{format_datetime(document.updated_at, include_year=True)}'
         '</td></tr>'
         for document in matching_documents
     )

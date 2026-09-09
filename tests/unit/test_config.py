@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
+from tests.integration.migration_support import CURRENT_HEAD
 
 from social_reply.shared.config import Settings
 
@@ -370,21 +371,21 @@ def test_local_environment_template_disables_future_platforms() -> None:
 def test_email_documentation_and_migration_head_contract() -> None:
     root = Path(__file__).resolve().parents[2]
     assert _configuration_email_keys(root / "docs/configuration.md") == set(_EMAIL_ENV_DEFAULTS)
-    assert _migration_heads(root / "migrations/versions") == {"a8f4d2c6e901"}
+    assert _migration_heads(root / "migrations/versions") == {CURRENT_HEAD}
 
     production_migration = (root / "docs/production-migration.md").read_text()
     docs_readme = (root / "docs/README.md").read_text()
     root_readme = (root / "README.md").read_text()
     assert re.search(
-        r"current Alembic graph has one head: `a8f4d2c6e901`",
+        rf"Revision `{CURRENT_HEAD}` follows `b9e5f3a7d102` and is the current code head\.",
         production_migration,
     )
     assert re.search(
-        r"Alembic graph has one current head:\s*`a8f4d2c6e901`",
+        rf"Alembic graph has one current head:\s*`{CURRENT_HEAD}`",
         docs_readme,
     )
     assert re.search(
-        r"current revision 等于唯一 head `a8f4d2c6e901`",
+        rf"current revision 等于唯一 head `{CURRENT_HEAD}`",
         root_readme,
     )
 

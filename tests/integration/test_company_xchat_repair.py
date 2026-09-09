@@ -183,7 +183,9 @@ async def test_user_active_grant_repair_preserves_scope_and_denies_inbox(
     session, monkeypatch, route
 ):
     owner = await create_staff(session, username=f"xchat-owner-{uuid.uuid4().hex}")
-    operator = await create_staff(session, username=f"xchat-grantee-{uuid.uuid4().hex}")
+    operator = await create_staff(
+        session, username=f"xchat-grantee-{uuid.uuid4().hex}", role="OPERATOR"
+    )
     seed = await _seed_xchat_account(
         session,
         owner_user_id=owner.user_id,
@@ -251,7 +253,9 @@ async def test_user_active_grant_repair_preserves_scope_and_denies_inbox(
 
 async def test_user_without_active_grant_is_rejected_without_network(session, monkeypatch):
     owner = await create_staff(session, username=f"xchat-no-grant-owner-{uuid.uuid4().hex}")
-    operator = await create_staff(session, username=f"xchat-no-grant-user-{uuid.uuid4().hex}")
+    operator = await create_staff(
+        session, username=f"xchat-no-grant-user-{uuid.uuid4().hex}", role="OPERATOR"
+    )
     seed = await _seed_xchat_account(session, owner_user_id=owner.user_id)
     before = await _account_snapshot(seed.account_id)
     client_calls, unlock_calls = _stub_xchat_network(monkeypatch)
@@ -352,7 +356,9 @@ async def test_missing_invalid_repair_version_is_rejected_without_network(
 
 async def test_repair_rechecks_session_after_real_revoke_during_unlock(session, monkeypatch):
     owner = await create_staff(session, username=f"xchat-revoke-owner-{uuid.uuid4().hex}")
-    operator = await create_staff(session, username=f"xchat-revoke-user-{uuid.uuid4().hex}")
+    operator = await create_staff(
+        session, username=f"xchat-revoke-user-{uuid.uuid4().hex}", role="OPERATOR"
+    )
     seed = await _seed_xchat_account(
         session,
         owner_user_id=owner.user_id,
@@ -399,7 +405,9 @@ async def test_repair_rechecks_session_after_real_revoke_during_unlock(session, 
 
 async def test_repair_cas_keeps_new_oauth_write_after_unlock_race(session, monkeypatch):
     owner = await create_staff(session, username=f"xchat-cas-owner-{uuid.uuid4().hex}")
-    operator = await create_staff(session, username=f"xchat-cas-user-{uuid.uuid4().hex}")
+    operator = await create_staff(
+        session, username=f"xchat-cas-user-{uuid.uuid4().hex}", role="OPERATOR"
+    )
     seed = await _seed_xchat_account(
         session,
         owner_user_id=owner.user_id,

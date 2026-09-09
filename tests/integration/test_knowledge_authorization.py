@@ -397,7 +397,11 @@ async def test_named_workspace_admin_succeeds_and_user_is_rejected(session, migr
 
 async def test_bootstrap_principal_can_write_an_allowed_actual_tenant(session, migrated_db):
     principal = await _bootstrap_principal()
-    document = await _seed_document(session, tenant_id="tenant-a")
+    document = await _seed_document(
+        session,
+        tenant_id="tenant-a",
+        question="How do I open the settings panel?",
+    )
     await session.commit()
 
     published = await execute_publish_knowledge(

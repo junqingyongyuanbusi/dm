@@ -29,12 +29,14 @@ def _client() -> httpx.AsyncClient:
     )
 
 
-async def _seed_users(session) -> tuple[models.AdminUser, models.AdminUser]:
+async def _seed_users(
+    session, *, first_role: str = "OPERATOR"
+) -> tuple[models.AdminUser, models.AdminUser]:
     first_user = models.AdminUser(
         username="channel-user-a",
         password_hash=await hash_password(_USER_PASSWORD),
         tenant_id="default",
-        role="USER",
+        role=first_role,
         must_change_password=False,
         status="active",
     )
@@ -42,7 +44,7 @@ async def _seed_users(session) -> tuple[models.AdminUser, models.AdminUser]:
         username="channel-user-b",
         password_hash=await hash_password(_USER_PASSWORD),
         tenant_id="default",
-        role="USER",
+        role="OPERATOR",
         must_change_password=False,
         status="active",
     )
@@ -336,22 +338,26 @@ async def test_historical_user_job_is_blocked_on_retry_and_worker_execution(
     from social_reply.application.account_management import jobs
 
     user, _sibling_user = await _seed_users(session)
-    historical_job = models.ProvisioningJob(
+    authenticated = await authenticate(user.username, _USER_PASSWORD)
+    assert authenticated is not None
+    principal, _raw_token = authenticated
+    job_id = await jobs.submit_provisioning_job(
         tenant_id="default",
         brand_id="default",
         platform="telegram",
-        actor=f"user:{user.username}",
-        owner_user_id=user.id,
-        idempotency_key="historical-user-active-job",
-        request={"automation_default": "BOT_ACTIVE"},
-        staging_secret=encrypt_secret_bundle({"token": "historical-secret"}),
-        status="FAILED",
-        current_step="FAILED",
-        result={},
-        last_error_code="PLATFORM_UNAVAILABLE",
-        last_error_message="temporary",
+        actor=principal.actor,
+        admin_session_id=principal.session_id,
+        request={"idempotency_key": "historical-user-active-job"},
+        secrets={"token": "historical-secret"},
     )
-    session.add(historical_job)
+    historical_job = await session.get(models.ProvisioningJob, job_id)
+    assert historical_job is not None
+    # Preserve valid provenance while recreating the retired unsafe policy.
+    historical_job.request = {"automation_default": "BOT_ACTIVE"}
+    historical_job.status = "FAILED"
+    historical_job.current_step = "FAILED"
+    historical_job.last_error_code = "PLATFORM_UNAVAILABLE"
+    historical_job.last_error_message = "temporary"
     await session.commit()
 
     async with _client() as client:
@@ -410,6 +416,17 @@ async def test_channel_lifecycle_commands_are_scoped_optimistic_and_audited(
         sibling_detail = await client.get(
             f"/app/t/default/channels/accounts/{sibling_account.id}"
         )
+        forbidden_active = await client.post(
+            f"/app/t/default/channels/accounts/{account.id}/automation",
+            data={
+                "csrf_token": csrf,
+                "target": "BOT_ACTIVE",
+                "expected_config_version": "1",
+            },
+        )
+
+    async with _client() as client:
+        csrf = await _login_superadmin(client)
         renamed = await client.post(
             f"/app/t/default/channels/accounts/{account.id}/rename",
             data={
@@ -424,14 +441,6 @@ async def test_channel_lifecycle_commands_are_scoped_optimistic_and_audited(
                 "csrf_token": csrf,
                 "name": "Stale write must fail",
                 "expected_config_version": "1",
-            },
-        )
-        forbidden_active = await client.post(
-            f"/app/t/default/channels/accounts/{account.id}/automation",
-            data={
-                "csrf_token": csrf,
-                "target": "BOT_ACTIVE",
-                "expected_config_version": "2",
             },
         )
         disabled = await client.post(
@@ -542,7 +551,7 @@ async def test_kill_switch_and_job_retry_are_idempotent_scoped_and_audited(
     from social_reply.application.account_management import channel_management
     from social_reply.shared.config import get_settings
 
-    first_user, _second_user = await _seed_users(session)
+    first_user, _second_user = await _seed_users(session, first_role="WORKSPACE_ADMIN")
     account = models.PlatformAccount(
         tenant_id="default",
         brand_id="default",
@@ -661,7 +670,7 @@ async def test_kill_switch_persists_unknown_audit_when_redis_apply_fails(
         kill_switch_recovery,
     )
 
-    first_user, _second_user = await _seed_users(session)
+    first_user, _second_user = await _seed_users(session, first_role="WORKSPACE_ADMIN")
     account = models.PlatformAccount(
         tenant_id="default",
         brand_id="default",
@@ -697,15 +706,19 @@ async def test_kill_switch_persists_unknown_audit_when_redis_apply_fails(
         lambda _url: FailingRedis(),
     )
 
+    authenticated = await authenticate(first_user.username, _USER_PASSWORD)
+    assert authenticated is not None
+    principal, _raw_token = authenticated
+
     with pytest.raises(RuntimeError, match="redis unavailable"):
         await channel_management.set_channel_account_kill_switch(
             tenant_id="default",
             account_id=account.id,
             actor=channel_management.ChannelActor(
-                actor=f"user:{first_user.username}",
-                role="USER",
-                user_id=first_user.id,
-                session_id=uuid.uuid4(),
+                actor=principal.actor,
+                role="ADMIN" if principal.is_workspace_admin else "USER",
+                user_id=principal.user_id,
+                session_id=principal.session_id,
             ),
             enabled=True,
         )

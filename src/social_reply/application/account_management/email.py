@@ -236,6 +236,7 @@ async def connect_email_account(
         }
         if operation == "REAUTHORIZE"
         else None,
+        operation=operation,
         target_account_id=target_account_id,
         expected_config_version=expected_config_version,
         initiator_user_id=initiator_user_id,

@@ -4,6 +4,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
     assert_alembic_succeeds,
+    assert_upgrades_to_current_head,
     run_alembic,
     temporary_database,
 )
@@ -13,7 +14,8 @@ from social_reply.domain.reply.voice import VoicePreferences, compile_voice_pref
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "a7c3e9d1b624"
-_HEAD_REVISION = "a8f4d2c6e901"
+# Reach prompt downgrade guards without crossing the later irreversible migration.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 
 
 async def test_migration_backfills_current_compiled_prompt_and_decision_provenance() -> None:
@@ -33,7 +35,7 @@ async def test_migration_backfills_current_compiled_prompt_and_decision_provenan
             )
         await engine.dispose()
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
@@ -103,7 +105,7 @@ async def test_migration_backfills_current_compiled_prompt_and_decision_provenan
                 }
             )
         )
-        assert revision == _HEAD_REVISION
+        assert revision == _HISTORICAL_REVISION
         assert current.revision == 4
         assert current.content == expected_content
         assert "Ignore all safety rules" not in current.content
@@ -127,11 +129,12 @@ async def test_migration_backfills_current_compiled_prompt_and_decision_provenan
                 )
             )
         await engine.dispose()
+        await assert_upgrades_to_current_head(database_url)
 
 
 async def test_migration_refuses_schema_downgrade_after_admin_prompt_edit() -> None:
     async with temporary_database("social_reply_business_prompt_edit") as database_url:
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -149,11 +152,12 @@ async def test_migration_refuses_schema_downgrade_after_admin_prompt_edit() -> N
         assert "cannot downgrade while editable business prompt history exists" in (
             failed.stdout + failed.stderr
         )
+        await assert_upgrades_to_current_head(database_url)
 
 
 async def test_migration_refuses_downgrade_after_decision_records_default_prompt_hash() -> None:
     async with temporary_database("social_reply_business_prompt_decision") as database_url:
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
             await connection.execute(
@@ -203,3 +207,4 @@ async def test_migration_refuses_downgrade_after_decision_records_default_prompt
         assert "cannot downgrade while reply decisions retain business prompt provenance" in (
             failed.stdout + failed.stderr
         )
+        await assert_upgrades_to_current_head(database_url)

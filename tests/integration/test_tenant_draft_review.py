@@ -8,7 +8,8 @@ from sqlalchemy import func, select, update
 
 from apps.api.main import create_app
 from social_reply.application.account_management import admin_console, saas_console
-from social_reply.application.account_management.auth import Principal, authenticate, hash_password
+from social_reply.application.account_management.auth import authenticate, hash_password
+from social_reply.application.knowledge import publication as knowledge_publication
 from social_reply.application.knowledge.commands import KnowledgeConflictError
 from social_reply.application.knowledge.publication import (
     UnpublishKnowledgeCommand,
@@ -185,7 +186,7 @@ async def _seed_draft(
                 direction=message_direction,
                 sender_type="contact",
                 text="Customer question",
-                reply_target={"chat_id": 123},
+                reply_target={"kind": "dm", "chat_id": 123},
                 decision_generation=message_generation,
             )
         )
@@ -236,17 +237,6 @@ async def _seed_draft(
         message_id=message_id,
         decision_id=decision_id,
         generation=conversation_generation,
-    )
-
-
-def _superadmin_principal() -> Principal:
-    return Principal(
-        session_id=uuid.uuid4(),
-        username="admin",
-        actor="user:admin",
-        tenant_id="default",
-        allowed_tenants=frozenset({"default"}),
-        role="SUPERADMIN",
     )
 
 
@@ -321,7 +311,9 @@ async def _attach_knowledge_provenance(
     await session.commit()
 
 
-async def test_actionable_draft_predicate_is_shared_by_admin_and_tenant_inbox(session) -> None:
+async def test_actionable_draft_predicate_is_shared_by_admin_and_tenant_inbox(
+    session, knowledge_admin_principal
+) -> None:
     valid = await _seed_draft(session)
     await _seed_draft(session, decision_generation=None)
     await _seed_draft(session, decision_generation=2)
@@ -355,7 +347,7 @@ async def test_actionable_draft_predicate_is_shared_by_admin_and_tenant_inbox(se
             .where(reviewable_draft_condition())
         )
     )
-    principal = _superadmin_principal()
+    principal = knowledge_admin_principal
     admin_summary = await admin_console._load_inbox_summary(
         session,
         frozenset({"default"}),
@@ -432,7 +424,7 @@ async def test_tenant_draft_panel_approves_and_legacy_admin_replay_is_idempotent
     assert legacy_replay.headers["location"] == "/admin/inbox?queue=drafts"
     assert conflicting_replay.status_code == 409
     assert conflicting_replay.json() == {"detail": "draft_approval_conflict"}
-    assert sent_messages == [({"chat_id": 123}, "Edited tenant reply")]
+    assert sent_messages == [({"kind": "dm", "chat_id": 123}, "Edited tenant reply")]
 
     outbox_count = await session.scalar(
         select(func.count())
@@ -707,6 +699,17 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
 
     monkeypatch.setattr(reply_review_service, "dispatch_actor", suppress_dispatch)
 
+    reviewer = await _seed_user(
+        session,
+        username="knowledge-race-reviewer",
+        role="WORKSPACE_ADMIN",
+    )
+    authenticated = await authenticate(reviewer.username, _PASSWORD)
+    assert authenticated is not None
+    reviewer_principal, _token = authenticated
+    # Distinct staff/session locks ensure the race exercises knowledge safety locks.
+    assert reviewer_principal.user_id != knowledge_admin_principal.user_id
+
     unpublish_first_draft = await _seed_draft(session)
     unpublish_first_document, unpublish_first_chunk = await _seed_published_knowledge(
         session,
@@ -718,35 +721,52 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
         unpublish_first_document,
         unpublish_first_chunk,
     )
+    approval_waiting_on_knowledge = asyncio.Event()
+    original_shared_lock = reply_review_service.acquire_shared_xact_lock
 
-    async with get_session_factory()() as unpublish_session:
-        await execute_unpublish_knowledge(
-            unpublish_session,
-            UnpublishKnowledgeCommand(
-                required_tenant_id="default",
-                principal=knowledge_admin_principal,
-                document_id=unpublish_first_document.id,
-            ),
-        )
-        approval_task = asyncio.create_task(
-            approve_draft(
-                decision_id=unpublish_first_draft.decision_id,
-                required_tenant_id="default",
-                actor="user:knowledge-admin",
-                final_reply_text=None,
-                expected_generation=unpublish_first_draft.generation,
-                expected_review_action="PENDING",
+    async def observe_approval_knowledge_lock(lock_session, lock_key):
+        approval_waiting_on_knowledge.set()
+        await original_shared_lock(lock_session, lock_key)
+
+    monkeypatch.setattr(
+        reply_review_service, "acquire_shared_xact_lock", observe_approval_knowledge_lock
+    )
+    approval_task = None
+    try:
+        async with get_session_factory()() as unpublish_session:
+            await execute_unpublish_knowledge(
+                unpublish_session,
+                UnpublishKnowledgeCommand(
+                    required_tenant_id="default",
+                    principal=knowledge_admin_principal,
+                    document_id=unpublish_first_document.id,
+                ),
             )
-        )
-        await asyncio.sleep(0.1)
-        approval_waited_for_unpublish = not approval_task.done()
-        await unpublish_session.commit()
+            approval_task = asyncio.create_task(
+                approve_draft(
+                    decision_id=unpublish_first_draft.decision_id,
+                    required_tenant_id="default",
+                    actor=reviewer_principal.actor,
+                    principal=reviewer_principal,
+                    final_reply_text=None,
+                    expected_generation=unpublish_first_draft.generation,
+                    expected_review_action="PENDING",
+                )
+            )
+            await asyncio.wait_for(approval_waiting_on_knowledge.wait(), timeout=5)
+            approval_waited_for_unpublish = not approval_task.done()
+            await unpublish_session.commit()
 
-    with pytest.raises(
-        DraftReviewConflict,
-        match="draft_knowledge_provenance_stale",
-    ):
-        await approval_task
+        with pytest.raises(
+            DraftReviewConflict,
+            match="draft_knowledge_provenance_stale",
+        ):
+            await asyncio.wait_for(approval_task, timeout=5)
+    finally:
+        if approval_task is not None:
+            if not approval_task.done():
+                approval_task.cancel()
+            await asyncio.gather(approval_task, return_exceptions=True)
     assert approval_waited_for_unpublish is True
 
     approval_first_draft = await _seed_draft(session)
@@ -775,6 +795,16 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
         "create_or_get_outbox_intent",
         pause_after_outbox_creation,
     )
+    unpublish_waiting_on_knowledge = asyncio.Event()
+    original_exclusive_lock = knowledge_publication.acquire_xact_lock
+
+    async def observe_unpublish_knowledge_lock(lock_session, lock_key):
+        unpublish_waiting_on_knowledge.set()
+        await original_exclusive_lock(lock_session, lock_key)
+
+    monkeypatch.setattr(
+        knowledge_publication, "acquire_xact_lock", observe_unpublish_knowledge_lock
+    )
 
     async def attempt_unpublish() -> str:
         async with get_session_factory()() as concurrent_session:
@@ -797,20 +827,29 @@ async def test_unpublish_and_draft_approval_serialize_both_race_orders(
         approve_draft(
             decision_id=approval_first_draft.decision_id,
             required_tenant_id="default",
-            actor="user:knowledge-admin",
+            actor=reviewer_principal.actor,
+            principal=reviewer_principal,
             final_reply_text=None,
             expected_generation=approval_first_draft.generation,
             expected_review_action="PENDING",
         )
     )
-    await asyncio.wait_for(approval_created_outbox.wait(), timeout=5)
-    unpublish_task = asyncio.create_task(attempt_unpublish())
-    await asyncio.sleep(0.1)
-    unpublish_waited_for_approval = not unpublish_task.done()
-    release_approval.set()
-
-    approval_result = await approval_task
-    unpublish_outcome = await unpublish_task
+    unpublish_task = None
+    try:
+        await asyncio.wait_for(approval_created_outbox.wait(), timeout=5)
+        unpublish_task = asyncio.create_task(attempt_unpublish())
+        await asyncio.wait_for(unpublish_waiting_on_knowledge.wait(), timeout=5)
+        unpublish_waited_for_approval = not unpublish_task.done()
+        release_approval.set()
+        approval_result = await asyncio.wait_for(approval_task, timeout=5)
+        unpublish_outcome = await asyncio.wait_for(unpublish_task, timeout=5)
+    finally:
+        release_approval.set()
+        tasks = tuple(task for task in (approval_task, unpublish_task) if task is not None)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     assert approval_result.created is True
     assert unpublish_waited_for_approval is True

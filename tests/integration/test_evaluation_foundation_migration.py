@@ -5,12 +5,17 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
-from tests.integration.migration_support import assert_alembic_succeeds, temporary_database
+from tests.integration.migration_support import (
+    CURRENT_HEAD,
+    assert_alembic_succeeds,
+    temporary_database,
+)
 
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "f3b8c1d4e726"
-_HEAD_REVISION = "a8f4d2c6e901"
+# Downgrade coverage stops before the irreversible workspace authority migration.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 
 
 async def test_evaluation_foundation_upgrade_constraints_and_downgrade() -> None:
@@ -31,7 +36,7 @@ async def test_evaluation_foundation_upgrade_constraints_and_downgrade() -> None
         assert "evaluation_runs" not in tables_before
         assert "evaluation_decisions" not in tables_before
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = (
@@ -64,7 +69,7 @@ async def test_evaluation_foundation_upgrade_constraints_and_downgrade() -> None
                     )
                 )
             }
-        assert revision == _HEAD_REVISION
+        assert revision == _HISTORICAL_REVISION
         assert {
             "uq_evaluation_runs_tenant_id_id",
             "ck_evaluation_runs_status",
@@ -346,7 +351,7 @@ async def test_evaluation_foundation_upgrade_constraints_and_downgrade() -> None
                 await connection.execute(text("SELECT version_num FROM alembic_version"))
             ).scalar_one()
         await engine.dispose()
-        assert reupgraded_revision == _HEAD_REVISION
+        assert reupgraded_revision == CURRENT_HEAD
 
 
 def _decision_insert():

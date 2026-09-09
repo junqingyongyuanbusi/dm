@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
+    CURRENT_HEAD,
     assert_alembic_succeeds,
     run_alembic,
     temporary_database,
@@ -14,7 +15,8 @@ pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "c2f4a6d8e901"
 _FEISHU_REVISION = "e4b7c2d9a610"
-_HEAD_REVISION = "a8f4d2c6e901"
+# The dedup round trip must not cross the irreversible workspace migration.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 _FEISHU_ACCOUNT_ID = "00000000-0000-0000-0000-00000000fe15"
 
 
@@ -85,13 +87,13 @@ async def test_feishu_platform_constraint_upgrade_and_fail_closed_downgrade():
                 )
             ).scalar_one()
         await engine.dispose()
-        assert revision == _HEAD_REVISION
+        assert revision == CURRENT_HEAD
         assert "feishu" in new_definition
 
 
 async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
     async with temporary_database("social_reply_feishu_dedup") as database_url:
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = (
@@ -107,7 +109,7 @@ async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
                 )
             ).scalar_one()
         await engine.dispose()
-        assert revision == _HEAD_REVISION
+        assert revision == _HISTORICAL_REVISION
         assert "UNIQUE INDEX" in index_definition
         assert "(platform_account_id, external_event_id)" in index_definition
         assert "source = 'feishu'::text" in index_definition
@@ -149,7 +151,7 @@ async def test_empty_database_feishu_dedup_index_upgrade_downgrade_reupgrade():
                 )
             ).scalar_one()
         await engine.dispose()
-        assert revision == _HEAD_REVISION
+        assert revision == CURRENT_HEAD
         assert index_count == 1
 
 

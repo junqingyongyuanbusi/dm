@@ -111,7 +111,9 @@ def test_health_uses_platform_specific_recorded_evidence(configuration, expected
 @pytest.mark.parametrize(
     "health_status", ["REAUTH_REQUIRED", "SUBSCRIPTION_MISSING", "APP_SUBSCRIPTION_MISSING"]
 )
-def test_known_meta_failures_are_actionable_even_when_messaging_is_disabled(platform, health_status):
+def test_known_meta_failures_are_actionable_even_when_messaging_is_disabled(
+    platform, health_status
+):
     account = account_view(
         platform=platform, config={"meta_health_status": health_status}, capability={"dm": False}
     )
@@ -276,7 +278,9 @@ def test_english_empty_states_and_owner_fallbacks(can_connect):
         reset_locale(locale_token)
     assert "No visible accounts yet" in empty_html
     assert "No matching accounts" in filtered_html
-    assert ("connect your first account" if can_connect else "contact an administrator") in empty_html
+    assert (
+        "connect your first account" if can_connect else "contact an administrator"
+    ) in empty_html
     assert "Organization account" in card_html
     assert "No identity" in card_html
     assert "Not checked" in card_html

@@ -31,7 +31,7 @@ async def test_manual_reauthorization_post_creates_canonical_job_without_inbox_a
         username=f"connection-operator-{uuid.uuid4().hex}",
         password_hash=password_hash,
         tenant_id="default",
-        role="USER",
+        role="OPERATOR",
         status="active",
         must_change_password=False,
     )

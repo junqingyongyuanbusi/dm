@@ -6,6 +6,7 @@ import uuid
 import httpx
 import pytest
 from sqlalchemy import select
+from tests.integration.test_reauthorization_contract import _connect_control_account
 
 from apps.api.main import create_app
 from social_reply.application.account_management import service
@@ -37,7 +38,8 @@ async def test_messenger_provisioning_activates_only_after_dm_subscription(
             return httpx.Response(200, json={"success": True})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
-    result = await connect_meta_account(
+    result = await _connect_control_account(
+        connect_meta_account,
         platform="facebook",
         external_account_id="page-1",
         access_token="page-token",
@@ -125,7 +127,8 @@ async def test_messenger_comment_provisioning_checks_permissions_and_enables_fee
             return httpx.Response(200, json={"success": True})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
-    result = await connect_meta_account(
+    result = await _connect_control_account(
+        connect_meta_account,
         platform="facebook",
         external_account_id="page-1",
         access_token="page-token",
@@ -216,7 +219,8 @@ async def test_messenger_webhook_during_subscription_is_durably_routed(
         return ("messages",)
 
     monkeypatch.setattr(service, "subscribe_meta_account", subscribe_during_provisioning)
-    result = await connect_meta_account(
+    result = await _connect_control_account(
+        connect_meta_account,
         platform="facebook",
         external_account_id="page-1",
         access_token="page-token",
@@ -257,7 +261,8 @@ async def test_failed_messenger_subscription_leaves_account_disabled(
         )
 
     with pytest.raises(httpx.HTTPStatusError):
-        await connect_meta_account(
+        await _connect_control_account(
+            connect_meta_account,
             platform="facebook",
             external_account_id="page-1",
             access_token="page-token",

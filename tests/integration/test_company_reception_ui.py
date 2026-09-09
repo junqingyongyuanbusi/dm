@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 from tests.integration.company_permission_support import (
     create_staff,
     login_client,
+    refresh_staff_principal,
     seed_conversation,
     seed_feishu_handoff,
     signed_card_request,
@@ -126,6 +127,7 @@ async def test_shared_saas_reception_transfers_from_a_to_b_and_fences_old_owner(
     await session.commit()
     conversation = await seed_conversation(
         session,
+        authorized_user_ids=(staff_a.user_id, staff_b.user_id),
         tenant_id="default",
         shared_with_support=True,
         state="BOT_ACTIVE",
@@ -252,6 +254,7 @@ async def test_workspace_admin_own_session_can_start_and_transfer_through_admin_
     target = await create_staff(session, username="company-reception-manager-target")
     conversation = await seed_conversation(
         session,
+        authorized_user_ids=(target.user_id,),
         tenant_id="default",
         shared_with_support=True,
         state="BOT_ACTIVE",
@@ -326,6 +329,7 @@ async def test_saas_resolve_rejects_every_unfinished_human_reply_status(
     staff = await create_staff(session, username=f"company-pending-{outbox_status.lower()}")
     conversation = await seed_conversation(
         session,
+        authorized_user_ids=(staff.user_id,),
         tenant_id="default",
         shared_with_support=True,
         state="BOT_ACTIVE",
@@ -405,6 +409,7 @@ async def test_delivered_human_reply_can_resolve_only_after_real_outbox_send(
     staff = await create_staff(session, username="company-delivery-success")
     conversation = await seed_conversation(
         session,
+        authorized_user_ids=(staff.user_id,),
         tenant_id="default",
         shared_with_support=True,
         state="BOT_ACTIVE",
@@ -528,7 +533,7 @@ async def test_feishu_resolve_uses_same_pending_delivery_guard(
             user_id=staff.user_id,
             work_item_id=conversation.work_id,
             expected_version=1,
-            principal=staff.principal,
+            principal=await refresh_staff_principal(staff),
         )
     )
     await asyncio.wait_for(dispatch_started.wait(), timeout=5)
@@ -582,6 +587,7 @@ async def test_disabled_account_history_is_readable_but_cannot_start_reception(s
     staff = await create_staff(session, username=f"company-disabled-{role.lower()}", role=role)
     conversation = await seed_conversation(
         session,
+        authorized_user_ids=(staff.user_id,),
         tenant_id="default",
         shared_with_support=True,
         account_status="DISABLED",
@@ -610,6 +616,7 @@ async def test_send_override_refreshes_only_when_work_version_changes(session, m
     assigned = await create_staff(session, username="company-override-assigned")
     conversation = await seed_conversation(
         session,
+        authorized_user_ids=(assigned.user_id,),
         tenant_id="default",
         shared_with_support=True,
         state="HUMAN_ACTIVE",
@@ -724,7 +731,7 @@ async def test_feishu_resolve_succeeds_after_real_deliver_outbox_sent(session, m
             user_id=staff.user_id,
             work_item_id=conversation.work_id,
             expected_version=1,
-            principal=staff.principal,
+            principal=await refresh_staff_principal(staff),
         )
     )
     await asyncio.wait_for(dispatch_started.wait(), timeout=5)

@@ -136,6 +136,7 @@ async def test_configured_employee_not_configuring_admin_owns_feishu_action(sess
         session,
         tenant_id="default",
         shared_with_support=True,
+        authorized_user_ids=(employee_id,),
         state="HANDOFF_PENDING",
         with_work=True,
     )

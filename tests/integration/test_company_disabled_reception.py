@@ -27,7 +27,12 @@ async def test_existing_waiting_work_cannot_be_claimed_after_account_disable(
 ):
     staff = await create_staff(session, role=role)
     manager = await create_staff(session, role="WORKSPACE_ADMIN")
-    conversation = await seed_conversation(session, work_status="WAITING", shared_with_support=True)
+    conversation = await seed_conversation(
+        session,
+        work_status="WAITING",
+        shared_with_support=True,
+        authorized_user_ids=(staff.user_id,),
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
     ) as client:

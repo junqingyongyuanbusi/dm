@@ -6,13 +6,15 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
     assert_alembic_succeeds,
+    assert_upgrades_to_current_head,
     temporary_database,
 )
 
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "f3a7c9e1b5d2"
-_HEAD_REVISION = "a8f4d2c6e901"
+# Exercise the reversible control-plane chain before workspace authority migration.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 
 
 async def test_agent_control_plane_backfills_scopes_and_preserves_tenant_boundaries() -> None:
@@ -73,7 +75,7 @@ async def test_agent_control_plane_backfills_scopes_and_preserves_tenant_boundar
                 )
         await engine.dispose()
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
@@ -116,7 +118,7 @@ async def test_agent_control_plane_backfills_scopes_and_preserves_tenant_boundar
                 )
             }
 
-        assert revision == _HEAD_REVISION
+        assert revision == _HISTORICAL_REVISION
         assert agents == [
             ("tenant-a", "brand-a", "Brand A Agent"),
             ("tenant-a", "default", "Default Agent"),
@@ -180,6 +182,7 @@ async def test_agent_control_plane_backfills_scopes_and_preserves_tenant_boundar
             }
         await engine.dispose()
         assert remaining_tables == set()
+        await assert_upgrades_to_current_head(database_url)
 
 
 async def _agent_id(engine, tenant_id: str, brand_id: str) -> uuid.UUID:

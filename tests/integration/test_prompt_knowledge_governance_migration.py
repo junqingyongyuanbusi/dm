@@ -3,6 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
     assert_alembic_succeeds,
+    assert_upgrades_to_current_head,
     run_alembic,
     temporary_database,
 )
@@ -15,7 +16,8 @@ from social_reply.application.reply_decision.persona import (
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "a9d4e6f2b713"
-_HEAD_REVISION = "a8f4d2c6e901"
+# Preserve governance effects before newer authority migrations alter legacy rows.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 
 
 async def test_historical_data_upgrade_downgrade_and_reupgrade():
@@ -94,7 +96,7 @@ async def test_historical_data_upgrade_downgrade_and_reupgrade():
             )
         await engine.dispose()
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = (
@@ -144,7 +146,7 @@ async def test_historical_data_upgrade_downgrade_and_reupgrade():
                 )
             ).all()
         await engine.dispose()
-        assert revision == _HEAD_REVISION
+        assert revision == _HISTORICAL_REVISION
         assert prompt.persona == DEFAULT_PERSONA
         assert prompt.voice_preferences == CANONICAL_VOICE_PREFERENCES
         assert prompt.revision == 5
@@ -188,7 +190,7 @@ async def test_historical_data_upgrade_downgrade_and_reupgrade():
         assert prompt_after_downgrade.revision == 5
         assert published_count == 399
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             prompt_after_reupgrade = (
@@ -200,6 +202,7 @@ async def test_historical_data_upgrade_downgrade_and_reupgrade():
         assert prompt_after_reupgrade.persona == DEFAULT_PERSONA
         assert prompt_after_reupgrade.voice_preferences == CANONICAL_VOICE_PREFERENCES
         assert prompt_after_reupgrade.revision == 6
+        await assert_upgrades_to_current_head(database_url)
 
 
 async def test_unknown_historical_knowledge_status_aborts_migration():

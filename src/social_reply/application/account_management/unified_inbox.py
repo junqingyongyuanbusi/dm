@@ -80,7 +80,10 @@ _COPY = {
     "brand": ("wikiglobal 金融客户服务", "wikiglobal financial customer service"),
     "clear": ("清除筛选", "Clear filters"),
     "non_text": ("非文本消息", "Non-text message"),
-    "reply_hint": ("核实客户问题后，输入回复内容…", "Verify the customer request, then write a reply…"),
+    "reply_hint": (
+        "核实客户问题后，输入回复内容…",
+        "Verify the customer request, then write a reply…",
+    ),
     "transfer_record": ("会话详情与转交", "Conversation details and transfer"),
     "record": ("查看会话详情", "View conversation details"),
     "history_limit": ("最多显示最近 100 条消息 · UTC", "Up to 100 recent messages · UTC"),

@@ -4,6 +4,10 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import insert, select
+from tests.integration.company_permission_support import (
+    grant_account_access,
+    grant_legacy_shared_access,
+)
 
 from social_reply.application.account_management.auth import (
     authenticate,
@@ -48,6 +52,7 @@ async def _seed_conversation(
     *,
     tenant_id="tenant-a",
     shared_with_support=False,
+    authorized_user_ids: tuple[uuid.UUID, ...] | None = None,
     state="BOT_ACTIVE",
     with_work=False,
 ):
@@ -69,6 +74,12 @@ async def _seed_conversation(
         )
     )
     await session.flush()
+    if authorized_user_ids is not None:
+        await grant_account_access(
+            session, tenant_id=tenant_id, account_id=account_id, user_ids=authorized_user_ids
+        )
+    elif shared_with_support:
+        await grant_legacy_shared_access(session, tenant_id=tenant_id, account_id=account_id)
     session.add(
         models.Contact(
             id=contact_id,
@@ -187,6 +198,13 @@ async def _seed_feishu_action(session, *, customer_shared: bool, employee_role: 
         ]
     )
     await session.flush()
+    if customer_shared:
+        await grant_account_access(
+            session,
+            tenant_id="tenant-feishu",
+            account_id=customer_account_id,
+            user_ids=(employee_id,),
+        )
     session.add_all(
         [
             models.Contact(
@@ -644,6 +662,9 @@ async def _seed_transfer_pair(session, user_a_id: uuid.UUID, user_b_id: uuid.UUI
     )
     await session.flush()
     work_ids = []
+    await grant_account_access(
+        session, tenant_id="tenant-a", account_id=account_id, user_ids=(user_a_id, user_b_id)
+    )
     for assigned_user_id in (user_a_id, user_b_id):
         contact_id, conversation_id, work_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         work_ids.append(work_id)
@@ -966,7 +987,7 @@ async def test_unverified_feishu_callback_digest_cannot_mint_action_proof():
 
 
 async def test_bootstrap_transfer_records_named_user_and_clears_session_source(session):
-    _account_id, _conversation_id, _message_id, work_id = await _seed_conversation(
+    account_id, _conversation_id, _message_id, work_id = await _seed_conversation(
         session,
         shared_with_support=True,
         state="HANDOFF_PENDING",
@@ -992,6 +1013,10 @@ async def test_bootstrap_transfer_records_named_user_and_clears_session_source(s
             status="active",
             must_change_password=False,
         )
+    )
+    await session.flush()
+    await grant_account_access(
+        session, tenant_id="tenant-a", account_id=account_id, user_ids=(target_id,)
     )
     await session.commit()
 

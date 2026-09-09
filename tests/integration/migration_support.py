@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from social_reply.shared.config import get_settings
 
+# Keep the expected graph head explicit so unexpected migration heads fail CI.
+CURRENT_HEAD = "c6f2a9d4e810"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -54,3 +56,14 @@ async def run_alembic(database_url: str, *args: str) -> subprocess.CompletedProc
 async def assert_alembic_succeeds(database_url: str, *args: str) -> None:
     result = await run_alembic(database_url, *args)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+async def assert_upgrades_to_current_head(database_url: str) -> None:
+    await assert_alembic_succeeds(database_url, "upgrade", "head")
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
+        assert revision == CURRENT_HEAD
+    finally:
+        await engine.dispose()

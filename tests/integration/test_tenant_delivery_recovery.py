@@ -898,9 +898,9 @@ async def test_tenant_delivery_routes_enforce_admin_role_csrf_and_hidden_scope(
         )
 
     assert user_response.status_code == 403
-    assert user_response.json() == {"detail": "tenant_admin_required"}
+    assert user_response.json() == {"detail": "capability_required:configure"}
     assert user_resolve_response.status_code == 403
-    assert user_resolve_response.json() == {"detail": "tenant_admin_required"}
+    assert user_resolve_response.json() == {"detail": "capability_required:configure"}
     assert superadmin_response.status_code == 303
     assert superadmin_resolve_response.status_code == 303
     assert csrf_response.status_code == 403

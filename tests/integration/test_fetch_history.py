@@ -25,7 +25,8 @@ async def _seed_conversation(session, *, tenant_id: str = "default") -> tuple[uu
             brand_id="b1",
             platform="telegram",
             name="a",
-            chatwoot_inbox_id=101,
+            config={"delivery_mode": "direct"},
+            capability={"dm": True, "max_text_length": 4096},
         )
     )
     await session.execute(
@@ -71,6 +72,7 @@ async def _add_message(
                 direction=direction,
                 sender_type="contact" if direction == "inbound" else "agent",
                 text=text,
+                reply_target={"kind": "dm", "chat_id": "u1"},
                 private=private,
                 occurred_at=datetime(2026, 7, 14, 10, minute, tzinfo=UTC),
             )

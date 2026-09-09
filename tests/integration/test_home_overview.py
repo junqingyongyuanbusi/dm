@@ -18,12 +18,12 @@ _RECORDED_TIMESTAMP = _RECORDED_AT.isoformat()
 def _principal(user_id: UUID | None = None) -> Principal:
     return Principal(
         session_id=uuid4(),
-        user_id=user_id,
+        user_id=user_id if user_id is not None else UUID(int=100),
         username="overview-operator",
         actor="user:overview-operator",
         allowed_tenants=frozenset({"tenant-a"}),
         tenant_id="tenant-a",
-        role="USER" if user_id is not None else "SUPERADMIN",
+        role="AGENT" if user_id is not None else "WORKSPACE_ADMIN",
     )
 
 
@@ -106,11 +106,11 @@ async def test_home_isolates_owner_and_every_tenant_before_limiting_handoffs(ses
     session.add_all([
         models.AdminUser(
             id=owner_id, username="overview-owner", tenant_id="tenant-a",
-            password_hash="unused-test-hash", role="USER",
+            password_hash="unused-test-hash", role="AGENT",
         ),
         models.AdminUser(
             id=other_owner_id, username="overview-other", tenant_id="tenant-a",
-            password_hash="unused-test-hash", role="USER",
+            password_hash="unused-test-hash", role="AGENT",
         ),
     ])
     await session.flush()

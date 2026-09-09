@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from tests.integration.company_permission_support import (
     create_staff,
+    refresh_staff_principal,
     seed_feishu_handoff,
     signed_card_request,
     signed_feishu_body,
@@ -430,7 +431,7 @@ async def test_claimed_transfer_force_refreshes_projection_and_fences_old_card(
         user_id=staff_a.user_id,
         target_user_id=staff_b.user_id,
         expected_version=1,
-        principal=staff_a.principal,
+        principal=await refresh_staff_principal(staff_a),
     )
 
     async with get_session_factory()() as fresh:
@@ -540,7 +541,7 @@ async def test_claimed_transfer_force_refreshes_projection_and_fences_old_card(
         user_id=staff_b.user_id,
         work_item_id=conversation.work_id,
         expected_version=2,
-        principal=staff_b.principal,
+        principal=await refresh_staff_principal(staff_b),
     )
     assert await outbox_module.deliver_outbox(str(outbox_id)) == "SENT"
     assert sent == ["B replies after the transfer"]

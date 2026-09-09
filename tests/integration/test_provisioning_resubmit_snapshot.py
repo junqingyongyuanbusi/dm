@@ -18,7 +18,7 @@ pytestmark = pytest.mark.integration
 async def test_same_key_resubmission_reloads_job_after_waiting_for_authority(
     session, migrated_db, monkeypatch, winner_state
 ):
-    owner = await create_staff(session)
+    owner = await create_staff(session, role="OPERATOR")
     submission = dict(
         tenant_id="default",
         brand_id="default",

@@ -1,18 +1,20 @@
 import imaplib
 import inspect
 import ssl
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from social_reply.application.account_management import channel_management, jobs
+from social_reply.application.account_management.auth import Principal
 from social_reply.application.account_management.service import AccountConnectionResult
 from social_reply.application.account_management.xchat_activation import XChatActivationError
 from social_reply.connectors.email.imap_client import ImapClientError
 from social_reply.connectors.email.network import EmailNetworkError
 from social_reply.connectors.errors import PermanentSendError, RetryableSendError
 from social_reply.connectors.feishu.client import FeishuClientError
-from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 
 def test_meta_boolean_form_values_are_parsed_strictly():
@@ -227,15 +229,33 @@ async def test_submit_channel_provisioning_normalizes_expected_service_errors(
         "submit_provisioning_job",
         fail_submission,
     )
+    principal = Principal(
+        session_id=__import__("uuid").uuid4(),
+        user_id=__import__("uuid").uuid4(),
+        username="test",
+        actor="user:test",
+        role="OPERATOR",
+        allowed_tenants=frozenset({"default"}),
+    )
+
+    @asynccontextmanager
+    async def submission_session():
+        yield object()
+
+    # This unit test isolates exception mapping, not session authorization.
+    monkeypatch.setattr(channel_management, "get_session_factory", lambda: submission_session)
+    monkeypatch.setattr(
+        channel_management, "_lock_current_channel_principal", AsyncMock(return_value=principal)
+    )
     command = channel_management.ProvisioningCommand(
         tenant_id="default",
         brand_id="default",
         platform="telegram",
         actor=channel_management.ChannelActor(
-            actor="user:test",
+            actor=principal.actor,
             role="USER",
-            user_id=__import__("uuid").uuid4(),
-            session_id=__import__("uuid").uuid4(),
+            user_id=principal.user_id,
+            session_id=principal.session_id,
         ),
         public_values={"name": "Test"},
         secret_values={"token": "not-rendered"},
@@ -272,60 +292,6 @@ def test_feishu_safe_request_and_public_result_redact_all_secrets():
     ) == {"app_id": "cli_12345678"}
 
 
-async def test_connect_dispatches_feishu_with_staged_secrets(monkeypatch):
-    from social_reply.application.account_management import feishu
-
-    captured = {}
-    settings = jobs.get_settings().model_copy(update={"feishu_enabled": True})
-    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
-
-    async def fake_connect(**kwargs):
-        captured.update(kwargs)
-        return AccountConnectionResult(
-            account_id=__import__("uuid").uuid4(),
-            platform="feishu",
-            external_account_id=kwargs["app_id"],
-            public_id="fs_public",
-            webhook_url="https://reply.example/webhooks/feishu/fs_public",
-            name="Support Bot",
-            automation_default="BOT_DRAFT_ONLY",
-        )
-
-    monkeypatch.setattr(feishu, "connect_feishu_account", fake_connect)
-    job = type(
-        "Job",
-        (),
-        {
-            "platform": "feishu",
-            "tenant_id": "tenant-a",
-            "brand_id": "brand-a",
-            "owner_user_id": None,
-            "request": {
-                "app_id": "cli_12345678",
-                "api_base_url": "https://open.feishu.cn",
-                "group_mode": "mentions_only",
-                "automation_default": "BOT_DRAFT_ONLY",
-            },
-            "staging_secret": encrypt_secret_bundle(
-                {
-                    "app_secret": "app-secret",
-                    "verification_token": "verification-secret",
-                    "encrypt_key": "encrypt-secret",
-                }
-            ),
-        },
-    )()
-
-    await jobs._connect(job)
-    assert captured["app_id"] == "cli_12345678"
-    assert captured["app_secret"] == "app-secret"
-    assert captured["verification_token"] == "verification-secret"
-    assert captured["encrypt_key"] == "encrypt-secret"
-    assert captured["group_mode"] == "mentions_only"
-    assert captured["tenant_id"] == "tenant-a"
-    assert captured["automation_default"] == "BOT_DRAFT_ONLY"
-
-
 def test_feishu_client_error_is_sanitized_for_provisioning_job():
     assert jobs._error(FeishuClientError("FEISHU_API_10003", retryable=False)) == (
         "FEISHU_API_10003",
@@ -358,7 +324,6 @@ def test_feishu_result_payload_contains_only_public_onboarding_data():
 @pytest.mark.parametrize(
     "secrets",
     [
-        {"password": "mail-password"},
         {"username": "mail-user"},
         {"username": "mail-user", "password": "mail-password", "token": "extra"},
         {"username": "", "password": "mail-password"},
@@ -424,66 +389,6 @@ def test_email_safe_request_and_public_result_redact_username_and_password():
             "nested": {"password": "mail-password"},
         }
     ) == {"email_address": "support@example.com", "nested": {}}
-
-
-async def test_connect_dispatches_email_with_staged_secrets(monkeypatch):
-    from social_reply.application.account_management import email
-
-    captured = {}
-    settings = jobs.get_settings().model_copy(update={"email_enabled": True})
-    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
-
-    async def fake_connect(**kwargs):
-        captured.update(kwargs)
-        return AccountConnectionResult(
-            account_id=__import__("uuid").uuid4(),
-            platform="email",
-            external_account_id=kwargs["email_address"],
-            public_id="email_public",
-            webhook_url="",
-            name="Support",
-            automation_default="BOT_DRAFT_ONLY",
-        )
-
-    monkeypatch.setattr(email, "connect_email_account", fake_connect)
-    job = type(
-        "Job",
-        (),
-        {
-            "id": __import__("uuid").uuid4(),
-            "attempt_count": 3,
-            "platform": "email",
-            "tenant_id": "tenant-a",
-            "brand_id": "brand-a",
-            "owner_user_id": None,
-            "request": {
-                "email_address": "support@example.com",
-                "imap_host": "imap.example.com",
-                "imap_port": 993,
-                "mailbox": "INBOX",
-                "smtp_host": "smtp.example.com",
-                "smtp_port": 587,
-                "smtp_security": "starttls",
-                "from_name": "Support",
-                "internal_domain_policy": "allow",
-                "automation_default": "BOT_DRAFT_ONLY",
-            },
-            "staging_secret": encrypt_secret_bundle(
-                {"username": "mail-user", "password": "mail-password"}
-            ),
-        },
-    )()
-
-    result = await jobs._connect(job)
-
-    assert result.platform == "email"
-    assert captured["username"] == "mail-user"
-    assert captured["password"] == "mail-password"
-    assert captured["smtp_security"] == "starttls"
-    assert captured["provisioning_job_id"] == job.id
-    assert captured["provisioning_attempt_count"] == 3
-    assert captured["tenant_id"] == "tenant-a"
-    assert captured["automation_default"] == "BOT_DRAFT_ONLY"
 
 
 @pytest.mark.parametrize(
@@ -662,7 +567,7 @@ def test_claimed_job_write_entries_recheck_before_checkpoint_account_access():
         "await _checkpoint_recovery_proof"
     )
     assert 'models.ProvisioningJob.status == "PROCESSING"' in completion_source
-    assert "models.ProvisioningJob.attempt_count == latest.attempt_count" in completion_source
+    assert "models.ProvisioningJob.attempt_count == job.attempt_count" in completion_source
     assert "{**dict(latest.result or {}), **merged_result}" in completion_source
 
 

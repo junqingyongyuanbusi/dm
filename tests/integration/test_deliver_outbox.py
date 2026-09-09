@@ -167,6 +167,47 @@ async def _seed(
     return conv_id, outbox_id
 
 
+@pytest.mark.parametrize(
+    ("notifications_enabled", "expected_status"),
+    [(False, "SENT"), (True, "CANCELLED")],
+)
+async def test_missing_optional_handoff_route_respects_notification_flag(
+    session, monkeypatch, notifications_enabled, expected_status
+):
+    settings = get_settings().model_copy(
+        update={"feishu_handoff_notifications_enabled": notifications_enabled}
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
+    conversation_id, outbox_id = await _seed(session)
+    assert await session.scalar(select(models.TenantFeishuHandoffConfig.id)) is None
+    await session.commit()
+    send_calls = []
+
+    async def send_text(*, target, text):
+        send_calls.append((target, text))
+        return "optional-route-provider-message"
+
+    _patch_direct_sender(monkeypatch, send_text)
+
+    assert await deliver_outbox(str(outbox_id)) == expected_status
+    assert len(send_calls) == (0 if notifications_enabled else 1)
+    async with get_session_factory()() as verify:
+        outbox = await verify.get(models.OutboxMessage, outbox_id)
+        assert outbox is not None
+        assert outbox.status == expected_status
+        if notifications_enabled:
+            assert outbox.last_error_code == "PUBLIC_SEND_ROUTE_INVALID"
+            intent = await verify.scalar(
+                select(models.HandoffNotificationIntent).where(
+                    models.HandoffNotificationIntent.conversation_id == conversation_id
+                )
+            )
+            assert intent is not None
+            assert intent.last_error_code == "FEISHU_HANDOFF_ROUTE_MISSING"
+        else:
+            assert outbox.platform_message_id == "optional-route-provider-message"
+
+
 async def _seed_human_delivery(session) -> tuple[uuid.UUID, uuid.UUID]:
     conversation_id, outbox_id = await _seed(session, state="HUMAN_ACTIVE")
     username = f"delivery-human-{uuid.uuid4().hex}"

@@ -5,11 +5,15 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import func, insert, select, update
 
 from apps.api.main import create_app
-from social_reply.application.account_management.auth import hash_password
+from social_reply.application.account_management.auth import authenticate, hash_password
+from social_reply.application.knowledge.commands import KnowledgeConflictError
+from social_reply.application.knowledge.publication import (
+    PublishKnowledgeCommand,
+    execute_publish_knowledge,
+)
 from social_reply.domain.automation.state_machine import ensure_state
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
@@ -21,7 +25,7 @@ async def _login(client: httpx.AsyncClient) -> str:
     page = await client.get("/admin/login")
     assert page.status_code == 200
     csrf = client.cookies["reply_admin_csrf"]
-    await client.post(
+    response = await client.post(
         "/admin/login",
         data={
             "csrf_token": csrf,
@@ -29,11 +33,22 @@ async def _login(client: httpx.AsyncClient) -> str:
             "password": "test-admin-password",
         },
     )
+    assert response.status_code == 303
     return csrf
 
 
 async def _login_superadmin(client: httpx.AsyncClient) -> str:
     return await _login(client)
+
+
+async def _claim_work_item(
+    client: httpx.AsyncClient, csrf: str, work_item_id: uuid.UUID
+) -> None:
+    response = await client.post(
+        f"/app/t/default/work-items/{work_item_id}/claim",
+        data={"csrf_token": csrf, "expected_version": "1"},
+    )
+    assert response.status_code == 303, response.text
 
 
 def _app_client() -> httpx.AsyncClient:
@@ -192,7 +207,9 @@ async def test_console_pages_render_after_login(migrated_db):
             assert canonical_response.status_code == 200, canonical_path
             assert "admin" in canonical_response.text
             assert 'href="/admin/system/overview"' in canonical_response.text
-            assert canonical_response.text.count('href="/admin') == 1
+            assert set(re.findall(r'href="(/admin[^"]*)"', canonical_response.text)) == {
+                "/admin/users", "/admin/system/overview",
+            }
         legacy_accounts = await client.get("/admin/accounts")
         legacy_knowledge = await client.get("/admin/knowledge")
 
@@ -218,7 +235,9 @@ async def test_representative_console_pages_render_in_english(migrated_db):
             assert response.status_code == 200, path
             assert '<html lang="en"' in response.text
             assert 'href="/admin/system/overview"' in response.text
-            assert response.text.count('href="/admin') == 1
+            assert set(re.findall(r'href="(/admin[^"]*)"', response.text)) == {
+                "/admin/users", "/admin/system/overview",
+            }
             for chinese_product_copy in (
                 "自动回复运行状况",
                 "统一工作队列",
@@ -251,7 +270,7 @@ async def test_conversation_detail_localizes_controls_but_preserves_customer_fac
     session,
     migrated_db,
 ):
-    _account_id, conversation_id, _message_id, _work_item_id = await _seed_inbox_conversation(
+    _account_id, conversation_id, _message_id, work_item_id = await _seed_inbox_conversation(
         session,
         suffix="localized-detail",
         display_name="双语客户事实",
@@ -260,7 +279,8 @@ async def test_conversation_detail_localizes_controls_but_preserves_customer_fac
     await session.commit()
 
     async with _app_client() as client:
-        await _login(client)
+        csrf = await _login(client)
+        await _claim_work_item(client, csrf, work_item_id)
         client.cookies.set("reply_ui_locale", "en")
         response = await client.get(f"/app/t/default/conversations/{conversation_id}")
 
@@ -292,7 +312,9 @@ async def test_grouped_navigation_uses_new_information_architecture(migrated_db)
         assert f'href="{legacy_account_path}"' not in page.text
     assert 'href="#main-content">跳到主要内容</a>' in page.text
     assert 'href="/admin/system/overview"' in page.text
-    assert page.text.count('href="/admin') == 1
+    assert set(re.findall(r'href="(/admin[^"]*)"', page.text)) == {
+        "/admin/users", "/admin/system/overview",
+    }
 
 
 async def test_system_console_slim_role_landings_and_legacy_get_redirects(
@@ -330,22 +352,26 @@ async def test_system_console_slim_role_landings_and_legacy_get_redirects(
             assert response.headers["location"] == canonical_path
 
         settings = await admin_client.get("/app/t/default/settings")
+        integrations = await admin_client.get("/app/t/default/settings?section=integration")
+        notifications = await admin_client.get("/app/t/default/settings?section=notifications")
         health = await admin_client.get("/app/t/default/health")
 
     assert settings.status_code == 200
+    assert integrations.status_code == notifications.status_code == 200
     for canonical_link in (
         "/app/t/default/agents/default/instructions",
         "/app/t/default/knowledge",
         "/app/t/default/channels",
-        "/app/t/default/channels/feishu/handoff",
         "/app/t/default/health",
         "/app/t/default/audit",
         "/app/t/default/journeys",
     ):
-        assert f'href="{canonical_link}"' in settings.text
+        assert f'href="{canonical_link}"' in integrations.text
+    assert 'href="/app/t/default/channels/feishu/handoff"' in notifications.text
     assert "/admin/content" not in settings.text
     assert "/admin/integrations" not in settings.text
-    assert "尚未持久化" in settings.text
+    assert "未配置" in settings.text
+    assert 'id="workspace-name" type="text" disabled' in settings.text
     assert health.status_code == 200
     assert "ingestion" in health.text
     assert "/admin/content" not in health.text
@@ -489,7 +515,7 @@ async def test_health_page_is_read_only(migrated_db):
     assert "csrf_token" not in main.group(1)
 
 
-async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, migrated_db):
+async def test_inbox_combines_recent_conversations_and_legacy_review_queues(session, migrated_db):
     now = datetime.now(UTC)
     old_account, old_conversation, old_message, _old_work = await _seed_inbox_conversation(
         session,
@@ -497,12 +523,22 @@ async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, mig
         display_name="Old customer",
         work_created_at=now - timedelta(hours=3),
     )
-    _new_account, _new_conversation, _new_message, new_work = await _seed_inbox_conversation(
+    _new_account, _new_conversation, new_message, new_work = await _seed_inbox_conversation(
         session,
         suffix="new",
         display_name="New customer",
         work_created_at=now - timedelta(minutes=5),
     )
+    # Database now() is constant within this transaction; set the actual list sort evidence.
+    for message_id, recorded_at in (
+        (old_message, now - timedelta(hours=3)),
+        (new_message, now - timedelta(minutes=5)),
+    ):
+        await session.execute(
+            update(models.Message)
+            .where(models.Message.id == message_id)
+            .values(created_at=recorded_at)
+        )
     newest_work = await session.get(models.HumanWorkItem, new_work)
     newest_work.reason_code = "RISK_WORD"
     newest_work.status = "CLAIMED"
@@ -561,7 +597,7 @@ async def test_inbox_combines_queues_and_sorts_oldest_waiting_first(session, mig
     assert human.status_code == 200
     assert '<meta http-equiv="refresh"' not in human.text
     assert '<meta http-equiv="refresh"' not in drafts.text
-    assert human.text.index("Old customer") < human.text.index("New customer")
+    assert human.text.index("New customer") < human.text.index("Old customer")
     assert "Original draft" in drafts.text
     assert f'action="/app/t/default/decisions/{decision_id}/approve"' in drafts.text
     assert "AMBIGUOUS_SEND" in delivery.text
@@ -597,9 +633,9 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
             "destination_type": "x_post_reply",
         },
     )
-    seeded: dict[str, tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = {}
+    seeded: dict[str, tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]] = {}
     for offset, spec in enumerate(specs):
-        account_id, conversation_id, message_id, _work_item_id = await _seed_inbox_conversation(
+        account_id, conversation_id, message_id, work_item_id = await _seed_inbox_conversation(
             session,
             suffix=spec["suffix"],
             display_name=spec["display_name"],
@@ -643,14 +679,16 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
                 last_error_code="SEND_ERROR",
             )
         )
-        seeded[spec["channel_type"]] = (account_id, conversation_id, message_id)
+        seeded[spec["channel_type"]] = (account_id, conversation_id, message_id, work_item_id)
     await session.commit()
 
     async with _app_client() as client:
-        await _login(client)
+        csrf = await _login(client)
         inbox_pages = {
             (queue, channel): await client.get(
-                "/app/t/default/inbox", params={"queue": queue, "channel": channel}
+                "/app/t/default/inbox",
+                params={"queue": "all", "channel_type": "" if channel == "all" else channel}
+                if queue == "human" else {"queue": queue, "channel": channel},
             )
             for queue in ("human", "drafts", "delivery")
             for channel in ("all", "dm", "comment")
@@ -668,6 +706,7 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
         facebook_conversations = await client.get(
             "/app/t/default/conversations", params={"platform": "facebook"}
         )
+        await _claim_work_item(client, csrf, seeded["mention"][3])
         mention_detail = await client.get(
             f"/app/t/default/conversations/{seeded['mention'][1]}"
         )
@@ -683,9 +722,18 @@ async def test_channel_filter_applies_to_all_inbox_queues_and_conversations(sess
         ):
             page = inbox_pages[(queue, channel)]
             assert page.status_code == 200
-            for name in expected_names:
+            matching_names = (
+                {"Channel comment customer"}
+                if queue == "human" and channel == "comment" else expected_names
+            )
+            for name in matching_names:
                 assert name in page.text
-            assert 'data-filter-text="' in page.text
+            if queue == "human":
+                for name in all_names - matching_names:
+                    assert name not in page.text
+                assert 'id="unified-inbox-filters"' in page.text
+            else:
+                assert 'data-filter-text="' in page.text
 
     for channel, expected_names in (
         ("all", all_names),
@@ -744,7 +792,8 @@ async def test_email_platform_filter_is_available_across_inbox_and_conversations
     assert counts.status_code == 200
     assert "Email filter customer" in inbox.text
     assert "Email filter customer" in conversations.text
-    assert 'data-filter-text="' in inbox.text
+    assert 'id="unified-inbox-filters"' in inbox.text
+    assert 'data-platform="email"' in inbox.text
     assert 'data-filter-text="' in conversations.text
     assert counts.json()["human"] == 1
 
@@ -1228,34 +1277,38 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
         captured.update(kwargs)
         return uuid.uuid4()
 
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import saas_console
 
-    monkeypatch.setattr(admin_console, "send_human_reply", fake_send_human_reply)
+    monkeypatch.setattr(saas_console, "send_human_reply", fake_send_human_reply)
     async with _app_client() as client:
         csrf = await _login(client)
         legacy_detail = await client.get(f"/admin/conversations/{conversation_id}")
+        waiting = await client.get(f"/app/t/default/conversations/{conversation_id}")
+        assert waiting.status_code == 200
+        assert 'name="reply_to_message_id"' not in waiting.text
+        await _claim_work_item(client, csrf, work_item_id)
         detail = await client.get(f"/app/t/default/conversations/{conversation_id}")
         key_match = re.search(r'name="idempotency_key" value="([^"]+)"', detail.text)
         assert key_match is not None
         invalid_csrf = await client.post(
-            f"/admin/conversations/{conversation_id}/reply",
+            f"/app/t/default/conversations/{conversation_id}/reply",
             data={
                 "csrf_token": "wrong",
                 "reply_to_message_id": str(message_id),
                 "idempotency_key": key_match.group(1),
                 "work_item_id": str(work_item_id),
-                "version": "1",
+                "expected_version": "2",
                 "text": "Human response",
             },
         )
         response = await client.post(
-            f"/admin/conversations/{conversation_id}/reply",
+            f"/app/t/default/conversations/{conversation_id}/reply",
             data={
                 "csrf_token": csrf,
                 "reply_to_message_id": str(message_id),
                 "idempotency_key": key_match.group(1),
                 "work_item_id": str(work_item_id),
-                "version": "1",
+                "expected_version": "2",
                 "text": "Human response",
             },
         )
@@ -1272,7 +1325,7 @@ async def test_conversation_detail_and_manual_reply_route_use_explicit_target(
     assert captured["conversation_id"] == conversation_id
     assert captured["reply_to_message_id"] == message_id
     assert captured["work_item_id"] == work_item_id
-    assert captured["expected_version"] == 1
+    assert captured["expected_version"] == 2
     assert captured["idempotency_key"] == key_match.group(1)
 
 
@@ -1315,7 +1368,7 @@ async def test_claim_and_resolve_copy_matches_one_click_handoff_lifecycle(sessio
 
 async def test_conversation_detail_uses_latest_100_messages_for_reply_target(session, migrated_db):
     now = datetime.now(UTC)
-    _account_id, conversation_id, _message_id, _work_item_id = await _seed_inbox_conversation(
+    _account_id, conversation_id, _message_id, work_item_id = await _seed_inbox_conversation(
         session,
         suffix="history-window",
         display_name="History customer",
@@ -1340,7 +1393,8 @@ async def test_conversation_detail_uses_latest_100_messages_for_reply_target(ses
     await session.commit()
 
     async with _app_client() as client:
-        await _login(client)
+        csrf = await _login(client)
+        await _claim_work_item(client, csrf, work_item_id)
         detail = await client.get(f"/app/t/default/conversations/{conversation_id}")
 
     assert detail.status_code == 200
@@ -1696,7 +1750,7 @@ async def test_accounts_page_renders_email_sanitized_health_without_password(
     assert response.status_code == 200
     assert "Support Email" in response.text
     assert "support@example.com" in response.text
-    assert "已连接" in response.text
+    assert "检测通过" in response.text
     assert leaked_password not in response.text
     assert "<script>" not in response.text
 
@@ -2265,7 +2319,7 @@ async def test_xchat_activation_error_renders_operator_notice(session, migrated_
         csrf = await _login(client)
         response = await client.post(
             f"/admin/accounts/{account_id}/xchat",
-            data={"csrf_token": csrf, "xchat_pin": "1234"},
+            data={"csrf_token": csrf, "xchat_pin": "1234", "expected_config_version": "1"},
         )
 
     assert response.status_code == 422
@@ -2538,16 +2592,17 @@ async def test_conversation_state_flip_takeover(session, migrated_db):
     assert outbox.status == "CANCELLED"
     assert outbox.last_error_code == "TAKEOVER"
     assert audit.action == "HUMAN_ACTIVE"
-    assert audit.detail == {"reason": "admin_manual"}
+    assert audit.detail == {"reason": "human_reception_started", "source": "BOT_ACTIVE"}
 
 
 async def test_email_conversation_transition_gate_blocks_bot_active_not_human_active(
     session, migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.account_management import admin_console, human_workflow
 
     settings = admin_console.get_settings().model_copy(update={"email_auto_reply_enabled": False})
     monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(human_workflow, "get_settings", lambda: settings)
     account_id, contact_id, conversation_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
         insert(models.PlatformAccount).values(
@@ -2589,7 +2644,7 @@ async def test_email_conversation_transition_gate_blocks_bot_active_not_human_ac
     await session.execute(
         insert(models.AutomationState).values(
             conversation_id=conversation_id,
-            state="CLOSED",
+            state="BOT_DRAFT_ONLY",
             state_version=1,
         )
     )
@@ -2600,11 +2655,11 @@ async def test_email_conversation_transition_gate_blocks_bot_active_not_human_ac
         detail = await client.get(f"/app/t/default/conversations/{conversation_id}")
         rejected = await client.post(
             f"/admin/conversations/{conversation_id}/state",
-            data={"csrf_token": csrf, "target": "BOT_ACTIVE", "expect": "CLOSED"},
+            data={"csrf_token": csrf, "target": "BOT_ACTIVE", "expect": "BOT_DRAFT_ONLY"},
         )
         takeover = await client.post(
             f"/admin/conversations/{conversation_id}/state",
-            data={"csrf_token": csrf, "target": "HUMAN_ACTIVE", "expect": "CLOSED"},
+            data={"csrf_token": csrf, "target": "HUMAN_ACTIVE", "expect": "BOT_DRAFT_ONLY"},
         )
 
     assert detail.status_code == 200
@@ -2625,10 +2680,9 @@ async def test_knowledge_add_and_delete_via_console(session, migrated_db, monkey
     async with _app_client() as client:
         csrf = await _login(client)
         resp = await client.post(
-            "/admin/knowledge/add",
+            "/app/t/default/knowledge/documents",
             data={
                 "csrf_token": csrf,
-                "tenant_id": "default",
                 "question": "你们几点营业",
                 "reply": "请联系 support@example.com",
                 "category": "常见",
@@ -2662,14 +2716,13 @@ async def test_duplicate_manual_knowledge_skips_embedding(migrated_db, monkeypat
 
     monkeypatch.setattr(runner, "_embedder", FakeEmbeddingClient())
     payload = {
-        "tenant_id": "default",
         "question": "duplicate question",
         "reply": "duplicate reply",
     }
     async with _app_client() as client:
         csrf = await _login(client)
         added = await client.post(
-            "/admin/knowledge/add",
+            "/app/t/default/knowledge/documents",
             data={"csrf_token": csrf, **payload},
         )
         assert "notice=created" in added.headers["location"]
@@ -2680,12 +2733,12 @@ async def test_duplicate_manual_knowledge_skips_embedding(migrated_db, monkeypat
 
         monkeypatch.setattr(runner, "_embedder", _FailIfCalledEmbeddingClient())
         duplicate = await client.post(
-            "/admin/knowledge/add",
+            "/app/t/default/knowledge/documents",
             data={"csrf_token": csrf, **payload},
         )
 
-    assert duplicate.status_code == 303
-    assert "notice=duplicate" in duplicate.headers["location"]
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {"detail": "knowledge_document_duplicate"}
 
 
 async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatch):
@@ -2703,8 +2756,8 @@ async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatc
     async with _app_client() as client:
         csrf = await _login(client)
         resp = await client.post(
-            "/admin/knowledge/import",
-            data={"csrf_token": csrf, "tenant_id": "default", "brand_id": "default"},
+            "/app/t/default/knowledge/import",
+            data={"csrf_token": csrf, "brand_id": "default"},
             files={"file": ("templates.csv", csv_body.encode("utf-8"), "text/csv")},
         )
         assert resp.status_code == 303
@@ -2727,8 +2780,8 @@ async def test_knowledge_csv_import_via_console(session, migrated_db, monkeypatc
     async with _app_client() as client:
         csrf = await _login(client)
         resp = await client.post(
-            "/admin/knowledge/import",
-            data={"csrf_token": csrf, "tenant_id": "default"},
+            "/app/t/default/knowledge/import",
+            data={"csrf_token": csrf},
             files={"file": ("templates.csv", csv_body.encode("utf-8"), "text/csv")},
         )
         assert resp.status_code == 303
@@ -2761,16 +2814,16 @@ async def test_knowledge_explicit_publish_unpublish_is_audited_and_idempotent(se
     async with _app_client() as client:
         csrf = await _login(client)
         published = await client.post(
-            f"/admin/knowledge/{doc_id}/status",
-            data={"csrf_token": csrf, "target": "published"},
+            f"/app/t/default/knowledge/documents/{doc_id}/publish",
+            data={"csrf_token": csrf},
         )
         same_target = await client.post(
-            f"/admin/knowledge/{doc_id}/status",
-            data={"csrf_token": csrf, "target": "published"},
+            f"/app/t/default/knowledge/documents/{doc_id}/publish",
+            data={"csrf_token": csrf},
         )
         unpublished = await client.post(
-            f"/admin/knowledge/{doc_id}/status",
-            data={"csrf_token": csrf, "target": "draft"},
+            f"/app/t/default/knowledge/documents/{doc_id}/unpublish",
+            data={"csrf_token": csrf},
         )
     assert published.status_code == same_target.status_code == unpublished.status_code == 303
     session.expire_all()
@@ -2823,8 +2876,8 @@ async def test_official_contact_knowledge_cannot_be_published(session, migrated_
     async with _app_client() as client:
         csrf = await _login(client)
         rejected = await client.post(
-            f"/admin/knowledge/{doc_id}/status",
-            data={"csrf_token": csrf, "target": "published"},
+            f"/app/t/default/knowledge/documents/{doc_id}/publish",
+            data={"csrf_token": csrf},
         )
     assert rejected.status_code == 409
     session.expire_all()
@@ -2842,11 +2895,8 @@ async def test_official_contact_knowledge_cannot_be_published(session, migrated_
 
 
 async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and_idempotent(
-    session, migrated_db, monkeypatch
+    session, migrated_db
 ):
-    from social_reply.application.account_management import admin_console
-
-    monkeypatch.setattr(admin_console, "_KNOWLEDGE_BULK_PUBLISH_CHUNK_SIZE", 1)
     normal = models.KnowledgeDocument(
         tenant_id="default",
         brand_id="b1",
@@ -2911,28 +2961,23 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
         assert 'action="/app/t/default/knowledge/bulk-publish"' in page.text
 
         bad_csrf = await client.post(
-            "/admin/knowledge/bulk-publish",
+            "/app/t/default/knowledge/bulk-publish",
             data={"csrf_token": "invalid", "tenant_id": "default"},
         )
-        missing_tenant = await client.post(
-            "/admin/knowledge/bulk-publish",
-            data={"csrf_token": csrf},
-        )
         first = await client.post(
-            "/admin/knowledge/bulk-publish",
-            data={"csrf_token": csrf, "tenant_id": "default"},
+            "/app/t/default/knowledge/bulk-publish",
+            data={"csrf_token": csrf, "tenant_id": "other-tenant"},
         )
         second = await client.post(
-            "/admin/knowledge/bulk-publish",
-            data={"csrf_token": csrf, "tenant_id": "default"},
+            "/app/t/default/knowledge/bulk-publish",
+            data={"csrf_token": csrf},
         )
         foreign_attempt = await client.post(
-            "/admin/knowledge/bulk-publish",
+            "/app/t/other-tenant/knowledge/bulk-publish",
             data={"csrf_token": csrf, "tenant_id": "other-tenant"},
         )
 
     assert bad_csrf.status_code == 403
-    assert missing_tenant.status_code == 422
     assert first.status_code == second.status_code == 303
     assert "notice=bulk_published&published=2" in first.headers["location"]
     assert "notice=bulk_published&published=0" in second.headers["location"]
@@ -2979,12 +3024,12 @@ async def test_knowledge_bulk_publish_normal_drafts_is_tenant_scoped_audited_and
 async def test_knowledge_import_batch_confirmation_and_english_publish_gate(
     session, migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.knowledge import publication
 
-    settings = admin_console.get_settings().model_copy(
+    settings = publication.get_settings().model_copy(
         update={"english_knowledge_only_enabled": True}
     )
-    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(publication, "get_settings", lambda: settings)
     first_batch = uuid.uuid4()
     second_batch = uuid.uuid4()
     english = models.KnowledgeDocument(
@@ -3047,15 +3092,15 @@ async def test_knowledge_import_batch_confirmation_and_english_publish_gate(
         assert str(first_batch) in page.text
         assert str(second_batch) in page.text
         confirmed = await client.post(
-            "/admin/knowledge/bulk-confirm-english",
+            "/app/t/default/knowledge/bulk-confirm-english",
             data={"csrf_token": csrf, "import_batch_id": str(first_batch)},
         )
         mixed_confirmation = await client.post(
-            f"/admin/knowledge/{mixed_id}/confirm-english",
+            f"/app/t/default/knowledge/documents/{mixed_id}/confirm-english",
             data={"csrf_token": csrf},
         )
         published = await client.post(
-            "/admin/knowledge/bulk-publish",
+            "/app/t/default/knowledge/bulk-publish",
             data={"csrf_token": csrf, "tenant_id": "default"},
         )
 
@@ -3088,15 +3133,16 @@ async def test_knowledge_import_batch_confirmation_and_english_publish_gate(
 async def test_runtime_mode_rejects_unverified_non_english_publish(
     session, migrated_db, monkeypatch
 ):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.knowledge import publication
 
-    settings = admin_console.get_settings().model_copy(
+    settings = publication.get_settings().model_copy(
         update={
             "multilingual_knowledge_reply_enabled": True,
             "english_knowledge_only_enabled": False,
         }
     )
-    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(publication, "get_settings", lambda: settings)
+    principal, _token = await authenticate("admin", "test-admin-password")
     doc = models.KnowledgeDocument(
         tenant_id="default",
         brand_id="b1",
@@ -3109,21 +3155,25 @@ async def test_runtime_mode_rejects_unverified_non_english_publish(
     session.add(doc)
     await session.commit()
 
-    with pytest.raises(HTTPException, match="confirm_english_before_publish"):
-        await admin_console._require_knowledge_publishable(session, doc)
+    with pytest.raises(KnowledgeConflictError, match="confirm_english_before_publish"):
+        await execute_publish_knowledge(
+            session, PublishKnowledgeCommand("default", principal, doc.id)
+        )
+    assert doc.status == "draft"
 
 
 async def test_runtime_publish_requires_current_embedding(session, migrated_db, monkeypatch):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.knowledge import publication
 
-    settings = admin_console.get_settings().model_copy(
+    settings = publication.get_settings().model_copy(
         update={
             "multilingual_knowledge_reply_enabled": True,
             "english_knowledge_only_enabled": False,
             "openai_embedding_model": "text-embedding-3-small",
         }
     )
-    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(publication, "get_settings", lambda: settings)
+    principal, _token = await authenticate("admin", "test-admin-password")
     doc = models.KnowledgeDocument(
         tenant_id="default",
         brand_id="b1",
@@ -3151,15 +3201,27 @@ async def test_runtime_publish_requires_current_embedding(session, migrated_db, 
     )
     await session.flush()
 
-    with pytest.raises(HTTPException, match="knowledge_embedding_not_ready"):
-        await admin_console._require_knowledge_publishable(session, doc)
+    with pytest.raises(KnowledgeConflictError, match="knowledge_embedding_not_ready"):
+        await execute_publish_knowledge(
+            session, PublishKnowledgeCommand("default", principal, doc.id)
+        )
+    assert doc.status == "draft"
 
-    class NoEmbeddingSession:
-        async def scalar(self, statement):
-            return None
-
-    with pytest.raises(HTTPException, match="knowledge_embedding_not_ready"):
-        await admin_console._require_knowledge_publishable(NoEmbeddingSession(), doc)
+    missing_embedding = models.KnowledgeDocument(
+        tenant_id="default",
+        question="How do I open a demo account?",
+        reply="Choose the demo account option.",
+        status="draft",
+        source_language="en",
+        language_verified=True,
+    )
+    session.add(missing_embedding)
+    await session.flush()
+    with pytest.raises(KnowledgeConflictError, match="knowledge_embedding_not_ready"):
+        await execute_publish_knowledge(
+            session, PublishKnowledgeCommand("default", principal, missing_embedding.id)
+        )
+    assert missing_embedding.status == "draft"
 
     session.add(
         models.KnowledgeChunk(
@@ -3176,19 +3238,23 @@ async def test_runtime_publish_requires_current_embedding(session, migrated_db, 
         )
     )
     await session.flush()
-    await admin_console._require_knowledge_publishable(session, doc)
+    published = await execute_publish_knowledge(
+        session, PublishKnowledgeCommand("default", principal, doc.id)
+    )
+    assert published.status == "published"
 
 
 async def test_single_publish_rejects_contact_like_reply(session, migrated_db, monkeypatch):
-    from social_reply.application.account_management import admin_console
+    from social_reply.application.knowledge import publication
 
-    settings = admin_console.get_settings().model_copy(
+    settings = publication.get_settings().model_copy(
         update={
             "multilingual_knowledge_reply_enabled": True,
             "english_knowledge_only_enabled": False,
         }
     )
-    monkeypatch.setattr(admin_console, "get_settings", lambda: settings)
+    monkeypatch.setattr(publication, "get_settings", lambda: settings)
+    principal, _token = await authenticate("admin", "test-admin-password")
     doc = models.KnowledgeDocument(
         tenant_id="default",
         brand_id="b1",
@@ -3214,8 +3280,11 @@ async def test_single_publish_rejects_contact_like_reply(session, migrated_db, m
     )
     await session.flush()
 
-    with pytest.raises(HTTPException, match="official_contact_requires_review"):
-        await admin_console._require_knowledge_publishable(session, doc)
+    with pytest.raises(KnowledgeConflictError, match="official_contact_requires_review"):
+        await execute_publish_knowledge(
+            session, PublishKnowledgeCommand("default", principal, doc.id)
+        )
+    assert doc.status == "draft"
 
 
 async def test_draft_knowledge_official_contact_classification_is_audited(session, migrated_db):
@@ -3245,19 +3314,19 @@ async def test_draft_knowledge_official_contact_classification_is_audited(sessio
     async with _app_client() as client:
         csrf = await _login(client)
         classified = await client.post(
-            f"/admin/knowledge/{doc_id}/official-contact",
+            f"/app/t/default/knowledge/documents/{doc_id}/official-contact",
             data={"csrf_token": csrf, "target": "true"},
         )
         same_target = await client.post(
-            f"/admin/knowledge/{doc_id}/official-contact",
+            f"/app/t/default/knowledge/documents/{doc_id}/official-contact",
             data={"csrf_token": csrf, "target": "true"},
         )
         # 分类成 official-contact 之后就不再可发布，原先"发布后禁止改分类"的
         # 断言对这类文档已不可达；改为直接锁死发布被拒。禁止改分类那条规则由
         # test_published_knowledge_cannot_be_reclassified 用普通文档覆盖。
         publish_attempt = await client.post(
-            f"/admin/knowledge/{doc_id}/status",
-            data={"csrf_token": csrf, "target": "published"},
+            f"/app/t/default/knowledge/documents/{doc_id}/publish",
+            data={"csrf_token": csrf},
         )
     assert classified.status_code == same_target.status_code == 303
     assert publish_attempt.status_code == 409
@@ -3309,11 +3378,11 @@ async def test_published_knowledge_cannot_be_reclassified(session, migrated_db):
     async with _app_client() as client:
         csrf = await _login(client)
         published = await client.post(
-            f"/admin/knowledge/{doc_id}/status",
-            data={"csrf_token": csrf, "target": "published"},
+            f"/app/t/default/knowledge/documents/{doc_id}/publish",
+            data={"csrf_token": csrf},
         )
         reclassify = await client.post(
-            f"/admin/knowledge/{doc_id}/official-contact",
+            f"/app/t/default/knowledge/documents/{doc_id}/official-contact",
             data={"csrf_token": csrf, "target": "true"},
         )
     assert published.status_code == 303
@@ -3337,14 +3406,14 @@ async def test_knowledge_status_is_tenant_scoped_and_target_is_explicit(session,
     async with _app_client() as client:
         csrf = await _login(client)
         invalid = await client.post(
-            f"/admin/knowledge/{foreign_id}/status",
+            f"/app/t/default/knowledge/documents/{foreign_id}/toggle",
             data={"csrf_token": csrf, "target": "toggle"},
         )
         cross_tenant = await client.post(
-            f"/admin/knowledge/{foreign_id}/status",
-            data={"csrf_token": csrf, "target": "published"},
+            f"/app/t/default/knowledge/documents/{foreign_id}/publish",
+            data={"csrf_token": csrf},
         )
-    assert invalid.status_code == 422
+    assert invalid.status_code == 404
     assert cross_tenant.status_code == 404
     session.expire_all()
     assert (await session.get(models.KnowledgeDocument, foreign_id)).status == "draft"
@@ -3358,12 +3427,13 @@ async def test_knowledge_csv_import_bad_header(session, migrated_db, monkeypatch
     async with _app_client() as client:
         csrf = await _login(client)
         resp = await client.post(
-            "/admin/knowledge/import",
-            data={"csrf_token": csrf, "tenant_id": "default"},
+            "/app/t/default/knowledge/import",
+            data={"csrf_token": csrf},
             files={"file": ("bad.csv", b"q,a\nx,y\n", "text/csv")},
         )
-        assert resp.status_code == 303
-        assert "notice=import_bad_csv" in resp.headers["location"]
+        assert resp.status_code == 422
+        assert "question" in resp.json()["detail"]
+        assert "reply" in resp.json()["detail"]
 
     page = None
     async with _app_client() as client:
@@ -3382,15 +3452,15 @@ async def test_knowledge_csv_import_rejects_bad_tenant_and_csrf(migrated_db, mon
     async with _app_client() as client:
         csrf = await _login(client)
         bad_tenant = await client.post(
-            "/admin/knowledge/import",
-            data={"csrf_token": csrf, "tenant_id": "not-allowed"},
+            "/app/t/not-allowed/knowledge/import",
+            data={"csrf_token": csrf},
             files={"file": ("t.csv", payload, "text/csv")},
         )
         assert bad_tenant.status_code == 403
 
         no_csrf = await client.post(
-            "/admin/knowledge/import",
-            data={"csrf_token": "wrong", "tenant_id": "default"},
+            "/app/t/default/knowledge/import",
+            data={"csrf_token": "wrong"},
             files={"file": ("t.csv", payload, "text/csv")},
         )
         assert no_csrf.status_code == 403

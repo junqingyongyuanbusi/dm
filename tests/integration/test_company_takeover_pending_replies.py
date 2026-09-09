@@ -3,7 +3,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
-from tests.integration.company_permission_support import create_staff, seed_conversation
+from tests.integration.company_permission_support import (
+    create_staff,
+    refresh_staff_principal,
+    seed_conversation,
+)
 
 from social_reply.application.account_management import human_workflow
 from social_reply.application.message_delivery import outbox as outbox_module
@@ -19,11 +23,13 @@ async def test_assignment_changes_dispose_only_unstarted_prior_replies(
 ):
     staff = await create_staff(session)
     manager = await create_staff(session, role="WORKSPACE_ADMIN")
-    conversation = await seed_conversation(session, shared_with_support=True)
+    conversation = await seed_conversation(
+        session, shared_with_support=True, authorized_user_ids=(staff.user_id,)
+    )
     monkeypatch.setattr(human_workflow, "dispatch_actor", AsyncMock())
     work_id = await human_workflow.start_human_reception(
         conversation_id=conversation.conversation_id,
-        principal=staff.principal,
+        principal=await refresh_staff_principal(staff),
     )
     old_reply_id = await _reply(conversation, staff)
     work = await session.get(models.HumanWorkItem, work_id)
@@ -47,7 +53,7 @@ async def test_assignment_changes_dispose_only_unstarted_prior_replies(
             user_id=staff.user_id,
             target_user_id=manager.user_id,
             expected_version=old_version,
-            principal=staff.principal,
+            principal=await refresh_staff_principal(staff),
         )
     elif operation == "start":
         await human_workflow.start_human_reception(
@@ -119,6 +125,6 @@ async def _reply(conversation, identity, *, override=False):
         allowed_tenants=identity.principal.allowed_tenants,
         actor=identity.principal.actor,
         user_id=identity.user_id,
-        principal=identity.principal,
+        principal=await refresh_staff_principal(identity),
         allow_override=override,
     )

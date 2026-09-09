@@ -2,8 +2,10 @@ import uuid
 
 import pytest
 from sqlalchemy import func, select
+from tests.integration.company_permission_support import create_staff
+from tests.integration.test_reauthorization_contract import _connect_control_account
 
-from social_reply.application.account_management import email
+from social_reply.application.account_management import email, jobs
 from social_reply.connectors.errors import PermanentSendError
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
@@ -44,13 +46,74 @@ def _smtp_factory(**kwargs):
     return _FakeSmtpClient(**kwargs)
 
 
+async def _reauthorize_account(
+    connector, *, platform, principal, target_account_id, expected_config_version, **values
+):
+    """Submit and claim a target-bound reauthorization using a real staff session."""
+    secret_fields = {
+        "username",
+        "password",
+        "app_secret",
+        "verification_token",
+        "encrypt_key",
+    }
+    local_fields = {
+        "tenant_id",
+        "brand_id",
+        "public_base_url",
+        "secrets_root",
+        "transport",
+        "imap_client_factory",
+        "smtp_client_factory",
+    }
+    job_id = await jobs.submit_provisioning_job(
+        tenant_id=values["tenant_id"],
+        brand_id=values["brand_id"],
+        platform=platform,
+        actor=principal.actor,
+        admin_session_id=principal.session_id,
+        operation="REAUTHORIZE",
+        target_account_id=target_account_id,
+        expected_config_version=expected_config_version,
+        request={
+            **{
+                key: value
+                for key, value in values.items()
+                if key not in secret_fields | local_fields
+            },
+            "idempotency_key": uuid.uuid4().hex,
+        },
+        secrets={key: value for key, value in values.items() if key in secret_fields},
+    )
+    claimed = await jobs._claim_job(job_id)
+    assert claimed is not None
+    assert claimed.actor == principal.actor
+    assert claimed.authority_kind == "STAFF_SESSION"
+    return await connector(
+        **values,
+        operation=claimed.operation,
+        target_account_id=claimed.target_account_id,
+        expected_config_version=claimed.expected_config_version,
+        owner_user_id=claimed.owner_user_id,
+        initiator_user_id=claimed.initiator_user_id,
+        initiator_session_id=claimed.initiator_session_id,
+        authority_kind=claimed.authority_kind,
+        authority_version=claimed.authority_version,
+        provisioning_job_id=claimed.id,
+        provisioning_attempt_count=claimed.attempt_count,
+    )
+
+
 async def test_email_provisioning_persists_ready_contract_and_rotates_config_version(
     migrated_db, monkeypatch, tmp_path
 ):
     settings = email.get_settings().model_copy(update={"email_enabled": True})
     monkeypatch.setattr(email, "get_settings", lambda: settings)
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
 
-    first = await email.connect_email_account(
+    first = await _connect_control_account(
+        email.connect_email_account,
+        platform="email",
         email_address=" Support@Example.COM. ",
         username="mail-user-1",
         password="mail-password-1",
@@ -94,7 +157,15 @@ async def test_email_provisioning_persists_ready_contract_and_rotates_config_ver
         "password": "mail-password-1",
     }
 
-    second = await email.connect_email_account(
+    async with get_session_factory()() as session:
+        staff = await create_staff(session, tenant_id="tenant-a", role="WORKSPACE_ADMIN")
+
+    second = await _reauthorize_account(
+        email.connect_email_account,
+        platform="email",
+        principal=staff.principal,
+        target_account_id=first.account_id,
+        expected_config_version=account.config_version,
         email_address="Support@example.com",
         username="mail-user-2",
         password="mail-password-2",
@@ -114,15 +185,19 @@ async def test_email_provisioning_persists_ready_contract_and_rotates_config_ver
 
     assert second.account_id == first.account_id
     assert second.public_id == first.public_id
+    assert second.credential_updated is True
+    assert second.connection_ready is False
     async with get_session_factory()() as session:
         updated = await session.get(models.PlatformAccount, first.account_id)
     assert updated.config_version == 2
-    assert updated.brand_id == "brand-b"
-    assert updated.name == "Support@example.com"
-    assert updated.config["smtp_port"] == 587
-    assert updated.config["smtp_security"] == "starttls"
-    assert updated.config["from_name"] is None
-    assert updated.config["internal_domain_policy"] == "allow"
+    assert updated.brand_id == "brand-a"
+    assert updated.name == "Support"
+    assert updated.owner_user_id == account.owner_user_id
+    assert updated.automation_default == "BOT_DRAFT_ONLY"
+    assert updated.config == {
+        **account.config,
+        "email_health_checked_at": updated.config["email_health_checked_at"],
+    }
     assert decrypt_secret_bundle(updated.credential_bundle) == {
         "username": "mail-user-2",
         "password": "mail-password-2",
@@ -188,7 +263,10 @@ async def test_failed_email_reprovision_does_not_overwrite_existing_account(
 ):
     settings = email.get_settings().model_copy(update={"email_enabled": True})
     monkeypatch.setattr(email, "get_settings", lambda: settings)
-    created = await email.connect_email_account(
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+    created = await _connect_control_account(
+        email.connect_email_account,
+        platform="email",
         email_address="support@example.com",
         username="mail-user",
         password="good-password",
@@ -209,8 +287,16 @@ async def test_failed_email_reprovision_does_not_overwrite_existing_account(
             **kwargs,
         )
 
+    async with get_session_factory()() as session:
+        staff = await create_staff(session, tenant_id="tenant-a", role="WORKSPACE_ADMIN")
+
     with pytest.raises(PermanentSendError, match="smtp_535"):
-        await email.connect_email_account(
+        await _reauthorize_account(
+            email.connect_email_account,
+            platform="email",
+            principal=staff.principal,
+            target_account_id=created.account_id,
+            expected_config_version=1,
             email_address="support@example.com",
             username="new-user",
             password="bad-password",

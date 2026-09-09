@@ -90,7 +90,8 @@ _COPY: dict[str, tuple[str, str]] = {
     "reports.distribution": ("渠道消息分布", "Channel message distribution"),
     "reports.distribution_note": (
         "按当前统计区间的真实入站消息展示，不生成缺失的历史趋势。",
-        "Actual inbound messages in the selected window; missing historical trends are not generated.",
+        "Actual inbound messages in the selected window; "
+        "missing historical trends are not generated.",
     ),
     "reports.messages_note": (
         "仅统计可访问账号，按消息记录时间计数，不含私有备注。",

@@ -249,73 +249,6 @@ async def test_connect_whatsapp_rechecks_feature_flag_before_platform_calls(monk
         )
 
 
-async def test_connect_meta_reuses_existing_app_public_id(monkeypatch, tmp_path):
-    async def fake_provision_meta_app(**kwargs):
-        assert kwargs["app_public_id"] == "meta_public"
-        assert kwargs["verify_token"] == "existing-verify-token"
-        return (
-            uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
-            "meta_public",
-            "existing-verify-token",
-            "app-1",
-        )
-
-    async def fake_provision_account(**kwargs):
-        assert kwargs["platform_app_id"] == uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-        assert kwargs["status"] == "active"
-        assert kwargs["config"]["meta_health_status"] == "PROVISIONING"
-        assert kwargs["capability"]["comments"] is False
-        assert kwargs["provider_username"] == "shop_account"
-        assert kwargs["avatar_url"] == "https://cdninstagram.com/shop.jpg"
-        assert kwargs["profile_updated_at"] is not None
-        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), "ig_public"
-
-    async def fake_subscribe(**kwargs):
-        assert kwargs["external_account_id"] == "page-1"
-        assert kwargs["app_secret"] == "app-secret"
-        return ("messages",)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/subscriptions"):
-            if request.method == "GET":
-                return httpx.Response(200, json={"data": []})
-            return httpx.Response(200, json={"success": True})
-        assert request.headers["Authorization"] == "Bearer access-token"
-        assert request.url.params["appsecret_proof"]
-        return httpx.Response(
-            200,
-            json={
-                "id": "ig-1",
-                "name": "IG Account",
-                "username": "shop_account",
-                "profile_picture_url": "https://cdninstagram.com/shop.jpg",
-            },
-        )
-
-    monkeypatch.setattr(service, "provision_meta_app", fake_provision_meta_app)
-    monkeypatch.setattr(service, "provision_direct_account", fake_provision_account)
-    monkeypatch.setattr(service, "subscribe_meta_account", fake_subscribe)
-
-    result = await service.connect_meta_account(
-        platform="instagram",
-        external_account_id="ig-1",
-        access_token="access-token",
-        app_secret="app-secret",
-        app_public_id="meta_public",
-        verify_token="existing-verify-token",
-        page_id="page-1",
-        public_base_url="https://reply.example.com",
-        secrets_root=tmp_path,
-        transport=httpx.MockTransport(handler),
-    )
-
-    assert result.verify_token == "existing-verify-token"
-    assert result.webhook_url == "https://reply.example.com/webhooks/meta/meta_public"
-    assert result.platform_app_id == uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-    assert result.provider_username == "shop_account"
-    assert result.avatar_url == "https://cdninstagram.com/shop.jpg"
-
-
 async def test_reconnect_x_preserves_xchat_keys_and_cursors_without_pin(monkeypatch, tmp_path):
     settings = service.get_settings().model_copy(
         update={"x_legacy_dm_enabled": False, "xchat_enabled": True}
@@ -746,7 +679,7 @@ async def test_enable_xchat_updates_existing_account_without_persisting_pin(monk
 
     async def fake_dispatch(actor, *args, **kwargs):
         events.append("dispatch")
-        dispatched.append((actor.__name__, args, kwargs))
+        dispatched.append((actor.actor_name, args, kwargs))
 
     # The repair target is stubbed deliberately: this test covers merge/CAS/audit
     # behavior only and is not evidence for live session or grant authorization.

@@ -222,6 +222,13 @@ chat and operator allowlist and the Feishu console delivers `card.action.trigger
 account-specific Card Action Callback URL. The provider API origin is fixed at
 `https://open.feishu.cn` rather than configured by an environment variable.
 
+Handoff notifications are optional for direct public replies derived from Bot decisions or draft
+approvals: when `FEISHU_HANDOFF_NOTIFICATIONS_ENABLED=false`, an absent tenant route
+(`FEISHU_HANDOFF_ROUTE_MISSING`) does not block those replies. This exception does not apply to an
+existing disabled or invalid route; those routes still block sending. Enabling notifications also
+requires a valid route. Route/account locking and all other send-time authorization, provenance,
+generation and kill-switch checks remain mandatory.
+
 The Feishu webhook route is always registered. While the feature is disabled, plaintext or encrypted
 URL-verification challenges still receive their challenge response. A valid encrypted normal event
 is acknowledged and retained as sanitized ignored ingress evidence, but is not dispatched into the

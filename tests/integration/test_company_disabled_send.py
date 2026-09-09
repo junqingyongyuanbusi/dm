@@ -7,6 +7,7 @@ from sqlalchemy import select
 from tests.integration.company_permission_support import (
     create_staff,
     login_client,
+    refresh_staff_principal,
     seed_conversation,
 )
 
@@ -28,11 +29,13 @@ async def test_disabled_account_rejects_writes_before_assignment_or_reply_cancel
 ):
     staff = await create_staff(session)
     manager = await create_staff(session, role="WORKSPACE_ADMIN")
-    conversation = await seed_conversation(session, shared_with_support=True)
+    conversation = await seed_conversation(
+        session, shared_with_support=True, authorized_user_ids=(staff.user_id,)
+    )
     monkeypatch.setattr(human_workflow, "dispatch_actor", AsyncMock())
     work_id = await human_workflow.start_human_reception(
         conversation_id=conversation.conversation_id,
-        principal=staff.principal,
+        principal=await refresh_staff_principal(staff),
     )
     await human_workflow.send_human_reply(
         conversation_id=conversation.conversation_id,
@@ -42,7 +45,7 @@ async def test_disabled_account_rejects_writes_before_assignment_or_reply_cancel
         allowed_tenants=staff.principal.allowed_tenants,
         actor=staff.principal.actor,
         user_id=staff.user_id,
-        principal=staff.principal,
+        principal=await refresh_staff_principal(staff),
     )
     await set_channel_account_status(
         tenant_id="default",

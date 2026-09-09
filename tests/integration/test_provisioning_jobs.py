@@ -22,6 +22,7 @@ from social_reply.application.account_management.system_user_management import (
 )
 from social_reply.connectors.email.imap_client import ImapClientError
 from social_reply.connectors.errors import PermanentSendError
+from social_reply.connectors.feishu.contracts import FEISHU_API_BASE_URL
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
@@ -54,6 +55,96 @@ async def test_submit_job_stages_secret_inline_not_in_request(migrated_db, tmp_p
     # public_job 白名单输出不得暴露 staging secret
     assert "super-secret-token" not in str(jobs.public_job(row))
     get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("platform", ["feishu", "email"])
+async def test_connect_dispatches_with_canonical_staged_secrets(
+    migrated_db, monkeypatch, platform
+):
+    from social_reply.application.account_management import email, feishu
+
+    settings = jobs.get_settings().model_copy(
+        update={"feishu_enabled": True, "email_enabled": True}
+    )
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+    if platform == "feishu":
+        connector_module, connector_name = feishu, "connect_feishu_account"
+        request = {
+            "app_id": "cli_12345678",
+            "api_base_url": FEISHU_API_BASE_URL,
+            "group_mode": "mentions_only",
+            "automation_default": "BOT_DRAFT_ONLY",
+        }
+        secrets = {
+            "app_secret": "app-secret",
+            "verification_token": "verification-secret",
+            "encrypt_key": "encrypt-secret",
+        }
+    else:
+        connector_module, connector_name = email, "connect_email_account"
+        request = {
+            "email_address": "support@example.com",
+            "imap_host": "imap.example.com",
+            "imap_port": 993,
+            "mailbox": "INBOX",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "smtp_security": "starttls",
+            "from_name": "Support",
+            "internal_domain_policy": "allow",
+            "automation_default": "BOT_DRAFT_ONLY",
+        }
+        secrets = {"username": "mail-user", "password": "mail-password"}
+    captured = {}
+
+    async def capture_connect(**kwargs):
+        captured.update(kwargs)
+        return AccountConnectionResult(
+            account_id=uuid.uuid4(),
+            platform=platform,
+            external_account_id=request.get("app_id", request.get("email_address")),
+            public_id="dispatch_public",
+            webhook_url="",
+            name="Support",
+            automation_default="BOT_DRAFT_ONLY",
+        )
+
+    monkeypatch.setattr(connector_module, connector_name, capture_connect)
+    job_id = await jobs.submit_control_provisioning_job(
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        platform=platform,
+        actor="service:control_api",
+        request={**request, "idempotency_key": uuid.uuid4().hex},
+        secrets=secrets,
+    )
+    claimed = await jobs._claim_job(job_id)
+    assert claimed is not None
+    result = await jobs._connect(claimed)
+    assert result.platform == platform
+    for key, value in {**request, **secrets}.items():
+        assert captured[key] == value
+    assert captured["tenant_id"] == "tenant-a"
+    assert captured["brand_id"] == "brand-a"
+    assert captured["provisioning_job_id"] == claimed.id
+    assert captured["provisioning_attempt_count"] == claimed.attempt_count
+    assert captured["authority_kind"] == claimed.authority_kind == "CONTROL_API"
+    assert captured["authority_version"] == claimed.authority_version == 1
+    assert captured["trusted_control_api"] is True
+
+
+async def test_new_email_job_rejects_password_only_without_retained_username(migrated_db):
+    with pytest.raises(ValueError, match="^invalid_email_credentials$"):
+        await jobs.submit_control_provisioning_job(
+            tenant_id="tenant-a",
+            brand_id="brand-a",
+            platform="email",
+            actor="service:control_api",
+            request={"email_address": "support@example.com"},
+            secrets={"password": "mail-password"},
+        )
+    async with get_session_factory()() as session:
+        assert await session.scalar(select(models.ProvisioningJob.id)) is None
 
 
 async def test_process_job_completes_and_deletes_staging_secret(migrated_db, tmp_path, monkeypatch):
@@ -1131,7 +1222,9 @@ async def test_sweep_snapshot_race_with_real_staff_authority_change(
     sweep_status,
     authority_action,
 ):
-    owner = await create_staff(session, username=f"provisioning-sweep-{uuid.uuid4().hex}")
+    owner = await create_staff(
+        session, username=f"provisioning-sweep-{uuid.uuid4().hex}", role="OPERATOR"
+    )
     bootstrap_principal = None
     if authority_action == "disable":
         bootstrap_principal, _bootstrap_token = await bootstrap_identity()
@@ -1256,7 +1349,9 @@ async def test_staff_retry_race_commits_once_then_worker_cannot_revert(
     session,
     monkeypatch,
 ):
-    owner = await create_staff(session, username=f"provisioning-retry-{uuid.uuid4().hex}")
+    owner = await create_staff(
+        session, username=f"provisioning-retry-{uuid.uuid4().hex}", role="OPERATOR"
+    )
 
     async def fail_connect(_job):
         request = httpx.Request("GET", "https://api.telegram.org/getMe")

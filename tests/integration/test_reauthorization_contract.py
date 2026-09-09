@@ -42,7 +42,7 @@ async def _seed_reauthorization_account() -> tuple[uuid.UUID, uuid.UUID, uuid.UU
                     username=f"owner-{owner_id}",
                     password_hash=password_hash,
                     tenant_id="default",
-                    role="USER",
+                    role="OPERATOR",
                     must_change_password=False,
                     status="active",
                 ),
@@ -51,7 +51,7 @@ async def _seed_reauthorization_account() -> tuple[uuid.UUID, uuid.UUID, uuid.UU
                     username=f"grantee-{grantee_id}",
                     password_hash=password_hash,
                     tenant_id="default",
-                    role="USER",
+                    role="OPERATOR",
                     must_change_password=False,
                     status="active",
                 ),
@@ -79,6 +79,14 @@ async def _seed_reauthorization_account() -> tuple[uuid.UUID, uuid.UUID, uuid.UU
         )
         await session.flush()
         session.add(
+            models.AccountAccessGrant(
+                tenant_id="default",
+                platform_account_id=account_id,
+                user_id=grantee_id,
+                active=True,
+            )
+        )
+        session.add(
             models.AccountReauthorizationGrant(
                 tenant_id="default",
                 platform_account_id=account_id,
@@ -97,6 +105,58 @@ async def _staff_session(user_id: uuid.UUID):
     assert principal.user_id == user_id
     assert principal.session_id is not None
     return principal, token
+
+
+async def _connect_control_account(connector, *, platform: str, **values):
+    """Exercise a connector with authority issued by the real machine submit path."""
+    secret_fields = {
+        "access_token",
+        "app_secret",
+        "verify_token",
+        "verification_token",
+        "encrypt_key",
+        "username",
+        "password",
+        "token",
+    }
+    local_fields = {
+        "transport",
+        "secrets_root",
+        "public_base_url",
+        "imap_client_factory",
+        "smtp_client_factory",
+        "tenant_id",
+        "brand_id",
+    }
+    job_id = await jobs.submit_control_provisioning_job(
+        tenant_id=values["tenant_id"],
+        brand_id=values["brand_id"],
+        platform=platform,
+        actor="service:control_api",
+        request={
+            **{
+                key: value
+                for key, value in values.items()
+                if key not in secret_fields | local_fields
+            },
+            "idempotency_key": uuid.uuid4().hex,
+        },
+        secrets={key: value for key, value in values.items() if key in secret_fields},
+    )
+    claimed = await jobs._claim_job(job_id)
+    assert claimed is not None
+    authority = {
+        "authority_kind": claimed.authority_kind,
+        "authority_version": claimed.authority_version,
+        "initiator_user_id": claimed.initiator_user_id,
+        "initiator_session_id": claimed.initiator_session_id,
+        "trusted_control_api": claimed.authority_kind == "CONTROL_API",
+        "provisioning_job_id": claimed.id,
+        "provisioning_attempt_count": claimed.attempt_count,
+    }
+    if platform in {"facebook", "instagram"}:
+        return await connector(platform=platform, **values, **authority)
+    return await connector(**values, **authority)
 
 
 _REAUTH_OAUTH_CREDENTIALS = {
@@ -297,6 +357,9 @@ async def _reauthorize_with_claim(
     **overrides,
 ):
     credentials = credential_bundle or {"access_token": "new"}
+    async with get_session_factory()() as session:
+        claimed = await session.get(models.ProvisioningJob, job_id)
+    assert claimed is not None
     values = {
         "platform": "x",
         "external_account_id": "x-42",
@@ -317,8 +380,8 @@ async def _reauthorize_with_claim(
         "expected_config_version": 1,
         "initiator_user_id": grantee_id,
         "initiator_session_id": principal.session_id,
-        "authority_kind": "STAFF_SESSION",
-        "authority_version": 1,
+        "authority_kind": claimed.authority_kind,
+        "authority_version": claimed.authority_version,
         "provisioning_job_id": job_id,
         "provisioning_attempt_count": attempt_count,
         "trusted_control_api": False,

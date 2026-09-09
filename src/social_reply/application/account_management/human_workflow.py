@@ -1595,21 +1595,21 @@ async def send_human_reply(
                 initiator_session_id=initiator_session_id,
                 human_work_item_version=work.version,
             )
-        session.add(
-            models.AuditLog(
-                tenant_id=conversation.tenant_id,
-                category="human_work",
-                actor=effective_actor,
-                action="SEND_REPLY",
-                subject_type="conversation",
-                subject_id=str(conversation.id),
-                detail={
-                    "human_work_item_id": str(work.id),
-                    "outbox_id": str(outbox_id),
-                    "reply_to_message_id": str(reply_to_message_id),
-                },
+            session.add(
+                models.AuditLog(
+                    tenant_id=conversation.tenant_id,
+                    category="human_work",
+                    actor=effective_actor,
+                    action="SEND_REPLY",
+                    subject_type="conversation",
+                    subject_id=str(conversation.id),
+                    detail={
+                        "human_work_item_id": str(work.id),
+                        "outbox_id": str(outbox_id),
+                        "reply_to_message_id": str(reply_to_message_id),
+                    },
+                )
             )
-        )
         await session.commit()
 
     from social_reply.application.message_delivery.actors import deliver_outbox_message

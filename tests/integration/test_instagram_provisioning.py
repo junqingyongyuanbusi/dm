@@ -2,13 +2,91 @@ import uuid
 
 import httpx
 import pytest
+from sqlalchemy import select
+from tests.integration.test_reauthorization_contract import _connect_control_account
 
 from social_reply.application.account_management import service
 from social_reply.application.account_management.service import connect_meta_account
 from social_reply.connectors.meta.client import appsecret_proof
 from social_reply.infrastructure.database import models
+from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 
 pytestmark = pytest.mark.integration
+
+
+async def test_connect_meta_reuses_existing_app_public_id(migrated_db, session, monkeypatch):
+    app_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    session.add(
+        models.PlatformApp(
+            id=app_id,
+            tenant_id="tenant-a",
+            platform_family="meta",
+            external_app_id="app-1",
+            public_id="meta_public",
+            name="Existing Meta App",
+            credential_bundle=encrypt_secret_bundle(
+                {"app_secret": "app-secret", "verify_token": "existing-verify-token"}
+            ),
+            config={},
+            status="active",
+        )
+    )
+    await session.commit()
+
+    async def subscribe(**kwargs):
+        assert kwargs["external_account_id"] == "page-1"
+        assert kwargs["app_secret"] == "app-secret"
+        session.expire_all()
+        account = await session.scalar(
+            select(models.PlatformAccount).where(
+                models.PlatformAccount.platform_app_id == app_id
+            )
+        )
+        assert account.status == "active"
+        assert account.config["meta_health_status"] == "PROVISIONING"
+        assert account.capability["comments"] is False
+        assert account.provider_username == "shop_account"
+        assert account.avatar_url == "https://cdninstagram.com/shop.jpg"
+        assert account.profile_updated_at is not None
+        return ("messages",)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/subscriptions"):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(200, json={"success": True})
+        assert request.headers["Authorization"] == "Bearer access-token"
+        assert request.url.params["appsecret_proof"]
+        return httpx.Response(
+            200,
+            json={
+                "id": "ig-1",
+                "name": "IG Account",
+                "username": "shop_account",
+                "profile_picture_url": "https://cdninstagram.com/shop.jpg",
+            },
+        )
+
+    monkeypatch.setattr(service, "subscribe_meta_account", subscribe)
+    result = await _connect_control_account(
+        connect_meta_account,
+        platform="instagram",
+        external_account_id="ig-1",
+        access_token="access-token",
+        app_secret="app-secret",
+        app_public_id="meta_public",
+        verify_token="existing-verify-token",
+        page_id="page-1",
+        public_base_url="https://reply.example.com",
+        tenant_id="tenant-a",
+        brand_id="brand-a",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result.verify_token == "existing-verify-token"
+    assert result.webhook_url == "https://reply.example.com/webhooks/meta/meta_public"
+    assert result.platform_app_id == app_id
+    assert result.provider_username == "shop_account"
+    assert result.avatar_url == "https://cdninstagram.com/shop.jpg"
 
 
 async def test_facebook_login_instagram_uses_page_subscription_path(
@@ -31,7 +109,8 @@ async def test_facebook_login_instagram_uses_page_subscription_path(
             return httpx.Response(200, json={"success": True})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
-    result = await connect_meta_account(
+    result = await _connect_control_account(
+        connect_meta_account,
         platform="instagram",
         external_account_id="ig-1",
         access_token="page-token",
@@ -94,7 +173,8 @@ async def test_instagram_login_uses_instagram_account_subscription_path(
             return httpx.Response(200, json={"success": True})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
-    result = await connect_meta_account(
+    result = await _connect_control_account(
+        connect_meta_account,
         platform="instagram",
         external_account_id="ig-1",
         access_token="instagram-token",
@@ -185,7 +265,8 @@ async def test_instagram_comment_provisioning_validates_permissions_and_subscrip
             return httpx.Response(200, json={"success": True})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
-    result = await connect_meta_account(
+    result = await _connect_control_account(
+        connect_meta_account,
         platform="instagram",
         external_account_id="ig-1",
         access_token="page-token" if login_mode == "facebook_login" else "instagram-token",

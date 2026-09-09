@@ -156,18 +156,19 @@ async def _reserve(session, account_id, conversation_id, *, raw_event_id=None, t
     return job_id, message_id, raw_event_id, snapshot
 
 
-async def _prepare_human_action(session, conversation_id, action):
+async def _prepare_human_action(session, conversation_id, action, principal):
     state = await session.get(models.AutomationState, conversation_id)
-    state.state = "HUMAN_ACTIVE" if action in {"resume", "resolve"} else "BOT_ACTIVE"
+    state.state = "HUMAN_ACTIVE"
     state.state_version += 1
-    if action == "resolve":
+    if action in {"resolve", "reply"}:
         await session.execute(
             insert(models.HumanWorkItem).values(
                 tenant_id="default",
                 conversation_id=conversation_id,
                 status="CLAIMED",
                 reason_code="LOCK_ORDER_TEST",
-                assigned_actor="user:reviewer",
+                assigned_actor=principal.actor,
+                assigned_user_id=principal.user_id,
                 claimed_at=datetime.now(UTC),
                 version=1,
             )
@@ -175,30 +176,33 @@ async def _prepare_human_action(session, conversation_id, action):
     await session.commit()
 
 
-async def _run_human_action(action, conversation_id, message_id):
+async def _run_human_action(action, conversation_id, message_id, principal):
     if action == "resume":
         await resume_bot(
             conversation_id=conversation_id,
-            allowed_tenants=frozenset({"default"}),
-            actor="user:reviewer",
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            principal=principal,
             target="BOT_DRAFT_ONLY",
         )
         return
-    if action == "resolve":
-        async with human_workflow.get_session_factory()() as lookup_session:
-            work = (
-                await lookup_session.execute(
-                    select(models.HumanWorkItem).where(
-                        models.HumanWorkItem.conversation_id == conversation_id,
-                        models.HumanWorkItem.status == "CLAIMED",
-                    )
+    async with human_workflow.get_session_factory()() as lookup_session:
+        work = (
+            await lookup_session.execute(
+                select(models.HumanWorkItem).where(
+                    models.HumanWorkItem.conversation_id == conversation_id,
+                    models.HumanWorkItem.status == "CLAIMED",
                 )
-            ).scalar_one()
-            work_item_id, expected_version = work.id, work.version
+            )
+        ).scalar_one()
+        work_item_id, expected_version = work.id, work.version
+    if action == "resolve":
         await resolve_human_work_item(
             work_item_id=work_item_id,
-            allowed_tenants=frozenset({"default"}),
-            actor="user:reviewer",
+            allowed_tenants=principal.allowed_tenants,
+            actor=principal.actor,
+            user_id=principal.user_id,
+            principal=principal,
             expected_version=expected_version,
             allow_override=False,
         )
@@ -208,10 +212,13 @@ async def _run_human_action(action, conversation_id, message_id):
         reply_to_message_id=message_id,
         text="Human reply wins",
         idempotency_key=f"generation-lock-order:{conversation_id}",
-        allowed_tenants=frozenset({"default"}),
-        actor="user:reviewer",
-        user_id=None,
-        allow_override=True,
+        allowed_tenants=principal.allowed_tenants,
+        actor=principal.actor,
+        user_id=principal.user_id,
+        principal=principal,
+        work_item_id=work_item_id,
+        expected_version=expected_version,
+        allow_override=False,
     )
 
 
@@ -718,11 +725,12 @@ async def test_direct_ingestion_takes_conversation_lock_before_raw_event_locks(
 async def test_generation_reservation_cannot_deadlock_with_human_action(
     session, monkeypatch, human_action
 ):
+    principal = await _prompt_admin_principal(session)
     account_id, conversation_id = await _seed_conversation(session)
     message_id, raw_event_id, snapshot = await _seed_generation_input(
         session, account_id, conversation_id
     )
-    await _prepare_human_action(session, conversation_id, human_action)
+    await _prepare_human_action(session, conversation_id, human_action, principal)
 
     async def no_dispatch(*_args, **_kwargs):
         return None
@@ -748,7 +756,7 @@ async def test_generation_reservation_cannot_deadlock_with_human_action(
                 {"key": f"social-reply:conversation-delivery:{conversation_id}"},
             )
             human_task = asyncio.create_task(
-                _run_human_action(human_action, conversation_id, message_id)
+                _run_human_action(human_action, conversation_id, message_id, principal)
             )
             await asyncio.wait_for(human_waiting.wait(), timeout=2)
             await generation_session.execute(text("SET LOCAL lock_timeout = '500ms'"))
@@ -782,11 +790,12 @@ async def test_generation_reservation_cannot_deadlock_with_human_action(
 async def test_generation_finalization_cannot_deadlock_with_human_action(
     session, monkeypatch, human_action
 ):
+    principal = await _prompt_admin_principal(session)
     account_id, conversation_id = await _seed_conversation(session)
     job_id, message_id, _raw_event_id, _snapshot = await _reserve(
         session, account_id, conversation_id
     )
-    await _prepare_human_action(session, conversation_id, human_action)
+    await _prepare_human_action(session, conversation_id, human_action, principal)
 
     class IgnoreLLM:
         async def decide(self, _context):
@@ -833,7 +842,7 @@ async def test_generation_finalization_cannot_deadlock_with_human_action(
     try:
         await asyncio.wait_for(finalization_has_lock.wait(), timeout=2)
         human_task = asyncio.create_task(
-            _run_human_action(human_action, conversation_id, message_id)
+            _run_human_action(human_action, conversation_id, message_id, principal)
         )
         await asyncio.wait_for(human_waiting.wait(), timeout=2)
         release_finalization.set()

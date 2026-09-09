@@ -12,6 +12,7 @@ from tests.integration.company_permission_support import (
     FeishuConversationSeed,
     FeishuHandoffSeed,
     create_staff,
+    grant_account_access,
     signed_card_request,
 )
 
@@ -275,6 +276,12 @@ async def _seed_shared_source(session) -> _RouteRaceSeed:
     ):
         session.add_all(row for row in seed_rows if isinstance(row, model_class))
         await session.flush()
+    await grant_account_access(
+        session,
+        tenant_id=_TENANT_ID,
+        account_id=_SOURCE_ACCOUNT_ID,
+        user_ids=(staff.user_id,),
+    )
     await session.commit()
     c2_conversation = FeishuConversationSeed(
         _SOURCE_ACCOUNT_ID,
@@ -636,7 +643,14 @@ async def test_route_guard_serializes_missing_creation_and_route_change(session)
     assert changed_route["config_version"] == 2
 
 
-async def test_blocked_route_stops_delivery_and_persists_failure_facts(session, monkeypatch):
+@pytest.mark.parametrize("notifications_enabled", [False, True])
+async def test_blocked_route_stops_delivery_and_persists_failure_facts(
+    session, monkeypatch, notifications_enabled
+):
+    settings = outbox_module.get_settings().model_copy(
+        update={"feishu_handoff_notifications_enabled": notifications_enabled}
+    )
+    monkeypatch.setattr(outbox_module, "get_settings", lambda: settings)
     seed = await _seed_shared_source(session)
     await session.execute(
         update(models.TenantFeishuHandoffConfig)

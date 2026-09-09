@@ -39,7 +39,7 @@ async def _login_database_user(
                 username=username,
                 password_hash=await hash_password(password),
                 tenant_id="default",
-                role="USER",
+                role="MANAGER",
                 must_change_password=False,
                 status="active",
             )
@@ -394,7 +394,7 @@ async def test_legacy_prompt_redirects_and_canonical_page_allow_superadmin(
     assert legacy.headers["location"] == "/app/t/default/agents/default/instructions"
 
 
-async def test_user_instructions_only_show_localized_behavior_summary(
+async def test_manager_instructions_only_show_localized_behavior_summary(
     session,
     migrated_db,
 ):

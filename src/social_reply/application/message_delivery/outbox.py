@@ -870,7 +870,14 @@ async def _public_bot_send_preflight(
     if locked_route is None:
         return "PUBLIC_SEND_SCOPE_INVALID"
     route_values, locked_accounts = locked_route
-    if route_values["status"] != "PENDING":
+    settings = get_settings()
+    optional_notification_route_missing = (
+        route_values["last_error_code"] == "FEISHU_HANDOFF_ROUTE_MISSING"
+        and settings.feishu_handoff_notifications_enabled is False
+    )
+    # An unconfigured optional notification route must not block direct replies;
+    # configured but disabled or invalid routes still fail closed.
+    if route_values["status"] != "PENDING" and not optional_notification_route_missing:
         return "PUBLIC_SEND_ROUTE_INVALID"
     account = locked_accounts.get(outbox.platform_account_id)
     conversation = await session.scalar(
@@ -952,7 +959,6 @@ async def _public_bot_send_preflight(
         and decision.reply_business_prompt_content_hash is None
     ):
         return "REPLY_BUSINESS_PROMPT_PROVENANCE_INVALID"
-    settings = get_settings()
     business_prompt_enabled = getattr(
         settings,
         "reply_business_prompt_enabled",

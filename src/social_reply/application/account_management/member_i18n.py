@@ -31,7 +31,8 @@ _LABELS = {
     "team.password_required": ("待修改密码", "Password change required"),
     "team.operator_note": (
         "运营仅访问本人或分配的账号；回复和接管权限在成员账号页单独设置。",
-        "Operators access owned or assigned accounts; set reply and takeover permissions per member.",
+        "Operators access owned or assigned accounts; "
+        "set reply and takeover permissions per member.",
     ),
     "team.capability": ("能力", "Capability"),
     "team.allowed": ("允许", "Allowed"),
@@ -39,7 +40,8 @@ _LABELS = {
     "team.per_member": ("按成员设置", "Set per member"),
     "team.matrix_note": (
         "角色权限只读；运营的回复与接管开关在「分配账号」中设置。",
-        "Role permissions are read-only; configure operator reply and takeover under Assign accounts.",
+        "Role permissions are read-only; "
+        "configure operator reply and takeover under Assign accounts.",
     ),
     "team.rule_scope": (
         "成员仅可访问当前工作区内本人或分配的账号；管理员可访问全部账号。",

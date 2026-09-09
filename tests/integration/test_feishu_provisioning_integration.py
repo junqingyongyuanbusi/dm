@@ -2,7 +2,11 @@ import asyncio
 import uuid
 
 import httpx
+import pytest
 from sqlalchemy import func, select, text
+from tests.integration.company_permission_support import create_staff
+from tests.integration.test_email_provisioning_integration import _reauthorize_account
+from tests.integration.test_reauthorization_contract import _connect_control_account
 
 from social_reply.application.account_management import feishu, jobs
 from social_reply.application.account_management.service import AccountConnectionResult
@@ -103,6 +107,7 @@ async def test_feishu_job_stages_secrets_and_clears_them_on_completion(migrated_
 async def test_connect_feishu_persists_direct_account_contract(migrated_db, monkeypatch):
     settings = feishu.get_settings().model_copy(update={"feishu_enabled": True})
     monkeypatch.setattr(feishu, "get_settings", lambda: settings)
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/tenant_access_token/internal"):
@@ -122,7 +127,9 @@ async def test_connect_feishu_persists_direct_account_contract(migrated_db, monk
             },
         )
 
-    result = await feishu.connect_feishu_account(
+    result = await _connect_control_account(
+        feishu.connect_feishu_account,
+        platform="feishu",
         app_id="cli_12345678",
         app_secret="app-secret",
         verification_token="verification-secret",
@@ -171,6 +178,7 @@ async def test_concurrent_first_feishu_provisioning_returns_one_callback_identit
 ):
     settings = feishu.get_settings().model_copy(update={"feishu_enabled": True})
     monkeypatch.setattr(feishu, "get_settings", lambda: settings)
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
 
     def transport() -> httpx.MockTransport:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -218,7 +226,9 @@ async def test_concurrent_first_feishu_provisioning_returns_one_callback_identit
     try:
         tasks = [
             asyncio.create_task(
-                feishu.connect_feishu_account(
+                _connect_control_account(
+                    feishu.connect_feishu_account,
+                    platform="feishu",
                     app_id="cli_first1234",
                     app_secret=app_secret,
                     verification_token="verification-secret",
@@ -231,11 +241,13 @@ async def test_concurrent_first_feishu_provisioning_returns_one_callback_identit
             )
             for app_secret in ("first-secret", "second-secret")
         ]
-        results = await asyncio.gather(*tasks)
-
-        assert len({result.account_id for result in results}) == 1
-        assert len({result.public_id for result in results}) == 1
-        assert len({result.webhook_url for result in results}) == 1
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        successes = [result for result in results if isinstance(result, AccountConnectionResult)]
+        conflicts = [result for result in results if isinstance(result, Exception)]
+        assert len(successes) == 1
+        assert len(conflicts) == 1
+        assert isinstance(conflicts[0], ValueError)
+        assert str(conflicts[0]) == "platform_account_already_exists"
         async with get_session_factory()() as session:
             account = (
                 await session.execute(
@@ -246,10 +258,12 @@ async def test_concurrent_first_feishu_provisioning_returns_one_callback_identit
                     )
                 )
             ).scalar_one()
-        assert results[0].account_id == account.id
-        assert results[0].public_id == account.public_id
-        assert results[0].webhook_url.endswith(f"/webhooks/feishu/{account.public_id}")
-        assert account.config_version == 2
+        assert successes[0].account_id == account.id
+        assert successes[0].public_id == account.public_id
+        assert successes[0].webhook_url.endswith(f"/webhooks/feishu/{account.public_id}")
+        assert account.config_version == 1
+        winning_secret = ("first-secret", "second-secret")[results.index(successes[0])]
+        assert decrypt_secret_bundle(account.credential_bundle)["app_secret"] == winning_secret
     finally:
         for task in tasks:
             if not task.done():
@@ -263,14 +277,18 @@ async def test_concurrent_first_feishu_provisioning_returns_one_callback_identit
             await connection.execute(text("DROP FUNCTION IF EXISTS delay_first_feishu_create()"))
 
 
-async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_sender(
+async def test_concurrent_feishu_reauthorization_fences_versions_and_refreshes_sender(
     migrated_db, monkeypatch
 ):
     settings = feishu.get_settings().model_copy(update={"feishu_enabled": True})
     monkeypatch.setattr(feishu, "get_settings", lambda: settings)
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+    reauthorization_barrier = None
+    inspected_reauthorizations = 0
 
     def transport() -> httpx.MockTransport:
-        def handler(request: httpx.Request) -> httpx.Response:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal inspected_reauthorizations
             if request.url.path.endswith("/tenant_access_token/internal"):
                 return httpx.Response(
                     200,
@@ -280,6 +298,11 @@ async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_se
                         "expire": 7200,
                     },
                 )
+            if reauthorization_barrier is not None:
+                inspected_reauthorizations += 1
+                if inspected_reauthorizations == 2:
+                    reauthorization_barrier.set()
+                await reauthorization_barrier.wait()
             return httpx.Response(
                 200,
                 json={
@@ -294,16 +317,45 @@ async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_se
 
         return httpx.MockTransport(handler)
 
-    initial = await feishu.connect_feishu_account(
+    initial = await _connect_control_account(
+        feishu.connect_feishu_account,
+        platform="feishu",
         app_id="cli_12345678",
         app_secret="secret-1",
         verification_token="verification-secret",
         encrypt_key="encrypt-secret",
         public_base_url="https://reply.example",
-        tenant_id="tenant-race",
+        tenant_id="tenant-a",
         brand_id="brand-a",
         transport=transport(),
     )
+    async with get_session_factory()() as session:
+        staff = await create_staff(session, tenant_id="tenant-a", role="WORKSPACE_ADMIN")
+
+    for secret_patch, error_code in (
+        ({"app_secret": "secret-2"}, "feishu_app_rotation_required"),
+        ({"verification_token": "replacement-token"}, "feishu_webhook_rotation_required"),
+        ({"encrypt_key": "replacement-key"}, "feishu_webhook_rotation_required"),
+    ):
+        with pytest.raises(ValueError, match=error_code):
+            await _reauthorize_account(
+                feishu.connect_feishu_account,
+                platform="feishu",
+                principal=staff.principal,
+                target_account_id=initial.account_id,
+                expected_config_version=1,
+                app_id="cli_12345678",
+                **{
+                    "app_secret": "secret-1",
+                    "verification_token": "verification-secret",
+                    "encrypt_key": "encrypt-secret",
+                    **secret_patch,
+                },
+                public_base_url="https://reply.example",
+                tenant_id="tenant-a",
+                brand_id="brand-a",
+                transport=transport(),
+            )
 
     created = []
 
@@ -328,7 +380,6 @@ async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_se
     async with engine.begin() as connection:
         await connection.execute(text("DROP TABLE IF EXISTS feishu_version_audit"))
         await connection.execute(text("DROP FUNCTION IF EXISTS audit_feishu_version()"))
-        await connection.execute(text("DROP FUNCTION IF EXISTS delay_feishu_reprovision()"))
         await connection.execute(
             text("CREATE TABLE feishu_version_audit (config_version integer NOT NULL)")
         )
@@ -346,58 +397,44 @@ async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_se
                 "EXECUTE FUNCTION audit_feishu_version()"
             )
         )
-        await connection.execute(
-            text(
-                "CREATE FUNCTION delay_feishu_reprovision() RETURNS trigger "
-                "LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$"
-            )
-        )
-        await connection.execute(
-            text(
-                "CREATE TRIGGER delay_feishu_reprovision BEFORE INSERT ON platform_accounts "
-                "FOR EACH ROW WHEN (NEW.tenant_id = 'tenant-race') "
-                "EXECUTE FUNCTION delay_feishu_reprovision()"
-            )
-        )
 
     updates: list[asyncio.Task] = []
     try:
+        reauthorization_barrier = asyncio.Event()
         updates = [
             asyncio.create_task(
-                feishu.connect_feishu_account(
+                _reauthorize_account(
+                    feishu.connect_feishu_account,
+                    platform="feishu",
+                    principal=staff.principal,
+                    target_account_id=initial.account_id,
+                    expected_config_version=1,
                     app_id="cli_12345678",
-                    app_secret=app_secret,
+                    app_secret="secret-1",
                     verification_token="verification-secret",
                     encrypt_key="encrypt-secret",
                     public_base_url="https://reply.example",
-                    tenant_id="tenant-race",
+                    tenant_id="tenant-a",
                     brand_id="brand-a",
                     transport=transport(),
                 )
             )
-            for app_secret in ("secret-2", "secret-3")
+            for _attempt in range(2)
         ]
-        deadline = asyncio.get_running_loop().time() + 5
-        sleeping_updates = 0
-        while asyncio.get_running_loop().time() < deadline:
-            async with get_session_factory()() as observer_session:
-                sleeping_updates = (
-                    await observer_session.execute(
-                        text(
-                            "SELECT count(*) FROM pg_stat_activity "
-                            "WHERE datname = current_database() "
-                            "AND pid <> pg_backend_pid() "
-                            "AND wait_event = 'PgSleep'"
-                        )
-                    )
-                ).scalar_one()
-            if sleeping_updates == 2:
-                break
-            await asyncio.sleep(0.01)
-        assert sleeping_updates == 2
-
-        results = await asyncio.gather(*updates)
-        assert {result.account_id for result in results} == {initial.account_id}
+        results = await asyncio.wait_for(
+            asyncio.gather(*updates, return_exceptions=True), timeout=10
+        )
+        successes = [result for result in results if isinstance(result, AccountConnectionResult)]
+        conflicts = [result for result in results if isinstance(result, Exception)]
+        assert len(successes) == 1
+        assert len(conflicts) == 1
+        assert isinstance(conflicts[0], ValueError)
+        assert str(conflicts[0]) == "account_reauthorization_version_conflict"
+        assert successes[0].account_id == initial.account_id
+        assert successes[0].public_id == initial.public_id
+        assert successes[0].webhook_url == initial.webhook_url
+        assert successes[0].credential_updated is True
+        assert successes[0].connection_ready is False
 
         async with get_session_factory()() as session:
             account = await session.get(models.PlatformAccount, initial.account_id)
@@ -414,15 +451,19 @@ async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_se
                 .all()
             )
         final_secret = decrypt_secret_bundle(account.credential_bundle)["app_secret"]
-        assert versions == [2, 3]
-        assert account.config_version == 3
-        assert final_secret in {"secret-2", "secret-3"}
+        assert versions == [2]
+        assert account.config_version == 2
+        assert final_secret == "secret-1"
+        assert decrypt_secret_bundle(account.webhook_secret_bundle) == {
+            "verification_token": "verification-secret",
+            "encrypt_key": "encrypt-secret",
+        }
 
         final_sender = await registry.get_platform_sender(initial.account_id)
         assert final_sender is not first_sender
         assert final_sender.app_secret == final_secret
         assert first_sender.closed is True
-        assert set(registry._senders) == {("feishu", initial.account_id, 3, 0)}
+        assert set(registry._senders) == {("feishu", initial.account_id, 2, 0)}
     finally:
         for update_task in updates:
             if not update_task.done():
@@ -434,9 +475,5 @@ async def test_concurrent_feishu_reprovisioning_advances_versions_and_rotates_se
             await connection.execute(
                 text("DROP TRIGGER IF EXISTS audit_feishu_version ON platform_accounts")
             )
-            await connection.execute(
-                text("DROP TRIGGER IF EXISTS delay_feishu_reprovision ON platform_accounts")
-            )
             await connection.execute(text("DROP FUNCTION IF EXISTS audit_feishu_version()"))
-            await connection.execute(text("DROP FUNCTION IF EXISTS delay_feishu_reprovision()"))
             await connection.execute(text("DROP TABLE IF EXISTS feishu_version_audit"))

@@ -35,9 +35,11 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
         csrf = await _login(client, "admin", "test-admin-password")
         page = await client.get("/admin/system/users")
         assert page.status_code == 200
-        assert "创建普通用户" in page.text
+        assert "创建员工账号" in page.text
         assert 'value="ADMIN"' not in page.text
-        assert "/role" not in page.text
+        assert 'value="SUPERADMIN"' not in page.text
+        assert 'value="WORKSPACE_ADMIN"' in page.text
+        assert 'value="AGENT"' in page.text
         rejected_admin = await client.post(
             "/admin/system/users",
             data={
@@ -65,7 +67,7 @@ async def test_superadmin_creates_user_and_user_must_change_password(session, mi
     user = (
         await session.execute(select(models.AdminUser).where(models.AdminUser.username == "alice"))
     ).scalar_one()
-    assert user.role == "USER"
+    assert user.role == "AGENT"
     assert user.tenant_id == "default"
     assert user.password_hash != initial_password
     assert await verify_password(user.password_hash, initial_password)
@@ -158,10 +160,10 @@ async def test_user_management_current_and_legacy_routes_are_bilingual(migrated_
     async with _client() as client:
         await _login(client, "admin", "test-admin-password")
         current_chinese = await client.get("/admin/system/users")
-        legacy_chinese_redirect = await client.get("/admin/users")
+        workspace_chinese = await client.get("/admin/users")
         client.cookies.set("reply_ui_locale", "en")
         current_english = await client.get("/admin/system/users")
-        legacy_english_redirect = await client.get("/admin/users")
+        workspace_english = await client.get("/admin/users")
 
     for response in (current_chinese, current_english):
         assert response.status_code == 200
@@ -169,13 +171,16 @@ async def test_user_management_current_and_legacy_routes_are_bilingual(migrated_
         assert 'data-page-layout="page"' in response.text
         assert "aria-current='page'" in response.text
 
-    for response in (legacy_chinese_redirect, legacy_english_redirect):
-        assert response.status_code == 303
-        assert response.headers["location"] == "/admin/system/users"
+    for response in (workspace_chinese, workspace_english):
+        assert response.status_code == 200
+        assert 'action="/admin/users"' in response.text
+        assert 'action="/admin/system/users"' not in response.text
 
-    assert "创建普通用户" in current_chinese.text
-    assert "Create user" in current_english.text
-    assert "创建普通用户" not in current_english.text
+    assert "成员与权限" in workspace_chinese.text
+    assert "Members and permissions" in workspace_english.text
+    assert "创建员工账号" in current_chinese.text
+    assert "Create staff account" in current_english.text
+    assert "创建员工账号" not in current_english.text
 
 
 async def test_system_user_lifecycle_requires_csrf_and_bootstrap_reauthentication(
@@ -232,7 +237,7 @@ async def test_system_user_lifecycle_requires_csrf_and_bootstrap_reauthenticatio
     )
     assert user is not None
     assert user.tenant_id == "default"
-    assert user.role == "USER"
+    assert user.role == "AGENT"
     assert user.status == "active"
     assert user.must_change_password is True
     assert await verify_password(user.password_hash, initial_password)
@@ -279,7 +284,7 @@ async def test_system_user_lifecycle_requires_csrf_and_bootstrap_reauthenticatio
     session.expire_all()
     updated_user = await session.get(models.AdminUser, user_id)
     assert updated_user is not None
-    assert updated_user.role == "USER"
+    assert updated_user.role == "AGENT"
     assert updated_user.status == "disabled"
     assert updated_user.must_change_password is True
     assert await verify_password(updated_user.password_hash, reset_password)

@@ -14,8 +14,14 @@ _COPY = {
     "notifications": ("通知偏好", "Notification preferences"),
     "integration": ("应用与凭证", "Apps and credentials"),
     "navigation": ("设置分区", "Settings sections"),
-    "settings_description": ("管理基础信息、接待时间与消息提醒。", "Manage workspace preferences and alerts."),
-    "audit_description": ("追踪账号、自动回复与权限变更。", "Track account, automation and access changes."),
+    "settings_description": (
+        "管理基础信息、接待时间与消息提醒。",
+        "Manage workspace preferences and alerts.",
+    ),
+    "audit_description": (
+        "追踪账号、自动回复与权限变更。",
+        "Track account, automation and access changes.",
+    ),
     "audit_empty": ("没有匹配的记录。", "No matching records."),
     "details": ("详情", "Details"),
     "name": ("工作空间名称", "Workspace name"),

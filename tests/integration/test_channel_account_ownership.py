@@ -31,7 +31,7 @@ async def _seed_users() -> tuple[uuid.UUID, uuid.UUID]:
                     username="channel-owner-a",
                     password_hash=password_hash,
                     tenant_id="tenant-a",
-                    role="USER",
+                    role="OPERATOR",
                     must_change_password=False,
                     status="active",
                 ),
@@ -40,7 +40,7 @@ async def _seed_users() -> tuple[uuid.UUID, uuid.UUID]:
                     username="channel-owner-b",
                     password_hash=password_hash,
                     tenant_id="tenant-a",
-                    role="USER",
+                    role="OPERATOR",
                     must_change_password=False,
                     status="active",
                 ),
@@ -75,7 +75,6 @@ async def _provision_account(
     )
     claimed = await jobs._claim_job(job_id)
     assert claimed is not None
-    assert claimed is not None
     await provisioning.bind_provisioning_external_identity(
         provisioning_job_id=job_id,
         provisioning_attempt_count=claimed.attempt_count,
@@ -102,8 +101,8 @@ async def _provision_account(
         provider_username=provider_username,
         avatar_url=avatar_url,
         profile_updated_at=datetime.now(UTC),
-        authority_kind="STAFF_SESSION",
-        authority_version=1,
+        authority_kind=claimed.authority_kind,
+        authority_version=claimed.authority_version,
         trusted_control_api=False,
         initiator_user_id=principal.user_id,
         initiator_session_id=principal.session_id,
@@ -124,7 +123,6 @@ async def _reauthorize_account(
         _token, session_id = await issue_session()
         principal = await principal_from_session_id(session_id)
         assert principal is not None
-        authority_kind = "BOOTSTRAP_SESSION"
         owner_user_id = None
     else:
         authenticated = await authenticate("channel-owner-a", "channel-owner-password-123")
@@ -132,7 +130,6 @@ async def _reauthorize_account(
         principal, token = authenticated
         session_id = principal.session_id
         owner_user_id = user_id
-        authority_kind = "STAFF_SESSION"
     assert session_id is not None
     credentials = {"bot_token": f"token-for-{name}"}
     async with get_session_factory()() as session:
@@ -190,8 +187,8 @@ async def _reauthorize_account(
         expected_config_version=1,
         initiator_user_id=principal.user_id,
         initiator_session_id=session_id,
-        authority_kind=authority_kind,
-        authority_version=1,
+        authority_kind=claimed.authority_kind,
+        authority_version=claimed.authority_version,
         trusted_control_api=False,
         provisioning_job_id=job_id,
         provisioning_attempt_count=claimed.attempt_count,
@@ -210,10 +207,10 @@ async def test_concurrent_users_cannot_both_claim_same_external_account(
     )
 
     successful_results = [result for result in results if isinstance(result, tuple)]
-    conflicts = [result for result in results if isinstance(result, PermissionError)]
+    conflicts = [result for result in results if isinstance(result, ValueError)]
     assert len(successful_results) == 1
     assert len(conflicts) == 1
-    assert str(conflicts[0]) == "platform_account_owner_conflict"
+    assert str(conflicts[0]) == "platform_account_already_exists"
 
     async with get_session_factory()() as session:
         accounts = list(
@@ -272,7 +269,8 @@ async def test_same_user_reauthorization_preserves_owner_and_public_id(
         )
     assert account is not None
     assert account.owner_user_id == first_user_id
-    assert account.name == "Reauthorized account"
+    # Credential repair must not rename an existing business account.
+    assert account.name == "Initial account"
     assert account.provider_username == "updated_bot"
     assert account.config_version == 2
     assert version_count == 1
@@ -301,5 +299,5 @@ async def test_admin_repair_preserves_existing_user_owner(migrated_db) -> None:
         account = await session.get(models.PlatformAccount, account_id)
     assert account is not None
     assert account.owner_user_id == first_user_id
-    assert account.name == "Admin repaired account"
+    assert account.name == "User account"
     assert account.provider_username == "repaired_bot"

@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
     assert_alembic_succeeds,
+    assert_upgrades_to_current_head,
     temporary_database,
 )
 
@@ -13,7 +14,6 @@ pytestmark = pytest.mark.integration
 
 _PREVIOUS_REVISION = "d4e9a2f6b710"
 _USER_ONLY_REVISION = "f3a7c9e1b5d2"
-_HEAD_REVISION = "a8f4d2c6e901"
 
 
 async def test_database_admin_roles_are_converted_to_user() -> None:
@@ -41,7 +41,7 @@ async def test_database_admin_roles_are_converted_to_user() -> None:
             )
         await engine.dispose()
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _USER_ONLY_REVISION)
 
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
@@ -53,13 +53,15 @@ async def test_database_admin_roles_are_converted_to_user() -> None:
             ).scalars().all()
         await engine.dispose()
 
-        assert revision == _HEAD_REVISION
+        assert revision == _USER_ONLY_REVISION
         assert roles == ["USER", "USER"]
+        await assert_upgrades_to_current_head(database_url)
 
 
 async def test_database_role_constraint_allows_only_user() -> None:
     async with temporary_database("social_reply_user_only_role_check") as database_url:
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        # USER-only was this historical revision's contract, not the workspace head's.
+        await assert_alembic_succeeds(database_url, "upgrade", _USER_ONLY_REVISION)
 
         engine = create_async_engine(database_url)
         async with engine.begin() as connection:
@@ -90,3 +92,4 @@ async def test_database_role_constraint_allows_only_user() -> None:
                         },
                     )
         await engine.dispose()
+        await assert_upgrades_to_current_head(database_url)

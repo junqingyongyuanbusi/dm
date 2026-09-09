@@ -246,7 +246,7 @@ async def test_user_channels_oauth_job_remains_owner_scoped(
                 username=_TENANT_USER_USERNAME,
                 password_hash=await hash_password(_TENANT_USER_PASSWORD),
                 tenant_id="default",
-                role="USER",
+                role="OPERATOR",
                 must_change_password=False,
                 status="active",
             )

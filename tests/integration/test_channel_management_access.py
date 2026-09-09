@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from tests.integration.company_permission_support import grant_account_access
 
 from social_reply.application.account_management import channel_management, jobs
 from social_reply.application.account_management.auth import (
@@ -269,7 +270,7 @@ async def test_account_access_change_rolls_back_with_work_outbox_and_card_on_fai
     assert conversation.id == work_after.conversation_id
 
 
-@pytest.mark.parametrize("mutation", ["owner", "support"])
+@pytest.mark.parametrize("mutation", ["owner", "grant"])
 async def test_same_value_access_retry_releases_stale_claimed_work(
     session, migrated_db, mutation
 ):
@@ -316,11 +317,12 @@ async def test_same_value_access_retry_releases_stale_claimed_work(
             expected_config_version=1,
         )
     else:
-        await channel_management.set_channel_account_support_visibility(
+        await channel_management.set_channel_account_access_grant(
             tenant_id="default",
             account_id=account.id,
             actor=_actor(bootstrap),
-            shared=False,
+            user_id=stale_user.id,
+            enabled=False,
             expected_config_version=1,
         )
 
@@ -345,9 +347,14 @@ async def test_same_value_access_retry_releases_stale_claimed_work(
 
 async def test_shared_inbox_access_does_not_grant_channel_administration(session, migrated_db):
     owner, _owner_principal = await _create_user(session, "channel-shared-owner")
-    _support, support_principal = await _create_user(session, "channel-shared-user")
+    support, support_principal = await _create_user(session, "channel-shared-user")
     account = await _create_account(session, owner_user_id=owner.id, shared=True)
+    await grant_account_access(
+        session, tenant_id="default", account_id=account.id, user_ids=(support.id,)
+    )
     await session.commit()
+    support_principal = await principal_from_session_id(support_principal.session_id)
+    assert support_principal is not None
     assert support_principal.can_access_account(account)
     with pytest.raises(channel_management.ChannelPermissionError, match="tenant_admin_required"):
         await channel_management.rename_channel_account(

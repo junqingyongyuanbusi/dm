@@ -4,11 +4,15 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
     assert_alembic_succeeds,
+    assert_upgrades_to_current_head,
     run_alembic,
     temporary_database,
 )
 
 pytestmark = pytest.mark.integration
+
+# Assert legacy repairs before workspace authority migration revokes old claims.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 
 
 async def test_platform_account_migration_rejects_incompatible_capability():
@@ -167,7 +171,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
             )
         await engine.dispose()
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             rows = (
@@ -184,7 +188,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
             ).scalar_one()
         await engine.dispose()
 
-        assert revision == "a8f4d2c6e901"
+        assert revision == _HISTORICAL_REVISION
         assert str(rows[0].conversation_id) == "00000000-0000-0000-0000-000000000103"
         assert rows[0].tenant_id == "tenant-a"
         assert rows[0].status == "CLAIMED"
@@ -220,6 +224,7 @@ async def test_human_work_hardening_repairs_legacy_rows():
         assert rows[4].assigned_actor is None
         assert rows[4].claimed_at is None
         assert rows[4].version == 2
+        await assert_upgrades_to_current_head(database_url)
 
 
 async def test_message_history_migration_backfills_and_round_trips():
@@ -309,7 +314,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                 await connection.execute(text(statement))
         await engine.dispose()
 
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             revision = (
@@ -350,7 +355,7 @@ async def test_message_history_migration_backfills_and_round_trips():
                     )
                 )
             ).all()
-        assert revision == "a8f4d2c6e901"
+        assert revision == _HISTORICAL_REVISION
         assert trigger_count == 1
         assert account_contract.status == "active"
         assert account_contract.capability == {
@@ -399,7 +404,7 @@ async def test_message_history_migration_backfills_and_round_trips():
         await engine.dispose()
 
         await assert_alembic_succeeds(database_url, "downgrade", "e7b2c4d9a610")
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
             counts = (
@@ -412,3 +417,4 @@ async def test_message_history_migration_backfills_and_round_trips():
             ).one()
         await engine.dispose()
         assert tuple(counts) == (3, 1, 3)
+        await assert_upgrades_to_current_head(database_url)

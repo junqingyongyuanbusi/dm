@@ -4,7 +4,14 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import func, insert, select, text
+from tests.integration.company_permission_support import (
+    COMPANY_PASSWORD,
+    bootstrap_identity,
+    create_staff,
+    grant_account_access,
+)
 
+from social_reply.application.account_management.auth import Principal, authenticate
 from social_reply.application.account_management.human_workflow import (
     HumanWorkflowConflict,
     HumanWorkflowError,
@@ -22,12 +29,22 @@ from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
 pytestmark = pytest.mark.integration
 
 
+async def _authenticated_principal(username: str = "alice") -> Principal:
+    result = await authenticate(username, COMPANY_PASSWORD)
+    assert result is not None
+    return result[0]
+
+
 async def _seed_conversation(
     session,
     *,
     platform: str = "telegram",
     automation_default: str = "BOT_ACTIVE",
 ) -> tuple[uuid.UUID, ...]:
+    alice = await create_staff(
+        session, username="alice", tenant_id="tenant-a", role="WORKSPACE_ADMIN"
+    )
+    bob = await create_staff(session, username="bob", tenant_id="tenant-a")
     account_id, contact_id, conversation_id, message_id, work_id, bot_outbox_id = (
         uuid.uuid4() for _ in range(6)
     )
@@ -134,6 +151,9 @@ async def _seed_conversation(
             status="PENDING",
         )
     )
+    await grant_account_access(
+        session, tenant_id="tenant-a", account_id=account_id, user_ids=(alice.user_id, bob.user_id)
+    )
     await session.commit()
     return account_id, conversation_id, message_id, work_id, bot_outbox_id
 
@@ -141,6 +161,15 @@ async def _seed_conversation(
 async def test_manual_reply_is_atomic_and_browser_idempotent(session, monkeypatch):
     account_id, conversation_id, message_id, work_id, bot_outbox_id = await _seed_conversation(
         session
+    )
+    principal = await _authenticated_principal()
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=principal.allowed_tenants,
+        actor=principal.actor,
+        user_id=principal.user_id,
+        expected_version=1,
+        principal=principal,
     )
 
     async def skip_dispatch(*_args, **_kwargs):
@@ -157,10 +186,11 @@ async def test_manual_reply_is_atomic_and_browser_idempotent(session, monkeypatc
         "idempotency_key": "browser-command-0001",
         "allowed_tenants": frozenset({"tenant-a"}),
         "actor": "user:alice",
+        "principal": principal,
         "user_id": None,
         "allow_override": True,
         "work_item_id": work_id,
-        "expected_version": 1,
+        "expected_version": 2,
     }
     first_id = await send_human_reply(**command)
     second_id = await send_human_reply(**command)
@@ -208,6 +238,15 @@ async def test_feishu_manual_reply_uses_shared_sender_and_outbox_uuid(session, m
     account_id, conversation_id, message_id, work_id, _bot_outbox_id = await _seed_conversation(
         session, platform="feishu"
     )
+    principal = await _authenticated_principal()
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=principal.allowed_tenants,
+        actor=principal.actor,
+        user_id=principal.user_id,
+        expected_version=1,
+        principal=principal,
+    )
 
     async def skip_dispatch(*_args, **_kwargs):
         return None
@@ -223,10 +262,11 @@ async def test_feishu_manual_reply_uses_shared_sender_and_outbox_uuid(session, m
         idempotency_key="feishu-manual-command-1",
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=principal,
         user_id=None,
         allow_override=True,
         work_item_id=work_id,
-        expected_version=1,
+        expected_version=2,
     )
     calls = []
 
@@ -268,6 +308,15 @@ async def test_manual_reply_delivers_without_reply_decision(session, monkeypatch
     _account_id, conversation_id, message_id, work_id, _bot_outbox_id = await _seed_conversation(
         session
     )
+    principal = await _authenticated_principal()
+    await claim_human_work_item(
+        work_item_id=work_id,
+        allowed_tenants=principal.allowed_tenants,
+        actor=principal.actor,
+        user_id=principal.user_id,
+        expected_version=1,
+        principal=principal,
+    )
 
     async def skip_dispatch(*_args, **_kwargs):
         return None
@@ -283,10 +332,11 @@ async def test_manual_reply_delivers_without_reply_decision(session, monkeypatch
         idempotency_key="browser-command-0002",
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=principal,
         user_id=None,
         allow_override=True,
         work_item_id=work_id,
-        expected_version=1,
+        expected_version=2,
     )
     sent: list[tuple[dict, str]] = []
 
@@ -327,6 +377,7 @@ async def test_claim_and_resolve_restore_account_policy(session, account_policy)
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         user_id=None,
         expected_version=1,
     )
@@ -347,6 +398,7 @@ async def test_claim_and_resolve_restore_account_policy(session, account_policy)
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         expected_version=2,
         allow_override=False,
     )
@@ -384,6 +436,7 @@ async def test_resolve_legacy_handoff_pending_restores_policy(session):
     work = await session.get(models.HumanWorkItem, work_id)
     work.status = "CLAIMED"
     work.assigned_actor = "user:alice"
+    work.assigned_user_id = (await _authenticated_principal()).user_id
     work.claimed_at = datetime.now(UTC)
     work.version = 2
     await session.commit()
@@ -392,6 +445,7 @@ async def test_resolve_legacy_handoff_pending_restores_policy(session):
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         expected_version=2,
         allow_override=False,
     )
@@ -414,6 +468,7 @@ async def test_resume_supports_resolved_legacy_handoff_pending(session):
         conversation_id=conversation_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         target="BOT_DRAFT_ONLY",
     )
     session.expire_all()
@@ -421,16 +476,32 @@ async def test_resume_supports_resolved_legacy_handoff_pending(session):
     assert state.state == "BOT_DRAFT_ONLY"
 
 
-async def test_concurrent_claim_exactly_one_succeeds(session):
+async def test_concurrent_claim_exactly_one_succeeds(session, monkeypatch):
+    from social_reply.application.account_management import human_workflow
+
     _account_id, conversation_id, _message_id, work_id, _bot_outbox_id = await _seed_conversation(
         session
     )
+    snapshots = []
+    both_snapshots_read = asyncio.Event()
+    read_work_snapshot = human_workflow._read_work_snapshot
+
+    async def read_before_either_claims(*args, **kwargs):
+        snapshot = await read_work_snapshot(*args, **kwargs)
+        snapshots.append(snapshot)
+        if len(snapshots) == 2:
+            both_snapshots_read.set()
+        await asyncio.wait_for(both_snapshots_read.wait(), timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(human_workflow, "_read_work_snapshot", read_before_either_claims)
 
     async def claim(actor: str):
         return await claim_human_work_item(
             work_item_id=work_id,
             allowed_tenants=frozenset({"tenant-a"}),
             actor=actor,
+            principal=await _authenticated_principal(actor.removeprefix("user:")),
             user_id=None,
             expected_version=1,
         )
@@ -443,7 +514,7 @@ async def test_concurrent_claim_exactly_one_succeeds(session):
     assert sum(result is None for result in results) == 1
     conflicts = [result for result in results if isinstance(result, HumanWorkflowConflict)]
     assert len(conflicts) == 1
-    assert str(conflicts[0]) == "human_work_item_version_conflict"
+    assert str(conflicts[0]) == "human_work_item_snapshot_conflict"
 
     session.expire_all()
     work = await session.get(models.HumanWorkItem, work_id)
@@ -491,6 +562,7 @@ async def test_handoff_lifecycle_does_not_change_sibling_conversation(session):
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         user_id=None,
         expected_version=1,
     )
@@ -498,6 +570,7 @@ async def test_handoff_lifecycle_does_not_change_sibling_conversation(session):
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         expected_version=2,
         allow_override=False,
     )
@@ -527,6 +600,7 @@ async def test_claim_preserves_explicit_human_active_mode_and_transfers_attribut
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         user_id=None,
         expected_version=1,
     )
@@ -559,6 +633,7 @@ async def test_claim_fails_closed_for_explicit_terminal_drift(session, drift_sta
             work_item_id=work_id,
             allowed_tenants=frozenset({"tenant-a"}),
             actor="user:alice",
+            principal=await _authenticated_principal(),
             user_id=None,
             expected_version=1,
         )
@@ -581,6 +656,7 @@ async def test_claim_version_failure_preserves_state(session):
             work_item_id=work_id,
             allowed_tenants=frozenset({"tenant-a"}),
             actor="user:alice",
+            principal=await _authenticated_principal(),
             user_id=None,
             expected_version=99,
         )
@@ -602,6 +678,7 @@ async def test_resolve_assignee_failure_preserves_state(session):
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         user_id=None,
         expected_version=1,
     )
@@ -610,6 +687,7 @@ async def test_resolve_assignee_failure_preserves_state(session):
             work_item_id=work_id,
             allowed_tenants=frozenset({"tenant-a"}),
             actor="user:bob",
+            principal=await _authenticated_principal("bob"),
             expected_version=2,
             allow_override=False,
         )
@@ -629,6 +707,8 @@ async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, mo
     _account_id, conversation_id, message_id, work_id, _bot_outbox_id = await _seed_conversation(
         session
     )
+    bootstrap, _token = await bootstrap_identity()
+    audit_count_before = await session.scalar(select(func.count()).select_from(models.AuditLog))
     await session.execute(text("ALTER TABLE human_work_items DISABLE TRIGGER ALL"))
     await session.execute(
         text("UPDATE human_work_items SET tenant_id = 'tenant-b' WHERE id = :work_id"),
@@ -659,8 +739,9 @@ async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, mo
     for operation in (claim_human_work_item, resolve_human_work_item):
         arguments = {
             "work_item_id": work_id,
-            "allowed_tenants": frozenset({"tenant-b"}),
-            "actor": "user:alice",
+            "allowed_tenants": bootstrap.allowed_tenants,
+            "actor": bootstrap.actor,
+            "principal": bootstrap,
             "expected_version": 1,
         }
         if operation is claim_human_work_item:
@@ -670,14 +751,15 @@ async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, mo
         with pytest.raises(HumanWorkflowConflict, match="tenant_mismatch"):
             await operation(**arguments)
 
-    with pytest.raises(HumanWorkflowConflict, match="tenant_mismatch"):
+    with pytest.raises(HumanWorkflowConflict, match="human_work_item_scope_mismatch"):
         await send_human_reply(
             conversation_id=conversation_id,
             reply_to_message_id=message_id,
             text="Must not send",
             idempotency_key="tenant-mismatch-manual",
-            allowed_tenants=frozenset({"tenant-a"}),
-            actor="user:alice",
+            allowed_tenants=bootstrap.allowed_tenants,
+            actor=bootstrap.actor,
+            principal=bootstrap,
             user_id=None,
             allow_override=True,
             work_item_id=work_id,
@@ -689,7 +771,10 @@ async def test_tenant_mismatch_fails_closed_for_human_work_mutations(session, mo
     assert work.status == "WAITING"
     assert work.version == 1
     assert dispatched == []
-    assert await session.scalar(select(func.count()).select_from(models.AuditLog)) == 0
+    assert (
+        await session.scalar(select(func.count()).select_from(models.AuditLog))
+        == audit_count_before
+    )
     assert (
         await session.scalar(
             select(func.count())
@@ -727,6 +812,7 @@ async def test_email_resume_rejects_bot_active_but_allows_draft(
             conversation_id=conversation_id,
             allowed_tenants=frozenset({"tenant-a"}),
             actor="user:alice",
+            principal=await _authenticated_principal(),
             target="BOT_ACTIVE",
         )
 
@@ -734,6 +820,7 @@ async def test_email_resume_rejects_bot_active_but_allows_draft(
         conversation_id=conversation_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         target="BOT_DRAFT_ONLY",
     )
     session.expire_all()
@@ -762,6 +849,7 @@ async def test_resolve_email_bot_active_policy_falls_back_to_draft(
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         user_id=None,
         expected_version=1,
     )
@@ -769,6 +857,7 @@ async def test_resolve_email_bot_active_policy_falls_back_to_draft(
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         expected_version=2,
         allow_override=False,
     )
@@ -787,6 +876,7 @@ async def test_resolve_meta_bot_active_policy_falls_back_to_draft(session):
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         user_id=None,
         expected_version=1,
     )
@@ -794,6 +884,7 @@ async def test_resolve_meta_bot_active_policy_falls_back_to_draft(session):
         work_item_id=work_id,
         allowed_tenants=frozenset({"tenant-a"}),
         actor="user:alice",
+        principal=await _authenticated_principal(),
         expected_version=2,
         allow_override=False,
     )

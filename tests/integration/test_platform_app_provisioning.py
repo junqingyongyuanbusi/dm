@@ -13,7 +13,17 @@ from social_reply.infrastructure.secret_crypto import (
 pytestmark = pytest.mark.integration
 
 
-async def test_x_platform_app_credentials_can_rotate_in_place(session, tmp_path):
+@pytest.mark.parametrize(
+    ("external_app_id", "consumer_secret", "expected_error"),
+    [
+        ("old-key", "old-secret", None),
+        ("old-key", "new-secret", "platform_app_rotation_required"),
+        ("new-key", "new-secret", "platform_app_public_id_external_id_mismatch"),
+    ],
+)
+async def test_x_platform_app_reuse_cannot_implicitly_rotate_identity_or_credentials(
+    session, tmp_path, external_app_id, consumer_secret, expected_error
+):
     app_id = uuid.uuid4()
     account_id = uuid.uuid4()
     await session.execute(
@@ -57,36 +67,51 @@ async def test_x_platform_app_credentials_can_rotate_in_place(session, tmp_path)
     )
     await session.commit()
 
-    persisted_id, public_id = await provision_platform_app(
+    provision_values = dict(
         platform_family="x",
-        external_app_id="new-key",
+        external_app_id=external_app_id,
         tenant_id="default",
         name="X OAuth App",
         public_id="x_oauth_default",
         public_id_prefix="xapp",
         secrets_root=tmp_path,
-        credential_bundle={"consumer_key": "new-key", "consumer_secret": "new-secret"},
+        credential_bundle={"consumer_key": external_app_id, "consumer_secret": consumer_secret},
         config={"api_base_url": "https://api.x.com"},
         allow_external_app_id_rotation=True,
     )
+    if expected_error is None:
+        persisted_id, public_id = await provision_platform_app(**provision_values)
+        assert persisted_id == app_id
+        assert public_id == "x_oauth_default"
+    else:
+        with pytest.raises(ValueError, match=expected_error):
+            await provision_platform_app(**provision_values)
 
     session.expire_all()
     app = await session.get(models.PlatformApp, app_id)
     account = await session.get(models.PlatformAccount, account_id)
-    assert persisted_id == app_id
-    assert public_id == "x_oauth_default"
     assert app is not None
-    assert app.external_app_id == "new-key"
-    assert app.config_version == 4
+    assert app.external_app_id == "old-key"
+    assert app.public_id == "x_oauth_default"
+    assert app.config_version == (4 if expected_error is None else 3)
+    assert app.name == ("X OAuth App" if expected_error is None else "Old X App")
     assert decrypt_secret_bundle(app.credential_bundle) == {
-        "consumer_key": "new-key",
-        "consumer_secret": "new-secret",
+        "consumer_key": "old-key",
+        "consumer_secret": "old-secret",
     }
     assert account is not None
     assert account.platform_app_id == app_id
+    assert decrypt_secret_bundle(account.credential_bundle) == {
+        "consumer_key": "old-key",
+        "consumer_secret": "old-secret",
+        "access_token": "token",
+        "access_token_secret": "token-secret",
+    }
+    rows = (await session.scalars(select(models.PlatformApp))).all()
+    assert len(rows) == 1
 
 
-async def test_platform_app_rotation_remains_opt_in(session, tmp_path):
+async def test_platform_app_external_identity_remains_immutable(session, tmp_path):
     await session.execute(
         insert(models.PlatformApp).values(
             id=uuid.uuid4(),

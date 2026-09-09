@@ -30,7 +30,24 @@ async def test_later_staff_reauthorization_preserves_old_applied_checkpoint_fact
     account_id, _owner_id, grantee_id = await _seed_reauthorization_account()
     principal_a, _token = await _staff_session(grantee_id)
     async with get_session_factory()() as session:
-        staff_b = await create_staff(session, tenant_id="default", role="WORKSPACE_ADMIN")
+        staff_b = await create_staff(session, tenant_id="default", role="OPERATOR")
+        session.add(
+            models.AccountAccessGrant(
+                tenant_id="default",
+                platform_account_id=account_id,
+                user_id=staff_b.user_id,
+                active=True,
+            )
+        )
+        session.add(
+            models.AccountReauthorizationGrant(
+                tenant_id="default",
+                platform_account_id=account_id,
+                user_id=staff_b.user_id,
+                active=True,
+            )
+        )
+        await session.commit()
     request = {"environment": "oauth", "external_account_id": "x-42", "public_id": "x_original"}
     common = dict(
         tenant_id="default",

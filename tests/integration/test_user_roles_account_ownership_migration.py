@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
     assert_alembic_succeeds,
+    assert_upgrades_to_current_head,
     run_alembic,
     temporary_database,
 )
@@ -14,7 +15,8 @@ pytestmark = pytest.mark.integration
 
 _PREVIOUS_REVISION = "b9d5e2f7c314"
 _OWNERSHIP_REVISION = "c8f1a4d7e203"
-_HEAD_REVISION = "b9e5f3a7d102"
+# Preserve USER-role ownership assertions before the USER-to-AGENT migration.
+_HISTORICAL_REVISION = "b9e5f3a7d102"
 
 
 async def test_role_and_account_ownership_migration_enforces_tenant_scope():
@@ -157,7 +159,7 @@ async def test_role_and_account_ownership_migration_enforces_tenant_scope():
         await engine.dispose()
 
         await assert_alembic_succeeds(database_url, "downgrade", _PREVIOUS_REVISION)
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
 
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
@@ -177,6 +179,7 @@ async def test_role_and_account_ownership_migration_enforces_tenant_scope():
             ).scalar_one()
         await engine.dispose()
 
-        assert revision == _HEAD_REVISION
+        assert revision == _HISTORICAL_REVISION
         assert roles == ["USER", "USER"]
         assert account_owner is None
+        await assert_upgrades_to_current_head(database_url)

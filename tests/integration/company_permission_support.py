@@ -11,11 +11,13 @@ from typing import Any
 
 import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from sqlalchemy import select
 
 from social_reply.application.account_management.auth import (
     Principal,
     authenticate,
     hash_password,
+    principal_from_session_id,
 )
 from social_reply.application.handoff_notifications.callbacks import (
     VerifiedFeishuCallback,
@@ -130,6 +132,51 @@ async def bootstrap_identity() -> tuple[Principal, str]:
     return principal, raw_token
 
 
+async def grant_account_access(
+    session,
+    *,
+    tenant_id: str,
+    account_id: uuid.UUID,
+    user_ids: tuple[uuid.UUID, ...],
+) -> None:
+    """Persist only the members explicitly authorized by this test scenario."""
+    session.add_all(
+        models.AccountAccessGrant(
+            tenant_id=tenant_id,
+            platform_account_id=account_id,
+            user_id=user_id,
+            active=True,
+        )
+        for user_id in dict.fromkeys(user_ids)
+    )
+    await session.flush()
+
+
+async def grant_legacy_shared_access(session, *, tenant_id: str, account_id: uuid.UUID) -> None:
+    """Snapshot existing staff for historical shared fixtures, never future members."""
+    user_ids = tuple(
+        await session.scalars(
+            select(models.AdminUser.id).where(
+                models.AdminUser.tenant_id == tenant_id,
+                models.AdminUser.status == "active",
+            )
+        )
+    )
+    await grant_account_access(
+        session, tenant_id=tenant_id, account_id=account_id, user_ids=user_ids
+    )
+
+
+async def refresh_staff_principal(staff: StaffIdentity) -> Principal:
+    session_id = staff.principal.session_id
+    if session_id is None:
+        raise AssertionError("fixture staff requires a real session")
+    principal = await principal_from_session_id(session_id)
+    if principal is None:
+        raise AssertionError("fixture staff session is no longer valid")
+    return principal
+
+
 async def login_client(
     client: httpx.AsyncClient,
     *,
@@ -159,6 +206,7 @@ async def seed_conversation(
     brand_id: str = "company-brand",
     owner_user_id: uuid.UUID | None = None,
     shared_with_support: bool = True,
+    authorized_user_ids: tuple[uuid.UUID, ...] | None = None,
     account_status: str = "active",
     account_name: str = "Company support account",
     automation_default: str = "BOT_ACTIVE",
@@ -198,6 +246,12 @@ async def seed_conversation(
         )
     )
     await session.flush()
+    if authorized_user_ids is not None:
+        await grant_account_access(
+            session, tenant_id=tenant_id, account_id=account_id, user_ids=authorized_user_ids
+        )
+    elif shared_with_support:
+        await grant_legacy_shared_access(session, tenant_id=tenant_id, account_id=account_id)
     contact_id = uuid.uuid4()
     session.add(
         models.Contact(
@@ -341,6 +395,7 @@ async def seed_feishu_handoff(
             brand_id=f"company-customer-{index}",
             owner_user_id=None,
             shared_with_support=customer_shared,
+            authorized_user_ids=tuple(member.user_id for member in staff) if customer_shared else (),
             account_name=f"Company customer account {index}",
             state="HUMAN_ACTIVE" if work_status == "CLAIMED" else "HANDOFF_PENDING",
             work_status=work_status,

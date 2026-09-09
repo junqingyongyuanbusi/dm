@@ -20,15 +20,15 @@ from social_reply.shared.config import Settings
 _RECORDED_AT = datetime(2026, 9, 6, 12, tzinfo=UTC)
 
 
-def _principal(*, superadmin: bool = False) -> Principal:
+def _principal(*, workspace_admin: bool = False) -> Principal:
     return Principal(
         session_id=UUID(int=100),
-        user_id=None if superadmin else UUID(int=101),
+        user_id=UUID(int=101),
         username="operator",
         actor="user:operator",
         allowed_tenants=frozenset({"tenant-a"}),
         tenant_id="tenant-a",
-        role="SUPERADMIN" if superadmin else "USER",
+        role="WORKSPACE_ADMIN" if workspace_admin else "AGENT",
     )
 
 
@@ -66,21 +66,21 @@ def _sql(statement) -> str:
     )
 
 
-@pytest.mark.parametrize("superadmin", [False, True])
-async def test_overview_scopes_and_bounds_only_explicit_business_projections(superadmin):
-    principal = _principal(superadmin=superadmin)
-    session = _session(*([()] * (4 if superadmin else 2)))
+@pytest.mark.parametrize("workspace_admin", [False, True])
+async def test_overview_scopes_and_bounds_only_explicit_business_projections(workspace_admin):
+    principal = _principal(workspace_admin=workspace_admin)
+    session = _session(*([()] * (4 if workspace_admin else 2)))
 
     overview = await load_home_overview(session, principal, "tenant-a", settings=_settings())
 
     assert overview == HomeOverview(alerts=(), activities=())
     statements = [call.args[0] for call in session.execute.await_args_list]
-    assert len(statements) == (4 if superadmin else 2)
+    assert len(statements) == (4 if workspace_admin else 2)
     for statement in statements:
         query = _sql(statement)
         assert "platform_accounts.tenant_id = 'tenant-a'" in query
-        assert ("platform_accounts.owner_user_id =" in query) == (not superadmin)
-        if not superadmin:
+        assert ("platform_accounts.owner_user_id =" in query) == (not workspace_admin)
+        if not workspace_admin:
             assert str(principal.user_id) in query
         assert "audit_logs" not in query
         for forbidden in ("payload", "credential", "error_message", "body", "actor_id"):
@@ -117,7 +117,7 @@ async def test_overview_scopes_and_bounds_only_explicit_business_projections(sup
     assert "human_work_items.created_at AS occurred_at" in handoff_query
     assert "ORDER BY human_work_items.created_at DESC, human_work_items.id DESC" in handoff_query
 
-    if superadmin:
+    if workspace_admin:
         sent_query, failed_query = map(_sql, activity_statements[1:])
         for query in (sent_query, failed_query):
             assert "outbox_messages.tenant_id = 'tenant-a'" in query
@@ -156,7 +156,7 @@ async def test_database_identity_cannot_enable_superadmin_delivery_sources():
     assert session.execute.await_count == 2
     assert all(
         "outbox_messages" not in _sql(call.args[0])
-        and "platform_accounts.owner_user_id =" in _sql(call.args[0])
+        and "WHERE false" in _sql(call.args[0])
         for call in session.execute.await_args_list
     )
 
@@ -233,7 +233,7 @@ async def test_activity_sources_merge_into_stable_top_five_using_evidence_time()
     )
 
     overview = await load_home_overview(
-        session, _principal(superadmin=True), "tenant-a", settings=_settings()
+        session, _principal(workspace_admin=True), "tenant-a", settings=_settings()
     )
 
     assert tuple(event.event_id.int for event in overview.activities) == (7, 6, 5, 4, 3)

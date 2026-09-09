@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
+    CURRENT_HEAD,
     assert_alembic_succeeds,
     run_alembic,
     temporary_database,
@@ -14,7 +15,6 @@ pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "b7e4c2d9a615"
 _EMAIL_REVISION = "e9a1c4f7b620"
-_HEAD_REVISION = "a8f4d2c6e901"
 
 
 async def test_email_contract_upgrade_constraints_and_fail_closed_downgrade():
@@ -206,7 +206,7 @@ async def test_email_contract_upgrade_constraints_and_fail_closed_downgrade():
                 )
             ).scalar_one()
         await engine.dispose()
-        assert revision == _HEAD_REVISION
+        assert revision == CURRENT_HEAD
         assert rate_index_count == 1
         assert reupgrade_index_valid is True
 

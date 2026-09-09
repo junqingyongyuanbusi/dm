@@ -65,9 +65,10 @@ async def _seed_feishu_account(session, *, tenant_id="default") -> uuid.UUID:
 
 async def test_admin_configures_handoff_route_and_operator(session):
     account_id = await _seed_feishu_account(session)
+    employee_id = uuid.uuid4()
     session.add(
         models.AdminUser(
-            id=uuid.uuid4(),
+            id=employee_id,
             username="configured-operator-employee",
             password_hash="test-only",
             tenant_id="default",
@@ -97,6 +98,7 @@ async def test_admin_configures_handoff_route_and_operator(session):
                 "tenant_id": "default",
                 "operator_open_id": "ou_agent",
                 "display_name": "Agent One",
+                "admin_user_id": str(employee_id),
                 "can_claim": "true",
                 "can_resolve": "true",
             },
@@ -111,6 +113,7 @@ async def test_admin_configures_handoff_route_and_operator(session):
     assert config.destination_chat_id == "oc_support"
     assert config.enabled is True
     assert saved_operator.operator_open_id == "ou_agent"
+    assert saved_operator.admin_user_id == employee_id
     assert saved_operator.status == "ACTIVE"
     actions = set((await session.execute(select(models.AuditLog.action))).scalars())
     assert {"SET_FEISHU_HANDOFF_CONFIG", "SET_FEISHU_HANDOFF_OPERATOR"} <= actions

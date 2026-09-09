@@ -799,6 +799,26 @@ async def test_knowledge_query_scopes_users_and_treats_like_wildcards_literally(
         password="query-default-password-123",
         role="USER",
     )
+    shared_account = models.PlatformAccount(
+        tenant_id="default",
+        brand_id="default",
+        platform="telegram",
+        name="Explicitly granted query account",
+        public_id=f"query-shared-{uuid.uuid4()}",
+        config={"delivery_mode": "direct"},
+        capability={"dm": True, "max_text_length": 4096},
+        automation_default="BOT_DRAFT_ONLY",
+        status="active",
+    )
+    session.add(shared_account)
+    await session.flush()
+    session.add(
+        models.AccountAccessGrant(
+            tenant_id="default",
+            user_id=owned_user.id,
+            platform_account_id=shared_account.id,
+        )
+    )
     session.add(
         models.PlatformAccount(
             tenant_id="default",
@@ -877,6 +897,20 @@ async def test_knowledge_query_scopes_users_and_treats_like_wildcards_literally(
                 data={"csrf_token": csrf_token, "q": query},
             )
 
+    ungranted_scope = await query_as(
+        no_account_user.username,
+        "query-default-password-123",
+        "scope token",
+    )
+    session.add(
+        models.AccountAccessGrant(
+            tenant_id="default",
+            user_id=no_account_user.id,
+            platform_account_id=shared_account.id,
+        )
+    )
+    await session.commit()
+
     owner_scope = await query_as(
         owned_user.username,
         "query-owner-password-123",
@@ -902,6 +936,11 @@ async def test_knowledge_query_scopes_users_and_treats_like_wildcards_literally(
         "test-admin-password",
         "scope token",
     )
+
+    assert ungranted_scope.status_code == 200
+    assert "SHARED-SCOPE-ANSWER" not in ungranted_scope.text
+    assert "OWNED-SCOPE-ANSWER" not in ungranted_scope.text
+    assert "FOREIGN-SCOPE-ANSWER" not in ungranted_scope.text
 
     assert owner_scope.status_code == 200
     assert "SHARED-SCOPE-ANSWER" in owner_scope.text
@@ -1008,12 +1047,11 @@ async def test_canonical_knowledge_permissions_legacy_redirects_and_safe_html(se
             f"/app/t/default/knowledge/documents/{sensitive_document.id}/confirm-english",
             data={"csrf_token": "wrong", "confirmation_reason": "manual review complete"},
         )
-        invalid_legacy_bool = await client.post(
-            "/admin/knowledge/add",
+        invalid_bool = await client.post(
+            "/app/t/default/knowledge/documents",
             data={
                 "csrf_token": admin_csrf,
-                "tenant_id": "default",
-                "question": "Legacy invalid boolean",
+                "question": "Invalid official contact boolean",
                 "reply": "Must be rejected",
                 "is_official_contact": "maybe",
             },
@@ -1034,7 +1072,8 @@ async def test_canonical_knowledge_permissions_legacy_redirects_and_safe_html(se
         assert "brand_id=secret-brand" in legacy.headers["location"]
         assert "status_filter=review" in legacy.headers["location"]
         assert csrf_rejected.status_code == 403
-        assert invalid_legacy_bool.status_code == 422
+        assert invalid_bool.status_code == 422
+        assert invalid_bool.json() == {"detail": "invalid_is_official_contact"}
         assert admin_csrf
 
     async with httpx.AsyncClient(
@@ -1047,7 +1086,15 @@ async def test_canonical_knowledge_permissions_legacy_redirects_and_safe_html(se
             username="knowledge-user",
             password="knowledge-user-password-123",
         )
-        forbidden = await client.get("/app/t/default/knowledge")
+        readonly_page = await client.get("/app/t/default/knowledge")
+        forbidden_write = await client.post(
+            "/app/t/default/knowledge/documents",
+            data={
+                "csrf_token": user_csrf,
+                "question": "Unauthorized knowledge write",
+                "reply": "Must not persist",
+            },
+        )
         query_page = await client.get("/app/t/default/knowledge-query")
         query_redirect = await client.get(
             "/app/t/default/knowledge-query?q=historical-secret@example.com"
@@ -1056,7 +1103,11 @@ async def test_canonical_knowledge_permissions_legacy_redirects_and_safe_html(se
             "/app/t/default/knowledge-query",
             data={"csrf_token": user_csrf, "q": "historical-secret"},
         )
-        assert forbidden.status_code == 403
+        assert readonly_page.status_code == 200
+        assert "private-contact@example.com" not in readonly_page.text
+        assert "HISTORICAL-PROTECTED-TOKEN" not in readonly_page.text
+        assert 'action="/app/t/default/knowledge/documents"' not in readonly_page.text
+        assert forbidden_write.status_code == 403
         assert query_page.status_code == 200
         assert query_redirect.status_code == 303
         assert query_redirect.headers["location"] == "/app/t/default/knowledge-query"

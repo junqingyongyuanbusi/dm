@@ -2,6 +2,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.integration.migration_support import (
+    CURRENT_HEAD,
     assert_alembic_succeeds,
     temporary_database,
 )
@@ -9,13 +10,14 @@ from tests.integration.migration_support import (
 pytestmark = pytest.mark.integration
 
 _BASE_REVISION = "d3f6a1b8c904"
-_HEAD_REVISION = "a8f4d2c6e901"
+# Keep the schema round trip within the historical reversible chain.
+_HISTORICAL_REVISION = "a8f4d2c6e901"
 
 
 async def test_upgrade_downgrade_and_reupgrade_feishu_handoff_notifications():
     async with temporary_database("social_reply_feishu_handoff") as database_url:
         await assert_alembic_succeeds(database_url, "upgrade", _BASE_REVISION)
-        await assert_alembic_succeeds(database_url, "upgrade", "head")
+        await assert_alembic_succeeds(database_url, "upgrade", _HISTORICAL_REVISION)
 
         engine = create_async_engine(database_url)
         async with engine.connect() as connection:
@@ -51,7 +53,7 @@ async def test_upgrade_downgrade_and_reupgrade_feishu_handoff_notifications():
             }
         await engine.dispose()
 
-        assert revision == _HEAD_REVISION
+        assert revision == _HISTORICAL_REVISION
         assert {
             "tenant_feishu_handoff_configs",
             "feishu_handoff_operators",
@@ -98,4 +100,4 @@ async def test_upgrade_downgrade_and_reupgrade_feishu_handoff_notifications():
                 await connection.execute(text("SELECT version_num FROM alembic_version"))
             ).scalar_one()
         await engine.dispose()
-        assert reupgraded_revision == _HEAD_REVISION
+        assert reupgraded_revision == CURRENT_HEAD
