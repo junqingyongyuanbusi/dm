@@ -21,6 +21,9 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://dev:dev@localhost:5432/social_reply"
     redis_url: str = "redis://localhost:6379/0"
+    dramatiq_namespace: str = Field(
+        default="dramatiq", min_length=1, max_length=64, pattern=r"\A[A-Za-z0-9_-]+\z"
+    )
     tenant_id: str = DEFAULT_TENANT_ID
     # Literal 收紧：配错 provider 在进程启动即报错，而非每条消息决策丢失
     llm_provider: Literal["stub", "openai"] = "stub"

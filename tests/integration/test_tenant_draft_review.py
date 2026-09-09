@@ -424,7 +424,7 @@ async def test_tenant_draft_panel_approves_and_legacy_admin_replay_is_idempotent
     assert legacy_replay.headers["location"] == "/admin/inbox?queue=drafts"
     assert conflicting_replay.status_code == 409
     assert conflicting_replay.json() == {"detail": "draft_approval_conflict"}
-    assert sent_messages == [({"kind": "dm", "chat_id": 123}, "Edited tenant reply")]
+    assert sent_messages == [({"chat_id": 123}, "Edited tenant reply")]
 
     outbox_count = await session.scalar(
         select(func.count())

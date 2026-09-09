@@ -285,6 +285,7 @@ async def test_sweep_reviews_stale_sending_in_ordered_batches_without_duplicate_
                 )
             ).scalars()
         )
+        assert len(reviewed_ids) == reviewed_count
         assert reviewed_ids == set(ordered_ids[:reviewed_count])
         attempts = (
             await session.execute(

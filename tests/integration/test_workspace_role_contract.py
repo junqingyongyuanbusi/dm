@@ -91,7 +91,10 @@ async def test_explicit_grant_and_revocation_scope_inbox_contacts_reports_and_au
         session, account_name="VISIBLE ACCOUNT", shared_with_support=False
     )
     hidden = await seed_conversation(
-        session, account_name="HIDDEN ACCOUNT", shared_with_support=True
+        session,
+        account_name="HIDDEN ACCOUNT",
+        shared_with_support=True,
+        authorized_user_ids=(),
     )
     grant = models.AccountAccessGrant(
         tenant_id="default",

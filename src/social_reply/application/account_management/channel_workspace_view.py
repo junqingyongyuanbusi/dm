@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from social_reply.application.account_management.channel_workspace_i18n import (
     CONNECTION_LABELS,
@@ -42,6 +42,28 @@ CAPABILITY_KEYS = ("dm", "comments", "session_messages", "templates", "x_chat", 
 AUTOMATION_STATES = frozenset({
     "BOT_DRAFT_ONLY", "BOT_ACTIVE", "HANDOFF_PENDING", "HUMAN_ACTIVE", "BOT_COOLDOWN", "CLOSED",
 })
+_CHANNEL_AVATAR_HOST_SUFFIXES = (".fbcdn.net", ".cdninstagram.com")
+_CHANNEL_AVATAR_HOSTS = frozenset({
+    "abs.twimg.com", "pbs.twimg.com", "platform-lookaside.fbsbx.com",
+})
+
+
+def safe_channel_avatar_url(value: object) -> str | None:
+    candidate = str(value or "").strip()
+    if not candidate or len(candidate) > 2048:
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        hostname = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return None
+    if hostname in _CHANNEL_AVATAR_HOSTS:
+        return candidate
+    if any(hostname.endswith(suffix) for suffix in _CHANNEL_AVATAR_HOST_SUFFIXES):
+        return candidate
+    return None
 
 
 @dataclass(frozen=True)
@@ -83,6 +105,7 @@ class ChannelAccountView:
     account_id: str
     name: str
     identity: str
+    avatar_url: str | None
     platform: str
     platform_label: str
     brand_id: str
@@ -135,9 +158,10 @@ def build_channel_account_view(
         account_id=str(account.id),
         name=account.name,
         identity=(
-            account.provider_username or account.external_account_id
-            or channel_copy("identity_unavailable")
+            f"@{account.provider_username.lstrip('@')}" if account.provider_username
+            else account.external_account_id or channel_copy("identity_unavailable")
         ),
+        avatar_url=safe_channel_avatar_url(account.avatar_url),
         platform=account.platform,
         platform_label=(
             channel_copy(account.platform) if account.platform in {"email", "feishu"}

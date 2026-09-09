@@ -288,8 +288,13 @@ async def test_user_without_account_access_is_rejected_without_network(
             csrf=csrf,
             expected_config_version="1",
         )
-        assert response.status_code == 403
-        assert response.json() == {"detail": "account_reauthorization_denied"}
+        if route == "legacy" and not has_reauthorization_grant:
+            # The legacy adapter hides accounts outside both its read and grant scopes.
+            assert response.status_code == 404
+            assert response.json() == {"detail": "x_account_not_found"}
+        else:
+            assert response.status_code == 403
+            assert response.json() == {"detail": "account_reauthorization_denied"}
         inbox = await client.get(f"/app/t/default/conversations/{seed.conversation_id}")
         assert inbox.status_code == 404
         assert inbox.json() == {"detail": "conversation_not_found"}

@@ -13,6 +13,7 @@
     <span class="channel-workspace-badge channel-workspace-badge-{{ account.health_tone }}">{{ account.health_label }}</span>
   </div>
   <div class="channel-workspace-identity">
+    {% if account.avatar_url %}<img class="saas-account-avatar" src="{{ account.avatar_url }}" alt="" width="40" height="40" loading="lazy" referrerpolicy="no-referrer">{% endif %}
     <h3>{{ account.name }}</h3>
     <p>{{ account.identity }}</p>
   </div>

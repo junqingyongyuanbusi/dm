@@ -246,10 +246,12 @@ async def sweep_outbox() -> list[uuid.UUID]:
             .limit(_SWEEP_BATCH_SIZE)
             .with_for_update(skip_locked=True)
         )
+        # Fix the locked batch before UPDATE so a subquery rescan cannot exceed the limit.
+        stale_candidate_ids = (await session.scalars(stale_candidates)).all()
         stale_rows = await session.execute(
             update(models.OutboxMessage)
             .where(
-                models.OutboxMessage.id.in_(stale_candidates),
+                models.OutboxMessage.id.in_(stale_candidate_ids),
                 *stale_predicates,
             )
             .values(status="NEEDS_REVIEW", last_error_code="STALE_SENDING")

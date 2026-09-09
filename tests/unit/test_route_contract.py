@@ -49,15 +49,17 @@ def test_external_protocol_and_admin_routes_remain_stable() -> None:
         assert routes[path] == {"GET"}
     assert routes["/admin/users"] == {"GET", "POST"}
     assert routes["/admin/system/users"] == {"GET", "POST"}
-    for retired_mutation in (
+    for legacy_mutation in (
         "/admin/knowledge/add",
         "/admin/knowledge/import",
         "/admin/knowledge/bulk-publish",
         "/admin/knowledge/bulk-confirm-english",
+        "/admin/knowledge/{doc_id}/confirm-english",
+        "/admin/knowledge/{doc_id}/official-contact",
         "/admin/knowledge/{doc_id}/status",
         "/admin/knowledge/{doc_id}/delete",
     ):
-        assert retired_mutation not in routes
+        assert routes[legacy_mutation] == {"POST"}
 
 
 def test_control_api_v1_routes_remain_stable() -> None:

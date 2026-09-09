@@ -296,19 +296,43 @@ async def test_user_cannot_provision_admin_managed_channels(
         csrf = await _login(client, user.username)
         whatsapp_response = await client.post(
             "/app/t/default/channels/accounts/whatsapp",
-            data={"csrf_token": csrf},
+            data={
+                "csrf_token": csrf,
+                "external_account_id": "policy-whatsapp",
+                "app_id": "policy-app",
+                "access_token": "policy-secret-access-token",
+                "app_secret": "policy-secret-app-secret",
+                "verify_token": "policy-secret-verify-token",
+            },
         )
         feishu_response = await client.post(
             "/app/t/default/channels/accounts/feishu",
-            data={"csrf_token": csrf},
+            data={
+                "csrf_token": csrf,
+                "app_id": "cli_policytest",
+                "app_secret": "policy-secret-app-secret",
+                "verification_token": "policy-secret-verification-token",
+                "encrypt_key": "policy-secret-encrypt-key",
+            },
         )
         telegram_active_response = await client.post(
             "/app/t/default/channels/accounts/telegram",
-            data={"csrf_token": csrf, "automation_default": "BOT_ACTIVE"},
+            data={
+                "csrf_token": csrf,
+                "automation_default": "BOT_ACTIVE",
+                "token": "policy-secret-telegram-token",
+            },
         )
         x_active_response = await client.post(
             "/app/t/default/channels/accounts/x",
-            data={"csrf_token": csrf, "automation_default": "BOT_ACTIVE"},
+            data={
+                "csrf_token": csrf,
+                "automation_default": "BOT_ACTIVE",
+                "consumer_key": "policy-secret-consumer-key",
+                "consumer_secret": "policy-secret-consumer-secret",
+                "access_token": "policy-secret-access-token",
+                "access_token_secret": "policy-secret-access-token-secret",
+            },
         )
 
     for response in (
@@ -319,6 +343,7 @@ async def test_user_cannot_provision_admin_managed_channels(
     ):
         assert response.status_code == 403
         assert response.json() == {"detail": "tenant_admin_required"}
+        assert "policy-secret" not in response.text
     assert (
         await session.scalar(
             select(models.ProvisioningJob.id).where(
@@ -591,6 +616,26 @@ async def test_kill_switch_and_job_retry_are_idempotent_scoped_and_audited(
         return None
 
     monkeypatch.setattr(channel_management, "dispatch_actor", ignore_dispatch)
+    first_command_pending = asyncio.Event()
+    second_command_applied = asyncio.Event()
+    reconcile_command = channel_management.reconcile_account_kill_switch_command
+
+    async def reconcile_after_both_commands_commit(operation_id, **kwargs):
+        # Force the real supersession window between durable intent and Redis apply.
+        if not first_command_pending.is_set():
+            first_command_pending.set()
+            async with asyncio.timeout(10):
+                await second_command_applied.wait()
+            return await reconcile_command(operation_id, **kwargs)
+        result = await reconcile_command(operation_id, **kwargs)
+        second_command_applied.set()
+        return result
+
+    monkeypatch.setattr(
+        channel_management,
+        "reconcile_account_kill_switch_command",
+        reconcile_after_both_commands_commit,
+    )
     redis = aioredis.from_url(get_settings().redis_url)
     redis_key = f"killswitch:account:default:{account.id}"
     await redis.delete(redis_key)
@@ -608,10 +653,18 @@ async def test_kill_switch_and_job_retry_are_idempotent_scoped_and_audited(
                 data={"csrf_token": csrf, "enabled": "true"},
             )
 
-        first_response, second_response = await asyncio.gather(
-            enable_kill_switch(first_client, first_csrf),
-            enable_kill_switch(second_client, second_csrf),
-        )
+        async def enable_after_first_command_commits():
+            async with asyncio.timeout(10):
+                await first_command_pending.wait()
+            return await enable_kill_switch(second_client, second_csrf)
+
+        async with asyncio.TaskGroup() as requests:
+            first_request = requests.create_task(enable_kill_switch(first_client, first_csrf))
+            second_request = requests.create_task(enable_after_first_command_commits())
+        first_response = first_request.result()
+        second_response = second_request.result()
+        duplicate_response = await enable_kill_switch(first_client, first_csrf)
+        assert await redis.exists(redis_key) == 1
         retry_response = await first_client.post(
             f"/app/t/default/channels/jobs/{job.id}/retry",
             data={"csrf_token": first_csrf},
@@ -624,7 +677,9 @@ async def test_kill_switch_and_job_retry_are_idempotent_scoped_and_audited(
         await first_client.aclose()
         await second_client.aclose()
 
-    assert first_response.status_code == second_response.status_code == 303
+    assert first_response.status_code == 409
+    assert first_response.json() == {"detail": "kill_switch_command_requires_reconfirmation"}
+    assert second_response.status_code == duplicate_response.status_code == 303
     assert retry_response.status_code == disable_response.status_code == 303
     assert await redis.exists(redis_key) == 0
     await redis.aclose()
@@ -645,8 +700,14 @@ async def test_kill_switch_and_job_retry_are_idempotent_scoped_and_audited(
             )
         ).scalars()
     )
-    assert len(kill_switch_audits) == 3
-    assert [audit.detail["enabled"] for audit in kill_switch_audits].count(True) == 2
+    assert len(kill_switch_audits) == 4
+    assert [audit.detail["status"] for audit in kill_switch_audits] == [
+        "SUPERSEDED", "APPLIED", "UNCHANGED", "APPLIED",
+    ]
+    assert kill_switch_audits[0].detail["superseded_by_operation_id"] == str(
+        kill_switch_audits[1].id
+    )
+    assert [audit.detail["enabled"] for audit in kill_switch_audits].count(True) == 3
     assert [audit.detail["changed"] for audit in kill_switch_audits].count(True) == 2
     retry_audit = await session.scalar(
         select(models.AuditLog).where(

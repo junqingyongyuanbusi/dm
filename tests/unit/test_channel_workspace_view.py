@@ -87,6 +87,43 @@ def test_filter_matches_raw_identity_case_insensitively_without_mutation():
     assert account.name == "Research & Support"
 
 
+@pytest.mark.parametrize("username", ["owned_handle", "@owned_handle"])
+def test_channel_card_restores_handle_and_allowlisted_avatar(username):
+    account = account_view(
+        platform="x",
+        provider_username=username,
+        avatar_url="https://pbs.twimg.com/profile_images/owned.jpg",
+    )
+    html = render_channel_card(account, tenant_id="tenant-a")
+    assert account.identity == "@owned_handle"
+    assert ChannelFilters(query="@owned_handle").matches(account)
+    assert "@owned_handle" in html
+    assert 'src="https://pbs.twimg.com/profile_images/owned.jpg"' in html
+    assert 'referrerpolicy="no-referrer"' in html
+
+
+@pytest.mark.parametrize(
+    "avatar_url",
+    [
+        "http://pbs.twimg.com/avatar.jpg",
+        "https://pbs.twimg.com.attacker.example/avatar.jpg",
+        "https://user:password@pbs.twimg.com/avatar.jpg",
+        "https://attacker.example/avatar.jpg",
+        "https://[invalid/avatar.jpg",
+        "javascript:alert(1)",
+    ],
+)
+def test_channel_card_omits_unsafe_avatar_and_escapes_handle(avatar_url):
+    account = account_view(
+        platform="x", provider_username='<script>alert("handle")</script>', avatar_url=avatar_url
+    )
+    html = render_channel_card(account, tenant_id="tenant-a")
+    assert account.avatar_url is None
+    assert 'class="saas-account-avatar"' not in html
+    assert "<script>" not in html
+    assert "@&lt;script&gt;" in html
+
+
 def test_active_alone_does_not_claim_connection_health():
     account = account_view()
     assert account.connection_status == "pending"

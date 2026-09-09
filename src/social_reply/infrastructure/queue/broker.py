@@ -30,7 +30,7 @@ def setup_broker() -> dramatiq.Broker:
             socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
             socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
         )
-        broker = RedisBroker(client=client)
+        broker = RedisBroker(client=client, namespace=settings.dramatiq_namespace)
     dramatiq.set_broker(broker)
     return broker
 

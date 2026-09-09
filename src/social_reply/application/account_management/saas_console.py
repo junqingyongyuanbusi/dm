@@ -4,7 +4,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -52,6 +52,9 @@ from social_reply.application.account_management.channel_management import (
     set_channel_account_support_visibility,
     set_channel_reauthorization_grant,
     submit_channel_provisioning,
+)
+from social_reply.application.account_management.channel_workspace_view import (
+    safe_channel_avatar_url as _safe_channel_avatar_url,
 )
 from social_reply.application.account_management.feishu_handoff_service import (
     FeishuHandoffConflict,
@@ -4402,32 +4405,6 @@ async def tenant_my_activity(request: Request, tenant_id: str) -> Response:
         active_navigation="activity",
         inbox_count=inbox_summary.total,
     )
-
-
-_CHANNEL_AVATAR_HOST_SUFFIXES = (
-    ".fbcdn.net",
-    ".cdninstagram.com",
-)
-_CHANNEL_AVATAR_HOSTS = {
-    "abs.twimg.com",
-    "pbs.twimg.com",
-    "platform-lookaside.fbsbx.com",
-}
-
-
-def _safe_channel_avatar_url(value: object) -> str | None:
-    candidate = str(value or "").strip()
-    if not candidate or len(candidate) > 2048:
-        return None
-    parsed = urlsplit(candidate)
-    hostname = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or parsed.username or parsed.password:
-        return None
-    if hostname in _CHANNEL_AVATAR_HOSTS:
-        return candidate
-    if any(hostname.endswith(suffix) for suffix in _CHANNEL_AVATAR_HOST_SUFFIXES):
-        return candidate
-    return None
 
 
 def _channel_icon_path(platform: str) -> str:

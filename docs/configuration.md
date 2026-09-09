@@ -70,6 +70,25 @@ Chatwoot has no runtime settings or three-role configuration contract. Its legac
 remain only for the C1 application-rollback and historical-audit window and will be removed by a
 separate C2 schema migration.
 
+## Dramatiq queue namespace
+
+`DRAMATIQ_NAMESPACE` defaults to `dramatiq`, preserving the existing Redis queue keys when
+unset. Its value must be 1-64 ASCII letters, digits, underscores or hyphens; empty values,
+whitespace and other characters are rejected at startup. API, Worker and Scheduler must share
+the same value. `scripts/validate_railway_config.py` automatically includes this Settings field
+in its shared-variable consistency checks; when explicitly configured, set it on all three roles.
+
+To start with a fresh actor-message queue, explicitly select a previously unused namespace
+while keeping the same `REDIS_URL`. Only Dramatiq's queue transport keys use this namespace;
+kill switches, OAuth state and other business Redis keys remain unchanged. Do not flush Redis.
+`TESTING=true` still uses StubBroker and does not create a Redis-backed queue.
+
+A fresh namespace isolates newly enqueued actor messages from the old queue; it neither migrates
+nor deletes old messages or PostgreSQL data. Before resuming work, use the queue-retirement CLI
+to put the selected old durable tasks into terminal states, otherwise recovery sweeps can enqueue
+them again into the fresh namespace. Stop old producers and consumers during the coordinated
+cutover: changing the namespace does not cancel messages already executing in an old worker.
+
 ## X integration
 
 | Variable | Default | Meaning |
