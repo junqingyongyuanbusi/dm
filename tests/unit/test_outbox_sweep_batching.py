@@ -14,11 +14,14 @@ def reset_dispatch_cursor(monkeypatch):
     monkeypatch.setattr(sweep_module, "_dispatch_cursor", None)
 
 
-def _capture_sweep(monkeypatch, pending_batches=((),)):
+def _capture_sweep(monkeypatch, pending_batches=((),), *, stale_candidate_ids=()):
     statements = []
     pending_results = iter(pending_batches)
     session = AsyncMock()
     session.__aenter__.return_value = session
+    stale_candidates = MagicMock()
+    stale_candidates.all.return_value = stale_candidate_ids
+    session.scalars.return_value = stale_candidates
 
     async def execute(statement):
         statements.append(statement)
@@ -43,9 +46,24 @@ def _compile_sql(statement):
 
 
 async def test_sweep_limits_stale_update_and_eligible_ids_in_postgres(monkeypatch):
-    session, statements, dispatch = _capture_sweep(monkeypatch)
+    stale_candidate_ids = tuple(uuid.UUID(int=1000 + index) for index in range(100))
+    session, statements, dispatch = _capture_sweep(
+        monkeypatch, stale_candidate_ids=stale_candidate_ids
+    )
 
     assert await sweep_module.sweep_outbox() == []
+
+    session.scalars.assert_awaited_once()
+    session.scalars.return_value.all.assert_called_once_with()
+    candidate_statement = session.scalars.await_args.args[0]
+    candidate_sql = _compile_sql(candidate_statement)
+    assert candidate_sql.startswith("SELECT outbox_messages.id FROM outbox_messages WHERE")
+    assert candidate_sql.count("outbox_messages.status = 'SENDING'") == 1
+    assert candidate_sql.count("outbox_messages.locked_at <") == 1
+    assert candidate_sql.endswith(
+        "ORDER BY outbox_messages.locked_at, outbox_messages.id LIMIT 100 FOR UPDATE SKIP LOCKED"
+    )
+    assert " OFFSET " not in candidate_sql
 
     stale_statement = next(
         statement
@@ -53,14 +71,17 @@ async def test_sweep_limits_stale_update_and_eligible_ids_in_postgres(monkeypatc
         if isinstance(statement, Update) and "RETURNING" in _compile_sql(statement)
     )
     stale_sql = _compile_sql(stale_statement)
-    assert "outbox_messages.id IN (SELECT outbox_messages.id" in stale_sql
-    assert (
-        "ORDER BY outbox_messages.locked_at, outbox_messages.id LIMIT 100 FOR UPDATE" in stale_sql
+    candidate_id_literals = ", ".join(f"'{candidate_id}'" for candidate_id in stale_candidate_ids)
+    assert f"outbox_messages.id IN ({candidate_id_literals})" in stale_sql
+    assert "SELECT" not in stale_sql
+    # The fixed locked batch and the UPDATE share the same staleness guard.
+    assert stale_sql.count("outbox_messages.status = 'SENDING'") == 1
+    assert stale_sql.count("outbox_messages.locked_at <") == 1
+    assert stale_statement.compile().params["locked_at_1"] == (
+        candidate_statement.compile().params["locked_at_1"]
     )
-    assert "FOR UPDATE SKIP LOCKED" in stale_sql
-    # Both candidate selection and the UPDATE itself must still require staleness.
-    assert stale_sql.count("outbox_messages.status = 'SENDING'") == 2
-    assert stale_sql.count("outbox_messages.locked_at <") == 2
+    assert "status='NEEDS_REVIEW'" in stale_sql
+    assert "last_error_code='STALE_SENDING'" in stale_sql
     assert "RETURNING outbox_messages.id, outbox_messages.attempt_count" in stale_sql
 
     eligible_statements = [statement for statement in statements if isinstance(statement, Select)]

@@ -74,6 +74,124 @@ def make_outbox(account, conversation, *, status="PENDING", created_at=OLD):
     )
 
 
+async def test_startup_namespace_proof_is_committed_with_retirement(cutover_session):
+    session = cutover_session
+    account, conversation = await seed_conversation(session)
+    outbox = make_outbox(account, conversation)
+    session.add(outbox)
+    await session.commit()
+    original_request = request_for()
+    request = replace(
+        original_request, startup_namespace=f"dramatiq-cutover-{original_request.cutover_id.hex}",
+    )
+    await run_cutover(session, request)
+    repeated = await run_cutover(session, request)
+    assert repeated["status"] == "already_applied"
+    audit = await session.get(models.AuditLog, request.cutover_id)
+    assert audit.detail["parameters"]["startup_contract"] == "fresh-queue-v1"
+    assert audit.detail["parameters"]["namespace"] == request.startup_namespace
+    await session.refresh(outbox)
+    assert outbox.status == "CANCELLED"
+    await session.commit()
+    with pytest.raises(ValueError, match="cutover_id_parameter_conflict"):
+        await run_cutover(session, original_request)
+
+
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("automation_state", ["HUMAN_ACTIVE", "HANDOFF_PENDING"])
+async def test_only_startup_resets_migration_updated_state_for_retired_work(
+    cutover_session, startup, automation_state,
+):
+    session = cutover_session
+    account, conversation = await seed_conversation(session)
+    work = models.HumanWorkItem(
+        tenant_id="default", conversation_id=conversation.id, status="WAITING",
+        reason_code="legacy-unassigned", created_at=OLD, version=7,
+    )
+    migration_time = BEFORE + timedelta(seconds=1)
+    state = models.AutomationState(
+        conversation_id=conversation.id, state=automation_state, state_version=8,
+        human_agent_id="legacy-agent", last_human_message_at=OLD,
+        resume_policy="AUTO", updated_at=migration_time,
+    )
+    session.add_all([work, state])
+    await session.commit()
+    request = request_for()
+    if startup:
+        request = replace(request, startup_namespace=f"dramatiq-cutover-{request.cutover_id.hex}")
+    report = await run_cutover(session, request)
+    assert report["counts"]["human_cancelled"] == 1
+    assert report["counts"]["automation_reset"] == int(startup)
+    await session.refresh(work)
+    await session.refresh(state)
+    await session.refresh(account)
+    assert work.status == "CANCELLED" and work.version == 8
+    assert state.state == ("BOT_DRAFT_ONLY" if startup else automation_state)
+    assert state.state_version == (9 if startup else 8)
+    assert state.human_agent_id == (None if startup else "legacy-agent")
+    assert state.last_human_message_at == (None if startup else OLD)
+    assert state.resume_policy == ("MANUAL" if startup else "AUTO")
+    if startup:
+        assert state.state_changed_reason == RETIRED
+    else:
+        assert state.updated_at == migration_time
+    assert account.credential_bundle == {"encrypted": "unchanged"}
+
+
+@pytest.mark.parametrize(
+    "guard", ["inbound-at-cutoff", "inbound-after-cutoff", "new-work", "only-new-work",
+              "no-work", "BOT_ACTIVE", "BOT_DRAFT_ONLY", "BOT_COOLDOWN"],
+)
+async def test_startup_preserves_new_activity_and_bot_states(cutover_session, guard):
+    session = cutover_session
+    _account, conversation = await seed_conversation(session)
+    original_state = guard if guard.startswith("BOT_") else "HANDOFF_PENDING"
+    state = models.AutomationState(
+        conversation_id=conversation.id, state=original_state, state_version=8,
+        human_agent_id="preserve-agent", resume_policy="AUTO",
+        updated_at=BEFORE + timedelta(seconds=1),
+    )
+    session.add(state)
+    if guard not in {"only-new-work", "no-work"}:
+        session.add(models.HumanWorkItem(
+            tenant_id="default", conversation_id=conversation.id, status="WAITING",
+            reason_code="old", created_at=OLD,
+        ))
+    if guard.startswith("inbound-"):
+        session.add(models.Message(
+            conversation_id=conversation.id, direction="inbound", sender_type="contact",
+            text="preserve-new-inbound", occurred_at=OLD,
+            created_at=BEFORE + timedelta(seconds=int(guard == "inbound-after-cutoff")),
+        ))
+    newer_work = None
+    if guard in {"new-work", "only-new-work"}:
+        # A closed newer item may coexist with the old open item; either blocks the reset.
+        newer_work = models.HumanWorkItem(
+            tenant_id="default", conversation_id=conversation.id,
+            status="RESOLVED" if guard == "new-work" else "WAITING",
+            reason_code="preserve-new-work", created_at=BEFORE,
+        )
+        session.add(newer_work)
+    await session.commit()
+    request = request_for()
+    request = replace(request, startup_namespace=f"dramatiq-cutover-{request.cutover_id.hex}")
+    report = await run_cutover(session, request)
+    assert report["counts"]["automation_reset"] == 0
+    assert report["counts"]["human_cancelled"] == int(guard not in {"only-new-work", "no-work"})
+    await session.refresh(state)
+    assert state.state == original_state and state.state_version == 8
+    assert state.human_agent_id == "preserve-agent" and state.resume_policy == "AUTO"
+    if newer_work is not None:
+        await session.refresh(newer_work)
+        assert newer_work.status == ("RESOLVED" if guard == "new-work" else "WAITING")
+        assert newer_work.version == 1
+    if guard.startswith("inbound-"):
+        message = await session.scalar(select(models.Message).where(
+            models.Message.conversation_id == conversation.id,
+        ))
+        assert message.text == "preserve-new-inbound"
+
+
 async def test_preview_is_database_read_only_and_leaves_business_and_audit_unchanged(
     cutover_session,
 ):

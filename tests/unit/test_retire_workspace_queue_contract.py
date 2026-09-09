@@ -1,5 +1,6 @@
 import argparse
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -51,6 +52,24 @@ async def test_invalid_request_never_accesses_database(changes, expected):
     with pytest.raises(ValueError, match=expected):
         await run_cutover(session, request)
     session.execute.assert_not_called()
+    session.begin.assert_not_called()
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_startup_request_requires_stopped_processes_and_bound_namespace(confirmed):
+    request = CutoverRequest(
+        tenant="default", cutover_id=uuid.uuid4(), before=datetime(2020, 1, 1, tzinfo=UTC),
+        confirm_processes_stopped=confirmed,
+    )
+    request = replace(
+        request, startup_namespace=(
+            "dramatiq-cutover-invalid" if confirmed else f"dramatiq-cutover-{request.cutover_id.hex}"
+        ),
+    )
+    session = AsyncMock()
+    expected = "startup_namespace_mismatch" if confirmed else "processes_stopped_confirmation_required"
+    with pytest.raises(ValueError, match=expected):
+        await run_cutover(session, request)
     session.begin.assert_not_called()
 
 

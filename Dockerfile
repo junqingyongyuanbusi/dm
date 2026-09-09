@@ -36,9 +36,10 @@ COPY apps ./apps
 COPY migrations ./migrations
 COPY alembic.ini entrypoint.sh ./
 COPY scripts/__init__.py scripts/assert_database_ready.py scripts/migrate_legacy_secrets.py \
-    scripts/prepare_database.py ./scripts/
+    scripts/prepare_database.py scripts/apply_startup_cutover.py ./scripts/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev \
+    && /app/.venv/bin/python -m scripts.apply_startup_cutover --validate
 
 # 可执行入口置于 PATH，后续命令无需 uv run 前缀
 ENV PATH="/app/.venv/bin:$PATH"

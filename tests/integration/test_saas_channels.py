@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from social_reply.application.account_management.meta_credentials import (
 from social_reply.application.account_management.ui_i18n import LOCALE_COOKIE_NAME
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.secret_crypto import encrypt_secret_bundle
+from social_reply.shared.config import get_settings
 
 pytestmark = pytest.mark.integration
 
@@ -289,7 +291,14 @@ async def test_superadmin_channels_page_is_tenant_wide_without_legacy_admin_link
 async def test_user_cannot_provision_admin_managed_channels(
     session,
     migrated_db,
+    monkeypatch,
 ) -> None:
+    from social_reply.application.account_management import channel_management
+
+    # Exercise authorization rather than Feishu's disabled-integration gate.
+    monkeypatch.setattr(get_settings(), "feishu_enabled", True)
+    submit_job = AsyncMock(side_effect=AssertionError("unauthorized_provisioning_submission"))
+    monkeypatch.setattr(channel_management, "submit_provisioning_job", submit_job)
     user, _sibling_user = await _seed_users(session)
 
     async with _client() as client:
@@ -341,9 +350,10 @@ async def test_user_cannot_provision_admin_managed_channels(
         telegram_active_response,
         x_active_response,
     ):
-        assert response.status_code == 403
+        assert response.status_code == 403, response.request.url.path
         assert response.json() == {"detail": "tenant_admin_required"}
         assert "policy-secret" not in response.text
+    submit_job.assert_not_awaited()
     assert (
         await session.scalar(
             select(models.ProvisioningJob.id).where(

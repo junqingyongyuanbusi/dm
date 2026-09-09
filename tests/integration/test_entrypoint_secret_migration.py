@@ -34,7 +34,7 @@ def test_release_requires_app_and_state_service_colocation():
     assert script.count("validate_railway_colocation") == 3
     assert "scripts/railway_active_region.py" in script
     assert "scripts/validate_railway_config.py" in script
-    assert script.count("validate_railway_config") == 4
+    assert script.count("validate_railway_config") == 5
     assert "capture_experimental_multilingual_gate" not in script
     assert "railway-compat-pre-${short_sha}" in script
     assert "require_ci_rollback_compatible_image" in script

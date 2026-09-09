@@ -23,7 +23,7 @@ RETIRED = "RETIRED_BY_CUTOVER"
 UNKNOWN = "WORKSPACE_QUEUE_CUTOVER_UNKNOWN"
 _LOCK_TABLES = (
     "admin_users, audit_logs, automation_states, conversations, decision_jobs, "
-    "handoff_notification_intents, human_work_items, outbox_messages, "
+    "handoff_notification_intents, human_work_items, messages, outbox_messages, "
     "platform_accounts, provisioning_jobs, raw_events, reply_decisions"
 )
 
@@ -46,6 +46,7 @@ class CutoverRequest:
     restore_admin_ids: tuple[uuid.UUID, ...] = ()
     apply: bool = False
     confirm_processes_stopped: bool = False
+    startup_namespace: str | None = None
 
     def validate(self) -> None:
         if self.tenant != "default" or self.tenant != get_settings().tenant_id:
@@ -54,8 +55,12 @@ class CutoverRequest:
             raise ValueError("before_timezone_required")
         if self.before > datetime.now(UTC):
             raise ValueError("before_in_future")
-        if self.apply and not self.confirm_processes_stopped:
+        if (self.apply or self.startup_namespace is not None) and not self.confirm_processes_stopped:
             raise ValueError("processes_stopped_confirmation_required")
+        if self.startup_namespace is not None and self.startup_namespace != (
+            f"dramatiq-cutover-{self.cutover_id.hex}"
+        ):
+            raise ValueError("startup_namespace_mismatch")
 
     def parameters(self) -> dict[str, Any]:
         return {
@@ -64,6 +69,8 @@ class CutoverRequest:
             "before": self.before.astimezone(UTC).isoformat(),
             "restore_admin_ids": sorted({str(value) for value in self.restore_admin_ids}),
             "schema": EXPECTED_SCHEMA,
+            **({"startup_contract": "fresh-queue-v1", "namespace": self.startup_namespace}
+               if self.startup_namespace is not None else {}),
         }
 
 
@@ -98,6 +105,22 @@ def _operations(request: CutoverRequest, now: datetime) -> tuple[Operation, ...]
     human_predicate = and_(old(human), human.status.in_(("WAITING", "CLAIMED")))
     human_conversations = select(human.conversation_id).where(human_predicate)
     state = models.AutomationState
+    reset_age = state.updated_at < request.before
+    if request.startup_namespace is not None:
+        message = models.Message
+        # Startup validates the fresh namespace after stopping old processes. Migration may
+        # touch legacy human states after before; only widen age for otherwise idle old work.
+        reset_age = or_(reset_age, and_(
+            state.state.in_(("HUMAN_ACTIVE", "HANDOFF_PENDING")),
+            ~select(message.id).where(
+                message.conversation_id == state.conversation_id,
+                message.direction == "inbound", message.created_at >= request.before,
+            ).exists(),
+            ~select(human.id).where(
+                human.conversation_id == state.conversation_id,
+                human.created_at >= request.before,
+            ).exists(),
+        ))
     outbox = models.OutboxMessage
     decision = models.DecisionJob
     draft = models.ReplyDecision
@@ -120,7 +143,7 @@ def _operations(request: CutoverRequest, now: datetime) -> tuple[Operation, ...]
     return (
         # This must precede cancelling the work items selected by the subquery.
         Operation("automation_reset", state, and_(
-            state.conversation_id.in_(human_conversations), state.updated_at < request.before,
+            state.conversation_id.in_(human_conversations), reset_age,
             state.state.in_(("HUMAN_ACTIVE", "HANDOFF_PENDING", "BOT_COOLDOWN")),
         ), {
             "state": "BOT_DRAFT_ONLY", "state_version": state.state_version + 1,

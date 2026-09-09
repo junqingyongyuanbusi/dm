@@ -37,6 +37,11 @@ Fixed production targets:
 Optional environment variables:
   DEPLOY_TIMEOUT_SECONDS     Per-service deployment timeout (default: 900)
   CI_TIMEOUT_SECONDS         CI wait timeout (default: 1200)
+
+Explicit development-only cutover (stops API/Worker/Scheduler):
+  --fresh-queue --restore-admin-id UUID --restore-admin-id UUID
+  Requires two distinct existing admin IDs. Preserves business data and passwords.
+  Does not stop Postgres/Redis. See docs/development-queue-cutover.md for recovery limits.
 EOF
 }
 
@@ -44,11 +49,6 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   usage
   exit 0
 fi
-if [[ $# -ne 0 ]]; then
-  usage >&2
-  exit 2
-fi
-
 log() {
   printf '[release] %s\n' "$*" >&2
 }
@@ -57,6 +57,36 @@ fail() {
   printf '[release] ERROR: %s\n' "$*" >&2
   exit 1
 }
+
+fresh_queue="false"
+fresh_queue_metadata='null'
+restore_admin_ids=()
+restore_admin_count=0
+expect_restore_id="false"
+for argument in "$@"; do
+  if [[ "$expect_restore_id" == "true" ]]; then
+    [[ "$argument" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+      || fail "--restore-admin-id requires a UUID"
+    restore_admin_ids+=("$argument")
+    restore_admin_count=$((restore_admin_count + 1))
+    expect_restore_id="false"
+    continue
+  fi
+  case "$argument" in
+    --fresh-queue)
+      [[ "$fresh_queue" == "false" ]] || fail "duplicate --fresh-queue"
+      fresh_queue="true"
+      ;;
+    --restore-admin-id) expect_restore_id="true" ;;
+    *) fail "unknown release argument: $argument" ;;
+  esac
+done
+[[ "$expect_restore_id" == "false" ]] || fail "missing --restore-admin-id value"
+if [[ "$fresh_queue" == "true" ]]; then
+  [[ "$restore_admin_count" -eq 2 ]] || fail "fresh queue requires two distinct admin IDs"
+elif [[ "$restore_admin_count" -ne 0 ]]; then
+  fail "--restore-admin-id requires --fresh-queue"
+fi
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
@@ -139,6 +169,31 @@ rollback_ref="${IMAGE_REPO}:railway-pre-${short_sha}"
 rollback_compatible_ref="${IMAGE_REPO}:railway-compat-pre-${short_sha}"
 manifest_path="dist/release-${full_sha}.json"
 revalidate_dev_head
+if [[ -f "$manifest_path" ]]; then
+  jq -e . "$manifest_path" >/dev/null || fail "existing release manifest is invalid JSON"
+  if [[ "$fresh_queue" == "true" ]] \
+    || jq -e '.fresh_queue != null' "$manifest_path" >/dev/null; then
+    fail "fresh queue recovery requires explicit operator review of $manifest_path; do not delete it or generate a new cutover ID"
+  fi
+fi
+if [[ "$fresh_queue" == "true" ]]; then
+  fresh_queue_metadata="$(python3 - "${restore_admin_ids[@]}" <<'PY'
+import json
+import sys
+import uuid
+
+admin_ids = sorted({str(uuid.UUID(value)) for value in sys.argv[1:]})
+if len(admin_ids) != 2:
+    raise SystemExit("fresh queue requires two distinct admin IDs")
+cutover_id = uuid.uuid4()
+print(json.dumps({"phase": "planned", "previous_namespaces": {}, "cutover": {
+    "cutover_id": str(cutover_id), "namespace": f"dramatiq-cutover-{cutover_id.hex}",
+    "tenant": "default", "restore_admin_ids": admin_ids,
+    "before": None, "processes_stopped": False,
+}}))
+PY
+  )" || fail "invalid fresh queue arguments"
+fi
 
 wait_for_ci() {
   local deadline=$((SECONDS + CI_TIMEOUT_SECONDS))
@@ -482,7 +537,8 @@ service_deployment_runtimes_json() {
   local service="$1"
   local service_id after_cursor="" accumulated='[]'
   local response page has_next_page next_cursor
-  service_id="$(railway_service_node "$service" | jq -r '.serviceId // ""')"
+  service_id="$(railway_service_node "$service" | jq -r '.serviceId // ""')" \
+    || fail "could not resolve Railway service ID for $service"
   [[ -n "$service_id" ]] || fail "cannot resolve Railway service ID for $service"
   while true; do
     response="$(railway api \
@@ -496,6 +552,12 @@ service_deployment_runtimes_json() {
       || fail "could not list Railway deployments for $service"
     jq -e '.data.deployments.edges and .data.deployments.pageInfo' \
       >/dev/null <<<"$response" || fail "invalid Railway deployment page for $service"
+    if [[ "$fresh_queue" == "true" ]]; then
+      jq -e '(.errors // [] | length) == 0
+        and (.data.deployments.edges | type) == "array"
+        and (.data.deployments.pageInfo.hasNextPage | type) == "boolean"' \
+        >/dev/null <<<"$response" || fail "incomplete Railway deployment page for $service"
+    fi
     page="$(jq '[.data.deployments.edges[].node]' <<<"$response")"
     accumulated="$(jq -cn \
       --argjson accumulated "$accumulated" \
@@ -672,6 +734,7 @@ write_manifest() {
   manifest_tmp="$(mktemp "${manifest_path}.tmp.XXXXXX")"
   jq -n \
     --arg status "$release_status" \
+    --argjson fresh_queue "$fresh_queue_metadata" \
     --arg rollout_phase "$rollout_phase" \
     --arg git_sha "$full_sha" \
     --arg image_repository "$IMAGE_REPO" \
@@ -701,6 +764,7 @@ write_manifest() {
     --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{
       status: $status,
+      fresh_queue: $fresh_queue,
       rollout_phase: $rollout_phase,
       git_sha: $git_sha,
       image_repository: $image_repository,
@@ -1041,7 +1105,12 @@ deploy_role() {
     printf '%s\n' "$active_id"
     return 0
   fi
-  if [[ "$active_digest" != "$previous_digest" \
+  if [[ -z "$active_id" || -z "$active_digest" ]]; then
+    [[ "$fresh_queue" == "true" ]] \
+      || fail "$service has no active deployment; stopped-predecessor recovery is fresh-only"
+    assert_fresh_role_stopped "$service"
+    validate_fresh_queue_variables
+  elif [[ "$active_digest" != "$previous_digest" \
     && "$active_digest" != "$rollback_compatible_digest" \
     && "$active_digest" != "$expected_digest" ]]; then
     fail "$service cannot resume from digest $active_digest"
@@ -1242,6 +1311,129 @@ run_standard_rollout() {
   write_manifest "$manifest_status" "$recorded_rollout_phase"
 }
 
+assert_fresh_role_stopped() {
+  local service="$1"
+  local predecessor_variable="previous_${service}_deployment_id"
+  local predecessor_id="${!predecessor_variable}"
+  local deployment_runtimes
+  [[ "$fresh_queue" == "true" && -n "$predecessor_id" ]] \
+    || fail "$service has no recorded fresh cutover predecessor"
+  jq -e --arg service "$service" --arg predecessor "$predecessor_id" \
+    '.previous_railway[($service + "_deployment_id")] == $predecessor
+      and .fresh_queue != null' "$manifest_path" >/dev/null \
+    || fail "$service stopped predecessor differs from release evidence"
+  deployment_runtime_json "$predecessor_id" \
+    | jq -e '.deploymentStopped == true' >/dev/null \
+    || fail "$service predecessor is not confirmed stopped"
+  deployment_runtimes="$(service_deployment_runtimes_json "$service")" \
+    || fail "$service deployment stop query failed"
+  jq -e --arg predecessor "$predecessor_id" '
+    type == "array" and length > 0 and any(.[]; .id == $predecessor)
+    and all(.[]; (.id | type) == "string" and (.id | length) > 0
+      and .deploymentStopped == true
+      and (.status == "SUCCESS" or .status == "REMOVED" or .status == "FAILED"
+        or .status == "CRASHED" or .status == "SKIPPED" or .status == "SLEEPING"))
+  ' >/dev/null <<<"$deployment_runtimes" \
+    || fail "$service has unstopped, unresolved or unknown deployment state"
+}
+
+validate_fresh_queue_variables() {
+  local service envelope namespace
+  envelope="$(jq -c '.cutover' <<<"$fresh_queue_metadata")"
+  namespace="$(jq -r '.namespace' <<<"$envelope")"
+  for service in "${RAILWAY_SERVICES[@]}"; do
+    railway variable list --project "$RAILWAY_PROJECT_ID" \
+      --environment "$RAILWAY_ENVIRONMENT" --service "$service" --json \
+      | jq -e --arg envelope "$envelope" --arg namespace "$namespace" --arg role "$service" \
+        '.WORKSPACE_QUEUE_CUTOVER == $envelope and .DRAMATIQ_NAMESPACE == $namespace
+          and .SERVICE_ROLE == $role and (.TENANT_ID // "default") == "default"' >/dev/null \
+      || fail "$service fresh cutover variables are missing or inconsistent"
+  done
+}
+
+preflight_fresh_queue_cutover() {
+  local service predecessor_variable predecessor_id variables old_namespace schema_head
+  [[ "$bridge_required" == "false" ]] \
+    || fail "fresh queue cannot be combined with a review Outbox capability bridge"
+  schema_head="$(uv run --frozen --no-dev python -c \
+    'from apps.cli.retire_workspace_queue import EXPECTED_SCHEMA; print(EXPECTED_SCHEMA)')"
+  [[ "$(target_database_head)" == "$schema_head" ]] \
+    || fail "fresh queue requires the retirement command's exact schema head"
+  [[ "$(image_digest "$latest_ref")" == "$previous_digest" ]] \
+    || fail "fresh queue must start before target promotion"
+  for service in "${RAILWAY_SERVICES[@]}"; do
+    predecessor_variable="previous_${service}_deployment_id"
+    predecessor_id="${!predecessor_variable}"
+    role_runtime_converged "$service" "$predecessor_id" "$previous_digest"
+    variables="$(railway variable list --project "$RAILWAY_PROJECT_ID" \
+      --environment "$RAILWAY_ENVIRONMENT" --service "$service" --json)"
+    jq -e 'has("WORKSPACE_QUEUE_CUTOVER") | not' >/dev/null <<<"$variables" \
+      || fail "$service already has a cutover envelope; operator recovery review required"
+    jq -e '(.TENANT_ID // "default") == "default"' >/dev/null <<<"$variables" \
+      || fail "fresh queue requires the default tenant on every role"
+    old_namespace="$(jq -r '.DRAMATIQ_NAMESPACE // "dramatiq"' <<<"$variables")"
+    fresh_queue_metadata="$(jq --arg service "$service" --arg namespace "$old_namespace" \
+      '.previous_namespaces[$service] = $namespace' <<<"$fresh_queue_metadata")"
+  done
+  write_manifest "prepared" "$recorded_rollout_phase"
+}
+
+prepare_fresh_queue_cutover() {
+  local service predecessor_variable predecessor_id deadline runtime stopped
+  local before envelope namespace
+  preflight_fresh_queue_cutover
+  for service in scheduler worker api; do
+    fresh_queue_metadata="$(jq --arg phase "stopping_${service}" \
+      '.phase = $phase' <<<"$fresh_queue_metadata")"
+    write_manifest "deploying" "$recorded_rollout_phase"
+    log "fresh cutover: stopping $service; receiving/sending downtime is intentional"
+    railway down --project "$RAILWAY_PROJECT_ID" --environment "$RAILWAY_ENVIRONMENT" \
+      --service "$service" --yes \
+      || fail "could not stop $service; retain manifest and review before recovery"
+    predecessor_variable="previous_${service}_deployment_id"
+    predecessor_id="${!predecessor_variable}"
+    deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
+    stopped="false"
+    while (( SECONDS < deadline )); do
+      runtime="$(deployment_runtime_json "$predecessor_id")"
+      stopped="$(jq -r '.deploymentStopped // false' <<<"$runtime")"
+      [[ "$stopped" == "true" ]] && break
+      sleep 5
+    done
+    [[ "$stopped" == "true" ]] || fail "$service stop timed out; cutover not confirmed"
+    assert_fresh_role_stopped "$service"
+    fresh_queue_metadata="$(jq --arg phase "stopped_${service}" \
+      '.phase = $phase' <<<"$fresh_queue_metadata")"
+    write_manifest "deploying" "$recorded_rollout_phase"
+  done
+  for service in "${RAILWAY_SERVICES[@]}"; do
+    assert_fresh_role_stopped "$service"
+  done
+  before="$(python3 -c \
+    'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="microseconds"))')"
+  fresh_queue_metadata="$(jq --arg before "$before" \
+    '.phase = "all_stopped" | .cutover.before = $before | .cutover.processes_stopped = true' \
+    <<<"$fresh_queue_metadata")"
+  write_manifest "deploying" "$recorded_rollout_phase"
+  envelope="$(jq -c '.cutover' <<<"$fresh_queue_metadata")"
+  namespace="$(jq -r '.namespace' <<<"$envelope")"
+  for service in "${RAILWAY_SERVICES[@]}"; do
+    assert_fresh_role_stopped "$service"
+    railway variable set "DRAMATIQ_NAMESPACE=$namespace" "WORKSPACE_QUEUE_CUTOVER=$envelope" \
+      --project "$RAILWAY_PROJECT_ID" --environment "$RAILWAY_ENVIRONMENT" \
+      --service "$service" --skip-deploys \
+      || fail "$service cutover variables failed; do not start any role"
+  done
+  validate_fresh_queue_variables
+  validate_railway_config
+  fresh_queue_metadata="$(jq '.phase = "configured"' <<<"$fresh_queue_metadata")"
+  write_manifest "deploying" "$recorded_rollout_phase"
+}
+
+if [[ "$fresh_queue" == "true" ]]; then
+  prepare_fresh_queue_cutover
+fi
+
 if [[ "$bridge_required" == "true" ]]; then
   log "activating review Outbox capability bridge: ${previous_review_outbox_capability} -> ${target_review_outbox_capability}"
   run_capability_bridge_rollout
@@ -1272,6 +1464,10 @@ validate_railway_image_auto_updates
 revalidate_dev_head
 require_latest_digest "$expected_digest" "final verification"
 recorded_rollout_phase="complete"
+if [[ "$fresh_queue" == "true" ]]; then
+  validate_fresh_queue_variables
+  fresh_queue_metadata="$(jq '.phase = "completed"' <<<"$fresh_queue_metadata")"
+fi
 write_manifest "completed" "$recorded_rollout_phase"
 
 log "release complete: $full_sha -> $expected_digest"

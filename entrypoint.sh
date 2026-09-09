@@ -11,6 +11,13 @@ if [ -z "$ROLE" ]; then
   echo "[entrypoint] SERVICE_ROLE is required (expected api|worker|scheduler)" >&2
   exit 1
 fi
+startup_cutover() {
+  if [ "${WORKSPACE_QUEUE_CUTOVER+x}" = x ]; then
+    python -m scripts.apply_startup_cutover "$1"
+  fi
+}
+startup_cutover --validate
+
 validate_worker_integer() {
   name="$1"
   value="$2"
@@ -32,6 +39,7 @@ case "$ROLE" in
   api)
     echo "[entrypoint] preparing database and encrypted secrets..."
     python -m scripts.prepare_database
+    startup_cutover --apply
     echo "[entrypoint] starting API on port ${PORT}..."
     exec uvicorn apps.api.main:app --host 0.0.0.0 --port "${PORT}"
     ;;
@@ -49,12 +57,14 @@ case "$ROLE" in
     export dramatiq_worker_timeout="$DRAMATIQ_WORKER_TIMEOUT_MS"
     echo "[entrypoint] verifying database readiness..."
     python -m scripts.assert_database_ready
+    startup_cutover --check
     echo "[entrypoint] starting dramatiq worker (${DRAMATIQ_PROCESSES} processes, ${DRAMATIQ_THREADS} threads/process, ${DRAMATIQ_WORKER_TIMEOUT_MS}ms idle timeout)..."
     exec dramatiq --processes "$DRAMATIQ_PROCESSES" --threads "$DRAMATIQ_THREADS" apps.worker.main
     ;;
   scheduler)
     echo "[entrypoint] verifying database readiness..."
     python -m scripts.assert_database_ready
+    startup_cutover --check
     echo "[entrypoint] starting recovery scheduler..."
     exec python -m apps.scheduler.main
     ;;
