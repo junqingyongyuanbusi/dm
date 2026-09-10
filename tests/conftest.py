@@ -1,5 +1,6 @@
 import os
 
+import pytest
 from sqlalchemy.engine import make_url
 
 # 测试套件必须与开发者本地 .env 隔离（密闭性）：
@@ -52,3 +53,15 @@ for _k, _v in _TEST_DEFAULTS.items():
 _database_name = make_url(os.environ["DATABASE_URL"]).database or ""
 if not _database_name.endswith("_test"):
     raise RuntimeError(f"pytest refuses to use non-test database: {_database_name or '<missing>'}")
+
+
+@pytest.fixture(autouse=True)
+def _reset_dispatch_cursor(monkeypatch):
+    """补扫的 `_dispatch_cursor` 是进程内遍历提示，不是业务事实。
+
+    跨测试残留会让批次从上一个测试的 UUID 之后开始（sweep.py:284-291），
+    随机漏掉本测试自己插入的行，造成顺序相关的 flake。每个测试从干净进度开始。
+    """
+    from social_reply.application.message_delivery import sweep
+
+    monkeypatch.setattr(sweep, "_dispatch_cursor", None)

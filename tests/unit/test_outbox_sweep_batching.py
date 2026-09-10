@@ -9,11 +9,6 @@ from sqlalchemy.dialects import postgresql
 from social_reply.application.message_delivery import sweep as sweep_module
 
 
-@pytest.fixture(autouse=True)
-def reset_dispatch_cursor(monkeypatch):
-    monkeypatch.setattr(sweep_module, "_dispatch_cursor", None)
-
-
 def _capture_sweep(monkeypatch, pending_batches=((),), *, stale_candidate_ids=()):
     statements = []
     pending_results = iter(pending_batches)

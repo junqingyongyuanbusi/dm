@@ -13,11 +13,6 @@ from social_reply.infrastructure.database import models
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture(autouse=True)
-def reset_dispatch_cursor(monkeypatch):
-    monkeypatch.setattr(sweep_module, "_dispatch_cursor", None)
-
-
 async def _seed(
     session, *, status="PENDING", next_attempt_at=None, locked_at=None, attempt_count=0
 ):
