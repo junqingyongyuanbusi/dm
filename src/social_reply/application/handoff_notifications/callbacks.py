@@ -90,11 +90,19 @@ def callback_request_digest(
     nonce: str | None,
     signature: str | None,
 ) -> VerifiedFeishuCallback:
-    if not verification_token.strip() or not encrypt_key.strip():
+    if not verification_token.strip():
         raise FeishuSecurityError()
-    verify_signature(
-        timestamp=timestamp, nonce=nonce, signature=signature, encrypt_key=encrypt_key, body=body
-    )
+    # 交互卡片回调（card.action.trigger）只用 Verification Token 鉴权，飞书不投递
+    # X-Lark 签名头（body 加密时同样没有）。强制要求签名会把每一条真实回调拒成 401，
+    # 飞书侧表现为错误码 200671。签名仅在客户端确实提供时校验，避免放松验签强度。
+    if timestamp and nonce and signature:
+        verify_signature(
+            timestamp=timestamp,
+            nonce=nonce,
+            signature=signature,
+            encrypt_key=encrypt_key,
+            body=body,
+        )
     envelope = parse_json_object(body)
     encrypted = envelope.get("encrypt")
     payload = (

@@ -874,8 +874,10 @@ async def test_card_action_claim_is_atomic_and_duplicate_event_is_idempotent(ses
     ).scalar_one() == 0
 
 
-async def test_card_action_requires_signature_and_verification_token(session):
-    # Card HTTP callbacks with an Encrypt Key must authenticate the raw request body.
+async def test_plaintext_card_action_is_authenticated_by_verification_token(session):
+    # 飞书把交互卡片回调作为明文 JSON 投递，仅用 Verification Token（header.token）
+    # 鉴权，不带 X-Lark 签名头。两条回调路由都必须接受未签名回调——若强制要求签名，
+    # 每条真实回调都会被拒成 401，飞书侧表现为错误码 200671。
     feishu_account_id = await _seed_account(session)
     _, work_id, public_id, nonce, _operator_ids = await _seed_card_work(
         session,
@@ -892,14 +894,32 @@ async def test_card_action_requires_signature_and_verification_token(session):
         card_revision=1,
     )
     app = _app(handoff_notifications_enabled=True)
-    response = await _post(app, "/webhooks/feishu/fs_primary", json_body=payload)
 
-    assert response.status_code == 401
+    by_base = await _post(app, "/webhooks/feishu/fs_primary", json_body=payload)
+    assert by_base.status_code == 200
+    assert by_base.json()["toast"]["type"] == "success"
     session.expire_all()
     work = await session.get(models.HumanWorkItem, work_id)
-    assert work is not None and work.status == "WAITING"
-    assert work.assigned_user_id is None
+    assert work.status == "CLAIMED"
+    assert work.assigned_actor == "user:ou_agent"
 
+    # 签名头存在但错误时必须照常拒绝：可选不等于不校验。
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    timestamp, request_nonce = str(int(time.time())), "tampered-signature"
+    tampered = await _post(
+        app,
+        "/webhooks/feishu/fs_primary/card-actions",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Lark-Request-Timestamp": timestamp,
+            "X-Lark-Request-Nonce": request_nonce,
+            "X-Lark-Signature": "0" * 64,
+        },
+    )
+    assert tampered.status_code == 401
+
+    # Verification Token 不匹配时，在任何回执写入或状态变更前拒绝。
     bad_payload = _card_action_payload(
         event_id="evt_plain_bad",
         operator_open_id="ou_agent",
@@ -910,38 +930,11 @@ async def test_card_action_requires_signature_and_verification_token(session):
         card_revision=1,
     )
     bad_payload["header"]["token"] = "not-the-token"
-    bad_body, bad_headers = _encrypted_request(bad_payload)
-    bad = await _post(
-        app,
-        "/webhooks/feishu/fs_primary/card-actions",
-        content=bad_body,
-        headers=bad_headers,
-    )
+    bad = await _post(app, "/webhooks/feishu/fs_primary/card-actions", json_body=bad_payload)
     assert bad.status_code == 401
     assert (
         await session.execute(select(func.count()).select_from(models.FeishuCardActionReceipt))
-    ).scalar_one() == 0
-
-    body = json.dumps(payload, separators=(",", ":")).encode()
-    timestamp, request_nonce = str(int(time.time())), "signed-plaintext"
-    signature = hashlib.sha256(
-        (timestamp + request_nonce + _ENCRYPT_KEY).encode() + body
-    ).hexdigest()
-    signed = await _post(
-        app,
-        "/webhooks/feishu/fs_primary/card-actions",
-        content=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Lark-Request-Timestamp": timestamp,
-            "X-Lark-Request-Nonce": request_nonce,
-            "X-Lark-Signature": signature,
-        },
-    )
-    assert signed.status_code == 200
-    assert signed.json()["toast"]["type"] == "success"
-    await session.refresh(work)
-    assert work.status == "CLAIMED"
+    ).scalar_one() == 1
 
 
 async def test_card_action_accepts_json_string_encoded_button_value(session):

@@ -44,12 +44,10 @@ def _request():
     )
 
 
-@pytest.mark.parametrize("change", ["missing_signature", "bad_signature", "token", "app", "body"])
+@pytest.mark.parametrize("change", ["bad_signature", "token", "app", "body"])
 def test_unverified_body_cannot_produce_callback_proof(change):
     _event, body, values = _request()
-    if change == "missing_signature":
-        values["signature"] = None
-    elif change == "bad_signature":
+    if change == "bad_signature":
         values["signature"] = "0" * 64
     elif change == "token":
         values["verification_token"] = "different-token"
@@ -59,6 +57,17 @@ def test_unverified_body_cannot_produce_callback_proof(change):
         body += b" "
     with pytest.raises(FeishuSecurityError):
         callback_request_digest(body, **values)
+
+
+def test_unsigned_card_callback_is_authenticated_by_verification_token_only():
+    # 飞书交互卡片回调不投递 X-Lark 签名头。缺失签名必须被接受——强制要求会把每条
+    # 真实回调拒成 401，飞书侧表现为错误码 200671。签名存在时仍走严格校验（见上）。
+    _event, body, values = _request()
+    values.update({"timestamp": None, "nonce": None, "signature": None})
+    proof = callback_request_digest(body, **values)
+    assert proof.is_verified
+    assert proof.provider_event_id == "event-1"
+    assert proof.digest == hashlib.sha256(body).hexdigest()
 
 
 def test_valid_callback_proof_is_bound_to_verified_body():

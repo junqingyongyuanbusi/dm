@@ -149,6 +149,18 @@ async def _account_payload(public_id: str, request: Request):
     except FeishuSecurityError as exc:
         status_code = 413 if exc.code == "feishu_request_too_large" else 401
         detail = "feishu_request_too_large" if status_code == 413 else "invalid_feishu_request"
+        # 401 是本路由唯一的非 200 出口，也是飞书 200671 的唯一来源；记录脱敏后的
+        # 拒绝原因与签名头存在性，避免再次只能靠 access log 反推。
+        logger.warning(
+            "feishu callback rejected account=%s reason=%s signed=%s",
+            account.public_id,
+            exc.code,
+            bool(
+                request.headers.get("X-Lark-Request-Timestamp")
+                and request.headers.get("X-Lark-Request-Nonce")
+                and request.headers.get("X-Lark-Signature")
+            ),
+        )
         raise HTTPException(status_code=status_code, detail=detail) from None
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=404, detail="feishu_account_not_found") from None
