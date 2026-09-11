@@ -32,7 +32,13 @@ _GROUPED_DIGITS = re.compile(r"(?<!\d)\d(?:[\s\-–—.·]*\d){5,}(?!\d)")
 _URL = re.compile(r"(?i)(?<![A-Z0-9_])(?:https?://|www\.)[A-Z0-9][^\s<>()]*")
 _BARE_DOMAIN = re.compile(
     r"(?i)(?<![A-Z0-9_@.-])"
-    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,24}"
+    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+"
+    # 顶级域必须真实存在：2 字母国家码，或下列通用顶级域。原规则只要求「字母.字母」，
+    # 于是句号后缺空格的普通句子（"misleading.While"、"1.Fundamental"）被误判成域名，
+    # 既误拦发布，也让正常的出站回复被 GUARD_PII_LEAK 无谓降级。
+    r"(?:com|net|org|gov|edu|mil|int|info|biz|name|pro|app|dev|xyz|online|site|shop|store"
+    r"|tech|cloud|blog|news|live|wiki|top|vip|club|work|art|page|link|email|group|travel|jobs"
+    r"|[A-Z]{2})"
     r"(?::\d{2,5})?(?:/[^\s<>()]*)?(?![A-Z0-9_.-])"
 )
 _HANDLE = re.compile(r"(?i)(?<![A-Z0-9_.+@-])@[A-Z0-9_][A-Z0-9_.-]{0,31}(?![A-Z0-9_@.-])")
@@ -40,8 +46,10 @@ _MESSAGING_ID = re.compile(
     r"(?ix)"
     r"(?:whats\s*app|we\s*chat|wechat|weixin|telegram|signal|skype|line|qq"
     r"|messenger|discord|viber|kakao\s*talk|kakaotalk|feishu|lark|微信|微訊|飞书|飛書)"
-    r"\s*(?:(?:id|user(?:name)?|handle|number|no\.?|账号|帳號|号码|號碼|号|號)"
-    r"\s*[:：]?\s*|[:：]\s*)"
+    # 联系方式必须与 App 名/标签同行：允许空白但不允许换行。否则小标题
+    # 「The Bottom Line:」换行后的正文首词会被当成 LINE 账号，误拦正常内容。
+    r"[^\S\n]*(?:(?:id|user(?:name)?|handle|number|no\.?|账号|帳號|号码|號碼|号|號)"
+    r"[^\S\n]*[:：]?[^\S\n]*|[:：][^\S\n]*)"
     r"(?:@|\+)?[A-Z0-9][A-Z0-9_.+-]{1,63}"
 )
 _SERVICE_NUMBER_CONTEXT = (
@@ -133,32 +141,43 @@ _IMPLICITLY_PROTECTED_ACRONYMS = frozenset(
 _FACT_SEPARATOR = re.compile(r"(?i)\b(?:and|or|ou|y|e)\b|[;,，；]|或|和|以及")
 
 
+# 联系方式检测分两类：域名类可被自有域名白名单放行，非域名类一律拦截。
+_DOMAIN_CONTACT_PATTERNS = (_URL, _BARE_DOMAIN)
+_OTHER_CONTACT_PATTERNS = (
+    _GROUPED_DIGITS,
+    _EMAIL,
+    _HANDLE,
+    _MESSAGING_ID,
+    _SHORT_SERVICE_NUMBER,
+)
+_CONTACT_PATTERNS = _OTHER_CONTACT_PATTERNS + _DOMAIN_CONTACT_PATTERNS
+
+# 官方自有域名。命中它的内容视为「已批准的联系方式」：既不阻塞知识发布
+# （publication._require_publishable），也不在投递时触发 GUARD_PII_LEAK 降级。
+# 子域自动覆盖（如 www.wikifx.com）。第三方域名——监管机构、经纪商、潜在克隆站——
+# 仍需人工审核，一律不列入；新增自有域名时在此追加即可。
+APPROVED_CONTACT_DOMAINS = frozenset({"wikifx.com"})
+
+
+def _is_approved_contact_domain(value: str) -> bool:
+    host = re.sub(r"(?i)^[a-z][a-z0-9+.-]*://", "", value)
+    host = host.split("/", 1)[0].split(":", 1)[0].strip(".").lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in APPROVED_CONTACT_DOMAINS)
+
+
 def has_contact_like(text: str) -> bool:
+    if any(pattern.search(text) for pattern in _OTHER_CONTACT_PATTERNS):
+        return True
     return any(
-        pattern.search(text)
-        for pattern in (
-            _GROUPED_DIGITS,
-            _EMAIL,
-            _URL,
-            _BARE_DOMAIN,
-            _HANDLE,
-            _MESSAGING_ID,
-            _SHORT_SERVICE_NUMBER,
-        )
+        not _is_approved_contact_domain(match.group(0))
+        for pattern in _DOMAIN_CONTACT_PATTERNS
+        for match in pattern.finditer(text)
     )
 
 
 def contact_values(text: str) -> tuple[str, ...]:
     values: list[str] = []
-    for pattern in (
-        _GROUPED_DIGITS,
-        _EMAIL,
-        _URL,
-        _BARE_DOMAIN,
-        _HANDLE,
-        _MESSAGING_ID,
-        _SHORT_SERVICE_NUMBER,
-    ):
+    for pattern in _CONTACT_PATTERNS:
         values.extend(match.group(0) for match in pattern.finditer(text))
     return tuple(dict.fromkeys(values))
 

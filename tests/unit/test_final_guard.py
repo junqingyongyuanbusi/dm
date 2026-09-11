@@ -218,6 +218,17 @@ def test_pii_with_dash_separators_blocked():
         "Broker license 12345 is listed for reference.",
         "The risk score is 9555 out of 10000.",
         "The malformed values https:// and www. are not contact destinations.",
+        # 句号后缺空格：普通句子曾被裸域名规则误判成域名，误拦发布并让正常回复降级。
+        "No, that claim is misleading.While segregated accounts matter, they are not a guarantee.",
+        "1.Fundamental Analysis 2. Technical Analysis 3. Sentiment",
+        "Please check our official Telegram signal group.Please be cautious of fake groups.",
+        # 「The Bottom Line:」是小标题，不是 LINE 账号。
+        "The Bottom Line:\nIf a broker is only registered, no regulator can help you.",
+        # 自有域名视为已批准的联系方式。
+        "Visit www.wikifx.com to verify the broker.",
+        "Check https://www.wikifx.com/broker before depositing.",
+        "The official site is wikifx.com.",
+        "See app.wikifx.com for the mobile app.",
     ),
 )
 def test_contact_like_detector_avoids_bounded_false_positives(reply_text):
@@ -227,6 +238,30 @@ def test_contact_like_detector_avoids_bounded_false_positives(reply_text):
         reply_visibility=Visibility.PUBLIC,
     )
     assert run_final_guard(decision, "telegram").action is ReplyAction.AUTO_REPLY
+
+
+@pytest.mark.parametrize(
+    "reply_text",
+    (
+        # 第三方域名（监管机构、经纪商、潜在克隆站）仍须拦截。
+        "Visit binary.com for details.",
+        "Check register.fca.org.uk to confirm the license.",
+        "See cysec.gov.cy for the regulator.",
+        # 白名单不能被后缀/子串绕过。
+        "Visit www.fake-wikifx.com now.",
+        "Open wikifx.com.evil.net to continue.",
+        "Go to evil.com/?ref=wikifx.com for the bonus.",
+    ),
+)
+def test_approved_domain_allowlist_cannot_be_bypassed(reply_text):
+    decision = ReplyDecision(
+        action=ReplyAction.AUTO_REPLY,
+        reply_text=reply_text,
+        reply_visibility=Visibility.PUBLIC,
+    )
+    result = run_final_guard(decision, "telegram")
+    assert result.action is ReplyAction.HANDOFF
+    assert "GUARD_PII_LEAK" in result.reason_codes
 
 
 def test_too_long_downgraded():
