@@ -1,8 +1,8 @@
 .channel-workspace {
-  --channel-text: #20252c;
-  --channel-muted: #69727e;
-  --channel-line: #e7e9ed;
-  --channel-green: #12765c;
+  --channel-text: var(--app-text, #20252c);
+  --channel-muted: var(--app-text-muted, #69727e);
+  --channel-line: var(--app-border, #e7e9ed);
+  --channel-green: var(--app-accent, #12765c);
   color: var(--channel-text);
   min-width: 0;
 }
@@ -15,7 +15,7 @@
 }
 
 .channel-workspace-metric {
-  background: #fff;
+  background: var(--app-surface);
   border: 1px solid var(--channel-line);
   border-radius: 10px;
   padding: 21px;
@@ -52,7 +52,7 @@
   padding: 0 11px;
   border: 1px solid var(--channel-line);
   border-radius: 7px;
-  background: #fff;
+  background: var(--app-surface);
   color: var(--channel-muted);
 }
 
@@ -77,9 +77,9 @@
   width: 160px;
   min-height: 39px;
   padding: 8px 10px;
-  border: 1px solid #dce0e6;
+  border: 1px solid var(--app-border-strong);
   border-radius: 7px;
-  background: #fff;
+  background: var(--app-surface);
   font: inherit;
   font-size: 14px;
   color: var(--channel-text);
@@ -110,7 +110,7 @@
   min-width: 0;
   border: 1px solid var(--channel-line);
   border-radius: 12px;
-  background: #fff;
+  background: var(--app-surface);
 }
 
 .channel-workspace-card-top,
@@ -129,7 +129,7 @@
   height: 40px;
   flex: none;
   border-radius: 12px;
-  background: #eef1f6;
+  background: var(--app-surface-muted);
 }
 
 .channel-workspace-platform-facebook { background: #eaf0ff; }
@@ -148,14 +148,14 @@
   font-size: 12px;
   font-weight: 500;
   line-height: 1.5;
-  background: #f0f2f5;
-  color: #5e6875;
+  background: var(--app-surface-muted);
+  color: var(--app-text-muted);
 }
 
-.channel-workspace-badge-success { color: #14664b; background: #e7f5ee; }
-.channel-workspace-badge-warning { color: #895512; background: #fff2dd; }
-.channel-workspace-badge-danger { color: #a93c37; background: #fceeed; }
-.channel-workspace-badge-muted { color: #717782; background: #f5f5f6; }
+.channel-workspace-badge-success { color: var(--app-success); background: var(--app-success-soft); }
+.channel-workspace-badge-warning { color: var(--app-warning); background: var(--app-warning-soft); }
+.channel-workspace-badge-danger { color: var(--app-danger); background: var(--app-danger-soft); }
+.channel-workspace-badge-muted { color: var(--app-text-muted); background: var(--app-surface-strong); }
 
 .channel-workspace-identity h3 {
   font-size: 16px;
@@ -184,8 +184,8 @@
 }
 
 .channel-workspace-account-details dt { color: var(--channel-muted); flex: none; }
-.channel-workspace-account-details dd { color: #58685f; margin: 0; text-align: right; overflow-wrap: anywhere; }
-.channel-workspace-blocked { color: #a93c37; }
+.channel-workspace-account-details dd { color: var(--app-text-subtle); margin: 0; text-align: right; overflow-wrap: anywhere; }
+.channel-workspace-blocked { color: var(--app-danger); }
 
 .channel-workspace-card-footer {
   border-top: 1px solid var(--channel-line);
@@ -211,16 +211,16 @@
   min-height: 39px;
   font-size: 14px;
   font-weight: 500;
-  border: 1px solid #dce0e6;
+  border: 1px solid var(--app-border-strong);
   border-radius: 7px;
   color: var(--channel-text);
-  background: #fff;
+  background: var(--app-surface);
   text-decoration: none;
   cursor: pointer;
 }
 
 .channel-workspace-button-small { padding: 6px 10px; min-height: 32px; font-size: 13px; }
-.channel-workspace-button:hover { background: #f3f5f7; }
+.channel-workspace-button:hover { background: var(--app-surface-muted); }
 
 .channel-workspace-add {
   font: inherit;
@@ -235,8 +235,8 @@
   text-decoration: none;
 }
 
-.channel-workspace-add:hover { border-color: #9ab5a6; background: #f2f7f3; text-decoration: none; }
-.channel-workspace-add-symbol { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 11px; background: #e9eeeb; color: #687774; font-size: 26px; }
+.channel-workspace-add:hover { border-color: color-mix(in srgb, var(--app-accent) 35%, var(--app-surface)); background: var(--app-accent-soft); text-decoration: none; }
+.channel-workspace-add-symbol { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 11px; background: var(--app-surface-strong); color: var(--app-text-muted); font-size: 26px; }
 .channel-workspace-add p { margin: 0; color: var(--channel-muted); font-size: 13px; line-height: 1.7; }
 .channel-workspace-empty { padding: 36px 20px; text-align: center; }
 .channel-workspace-empty h2 { font-size: 17px; margin: 0 0 8px; }
@@ -244,7 +244,7 @@
 .channel-workspace-progress {
   border: 1px solid var(--channel-line);
   border-radius: 12px;
-  background: #fff;
+  background: var(--app-surface);
   margin-top: 24px;
   scroll-margin-top: 20px;
 }
@@ -257,7 +257,7 @@
   overflow-y: auto;
   border: 1px solid var(--channel-line);
   border-radius: 14px;
-  background: #fff;
+  background: var(--app-surface);
   color: var(--channel-text);
   box-shadow: 0 24px 80px #20252c26;
 }
@@ -289,9 +289,18 @@
 .channel-workspace #maintenance-channels { margin-top: 24px; }
 
 .channel-workspace :is(a, button, input, select, summary):focus-visible {
-  outline: 3px solid #2563eb;
+  outline: 3px solid var(--app-info);
   outline-offset: 3px;
 }
+
+html[data-theme="dark"] .channel-workspace-platform-facebook { background: #12224a; }
+html[data-theme="dark"] .channel-workspace-platform-instagram { background: #3a1f30; color: #e387bd; }
+html[data-theme="dark"] .channel-workspace-platform-telegram { background: #10303f; }
+html[data-theme="dark"] .channel-workspace-platform-whatsapp { background: #143526; color: #4ed68f; }
+html[data-theme="dark"] .channel-workspace-platform-email { background: #23262e; }
+
+/* The X logo asset is solid near-black; invert it so it stays visible on dark surfaces. */
+html[data-theme="dark"] .channel-workspace-platform img[src$="/x.svg"] { filter: invert(1); }
 
 @media (max-width: 1180px) {
   .channel-workspace-grid,
