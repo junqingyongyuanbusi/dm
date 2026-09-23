@@ -164,9 +164,9 @@ async def test_request_persists_complete_operation_contract(
     from social_reply.application.account_management import kill_switch_recovery
 
     monkeypatch.setattr(
-        kill_switch_recovery.aioredis,
-        "from_url",
-        lambda _url: fake_redis,
+        kill_switch_recovery,
+        "make_async_redis_client",
+        lambda: fake_redis,
     )
 
     _token, admin_session_id = await issue_session()
@@ -224,9 +224,9 @@ async def test_sweep_recovers_pending_command_after_crash_window(
     from social_reply.application.account_management import kill_switch_recovery
 
     monkeypatch.setattr(
-        kill_switch_recovery.aioredis,
-        "from_url",
-        lambda _url: fake_redis,
+        kill_switch_recovery,
+        "make_async_redis_client",
+        lambda: fake_redis,
     )
 
     recovered = await sweep_account_kill_switch_commands(batch_size=10)
@@ -267,9 +267,9 @@ async def test_newer_command_supersedes_stale_command_without_old_overwrite(
     from social_reply.application.account_management import kill_switch_recovery
 
     monkeypatch.setattr(
-        kill_switch_recovery.aioredis,
-        "from_url",
-        lambda _url: fake_redis,
+        kill_switch_recovery,
+        "make_async_redis_client",
+        lambda: fake_redis,
     )
 
     recovered = await sweep_account_kill_switch_commands(batch_size=10)
@@ -308,9 +308,9 @@ async def test_ambiguous_redis_delete_is_fail_closed_then_retried_idempotently(
     from social_reply.application.account_management import kill_switch_recovery
 
     monkeypatch.setattr(
-        kill_switch_recovery.aioredis,
-        "from_url",
-        lambda _url: fake_redis,
+        kill_switch_recovery,
+        "make_async_redis_client",
+        lambda: fake_redis,
     )
 
     first_recovered = await sweep_account_kill_switch_commands(batch_size=10)
@@ -384,9 +384,9 @@ async def test_uncertain_target_and_stale_ownership_remain_fail_closed(
     from social_reply.application.account_management import kill_switch_recovery
 
     monkeypatch.setattr(
-        kill_switch_recovery.aioredis,
-        "from_url",
-        lambda _url: fake_redis,
+        kill_switch_recovery,
+        "make_async_redis_client",
+        lambda: fake_redis,
     )
 
     recovered = await sweep_account_kill_switch_commands(batch_size=10)
@@ -432,9 +432,9 @@ async def test_sweep_limits_each_pass_by_account(
     from social_reply.application.account_management import kill_switch_recovery
 
     monkeypatch.setattr(
-        kill_switch_recovery.aioredis,
-        "from_url",
-        lambda _url: fake_redis,
+        kill_switch_recovery,
+        "make_async_redis_client",
+        lambda: fake_redis,
     )
 
     first_pass = await sweep_account_kill_switch_commands(batch_size=1)
@@ -484,7 +484,7 @@ async def test_staff_redis_retry_rechecks_current_authority(
     await session.commit()
     key = _redis_key(account.id)
     redis = FakeRedis(values={key}, fail_delete_after_apply_once=True)
-    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    monkeypatch.setattr(kill_switch_recovery, "make_async_redis_client", lambda: redis)
     with pytest.raises(RuntimeError, match="redis delete result unknown"):
         await channel_management.set_channel_account_kill_switch(
             tenant_id="default", account_id=account.id, actor=actor, enabled=False
@@ -552,7 +552,7 @@ async def test_rejected_command_only_retries_protective_write(session, migrated_
     user.role = "USER"
     await session.commit()
     redis = FakeRedis(fail_set=True)
-    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    monkeypatch.setattr(kill_switch_recovery, "make_async_redis_client", lambda: redis)
     assert await reconcile_account_kill_switch_command(operation_id) == "FAIL_CLOSED_PENDING"
     user.role = "WORKSPACE_ADMIN"
     await session.commit()
@@ -592,7 +592,7 @@ async def test_rejected_batch_does_not_starve_later_valid_command(
         rows.append((account, audit))
     await session.commit()
     redis = FakeRedis(values={_redis_key(account.id) for account, _ in rows})
-    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    monkeypatch.setattr(kill_switch_recovery, "make_async_redis_client", lambda: redis)
     await sweep_account_kill_switch_commands(batch_size=2)
     await sweep_account_kill_switch_commands(batch_size=2)
     for _account, audit in rows:
@@ -630,7 +630,7 @@ async def test_invalid_account_scope_is_quarantined_without_starving_valid_work(
     )
     await session.commit()
     redis = FakeRedis()
-    monkeypatch.setattr(kill_switch_recovery.aioredis, "from_url", lambda _url: redis)
+    monkeypatch.setattr(kill_switch_recovery, "make_async_redis_client", lambda: redis)
     assert await sweep_account_kill_switch_commands(batch_size=1) == [invalid.id]
     await session.refresh(invalid)
     assert invalid.detail["status"] == "QUARANTINED"

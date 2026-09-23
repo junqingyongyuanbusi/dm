@@ -39,17 +39,12 @@ def test_production_broker_configures_redis_timeouts_and_namespace(monkeypatch, 
     captured = {}
     redis_client = object()
     redis_broker = object()
+    redis_factory = Mock(return_value=redis_client)
     monkeypatch.delenv("DRAMATIQ_NAMESPACE", raising=False)
     namespace_options = {} if namespace is None else {"dramatiq_namespace": namespace}
     settings = Settings(_env_file=None, testing=True, **namespace_options)
     expected_namespace = "dramatiq" if namespace is None else namespace
     assert settings.dramatiq_namespace == expected_namespace
-
-    class FakeRedis:
-        @classmethod
-        def from_url(cls, url, **kwargs):
-            captured["redis"] = (url, kwargs)
-            return redis_client
 
     monkeypatch.setattr(
         broker_module,
@@ -58,7 +53,7 @@ def test_production_broker_configures_redis_timeouts_and_namespace(monkeypatch, 
             update={"testing": False, "redis_url": "redis://queue.example/0"}
         ),
     )
-    monkeypatch.setattr(broker_module, "Redis", FakeRedis)
+    monkeypatch.setattr(broker_module, "make_sync_redis_client", redis_factory)
     broker_factory = Mock(return_value=redis_broker)
     monkeypatch.setattr(broker_module, "RedisBroker", broker_factory)
     monkeypatch.setattr(
@@ -70,10 +65,7 @@ def test_production_broker_configures_redis_timeouts_and_namespace(monkeypatch, 
     assert broker_module.setup_broker() is redis_broker
     broker_factory.assert_called_once_with(client=redis_client, namespace=expected_namespace)
     assert captured["broker"] is redis_broker
-    assert captured["redis"] == (
-        "redis://queue.example/0",
-        {"socket_connect_timeout": 3, "socket_timeout": 3},
-    )
+    redis_factory.assert_called_once_with("redis://queue.example/0")
 
 
 @pytest.mark.parametrize("namespace", ["A", "a" * 64, "Fresh_queue-2026"])
@@ -113,7 +105,7 @@ def test_custom_namespace_does_not_change_stub_broker(monkeypatch):
     broker_factory = Mock(side_effect=AssertionError("StubBroker must not create RedisBroker"))
     register_broker = Mock()
     monkeypatch.setattr(broker_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(broker_module.Redis, "from_url", redis_factory)
+    monkeypatch.setattr(broker_module, "make_sync_redis_client", redis_factory)
     monkeypatch.setattr(broker_module, "RedisBroker", broker_factory)
     monkeypatch.setattr(broker_module.dramatiq, "set_broker", register_broker)
 

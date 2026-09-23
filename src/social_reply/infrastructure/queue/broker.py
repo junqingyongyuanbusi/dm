@@ -12,7 +12,7 @@ def setup_broker() -> dramatiq.Broker:
         broker = StubBroker()
     else:
         broker = RedisBroker(
-            client=make_sync_redis_client(),
+            client=make_sync_redis_client(settings.redis_url),
             namespace=settings.dramatiq_namespace,
         )
     dramatiq.set_broker(broker)

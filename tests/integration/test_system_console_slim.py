@@ -81,7 +81,7 @@ async def test_system_overview_and_audit_only_render_security_metadata(
     from social_reply.application.account_management import saas_console
 
     memory_redis = _MemoryRedis()
-    monkeypatch.setattr(saas_console.aioredis, "from_url", lambda _url: memory_redis)
+    monkeypatch.setattr(saas_console, "make_async_redis_client", lambda: memory_redis)
     session.add_all(
         [
             models.AdminUser(
@@ -186,9 +186,9 @@ async def test_system_overview_marks_global_safety_as_degraded_when_redis_is_una
     from social_reply.application.account_management import saas_console
 
     monkeypatch.setattr(
-        saas_console.aioredis,
-        "from_url",
-        lambda _url: _UnavailableRedis(),
+        saas_console,
+        "make_async_redis_client",
+        lambda: _UnavailableRedis(),
     )
 
     async with _client() as client:
@@ -269,7 +269,7 @@ async def test_global_kill_switch_change_is_audited(session, migrated_db, monkey
     from social_reply.application.account_management import admin_console
 
     memory_redis = _MemoryRedis()
-    monkeypatch.setattr(admin_console.aioredis, "from_url", lambda _url: memory_redis)
+    monkeypatch.setattr(admin_console, "make_async_redis_client", lambda: memory_redis)
 
     async with _client() as client:
         csrf = await _login(client, "admin", "test-admin-password")
@@ -354,7 +354,7 @@ async def test_global_kill_switch_rolls_back_when_audit_commit_fails(
             return None
 
     memory_redis = _MemoryRedis()
-    monkeypatch.setattr(admin_console.aioredis, "from_url", lambda _url: memory_redis)
+    monkeypatch.setattr(admin_console, "make_async_redis_client", lambda: memory_redis)
     monkeypatch.setattr(
         admin_console,
         "get_session_factory",

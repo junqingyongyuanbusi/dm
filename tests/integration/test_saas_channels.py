@@ -771,9 +771,9 @@ async def test_kill_switch_persists_unknown_audit_when_redis_apply_fails(
             return None
 
     monkeypatch.setattr(
-        kill_switch_recovery.aioredis,
-        "from_url",
-        lambda _url: FailingRedis(),
+        kill_switch_recovery,
+        "make_async_redis_client",
+        lambda: FailingRedis(),
     )
 
     authenticated = await authenticate(first_user.username, _USER_PASSWORD)

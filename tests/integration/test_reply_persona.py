@@ -568,7 +568,7 @@ async def test_trial_uses_current_business_prompt_without_persisting_or_sending(
 
     monkeypatch.setattr(runner, "_llm", _CaptureLLM())
     fake_redis = _FakeTrialRedis()
-    monkeypatch.setattr(reply_prompt_trial.aioredis, "from_url", lambda _url: fake_redis)
+    monkeypatch.setattr(reply_prompt_trial, "make_async_redis_client", lambda: fake_redis)
     prompt_text = "Explain the answer clearly and finish with one practical next step."
 
     async with _app_client() as client:
@@ -621,9 +621,9 @@ async def test_trial_redacts_pii_before_reaching_the_model(session, migrated_db,
 
     monkeypatch.setattr(runner, "_llm", _CaptureLLM())
     monkeypatch.setattr(
-        reply_prompt_trial.aioredis,
-        "from_url",
-        lambda _url: _FakeTrialRedis(),
+        reply_prompt_trial,
+        "make_async_redis_client",
+        lambda: _FakeTrialRedis(),
     )
     async with _app_client() as client:
         csrf = await _login(client)
@@ -657,7 +657,7 @@ async def test_trial_rate_limit_and_redis_failure_fail_closed(
 
     monkeypatch.setattr(runner, "_llm", _CountingLLM())
     fake_redis = _FakeTrialRedis()
-    monkeypatch.setattr(reply_prompt_trial.aioredis, "from_url", lambda _url: fake_redis)
+    monkeypatch.setattr(reply_prompt_trial, "make_async_redis_client", lambda: fake_redis)
     async with _app_client() as client:
         csrf = await _login(client)
         successful_responses = [
@@ -678,9 +678,9 @@ async def test_trial_rate_limit_and_redis_failure_fail_closed(
     assert calls == reply_prompt_trial.REPLY_PROMPT_TRIAL_RATE_LIMIT
 
     monkeypatch.setattr(
-        reply_prompt_trial.aioredis,
-        "from_url",
-        lambda _url: _UnavailableTrialRedis(),
+        reply_prompt_trial,
+        "make_async_redis_client",
+        lambda: _UnavailableTrialRedis(),
     )
     async with _app_client() as client:
         csrf = await _login(client)
