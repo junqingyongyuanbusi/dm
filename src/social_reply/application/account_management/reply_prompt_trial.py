@@ -4,8 +4,6 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 
-import redis.asyncio as aioredis
-
 from social_reply.application.account_management.reply_prompt_policy import (
     ReplyBusinessPromptScopeError,
     load_current_reply_business_prompt,
@@ -14,7 +12,7 @@ from social_reply.application.reply_decision.runner import _get_llm
 from social_reply.domain.reply.guard import redact_pii
 from social_reply.domain.reply.llm import LLMContext
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.shared.config import get_settings
+from social_reply.infrastructure.redis_client import make_async_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +70,7 @@ def _normalize_trial_input(input_text: str) -> str:
 
 
 async def _consume_trial_rate_limit(*, tenant_id: str, actor: str) -> None:
-    redis_client = aioredis.from_url(get_settings().redis_url)
+    redis_client = make_async_redis_client()
     try:
         rate_limit_key = _trial_rate_limit_key(tenant_id, actor)
         request_count = int(await redis_client.incr(rate_limit_key))

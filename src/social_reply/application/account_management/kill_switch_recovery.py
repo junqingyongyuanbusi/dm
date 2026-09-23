@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-import redis.asyncio as aioredis
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +12,7 @@ from social_reply.application.account_management.access import lock_user_authori
 from social_reply.application.account_management.auth import principal_from_session_row
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
-from social_reply.shared.config import get_settings
+from social_reply.infrastructure.redis_client import make_async_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -465,7 +464,7 @@ async def reconcile_account_kill_switch_command(
     except ValueError as exc:
         raise RuntimeError("kill_switch_account_id_invalid") from exc
 
-    redis = aioredis.from_url(get_settings().redis_url)
+    redis = make_async_redis_client()
     try:
         result = await _reconcile_account_scope(
             tenant_id=audit.tenant_id,
@@ -548,7 +547,7 @@ async def sweep_account_kill_switch_commands(
             )
         ).all()
 
-    redis = aioredis.from_url(get_settings().redis_url)
+    redis = make_async_redis_client()
     resolved_operation_ids: list[uuid.UUID] = []
     try:
         for tenant_id, subject_id, _oldest_pending_at in account_scopes:

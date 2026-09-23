@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlencode
 
-import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from markupsafe import Markup
@@ -222,6 +221,7 @@ from social_reply.domain.reply.business_prompt import (
 from social_reply.domain.reply.guard import has_contact_like
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.redis_client import make_async_redis_client
 from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
 router = APIRouter(tags=["saas-console"])
@@ -4977,7 +4977,7 @@ async def tenant_channels(
             .all()
         )
     settings = get_settings()
-    redis = aioredis.from_url(settings.redis_url)
+    redis = make_async_redis_client()
     try:
         kill_switch_values = (
             await redis.mget(
@@ -5485,7 +5485,7 @@ async def channel_account_detail(
                 )
             )
         )
-    redis = aioredis.from_url(get_settings().redis_url)
+    redis = make_async_redis_client()
     try:
         kill_switch_enabled = bool(
             await redis.exists(f"killswitch:account:{tenant_id}:{account_id}")
@@ -7294,7 +7294,7 @@ async def _load_system_overview() -> tuple[dict[str, int | str | bool], list[mod
         )
 
     global_kill_switch_state = "unavailable"
-    redis = aioredis.from_url(get_settings().redis_url)
+    redis = make_async_redis_client()
     try:
         global_kill_switch_state = (
             "enabled"

@@ -1,8 +1,6 @@
 from typing import Protocol
 
-import redis.asyncio as aioredis
-
-from social_reply.shared.config import get_settings
+from social_reply.infrastructure.redis_client import make_async_redis_client
 
 
 class _RedisLike(Protocol):
@@ -33,5 +31,5 @@ def make_killswitch_checker() -> KillSwitchChecker:
     """Return a process-wide checker so decision and delivery share one Redis pool."""
     global _redis
     if _redis is None:
-        _redis = aioredis.from_url(get_settings().redis_url)
+        _redis = make_async_redis_client()
     return KillSwitchChecker(_redis)

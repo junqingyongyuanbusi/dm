@@ -16,7 +16,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote, urlencode
 
-import redis.asyncio as aioredis
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
@@ -27,6 +26,7 @@ from social_reply.application.account_management.auth import Principal, principa
 from social_reply.application.account_management.ui_i18n import translate
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.redis_client import make_async_redis_client
 from social_reply.infrastructure.secret_crypto import decrypt_secret_bundle, encrypt_secret_bundle
 from social_reply.shared.config import get_settings
 
@@ -314,7 +314,7 @@ def oauth_provisioning_error_response(
     )
 
 def oauth_redis():
-    return aioredis.from_url(get_settings().redis_url)
+    return make_async_redis_client()
 
 
 def oauth_state_key(namespace: str, key: str) -> str:

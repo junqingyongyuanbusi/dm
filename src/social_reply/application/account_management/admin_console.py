@@ -11,7 +11,6 @@ from datetime import UTC, datetime, timedelta
 from typing import NoReturn
 from urllib.parse import quote, urlencode
 
-import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import and_, desc, func, or_, select
@@ -123,6 +122,7 @@ from social_reply.domain.platform_accounts import capability_text_limit
 from social_reply.domain.reply.business_prompt import BusinessPromptValidationError
 from social_reply.infrastructure.database import models
 from social_reply.infrastructure.database.engine import get_session_factory
+from social_reply.infrastructure.redis_client import make_async_redis_client
 from social_reply.shared.config import DEFAULT_TENANT_ID, get_settings
 
 logger = logging.getLogger(__name__)
@@ -3518,7 +3518,7 @@ async def accounts_page(request: Request) -> Response:
             .scalars()
             .all()
         )
-    redis = aioredis.from_url(settings.redis_url)
+    redis = make_async_redis_client()
     try:
         account_keys = [f"killswitch:account:{a.tenant_id}:{a.id}" for a in accounts]
         account_flags = await redis.mget(account_keys) if account_keys else []
@@ -3821,9 +3821,8 @@ async def safety_page(request: Request) -> Response:
     if not principal.is_superadmin:
         raise HTTPException(status_code=403, detail="superadmin_required")
     csrf = _csrf(request)
-    settings = get_settings()
     tenants = sorted(principal.allowed_tenants)
-    redis = aioredis.from_url(settings.redis_url)
+    redis = make_async_redis_client()
     try:
         flags = await redis.mget([f"killswitch:global:{tenant}" for tenant in tenants])
     finally:
@@ -4014,7 +4013,6 @@ async def killswitch_toggle(request: Request) -> Response:
         return principal
     form = await _form(request)
     _require_csrf(request, form)
-    settings = get_settings()
     tenant_id = form.get("tenant_id", "")
     if tenant_id not in principal.allowed_tenants:
         raise HTTPException(status_code=403, detail="tenant_access_denied")
@@ -4049,7 +4047,7 @@ async def killswitch_toggle(request: Request) -> Response:
             )
         if account is None or account.tenant_id != tenant_id:
             raise HTTPException(status_code=404, detail="account_not_found")
-        redis = aioredis.from_url(settings.redis_url)
+        redis = make_async_redis_client()
         try:
             current_enabled = bool(
                 await redis.exists(f"killswitch:account:{tenant_id}:{account_id}")
@@ -4080,7 +4078,7 @@ async def killswitch_toggle(request: Request) -> Response:
         )
     else:
         raise HTTPException(status_code=422, detail="invalid_killswitch_scope")
-    redis = aioredis.from_url(settings.redis_url)
+    redis = make_async_redis_client()
     lock_key = ""
     lock_token = ""
     try:
